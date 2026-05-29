@@ -37,6 +37,18 @@ fn sample_local_actor(suffix: &str) -> repo::actor::NewActor {
         private_key_pem: Some(
             "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----".into(),
         ),
+        // M3b: Ed25519 鍵を併載する。core レイヤは PEM をパースせず TEXT として
+        // 保存するだけなので MOCK で round trip を回せる (multibase 変換は
+        // sakurasato-server の actor JSON テスト側で本物の鍵を使う)。
+        ed25519_public_key_id: Some(format!(
+            "https://example.test/users/alice{suffix}#ed25519-key"
+        )),
+        ed25519_public_key_pem: Some(
+            "-----BEGIN PUBLIC KEY-----\nMOCK-ED\n-----END PUBLIC KEY-----".into(),
+        ),
+        ed25519_private_key_pem: Some(
+            "-----BEGIN PRIVATE KEY-----\nMOCK-ED-PRIV\n-----END PRIVATE KEY-----".into(),
+        ),
         also_known_as: vec![format!("https://old.example.test/users/alice{suffix}")],
         moved_to_ap_id: None,
         is_local: true,
@@ -69,15 +81,33 @@ async fn actor_round_trip(pool: PgPool) -> sqlx::Result<()> {
     let refetched = repo::actor::get_by_id(&pool, inserted.id).await?.unwrap();
     assert!(refetched.fetched_at.is_some());
 
-    // 秘密鍵が Debug / Serialize 経由で漏れないことを担保する (M2 レビュー指摘)。
+    // Ed25519 鍵が round trip し、actor JSON 側で読める形で保存されているこ
+    // とを確認する。
+    assert_eq!(
+        refetched.ed25519_public_key_id.as_deref(),
+        Some("https://example.test/users/alice1#ed25519-key"),
+    );
+    assert!(refetched.ed25519_public_key_pem.is_some());
+    assert!(refetched.ed25519_private_key_pem.is_some());
+
+    // 秘密鍵 (RSA + Ed25519 両方) が Debug / Serialize 経由で漏れないことを
+    // 担保する (M2 レビュー指摘 + M3b で Ed25519 にも同じ保護を拡張)。
     let debug_repr = format!("{refetched:?}");
     assert!(
         debug_repr.contains("private_key_pem: Some(\"<redacted>\")"),
         "private_key_pem must be redacted in Debug, got: {debug_repr}"
     );
     assert!(
+        debug_repr.contains("ed25519_private_key_pem: Some(\"<redacted>\")"),
+        "ed25519_private_key_pem must be redacted in Debug, got: {debug_repr}"
+    );
+    assert!(
         !debug_repr.contains("BEGIN PRIVATE KEY"),
         "private key body leaked into Debug: {debug_repr}"
+    );
+    assert!(
+        !debug_repr.contains("MOCK-ED-PRIV"),
+        "Ed25519 private key body leaked into Debug: {debug_repr}"
     );
 
     let json = serde_json::to_string(&refetched).unwrap();
@@ -88,6 +118,10 @@ async fn actor_round_trip(pool: PgPool) -> sqlx::Result<()> {
     assert!(
         !json.contains("BEGIN PRIVATE KEY"),
         "private key body leaked into JSON: {json}"
+    );
+    assert!(
+        !json.contains("MOCK-ED-PRIV"),
+        "Ed25519 private key body leaked into JSON: {json}"
     );
 
     Ok(())

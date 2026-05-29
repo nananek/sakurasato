@@ -27,6 +27,12 @@ pub struct NewActor {
     pub public_key_id: String,
     pub public_key_pem: String,
     pub private_key_pem: Option<String>,
+    /// Ed25519 公開鍵 ID (典型的には `<ap_id>#ed25519-key`)。RSA とのデュア
+    /// ル鍵運用のため [`Self::public_key_id`] と並べて保持する。Ed25519 鍵を
+    /// 持たない remote actor では `None`。
+    pub ed25519_public_key_id: Option<String>,
+    pub ed25519_public_key_pem: Option<String>,
+    pub ed25519_private_key_pem: Option<String>,
     pub also_known_as: Vec<String>,
     pub moved_to_ap_id: Option<String>,
     pub is_local: bool,
@@ -54,6 +60,12 @@ impl std::fmt::Debug for NewActor {
                 "private_key_pem",
                 &self.private_key_pem.as_ref().map(|_| "<redacted>"),
             )
+            .field("ed25519_public_key_id", &self.ed25519_public_key_id)
+            .field("ed25519_public_key_pem", &self.ed25519_public_key_pem)
+            .field(
+                "ed25519_private_key_pem",
+                &self.ed25519_private_key_pem.as_ref().map(|_| "<redacted>"),
+            )
             .field("also_known_as", &self.also_known_as)
             .field("moved_to_ap_id", &self.moved_to_ap_id)
             .field("is_local", &self.is_local)
@@ -80,17 +92,20 @@ where
             ap_id, preferred_username, host, display_name, summary,
             icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
             followers_url, following_url, public_key_id, public_key_pem,
-            private_key_pem, also_known_as, moved_to_ap_id, is_local, actor_type
+            private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
+            also_known_as, moved_to_ap_id, is_local, actor_type
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $18, $19
+            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
         )
         RETURNING
             id, ap_id, preferred_username, host, display_name, summary,
             icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
             followers_url, following_url, public_key_id, public_key_pem,
             private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
         "#,
@@ -109,6 +124,9 @@ where
         new.public_key_id,
         new.public_key_pem,
         new.private_key_pem,
+        new.ed25519_public_key_id,
+        new.ed25519_public_key_pem,
+        new.ed25519_private_key_pem,
         also_known_as_json,
         new.moved_to_ap_id,
         new.is_local,
@@ -128,6 +146,7 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<ActorRow>>
             icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
             followers_url, following_url, public_key_id, public_key_pem,
             private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
         FROM actor WHERE id = $1
@@ -148,6 +167,7 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Act
             icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
             followers_url, following_url, public_key_id, public_key_pem,
             private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
         FROM actor WHERE ap_id = $1
@@ -173,6 +193,7 @@ pub async fn get_by_username_host(
             icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
             followers_url, following_url, public_key_id, public_key_pem,
             private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
         FROM actor WHERE preferred_username = $1 AND host = $2
