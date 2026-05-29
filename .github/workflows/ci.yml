@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Cargo workspace がまだ無い間 (M1 着手前) は Rust ステップをスキップして
+      # required status check を緑に保つ。Cargo.toml が入った時点で本稼働する。
+      - name: Detect Cargo workspace
+        id: cargo
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Cargo.toml が無いため Rust ステップをスキップします (M1 以降で有効化)"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.cargo.outputs.present == 'true'
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.cargo.outputs.present == 'true'
+
+      - name: rustfmt
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo fmt --all --check
+
+      - name: clippy
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        if: steps.cargo.outputs.present == 'true'
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo test --workspace

@@ -1,0 +1,125 @@
+name: Claude PR review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  claude-review:
+    # Trigger conditions:
+    #   - any PR open/sync/reopen
+    #   - PR review comment mentioning @claude (= 人による mention のみ、
+    #     bot 投稿は除外して self-trigger spam を防ぐ)
+    #   - issue/PR comment mentioning @claude (同上)
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'pull_request_review_comment' &&
+       github.event.comment.user.type != 'Bot' &&
+       contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       github.event.comment.user.type != 'Bot' &&
+       contains(github.event.comment.body, '@claude'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # `gh pr comment` を allow して Claude が直接 PR conversation に
+          # 投稿できるようにする。default では Bash tool が制限されてて、
+          # action 内蔵の buffered inline comment 経路を Claude が選ばない
+          # ため silent で終わる事案があった (iikanji-kakeibo 由来の知見)。
+          claude_args: '--allowed-tools Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh api:*)'
+          prompt: |
+            この repo (`sakurasato`) は **お一人様 TUI 専用 Fediverse (ActivityPub)
+            サーバ**。Rust 製で、`crates/server` が AP 連合デーモン + ローカル API +
+            最小 Web、`crates/tui` が TUI クライアント、`crates/media-proxy` が
+            画像変換/外部取得を隔離するコンテナ、`crates/core` が共有ドメイン型。
+            DB は PostgreSQL 18、ストレージは versitygw (S3 互換, 非公開)。
+            **セキュリティ最重視** + **distroless/rootless 徹底** が設計方針。
+            詳細は `CLAUDE.md` 参照。ライセンスは MIT。
+
+            この PR を以下の観点でレビューしてほしい。
+
+            ### Rust 安全性
+            - `unsafe` が増えていないか (各クレートは `#![forbid(unsafe_code)]` 方針)
+            - `unwrap`/`expect`/`panic!` の濫用がないか (特にネットワーク・パース経路)
+            - エラーは握り潰さず `thiserror`/`anyhow` で扱われているか
+
+            ### ActivityPub 連合 / なりすまし
+            - inbox 受信で HTTP 署名検証を経ているか、検証前に副作用を起こしていないか
+            - actor / object の `id` ホストと取得元ホストの一致を検証しているか
+              (なりすまし object 注入の防止)
+            - `Move`(`movedTo`/`alsoKnownAs`) 受け入れで双方向の合意検証をしているか
+              (一方的な移行・フォロワー奪取の防止)
+            - 配送キューのリトライが無限増幅・自己宛ループを起こさないか
+
+            ### SSRF / 危険入力の隔離 (最重要)
+            - **外部 URL 取得・画像デコードが必ず `media-proxy` 経由か。`server`/`tui`
+              本体が信頼できないバイト列を直接デコード・fetch していないか**
+            - SSRF 対策: private/loopback/link-local/reserved の遮断、リダイレクト毎の
+              再検証、CIDR allowlist が効いているか
+            - 画像処理に `max_size`/`max_pixels` 上限があるか (デコード爆弾対策)
+            - egress を許可するのは media-proxy のみという前提が崩れていないか
+
+            ### アップロード / メディア
+            - アップロード画像は media-proxy で再エンコード + EXIF/位置情報除去
+              (サニタイズ) を経ているか
+            - 絵文字 zip インポートで **zip slip (パストラバーサル)** 対策、
+              shortcode のサニタイズ、ファイルサイズ/件数上限があるか
+            - versitygw は非公開前提。署名なしで公開バケットを作っていないか
+
+            ### DB / 認証境界
+            - sqlx は compile-time checked query (`query!`/`query_as!`) を使い、
+              文字列連結による SQL を作っていないか
+            - ローカル API (Unix ソケット) のファイルパーミッションが認証境界として
+              機能しているか、トークンが漏れていないか
+
+            ### TUI
+            - 色をハードコードしていないか (必ずテーマ経由)
+            - 視覚刺激抑制モードの要素別画像トグルを尊重しているか
+              (off の要素で画像をデコード/表示していないか)
+
+            ### コンテナ / インフラ
+            - distroless/rootless、read-only rootfs、`cap_drop: [ALL]`、
+              `no-new-privileges` が維持されているか
+            - 不要なネットワーク公開・ポート開放を追加していないか
+
+            ### コード品質一般
+            - secrets (秘密鍵 / トークン / `.env` 等) が差分に紛れていないか
+            - ログ (`tracing`) に秘密情報・トークンを出していないか
+            - 依存追加時に GPL/AGPL/SSPL 系ライセンスが混入していないか (MIT 互換維持)
+            - dead code / 不要コメント / TODO の置き去りがないか
+            - 既存パターン (設定読み出し、エラー型、命名) に整合しているか
+
+            **Output (必須)**:
+            review summary を **必ず top-level PR comment として post** すること。
+            silent で終わらない。手順:
+
+            1. Review 内容を markdown でまとめる (= verdict 行 + 観点別の OK/NG 表
+               + 補足説明)
+            2. 投稿:
+               `gh pr comment <PR_NUMBER> --body "<review markdown>"`
+               (PR_NUMBER は `gh pr list --head <branch> --json number` で取得)
+            3. 1 行目に **verdict: approve / request-changes / block** の
+               いずれかを必ず入れる
+            4. 行依存の finding があれば追加で
+               `gh pr review <N> --comment --body "..."` で個別 line comment
+               (= 任意、無くてもよい)
+
+            日本語で書くこと。
