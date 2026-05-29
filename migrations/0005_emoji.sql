@@ -4,8 +4,10 @@
 
 CREATE TABLE emoji (
     id           BIGSERIAL   PRIMARY KEY,
-    -- shortcode (コロンなし、例: "blob_party")
-    shortcode    TEXT        NOT NULL,
+    -- shortcode (コロンなし、例: "blob_party")。
+    -- zip-slip 相当の S3 キー注入を防ぐため、本体側 + DB の二重で文字種制限する。
+    shortcode    TEXT        NOT NULL
+                              CHECK (shortcode ~ '^[a-zA-Z0-9_-]{1,64}$'),
     -- host (NULL = 本サーバ所有)
     host         TEXT,
     -- カテゴリ (Misskey 互換)

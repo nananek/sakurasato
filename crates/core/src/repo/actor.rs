@@ -7,7 +7,10 @@ use crate::model::ActorRow;
 
 /// Fields required to insert a new actor row. Database-managed columns
 /// (`id`, `created_at`, `updated_at`) are not part of this struct.
-#[derive(Debug, Clone)]
+///
+/// Custom `Debug` redacts `private_key_pem`; deriving `Debug` would leak the
+/// signing key into any `tracing::debug!(?new_actor)` call.
+#[derive(Clone)]
 pub struct NewActor {
     pub ap_id: String,
     pub preferred_username: String,
@@ -28,6 +31,35 @@ pub struct NewActor {
     pub moved_to_ap_id: Option<String>,
     pub is_local: bool,
     pub actor_type: String,
+}
+
+impl std::fmt::Debug for NewActor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewActor")
+            .field("ap_id", &self.ap_id)
+            .field("preferred_username", &self.preferred_username)
+            .field("host", &self.host)
+            .field("display_name", &self.display_name)
+            .field("summary", &self.summary)
+            .field("icon_url", &self.icon_url)
+            .field("image_url", &self.image_url)
+            .field("inbox_url", &self.inbox_url)
+            .field("shared_inbox_url", &self.shared_inbox_url)
+            .field("outbox_url", &self.outbox_url)
+            .field("followers_url", &self.followers_url)
+            .field("following_url", &self.following_url)
+            .field("public_key_id", &self.public_key_id)
+            .field("public_key_pem", &self.public_key_pem)
+            .field(
+                "private_key_pem",
+                &self.private_key_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .field("also_known_as", &self.also_known_as)
+            .field("moved_to_ap_id", &self.moved_to_ap_id)
+            .field("is_local", &self.is_local)
+            .field("actor_type", &self.actor_type)
+            .finish()
+    }
 }
 
 /// Insert a new actor and return the persisted row.

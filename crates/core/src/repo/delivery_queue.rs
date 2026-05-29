@@ -10,6 +10,10 @@ use sqlx::types::Json;
 
 use crate::model::DeliveryQueueRow;
 
+/// Default maximum delivery attempts before a queue row is permanently
+/// retired into the `dead` state. The worker can override this per call.
+pub const DEFAULT_MAX_ATTEMPTS: i32 = 10;
+
 pub async fn enqueue(
     pool: &PgPool,
     inbox_url: &str,
@@ -52,13 +56,26 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<DeliveryQu
     .await
 }
 
-/// Mark a delivery as failed and schedule the next attempt. Used by the M3
-/// delivery worker after a non-fatal HTTP error.
+/// Mark a delivery as failed and schedule the next attempt.
+///
+/// Behaviour:
+/// - Increments `attempts`.
+/// - If the new `attempts` reaches `max_attempts`, the row is moved to
+///   `state = 'dead'` so the worker will never pick it again.
+/// - Otherwise the row goes back to `state = 'failed'` and the worker
+///   will re-lease it after `next_attempt_at`.
+/// - Rows that are already `'dead'` are left untouched, so a stale worker
+///   cannot resurrect a retired delivery.
+///
+/// `max_attempts` is parameterised so the worker can tune it (e.g. raise
+/// it temporarily during a known remote outage). Use
+/// [`DEFAULT_MAX_ATTEMPTS`] otherwise.
 pub async fn mark_failed(
     pool: &PgPool,
     id: i64,
     last_error: &str,
     next_attempt_at: DateTime<Utc>,
+    max_attempts: i32,
 ) -> sqlx::Result<()> {
     sqlx::query!(
         r#"
@@ -66,12 +83,16 @@ pub async fn mark_failed(
         SET attempts = attempts + 1,
             last_error = $1,
             next_attempt_at = $2,
-            state = 'failed',
+            state = CASE
+                WHEN attempts + 1 >= $3 THEN 'dead'
+                ELSE 'failed'
+            END,
             updated_at = now()
-        WHERE id = $3
+        WHERE id = $4 AND state != 'dead'
         "#,
         last_error,
         next_attempt_at,
+        max_attempts,
         id,
     )
     .execute(pool)

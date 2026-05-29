@@ -9,6 +9,11 @@
 networks:
   internal:
     # 本番では internal: true で外部不可達。dev では host からの直接接続を許可。
+    #
+    # 警告: この overlay を **クラウドホスト上では絶対に使用しないこと**。
+    # internal: false にすると postgres・versitygw 含む全コンテナが外向き通信
+    # 可能になり、IMDS (169.254.169.254) 経由でクラウドメタデータが漏洩する
+    # リスクがある。ローカル開発機 (laptop / 自宅サーバ) でのみ使う。
     internal: false
 
 services:

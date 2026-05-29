@@ -35,8 +35,10 @@ CREATE TABLE actor (
     moved_to_ap_id     TEXT,
     -- 本サーバ所属か (TRUE: 本人 / instance.actor, FALSE: remote)
     is_local           BOOLEAN     NOT NULL,
-    -- AP type: "Person" / "Service" / "Application" など
-    actor_type         TEXT        NOT NULL DEFAULT 'Person',
+    -- AP type: "Person" / "Service" / "Application" など。AP 規格上は
+    -- ほかにも値がありうるが、本サーバでは下記 5 種だけを受け入れる。
+    actor_type         TEXT        NOT NULL DEFAULT 'Person'
+                                   CHECK (actor_type IN ('Person', 'Service', 'Application', 'Group', 'Organization')),
     -- 最終フェッチ時刻 (remote actor 用)
     fetched_at         TIMESTAMPTZ,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),

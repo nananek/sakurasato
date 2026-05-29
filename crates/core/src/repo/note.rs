@@ -5,7 +5,7 @@ use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use sqlx::types::Json;
 
-use crate::model::NoteRow;
+use crate::model::{NoteRow, Visibility};
 
 #[derive(Debug, Clone)]
 pub struct NewNote {
@@ -16,7 +16,7 @@ pub struct NewNote {
     pub in_reply_to_ap_id: Option<String>,
     pub in_reply_to_note_id: Option<i64>,
     pub summary: Option<String>,
-    pub visibility: String,
+    pub visibility: Visibility,
     pub sensitive: bool,
     pub to_recipients: Vec<String>,
     pub cc_recipients: Vec<String>,
@@ -61,7 +61,7 @@ pub async fn insert(pool: &PgPool, new: NewNote) -> sqlx::Result<NoteRow> {
         new.in_reply_to_ap_id,
         new.in_reply_to_note_id,
         new.summary,
-        new.visibility,
+        new.visibility.as_str(),
         new.sensitive,
         to_recipients_json,
         cc_recipients_json,

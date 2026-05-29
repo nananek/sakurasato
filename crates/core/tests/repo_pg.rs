@@ -14,7 +14,7 @@
 
 #![forbid(unsafe_code)]
 
-use sakurasato_core::model::FollowState;
+use sakurasato_core::model::{FollowState, Visibility};
 use sakurasato_core::repo;
 use sqlx::PgPool;
 
@@ -105,7 +105,7 @@ async fn note_round_trip(pool: PgPool) -> sqlx::Result<()> {
         in_reply_to_ap_id: None,
         in_reply_to_note_id: None,
         summary: None,
-        visibility: "public".into(),
+        visibility: Visibility::Public,
         sensitive: false,
         to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
         cc_recipients: vec![format!("{}/followers", author.ap_id)],
@@ -156,13 +156,92 @@ async fn delivery_queue_enqueue_and_fail(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(row.state, "pending");
 
     let next = chrono::Utc::now() + chrono::Duration::seconds(60);
-    repo::delivery_queue::mark_failed(&pool, row.id, "503 Service Unavailable", next).await?;
+    repo::delivery_queue::mark_failed(
+        &pool,
+        row.id,
+        "503 Service Unavailable",
+        next,
+        repo::delivery_queue::DEFAULT_MAX_ATTEMPTS,
+    )
+    .await?;
     let after = repo::delivery_queue::get_by_id(&pool, row.id)
         .await?
         .unwrap();
     assert_eq!(after.attempts, 1);
     assert_eq!(after.state, "failed");
     assert_eq!(after.last_error.as_deref(), Some("503 Service Unavailable"));
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delivery_queue_transitions_to_dead_at_max_attempts(pool: PgPool) -> sqlx::Result<()> {
+    let sender = repo::actor::insert(&pool, sample_local_actor("dead")).await?;
+    let row = repo::delivery_queue::enqueue(
+        &pool,
+        "https://gone.example/inbox",
+        &serde_json::json!({"type": "Create"}),
+        sender.id,
+    )
+    .await?;
+    let later = chrono::Utc::now() + chrono::Duration::seconds(60);
+    // max_attempts=3 で 3 回失敗させる → 3 回目で dead 遷移。
+    for _ in 0..3 {
+        repo::delivery_queue::mark_failed(&pool, row.id, "boom", later, 3).await?;
+    }
+    let after = repo::delivery_queue::get_by_id(&pool, row.id)
+        .await?
+        .unwrap();
+    assert_eq!(after.attempts, 3);
+    assert_eq!(
+        after.state, "dead",
+        "must retire to dead after max_attempts"
+    );
+
+    // 既に dead の行は mark_failed を呼んでも変わらないことを担保 (F-2)。
+    repo::delivery_queue::mark_failed(&pool, row.id, "ignored", later, 3).await?;
+    let untouched = repo::delivery_queue::get_by_id(&pool, row.id)
+        .await?
+        .unwrap();
+    assert_eq!(untouched.attempts, 3, "dead row must not be resurrected");
+    assert_eq!(untouched.state, "dead");
+    assert_eq!(
+        untouched.last_error.as_deref(),
+        Some("boom"),
+        "last_error stays from the dead transition"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn emoji_upsert_rejects_invalid_shortcode(pool: PgPool) -> sqlx::Result<()> {
+    let cases = [
+        "../escape",
+        "with space",
+        "コロン",
+        "",
+        // 65 chars
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+    ];
+    for bad in cases {
+        let err = repo::emoji::upsert_local(
+            &pool,
+            repo::emoji::NewLocalEmoji {
+                shortcode: bad.into(),
+                category: None,
+                aliases: vec![],
+                image_key: "x".into(),
+                media_type: "image/png".into(),
+            },
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("expected error for shortcode {bad:?}"));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid emoji shortcode"),
+            "wrong error for {bad:?}: {msg}"
+        );
+    }
     Ok(())
 }
 
@@ -214,7 +293,7 @@ async fn reaction_insert_and_delete(pool: PgPool) -> sqlx::Result<()> {
             in_reply_to_ap_id: None,
             in_reply_to_note_id: None,
             summary: None,
-            visibility: "public".into(),
+            visibility: Visibility::Public,
             sensitive: false,
             to_recipients: vec![],
             cc_recipients: vec![],
