@@ -122,15 +122,33 @@ fn headers_to_map(req: &Request<Body>) -> HeaderMap {
     req.headers().clone()
 }
 
-/// cavage RSA-SHA256 で POST inbox リクエストを組み立てる。
-///
-/// `headers_to_cover` には `(request-target) host date digest` を含める。
+/// cavage RSA-SHA256 で POST inbox リクエストを組み立てる (default covered)。
 fn build_cavage_post(
     body: &[u8],
     rsa_priv_pem: &str,
     keyid: &str,
     date: &str,
     digest_override: Option<&str>,
+) -> Request<Body> {
+    build_cavage_post_with_covered(
+        body,
+        rsa_priv_pem,
+        keyid,
+        date,
+        digest_override,
+        &["(request-target)", "host", "date", "digest"],
+    )
+}
+
+/// cavage の covered headers を任意に指定して POST inbox を組み立てる。
+/// covered 不足のテスト (F2/F4) で使う。
+fn build_cavage_post_with_covered(
+    body: &[u8],
+    rsa_priv_pem: &str,
+    keyid: &str,
+    date: &str,
+    digest_override: Option<&str>,
+    covered: &[&str],
 ) -> Request<Body> {
     let path = "/inbox";
     let digest_value = digest_override.map_or_else(|| digest::format_cavage(body), str::to_string);
@@ -142,12 +160,12 @@ fn build_cavage_post(
         .body(Body::from(body.to_vec()))
         .unwrap();
     let headers = headers_to_map(&req);
-    let covered = ["(request-target)", "host", "date", "digest"];
-    let base = cavage::build_signature_base("POST", path, &covered, &headers, None, None).unwrap();
+    let base = cavage::build_signature_base("POST", path, covered, &headers, None, None).unwrap();
     let sig_bytes = cavage::sign_rsa_sha256(base.as_bytes(), rsa_priv_pem).unwrap();
     let sig_b64 = B64.encode(sig_bytes);
+    let headers_param = covered.join(" ");
     let sig_header = format!(
-        "keyId=\"{keyid}\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"{sig_b64}\""
+        "keyId=\"{keyid}\",algorithm=\"rsa-sha256\",headers=\"{headers_param}\",signature=\"{sig_b64}\""
     );
     let name = HeaderName::from_static("signature");
     req.headers_mut()
@@ -155,21 +173,43 @@ fn build_cavage_post(
     req
 }
 
-/// RFC 9421 + Ed25519 で POST inbox リクエストを組み立てる。
+/// RFC 9421 + Ed25519 で POST inbox リクエストを組み立てる (default covered)。
 fn build_rfc9421_post(
     body: &[u8],
     ed25519_priv_pem: &str,
     keyid: &str,
     date: &str,
 ) -> Request<Body> {
+    build_rfc9421_post_with_covered(
+        body,
+        ed25519_priv_pem,
+        keyid,
+        date,
+        &["@method", "@target-uri", "host", "date", "content-digest"],
+        None,
+    )
+}
+
+/// RFC 9421 の covered components / `created` パラメタを任意に指定する版。
+/// covered 不足 (F1) や `created` 異常値 (F5) のテストで使う。
+fn build_rfc9421_post_with_covered(
+    body: &[u8],
+    ed25519_priv_pem: &str,
+    keyid: &str,
+    date: &str,
+    covered: &[&str],
+    created_override: Option<i64>,
+) -> Request<Body> {
     let path = "/inbox";
     let target_uri = format!("https://{HOST}{path}");
     let content_digest = digest::format_content_digest(body);
-    let now = httpdate::parse_http_date(date)
+    #[allow(clippy::cast_possible_wrap, reason = "test fixture, secs fits in i64")]
+    let created_default = httpdate::parse_http_date(date)
         .unwrap()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs();
+        .as_secs() as i64;
+    let created = created_override.unwrap_or(created_default);
     let mut req = Request::post(path)
         .header("host", HOST)
         .header("date", date)
@@ -178,12 +218,15 @@ fn build_rfc9421_post(
         .body(Body::from(body.to_vec()))
         .unwrap();
     let headers = headers_to_map(&req);
-    let covered = ["@method", "@target-uri", "host", "date", "content-digest"];
-    let raw_value = format!(
-        r#"("@method" "@target-uri" "host" "date" "content-digest");created={now};keyid="{keyid}";alg="ed25519""#,
-    );
+    let covered_quoted = covered
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let raw_value =
+        format!(r#"({covered_quoted});created={created};keyid="{keyid}";alg="ed25519""#);
     let base =
-        rfc9421::build_signature_base("POST", &target_uri, &covered, &headers, &raw_value).unwrap();
+        rfc9421::build_signature_base("POST", &target_uri, covered, &headers, &raw_value).unwrap();
     let sig_bytes = rfc9421::sign_ed25519(base.as_bytes(), ed25519_priv_pem).unwrap();
     let sig_b64 = B64.encode(sig_bytes);
     let input_value = format!("sig1={raw_value}");
@@ -408,4 +451,177 @@ async fn user_inbox_path_also_verifies_signature(pool: PgPool) {
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+// ===========================================================================
+// Regression tests for PR #19 review findings (F1, F2, F4, F5, F7, F8).
+// ===========================================================================
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn cavage_missing_digest_in_covered_returns_400(pool: PgPool) {
+    // F2: digest が covered に無いと MITM がボディ+Digest を差し替えて
+    // 通せる。最小 covered set 強制で 400 で弾く。
+    let (priv_pem, pub_pem) = fresh_rsa();
+    repo::actor::insert(&pool, build_remote_actor(&pub_pem, None))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let body = br#"{"type":"Follow"}"#;
+    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#main-key");
+    let req = build_cavage_post_with_covered(
+        body,
+        &priv_pem,
+        &keyid,
+        &now_http_date(),
+        None,
+        &["(request-target)", "host", "date"], // digest を抜く
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn cavage_missing_host_in_covered_returns_400(pool: PgPool) {
+    // F4: host が covered に無いと別宛先への replay が可能。
+    let (priv_pem, pub_pem) = fresh_rsa();
+    repo::actor::insert(&pool, build_remote_actor(&pub_pem, None))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let body = br#"{"type":"Follow"}"#;
+    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#main-key");
+    let req = build_cavage_post_with_covered(
+        body,
+        &priv_pem,
+        &keyid,
+        &now_http_date(),
+        None,
+        &["(request-target)", "date", "digest"], // host を抜く
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_missing_content_digest_in_covered_returns_400(pool: PgPool) {
+    // F1: content-digest が covered に無いとボディが一切検証されない。
+    let (rsa_priv, rsa_pub) = fresh_rsa();
+    let (ed_priv, ed_pub) = fresh_ed25519();
+    let _ = rsa_priv;
+    repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let body = br#"{"type":"Follow"}"#;
+    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#ed25519-key");
+    let req = build_rfc9421_post_with_covered(
+        body,
+        &ed_priv,
+        &keyid,
+        &now_http_date(),
+        &["@method", "@target-uri", "host", "date"], // content-digest を抜く
+        None,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_empty_covered_returns_400(pool: PgPool) {
+    // F1 + F4 同時: `sig1=();...` の空 covered は何もコミットしないので
+    // 拒否する。
+    let (rsa_priv, rsa_pub) = fresh_rsa();
+    let (ed_priv, ed_pub) = fresh_ed25519();
+    let _ = rsa_priv;
+    repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let body = br#"{"type":"Follow"}"#;
+    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#ed25519-key");
+    let req = build_rfc9421_post_with_covered(body, &ed_priv, &keyid, &now_http_date(), &[], None);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_created_overflow_does_not_panic(pool: PgPool) {
+    // F5: created=i64::MAX で SystemTime + Duration がパニックしないこと。
+    // 認証突破せず inbox を落とせるとマズい。401 / 400 のいずれかが返れば OK。
+    let (rsa_priv, rsa_pub) = fresh_rsa();
+    let (ed_priv, ed_pub) = fresh_ed25519();
+    let _ = rsa_priv;
+    repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let body = br#"{"type":"Follow"}"#;
+    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#ed25519-key");
+    let req = build_rfc9421_post_with_covered(
+        body,
+        &ed_priv,
+        &keyid,
+        &now_http_date(),
+        &["@method", "@target-uri", "host", "date", "content-digest"],
+        Some(i64::MAX),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    // どちらに分類されるかは実装詳細だが、サーバが panic していない (= 5xx
+    // でも 4xx でも何か返している) ことだけは厳密に保証する。
+    assert!(
+        resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::BAD_REQUEST,
+        "created=i64::MAX should be rejected, got {}",
+        resp.status()
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn cavage_iso8601_date_returns_400_not_401(pool: PgPool) {
+    // F7: ISO 8601 形式 (RFC 7231 非準拠) の Date は構造的不備として 400。
+    // 401 だと Mastodon 系の再送ループが止まらない。
+    let (priv_pem, pub_pem) = fresh_rsa();
+    repo::actor::insert(&pool, build_remote_actor(&pub_pem, None))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let body = br#"{"type":"Follow"}"#;
+    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#main-key");
+    let req = build_cavage_post(body, &priv_pem, &keyid, "2024-01-01T00:00:00Z", None);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn cavage_unterminated_quoted_keyid_returns_400(pool: PgPool) {
+    // F8: keyId="..." の閉じ忘れは無言で受理されず、Malformed → 400 で弾く。
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let bad_sig =
+        "keyId=\"https://example/users/a#main-key,algorithm=\"rsa-sha256\",signature=\"AAAA\"";
+    let resp = app
+        .oneshot(
+            Request::post("/inbox")
+                .header("host", HOST)
+                .header("date", now_http_date())
+                .header("content-type", "application/activity+json")
+                .header("signature", bad_sig)
+                .body(Body::from(r#"{"type":"Follow"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

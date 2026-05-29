@@ -65,11 +65,15 @@ where
         // 3. keyId → ap_id を取り出して actor を引く。未知なら 401。
         let parsed_keyid =
             keyid::parse(&info.key_id).map_err(|e| SigError::KeyIdMalformed(e.to_string()))?;
+        // DB エラーと「actor が存在しない」を分離 (F6): DB 障害なら
+        // 503 を返して Mastodon 系の長めのリトライ保持に乗せる。actor が
+        // 居ないだけなら 401 で再送ループに乗せ、M3b-3 の remote fetch で
+        // 補完されるのを待つ。
         let actor = repo::actor::get_by_ap_id(state.pool(), parsed_keyid.ap_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, ap_id = %parsed_keyid.ap_id, "DB error during actor lookup");
-                SigError::UnknownActor
+                SigError::Internal
             })?
             .ok_or(SigError::UnknownActor)?;
 

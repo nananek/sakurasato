@@ -141,9 +141,13 @@ pub(crate) fn parse_signature_input(header: &str) -> Result<SignatureInput<'_>, 
             .ok_or(ParseError::Malformed("parameter missing '='"))?;
         let k = k.trim();
         let v_raw = v.trim();
-        let v = v_raw
-            .strip_prefix('"')
-            .map_or(v_raw, |inner| inner.strip_suffix('"').unwrap_or(inner));
+        // 開き `"` があれば閉じ `"` も必須 (F8)。閉じ忘れを無言で受理しない。
+        let v = match v_raw.strip_prefix('"') {
+            Some(inner) => inner
+                .strip_suffix('"')
+                .ok_or(ParseError::Malformed("unterminated quoted parameter value"))?,
+            None => v_raw,
+        };
         match k {
             "created" => created = Some(v.parse()?),
             "keyid" => keyid = Some(v),

@@ -94,12 +94,20 @@ pub(crate) enum SigError {
     UnsupportedKeyKind(KeyKind),
     #[error("alg parameter does not match keyId kind")]
     AlgMismatch,
+
+    // --- 503 Service Unavailable: サーバ側の一時障害 (DB 接続失敗等)。
+    //     Mastodon は 5xx を長めに保持してリトライするので、DB が回復すれば
+    //     アクティビティを失わない。401 (UnknownActor) で握ると相手側キュー
+    //     から早期に破棄される可能性がある。
+    #[error("internal server error during signature verification")]
+    Internal,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum SigErrorClass {
     BadRequest,
     Unauthorized,
+    Internal,
 }
 
 impl SigError {
@@ -118,6 +126,7 @@ impl SigError {
             | Self::ActorMissingKey(_)
             | Self::UnsupportedKeyKind(_)
             | Self::AlgMismatch => SigErrorClass::Unauthorized,
+            Self::Internal => SigErrorClass::Internal,
         }
     }
 }
@@ -126,10 +135,17 @@ impl IntoResponse for SigError {
     fn into_response(self) -> Response {
         // 検証失敗の中身はレスポンスに出さない (情報漏洩防止)。
         // ログには出すが、秘密鍵や signature 本体は元々持っていないので安全。
-        tracing::warn!(error = %self, "inbox signature verification failed");
         match self.class() {
-            SigErrorClass::BadRequest => (StatusCode::BAD_REQUEST, "bad request").into_response(),
+            SigErrorClass::Internal => {
+                tracing::error!(error = %self, "inbox internal error");
+                (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response()
+            }
+            SigErrorClass::BadRequest => {
+                tracing::warn!(error = %self, "inbox signature verification failed");
+                (StatusCode::BAD_REQUEST, "bad request").into_response()
+            }
             SigErrorClass::Unauthorized => {
+                tracing::warn!(error = %self, "inbox signature verification failed");
                 (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
             }
         }
@@ -245,13 +261,24 @@ fn verify_cavage_with_actor(
     let parsed = cavage::parse_signature_header(sig_header)
         .map_err(|e| SigError::SignatureMalformed(e.to_string()))?;
 
-    // Date のずれをまず確認 (clock skew)。Mastodon 系は Date を必ず送る。
+    // **最小 covered set 強制** (F1+F2+F4): POST inbox では署名が
+    // `(request-target)+host+date+digest` の 4 要素すべてにコミットしている
+    // ことを必須化する。digest が covered に無いと MITM がボディ+Digest
+    // ヘッダを差し替えても署名検証が通ってしまう (= ボディ完全性が崩れる)。
+    // host が無いと別宛先への replay が成立、date が無いと clock skew 制約が
+    // 名目化、(request-target) が無いと別エンドポイントへの転送が通る。
+    require_covered_cavage(&parsed.headers)?;
+
+    // Date のずれを確認 (clock skew)。Date の **パース失敗** は構造的
+    // 不備として 400 で返す (F7): ISO 8601 等 RFC 7231 非準拠の値を 401 に
+    // すると Mastodon 系が無限リトライするため。
     let date_str = header_value(ctx.headers, "date").map_err(|_| SigError::DateMissing)?;
-    let date_time = httpdate::parse_http_date(date_str).map_err(|_| SigError::ClockSkew)?;
+    let date_time = httpdate::parse_http_date(date_str)
+        .map_err(|e| SigError::SignatureMalformed(format!("Date header is not RFC 7231: {e}")))?;
     check_skew(date_time, now)?;
 
-    // Digest 検証。headers パラメタに `digest` が含まれていなくても、
-    // body 付き POST では必須 (Mastodon が要求する)。
+    // Digest 検証。covered 強制で `digest` 必須化済みなので、ヘッダ存在 +
+    // 内容一致を独立に確認 (これで body 改竄を弾く)。
     let digest_header = ctx.headers.get("digest").and_then(|v| v.to_str().ok());
     digest::verify_cavage(ctx.body, digest_header).map_err(|e| map_digest_err(&e))?;
 
@@ -284,6 +311,12 @@ fn verify_rfc9421_with_actor(
     let parsed = rfc9421::parse_signature_input(input_header)
         .map_err(|e| SigError::SignatureMalformed(e.to_string()))?;
 
+    // **最小 covered set 強制** (F1+F4): POST inbox では署名が `@method` /
+    // `@target-uri` / (`host` か `@authority`) / `content-digest` のすべてに
+    // コミットしている必要がある。空 covered (`sig1=();...`) や
+    // `content-digest` を省いた署名は、ボディ・宛先・メソッドを保護しない。
+    require_covered_rfc9421(&parsed.covered)?;
+
     // alg が明記されていれば key_kind との整合を確認。
     if let Some(alg) = parsed.alg {
         match (info.key_kind, alg) {
@@ -294,22 +327,28 @@ fn verify_rfc9421_with_actor(
 
     // clock skew: created があれば使う、無ければ Date ヘッダで代替。
     let event_time = if let Some(created) = parsed.created {
+        let secs = u64::try_from(created).map_err(|_| SigError::ClockSkew)?;
+        // `SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX)` は内部の
+        // timespec オーバーフローでパニックする実装が存在する (F5)。
+        // checked_add で安全に弾く。
         SystemTime::UNIX_EPOCH
-            + Duration::from_secs(u64::try_from(created).map_err(|_| SigError::ClockSkew)?)
+            .checked_add(Duration::from_secs(secs))
+            .ok_or(SigError::ClockSkew)?
     } else {
         let date_str = header_value(ctx.headers, "date").map_err(|_| SigError::DateMissing)?;
-        httpdate::parse_http_date(date_str).map_err(|_| SigError::ClockSkew)?
+        httpdate::parse_http_date(date_str).map_err(|e| {
+            SigError::SignatureMalformed(format!("Date header is not RFC 7231: {e}"))
+        })?
     };
     check_skew(event_time, now)?;
 
-    // Content-Digest 検証 (covered に含まれていれば必須)。
-    if parsed.covered.contains(&"content-digest") {
-        let header = ctx
-            .headers
-            .get("content-digest")
-            .and_then(|v| v.to_str().ok());
-        digest::verify_content_digest(ctx.body, header).map_err(|e| map_digest_err(&e))?;
-    }
+    // Content-Digest 検証。covered 強制で必須化済みなので、ヘッダ存在 +
+    // 内容一致を独立に確認。
+    let header = ctx
+        .headers
+        .get("content-digest")
+        .and_then(|v| v.to_str().ok());
+    digest::verify_content_digest(ctx.body, header).map_err(|e| map_digest_err(&e))?;
 
     // signature base 組み立て。
     let base = rfc9421::build_signature_base(
@@ -354,6 +393,39 @@ fn check_skew(event: SystemTime, now: SystemTime) -> Result<(), SigError> {
     } else {
         Ok(())
     }
+}
+
+/// cavage POST inbox に必須な最小 covered headers。1 つでも欠けると
+/// ボディ完全性 / 宛先 / 時刻 / メソッドのどれかが署名にコミットされない。
+const CAVAGE_REQUIRED_COVERED: &[&str] = &["(request-target)", "host", "date", "digest"];
+
+fn require_covered_cavage(headers: &[&str]) -> Result<(), SigError> {
+    for needed in CAVAGE_REQUIRED_COVERED {
+        if !headers.contains(needed) {
+            return Err(SigError::SignatureMalformed(format!(
+                "cavage covered headers must include {needed}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// RFC 9421 POST inbox に必須な最小 covered components。`host` は
+/// `@authority` (derived component) で代替できる。
+fn require_covered_rfc9421(covered: &[&str]) -> Result<(), SigError> {
+    for needed in ["@method", "@target-uri", "content-digest"] {
+        if !covered.contains(&needed) {
+            return Err(SigError::SignatureMalformed(format!(
+                "RFC 9421 covered must include {needed}"
+            )));
+        }
+    }
+    if !covered.contains(&"host") && !covered.contains(&"@authority") {
+        return Err(SigError::SignatureMalformed(
+            "RFC 9421 covered must include host or @authority".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn map_digest_err(e: &digest::DigestError) -> SigError {
@@ -504,5 +576,87 @@ mod tests {
         let body = SigError::BadSignature.into_response();
         assert_eq!(body.status(), StatusCode::UNAUTHORIZED);
         // body 文字列は固定汎用文言で、enum メッセージは漏れない。
+    }
+
+    #[test]
+    fn internal_error_returns_503() {
+        // F6: DB エラーなど内部障害は 503 を返し、相手のリトライ保持を
+        // 長く取らせる (401 だと早期に破棄される)。
+        let body = SigError::Internal.into_response();
+        assert_eq!(body.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn require_covered_cavage_accepts_full_set() {
+        require_covered_cavage(&["(request-target)", "host", "date", "digest"]).unwrap();
+    }
+
+    #[test]
+    fn require_covered_cavage_accepts_extra_headers() {
+        // 必須要素を含んだ上で extra なヘッダがあっても OK。
+        require_covered_cavage(&[
+            "(request-target)",
+            "host",
+            "date",
+            "digest",
+            "content-type",
+            "user-agent",
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn require_covered_cavage_rejects_missing_digest() {
+        // F2: digest が covered に無いと MITM がボディ差し替え可能。
+        let err = require_covered_cavage(&["(request-target)", "host", "date"]).unwrap_err();
+        assert!(matches!(err, SigError::SignatureMalformed(_)));
+    }
+
+    #[test]
+    fn require_covered_cavage_rejects_missing_host() {
+        // F4: host が covered に無いと別宛先への replay が可能。
+        let err = require_covered_cavage(&["(request-target)", "date", "digest"]).unwrap_err();
+        assert!(matches!(err, SigError::SignatureMalformed(_)));
+    }
+
+    #[test]
+    fn require_covered_cavage_rejects_empty() {
+        let err = require_covered_cavage(&[]).unwrap_err();
+        assert!(matches!(err, SigError::SignatureMalformed(_)));
+    }
+
+    #[test]
+    fn require_covered_rfc9421_accepts_canonical_set() {
+        require_covered_rfc9421(&["@method", "@target-uri", "host", "date", "content-digest"])
+            .unwrap();
+    }
+
+    #[test]
+    fn require_covered_rfc9421_accepts_authority_instead_of_host() {
+        // host の代わりに @authority (derived component) でも OK。
+        require_covered_rfc9421(&["@method", "@target-uri", "@authority", "content-digest"])
+            .unwrap();
+    }
+
+    #[test]
+    fn require_covered_rfc9421_rejects_missing_content_digest() {
+        // F1: content-digest が無いとボディ完全性が崩れる。
+        let err = require_covered_rfc9421(&["@method", "@target-uri", "host"]).unwrap_err();
+        assert!(matches!(err, SigError::SignatureMalformed(_)));
+    }
+
+    #[test]
+    fn require_covered_rfc9421_rejects_empty() {
+        // 空 covered (`sig1=();...`) は受理しない。
+        let err = require_covered_rfc9421(&[]).unwrap_err();
+        assert!(matches!(err, SigError::SignatureMalformed(_)));
+    }
+
+    #[test]
+    fn require_covered_rfc9421_rejects_missing_host_and_authority() {
+        // F4: host も @authority も無ければ宛先 binding が無い。
+        let err =
+            require_covered_rfc9421(&["@method", "@target-uri", "content-digest"]).unwrap_err();
+        assert!(matches!(err, SigError::SignatureMalformed(_)));
     }
 }

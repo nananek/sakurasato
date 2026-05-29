@@ -124,9 +124,15 @@ pub(crate) fn parse_signature_header(header: &str) -> Result<SignatureHeader<'_>
         let k = k.trim();
         let v_raw = v.trim();
         // 文字列値は `"..."` で囲まれている。created/expires は引用符無し。
-        let v = v_raw
-            .strip_prefix('"')
-            .map_or(v_raw, |inner| inner.strip_suffix('"').unwrap_or(inner));
+        // 開き `"` があれば閉じ `"` も必須 (F8): `keyId="https://x` のような
+        // 閉じ忘れを無言で `https://x` として受理すると、攻撃者が任意の
+        // keyId を仕込める。strict にパースする。
+        let v = match v_raw.strip_prefix('"') {
+            Some(inner) => inner.strip_suffix('"').ok_or_else(|| {
+                ParseError::Malformed(format!("unterminated quoted value for {k}"))
+            })?,
+            None => v_raw,
+        };
         match k {
             "keyId" => key_id = Some(v),
             "algorithm" => algorithm = Some(v),
