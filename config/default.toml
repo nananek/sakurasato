@@ -1,0 +1,25 @@
+# Sakurasato 既定設定。
+# 環境変数 SAKURASATO_<SECTION>__<KEY> で個別に上書きできる。
+# 例: SAKURASATO_SERVER__HOST=example.com
+
+[server]
+host = "localhost"
+bind = "0.0.0.0:8080"
+local_api_socket = "/run/sakurasato/local.sock"
+user = "me"
+
+[database]
+url = "postgres://sakurasato:sakurasato@postgres:5432/sakurasato"
+
+[storage]
+# versitygw は非公開。compose 内部ネットからのみ到達する。
+endpoint = "http://versitygw:7070"
+bucket = "sakurasato"
+region = "us-east-1"
+access_key_id = "sakurasato"
+secret_access_key = "sakurasato-change-me"
+
+[media_proxy]
+socket = "/run/sakurasato/media.sock"
+max_bytes = 26214400      # 25 MiB
+max_pixels = 33554432     # 8192 * 4096 相当

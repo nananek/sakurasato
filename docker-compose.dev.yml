@@ -1,0 +1,24 @@
+# 開発用 overlay。`docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build` で使う。
+# 本番との差分:
+#   - postgres / versitygw をホストへポート公開してデバッグ可能に。
+#   - server を外部公開 (8080) してリバースプロキシなしでも触れるように。
+#   - tracing ログを debug に。
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  versitygw:
+    ports:
+      - "127.0.0.1:7070:7070"
+
+  server:
+    environment:
+      RUST_LOG: "sakurasato=debug,info"
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  media-proxy:
+    environment:
+      RUST_LOG: "sakurasato=debug,info"
