@@ -1,0 +1,149 @@
+# Misskey ↔ sakurasato 連合テスト (M3b-2 PR3)。
+#
+# Misskey 本家は RSA 鍵のみ (FEP-521a `assertionMethod` 未対応) なので
+# cavage RSA-SHA256 経路の検証要員。Ed25519 検証は nekonoverse compose で。
+#
+# 起動: scripts/federation-test/up.sh misskey
+# 停止: scripts/federation-test/down.sh misskey
+
+services:
+  certs:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache openssl >/dev/null 2>&1 && /gen-certs.sh"
+    environment:
+      CERT_DOMAINS: sakurasato,misskey
+    volumes:
+      - certs:/certs
+      - ./federation-test/_common/gen-certs.sh:/gen-certs.sh:ro
+
+  # ── Sakurasato Instance ───────────────────────────────────
+  postgres-sks:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: sakurasato
+      POSTGRES_USER: sakurasato
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U sakurasato
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - misskey-fed
+
+  sakurasato-init:
+    build:
+      context: ..
+      dockerfile: docker/server.Dockerfile
+    image: sakurasato/server:dev
+    command: ["init", "--display-name", "Sakurasato Test"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      postgres-sks:
+        condition: service_healthy
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - misskey-fed
+    restart: "no"
+
+  sakurasato-server:
+    image: sakurasato/server:dev
+    command: ["serve"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - misskey-fed
+
+  nginx-sks:
+    image: nginx:alpine
+    volumes:
+      - ./federation-test/_common/nginx-sakurasato.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      sakurasato-server:
+        condition: service_started
+      certs:
+        condition: service_completed_successfully
+    networks:
+      misskey-fed:
+        aliases:
+          - sakurasato
+
+  # ── Misskey Instance ───────────────────────────────────────
+  postgres-mk:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - misskey-fed
+
+  redis-mk:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - misskey-fed
+
+  misskey-app:
+    image: misskey/misskey:2025.2.1
+    environment:
+      # Misskey は undici / node-fetch で TLS を投げ、NODE_EXTRA_CA_CERTS は
+      # 効かないので test CA を信頼させる手段が現状無い。テスト専用 compose
+      # 内に閉じた経路なので TLS 検証ごと無効化する。本番には絶対に持ち込まない
+      # こと。
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    depends_on:
+      postgres-mk:
+        condition: service_healthy
+      redis-mk:
+        condition: service_healthy
+    volumes:
+      - ./federation-test/misskey-federation/misskey.yml:/misskey/.config/default.yml:ro
+    networks:
+      - misskey-fed
+
+  nginx-mk:
+    image: nginx:alpine
+    volumes:
+      - ./federation-test/misskey-federation/nginx-misskey.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      - misskey-app
+      - certs
+    networks:
+      misskey-fed:
+        aliases:
+          - misskey
+
+volumes:
+  certs:
+
+networks:
+  misskey-fed:
+    driver: bridge

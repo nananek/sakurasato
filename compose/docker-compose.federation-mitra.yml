@@ -1,0 +1,142 @@
+# Mitra ↔ sakurasato 連合テスト (M3b-2 PR3)。
+#
+# Mitra は FEP-521a Multikey 対応で Ed25519 主対向の 1 つ (もう 1 つは
+# nekonoverse compose)。RFC 9421 + Ed25519 経路の検証要員。
+#
+# 起動: scripts/federation-test/up.sh mitra
+# 停止: scripts/federation-test/down.sh mitra
+
+services:
+  certs:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache openssl >/dev/null 2>&1 && /gen-certs.sh"
+    environment:
+      CERT_DOMAINS: sakurasato,mitra
+    volumes:
+      - certs:/certs
+      - ./federation-test/_common/gen-certs.sh:/gen-certs.sh:ro
+
+  # ── Sakurasato Instance ───────────────────────────────────
+  postgres-sks:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: sakurasato
+      POSTGRES_USER: sakurasato
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U sakurasato
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - mitra-fed
+
+  sakurasato-init:
+    build:
+      context: ..
+      dockerfile: docker/server.Dockerfile
+    image: sakurasato/server:dev
+    command: ["init", "--display-name", "Sakurasato Test"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      postgres-sks:
+        condition: service_healthy
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - mitra-fed
+    restart: "no"
+
+  sakurasato-server:
+    image: sakurasato/server:dev
+    command: ["serve"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - mitra-fed
+
+  nginx-sks:
+    image: nginx:alpine
+    volumes:
+      - ./federation-test/_common/nginx-sakurasato.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      sakurasato-server:
+        condition: service_started
+      certs:
+        condition: service_completed_successfully
+    networks:
+      mitra-fed:
+        aliases:
+          - sakurasato
+
+  # ── Mitra Instance ─────────────────────────────────────────
+  postgres-mitra:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: mitra
+      POSTGRES_USER: mitra
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U mitra
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - mitra-fed
+
+  mitra-app:
+    # 再現性のためタグ固定。`latest` だと再 up で異なるバージョンが引かれる。
+    # 上げる場合は https://hub.docker.com/r/bleakfuture0/mitra/tags
+    image: bleakfuture0/mitra:v5.4.0
+    entrypoint: ["/custom-entrypoint.sh"]
+    environment:
+      CONFIG_PATH: /etc/mitra/config.yaml
+    volumes:
+      - ./federation-test/mitra-federation/mitra-config.yaml:/etc/mitra/config.yaml:ro
+      - ./federation-test/mitra-federation/mitra-entrypoint.sh:/custom-entrypoint.sh:ro
+      - certs:/certs:ro
+      - mitra-storage:/var/lib/mitra
+    depends_on:
+      postgres-mitra:
+        condition: service_healthy
+      certs:
+        condition: service_completed_successfully
+    networks:
+      - mitra-fed
+
+  nginx-mitra:
+    image: nginx:alpine
+    volumes:
+      - ./federation-test/mitra-federation/nginx-mitra.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      - mitra-app
+      - certs
+    networks:
+      mitra-fed:
+        aliases:
+          - mitra
+
+volumes:
+  certs:
+  mitra-storage:
+
+networks:
+  mitra-fed:
+    driver: bridge
