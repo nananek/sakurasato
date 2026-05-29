@@ -12,6 +12,10 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 mod common {
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::pkcs8::EncodePublicKey;
+    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+    use rsa::rand_core::OsRng;
     use sakurasato_core::repo::actor::NewActor;
 
     pub(super) fn sample_local_actor(username: &str, host: &str) -> NewActor {
@@ -34,11 +38,27 @@ mod common {
             private_key_pem: Some(
                 "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----".into(),
             ),
+            ed25519_public_key_id: Some(format!("{ap_id}#ed25519-key")),
+            ed25519_public_key_pem: Some(sample_ed25519_public_pem()),
+            ed25519_private_key_pem: Some(
+                "-----BEGIN PRIVATE KEY-----\nMOCK-ED\n-----END PRIVATE KEY-----".into(),
+            ),
             also_known_as: vec![],
             moved_to_ap_id: None,
             is_local: true,
             actor_type: "Person".into(),
         }
+    }
+
+    /// 本物の Ed25519 公開鍵 PEM をテスト用に毎回生成する。actor JSON 側で
+    /// PEM を multibase に変換するため、MOCK な PEM だと変換に失敗して
+    /// `assertionMethod` が omit され、検証ができない。
+    pub(super) fn sample_ed25519_public_pem() -> String {
+        let signing = SigningKey::generate(&mut OsRng);
+        signing
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap()
     }
 }
 
@@ -210,6 +230,96 @@ async fn actor_json_redacts_private_key(pool: PgPool) {
     assert!(
         !text.contains("BEGIN PRIVATE KEY"),
         "must NOT include private key body"
+    );
+    assert!(
+        !text.contains("MOCK-ED"),
+        "must NOT leak Ed25519 private key marker: {text}",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_json_publishes_ed25519_assertion_method(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/users/alice")
+                .header("accept", "application/activity+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+
+    // @context に Multikey 用 URI が積まれていること。
+    let ctx = json["@context"].as_array().expect("context is array");
+    assert!(
+        ctx.iter()
+            .any(|v| v == "https://w3id.org/security/multikey/v1"),
+        "context must include multikey vocab: {ctx:?}",
+    );
+
+    // assertionMethod: Multikey 1 件、Ed25519 鍵 ID と multibase 値を含む。
+    let am = json["assertionMethod"]
+        .as_array()
+        .expect("assertionMethod should be present");
+    assert_eq!(am.len(), 1, "expected exactly one Multikey: {am:?}");
+    let entry = &am[0];
+    assert_eq!(entry["type"], "Multikey");
+    assert_eq!(entry["id"], "https://example.test/users/alice#ed25519-key");
+    assert_eq!(entry["controller"], "https://example.test/users/alice");
+    let mb = entry["publicKeyMultibase"]
+        .as_str()
+        .expect("publicKeyMultibase must be a string");
+    assert!(
+        mb.starts_with('z'),
+        "publicKeyMultibase must be base58btc-prefixed: {mb}",
+    );
+    // base58btc("ed 01" || 32-byte) は概ね 48 文字 + 'z'。
+    assert!(
+        (48..=52).contains(&mb.len()),
+        "unexpected multibase length: {mb}",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_json_omits_assertion_method_when_no_ed25519(pool: PgPool) {
+    // Ed25519 鍵を持たない actor (旧 M3a の local actor 等) では
+    // assertionMethod を omit し、multikey context も載せない。
+    let mut new = common::sample_local_actor("bob", "example.test");
+    new.ed25519_public_key_id = None;
+    new.ed25519_public_key_pem = None;
+    new.ed25519_private_key_pem = None;
+    repo::actor::insert(&pool, new).await.unwrap();
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/users/bob")
+                .header("accept", "application/activity+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert!(
+        json.get("assertionMethod").is_none(),
+        "assertionMethod must be omitted when actor has no Ed25519 key: {json}",
+    );
+    let ctx = json["@context"].as_array().expect("context is array");
+    assert!(
+        !ctx.iter()
+            .any(|v| v == "https://w3id.org/security/multikey/v1"),
+        "multikey context must be omitted alongside assertionMethod: {ctx:?}",
     );
 }
 

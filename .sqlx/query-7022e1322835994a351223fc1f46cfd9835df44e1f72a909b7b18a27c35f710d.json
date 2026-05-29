@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at\n        FROM actor WHERE preferred_username = $1 AND host = $2\n        ",
+  "query": "\n        SELECT\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at\n        FROM actor WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -181,6 +181,39 @@
       },
       {
         "ordinal": 16,
+        "name": "ed25519_public_key_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "ed25519_public_key_id"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "ed25519_public_key_pem",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "ed25519_public_key_pem"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "ed25519_private_key_pem",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "ed25519_private_key_pem"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
         "name": "also_known_as: Json<Vec<String>>",
         "type_info": "Jsonb",
         "origin": {
@@ -191,7 +224,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 20,
         "name": "moved_to_ap_id",
         "type_info": "Text",
         "origin": {
@@ -202,7 +235,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 21,
         "name": "is_local",
         "type_info": "Bool",
         "origin": {
@@ -213,7 +246,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 22,
         "name": "actor_type",
         "type_info": "Text",
         "origin": {
@@ -224,7 +257,7 @@
         }
       },
       {
-        "ordinal": 20,
+        "ordinal": 23,
         "name": "fetched_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -235,7 +268,7 @@
         }
       },
       {
-        "ordinal": 21,
+        "ordinal": 24,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -246,7 +279,7 @@
         }
       },
       {
-        "ordinal": 22,
+        "ordinal": 25,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -259,8 +292,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text"
+        "Int8"
       ]
     },
     "nullable": [
@@ -280,6 +312,9 @@
       false,
       false,
       true,
+      true,
+      true,
+      true,
       false,
       true,
       false,
@@ -289,5 +324,5 @@
       false
     ]
   },
-  "hash": "4c0ec662cde2261eaa15d98f0598fa319fc79752c26d1e60e6e3a22fecbc10e1"
+  "hash": "7022e1322835994a351223fc1f46cfd9835df44e1f72a909b7b18a27c35f710d"
 }

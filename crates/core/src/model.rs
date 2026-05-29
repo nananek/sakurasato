@@ -38,6 +38,17 @@ pub struct ActorRow {
     /// 永続化からの復元は `sqlx::FromRow` が担うので serde を経由する必要はない。
     #[serde(skip)]
     pub private_key_pem: Option<String>,
+    /// Ed25519 公開鍵の `ActivityPub` キー ID (FEP-521a `assertionMethod` の
+    /// `id`)。RSA 側 [`Self::public_key_id`] とは別物。Ed25519 鍵を持たない
+    /// local actor (`init --force` 未実行の旧 actor) や、`publicKey` に RSA
+    /// しか公開していない remote actor では `None`。
+    pub ed25519_public_key_id: Option<String>,
+    /// Ed25519 公開鍵 (PKCS#8 SPKI PEM)。
+    pub ed25519_public_key_pem: Option<String>,
+    /// Ed25519 秘密鍵 (PKCS#8 PEM)。RSA 側と同じく
+    /// マスアサインメント脆弱性回避のため `#[serde(skip)]`。
+    #[serde(skip)]
+    pub ed25519_private_key_pem: Option<String>,
     pub also_known_as: Json<Vec<String>>,
     pub moved_to_ap_id: Option<String>,
     pub is_local: bool,
@@ -68,6 +79,12 @@ impl std::fmt::Debug for ActorRow {
             .field(
                 "private_key_pem",
                 &self.private_key_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .field("ed25519_public_key_id", &self.ed25519_public_key_id)
+            .field("ed25519_public_key_pem", &self.ed25519_public_key_pem)
+            .field(
+                "ed25519_private_key_pem",
+                &self.ed25519_private_key_pem.as_ref().map(|_| "<redacted>"),
             )
             .field("also_known_as", &self.also_known_as)
             .field("moved_to_ap_id", &self.moved_to_ap_id)

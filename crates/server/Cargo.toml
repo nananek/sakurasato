@@ -30,9 +30,15 @@ serde_json.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
 rsa.workspace = true
+ed25519-dalek.workspace = true
+multibase.workspace = true
 http.workspace = true
 
 [dev-dependencies]
 sakurasato-core = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+# integration tests need real Ed25519 keypairs (mock PEM can't be parsed by
+# the actor JSON multibase converter).
+ed25519-dalek = { workspace = true }
+rsa = { workspace = true }

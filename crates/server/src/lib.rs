@@ -8,6 +8,7 @@
 
 pub mod cli;
 pub mod init;
+pub mod multikey;
 pub mod routes;
 pub mod serve;
 pub mod state;
