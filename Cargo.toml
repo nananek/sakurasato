@@ -40,6 +40,8 @@ figment = { version = "0.10", features = ["toml", "env"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+percent-encoding = "2"
+url = "2"
 
 [profile.release]
 lto = "thin"

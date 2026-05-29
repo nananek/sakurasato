@@ -14,7 +14,7 @@ COPY config ./config
 
 # BuildKit のキャッシュマウントで registry とビルド成果物を温存。
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target,id=sakurasato-target \
+    --mount=type=cache,target=/build/target,id=sakurasato-server-target \
     cargo build --release --target x86_64-unknown-linux-musl -p sakurasato-server && \
     cp target/x86_64-unknown-linux-musl/release/sakurasato-server /sakurasato-server
 

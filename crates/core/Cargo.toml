@@ -16,6 +16,9 @@ anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 figment.workspace = true
+percent-encoding.workspace = true
 
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }
+serde_json.workspace = true
+url.workspace = true

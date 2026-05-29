@@ -10,7 +10,31 @@ use figment::{
     Figment,
     providers::{Env, Format, Toml},
 };
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
+
+/// URL userinfo encode set per RFC 3986: percent-encode anything outside
+/// the unreserved set so passwords with `@`/`:`/`/`/`?`/`#`/`%` don't
+/// break the parser.
+const USERINFO_ENCODE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b':')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 /// Top-level Sakurasato configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -49,7 +73,10 @@ pub struct DatabaseConfig {
 
 impl DatabaseConfig {
     /// Resolve the connection URL, substituting `{password}` from
-    /// [`Self::password_file`] when present.
+    /// [`Self::password_file`] when present. The password is percent-encoded
+    /// per RFC 3986 userinfo before insertion, so passwords containing
+    /// `@`, `:`, `/`, `#`, or other reserved characters do not corrupt
+    /// the URL.
     pub fn resolved_url(&self) -> anyhow::Result<String> {
         if !self.url.contains("{password}") {
             return Ok(self.url.clone());
@@ -65,18 +92,61 @@ impl DatabaseConfig {
                 path.display()
             )
         })?;
-        Ok(self.url.replace("{password}", raw.trim()))
+        let encoded = utf8_percent_encode(raw.trim(), USERINFO_ENCODE).to_string();
+        Ok(self.url.replace("{password}", &encoded))
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct StorageConfig {
     /// S3 endpoint (versitygw is reached internally, never published).
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
     pub access_key_id: String,
+    /// S3 secret access key. Skipped from serialization to avoid leaks via
+    /// `serde_json::to_string(&config)` and custom-redacted in `Debug` so
+    /// it never appears in `tracing::debug!(?config)` either. Prefer
+    /// setting [`Self::secret_access_key_file`] over hard-coding this.
+    #[serde(skip_serializing)]
     pub secret_access_key: String,
+    /// Optional path to a file containing the S3 secret access key. When
+    /// set, its contents (trimmed) take precedence over
+    /// [`Self::secret_access_key`].
+    #[serde(default)]
+    pub secret_access_key_file: Option<PathBuf>,
+}
+
+impl StorageConfig {
+    /// Returns the effective secret access key, reading from
+    /// [`Self::secret_access_key_file`] when set.
+    pub fn resolved_secret_access_key(&self) -> anyhow::Result<String> {
+        match &self.secret_access_key_file {
+            Some(path) => {
+                let raw = std::fs::read_to_string(path).map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed to read storage secret_access_key_file {}: {err}",
+                        path.display()
+                    )
+                })?;
+                Ok(raw.trim().to_owned())
+            }
+            None => Ok(self.secret_access_key.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("secret_access_key_file", &self.secret_access_key_file)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -187,6 +257,82 @@ max_pixels = 33554432
                 cfg.database.resolved_url().unwrap(),
                 "postgres://sakurasato:s3cret@postgres:5432/sakurasato"
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolved_url_percent_encodes_special_chars() {
+        Jail::expect_with(|jail| {
+            let dir = jail.directory().to_path_buf();
+            let pw_path = dir.join("pw.txt");
+            // 全部生のまま埋めると URL の userinfo 区切り (`@`, `:`) を壊す。
+            std::fs::write(&pw_path, "p@ss/wo:rd#1\n").unwrap();
+            let path = write_default(jail);
+            jail.set_env(
+                "SAKURASATO_DATABASE__PASSWORD_FILE",
+                pw_path.to_str().unwrap(),
+            );
+            let cfg = Config::load(&path, None).unwrap();
+            let resolved = cfg.database.resolved_url().unwrap();
+            assert_eq!(
+                resolved,
+                "postgres://sakurasato:p%40ss%2Fwo%3Ard%231@postgres:5432/sakurasato"
+            );
+            // url クレートで再パースして host が壊れていないことも確認。
+            let parsed = url::Url::parse(&resolved).unwrap();
+            assert_eq!(parsed.host_str(), Some("postgres"));
+            assert_eq!(parsed.password(), Some("p%40ss%2Fwo%3Ard%231"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolved_secret_access_key_reads_file_when_set() {
+        Jail::expect_with(|jail| {
+            let dir = jail.directory().to_path_buf();
+            let key_path = dir.join("s3.txt");
+            std::fs::write(&key_path, "the-real-key\n").unwrap();
+            let path = write_default(jail);
+            jail.set_env(
+                "SAKURASATO_STORAGE__SECRET_ACCESS_KEY_FILE",
+                key_path.to_str().unwrap(),
+            );
+            let cfg = Config::load(&path, None).unwrap();
+            assert_eq!(
+                cfg.storage.resolved_secret_access_key().unwrap(),
+                "the-real-key"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn storage_debug_redacts_secret_access_key() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            let cfg = Config::load(&path, None).unwrap();
+            let dbg = format!("{:?}", cfg.storage);
+            assert!(dbg.contains("<redacted>"), "debug must mask secret: {dbg}");
+            assert!(
+                !dbg.contains("minio12345"),
+                "secret leaked into debug: {dbg}"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn storage_serialize_skips_secret_access_key() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            let cfg = Config::load(&path, None).unwrap();
+            let json = serde_json::to_string(&cfg.storage).unwrap();
+            assert!(
+                !json.contains("minio12345"),
+                "secret leaked into JSON: {json}"
+            );
+            assert!(!json.contains("secret_access_key\":\""), "{json}");
             Ok(())
         });
     }

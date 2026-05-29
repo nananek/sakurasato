@@ -21,8 +21,11 @@ endpoint = "http://versitygw:7070"
 bucket = "sakurasato"
 region = "us-east-1"
 access_key_id = "sakurasato"
-# CHANGE-ME: 本番では必ず compose secret か KMS 経由で差し替えること。
+# CHANGE-ME: secret_access_key はプレースホルダ。本番は必ず
+# secret_access_key_file (= /run/secrets/...) か KMS 経由で差し替え、
+# この値を読まれない構成にすること。
 secret_access_key = "sakurasato-change-me"
+# secret_access_key_file = "/run/secrets/s3_secret_key"
 
 [media_proxy]
 socket = "/run/sakurasato/media.sock"

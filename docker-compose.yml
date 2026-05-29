@@ -105,16 +105,21 @@ services:
       SAKURASATO_DATABASE__URL: "postgres://sakurasato:{password}@postgres:5432/sakurasato"
       SAKURASATO_DATABASE__PASSWORD_FILE: "/run/secrets/postgres_password"
       SAKURASATO_STORAGE__ENDPOINT: "http://versitygw:7070"
+      # versitygw と同じ secret を読ませることで S3 認証を整合させる。
+      SAKURASATO_STORAGE__SECRET_ACCESS_KEY_FILE: "/run/secrets/s3_secret_key"
       SAKURASATO_MEDIA_PROXY__SOCKET: "/run/sakurasato/media.sock"
-      # TUI (ホスト端末) が ./run 経由で触れる位置に socket を作る。
       SAKURASATO_SERVER__LOCAL_API_SOCKET: "/run/sakurasato-local/local.sock"
     secrets:
       - postgres_password
+      - s3_secret_key
     volumes:
       # media-proxy と共有する Unix socket (内部通信専用)。
       - media_sock:/run/sakurasato
-      # TUI クライアント (ホスト端末) から接続するためのローカル API ソケット領域。
-      - ./run:/run/sakurasato-local
+      # TUI 用ローカル API ソケット領域。M1 時点では named volume を使い
+      # docker が所有権を管理する (host bind だと distroless nonroot=65532 が
+      # 書き込めない)。M5 で TUI を実装する際は本ボリュームを host から触れる
+      # 形に切り替える (例: bind mount + 事前 chown、または UDS forwarder)。
+      - local_sock:/run/sakurasato-local
     networks:
       # server は外部 egress を持たない (internal のみ)。配送は media-proxy 経由。
       # 公開は外側のリバースプロキシ (caddy 等) が担当する。
@@ -131,6 +136,7 @@ volumes:
   postgres_data:
   versitygw_data:
   media_sock:
+  local_sock:
 
 secrets:
   postgres_password:
