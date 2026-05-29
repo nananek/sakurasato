@@ -174,6 +174,9 @@ rustup target add x86_64-unknown-linux-musl   # distroless 用静的ビルド
 cargo install sqlx-cli --no-default-features --features postgres
 
 # docker / docker compose は導入済み（v29 / compose v5）
+
+# git hooks を有効化（main 保護: 直接 commit/push を禁止）
+git config core.hooksPath .githooks
 ```
 
 ---
@@ -211,7 +214,45 @@ cargo run -p sakurasato-tui
 
 ---
 
-## 11. 実装マイルストーン
+## 11. リポジトリ運用・CI/CD
+
+### リポジトリ
+- GitHub: **`nananek/sakurasato`**（Public / MIT / © 2026 nananek）
+- 実装ロードマップ: Issue **#1〜#10**（= M1〜M10）、**#11** がトラッキング。
+
+### ブランチ運用
+- **`main`**: リリース専用の保護ブランチ。**直接 push 禁止（PR 必須）**、force-push/削除禁止、linear history。
+- **`develop`**: 開発の主軸。Claude はここで自由に作業・直 push してよい。
+- フロー: `develop`（必要なら `feature/*` → `develop`）→ **`develop` → `main` の PR** → **nananek が手動マージ**。
+  - **Claude は `develop` → `main` のマージを実行しない**（auto-merge も無効化済み）。PR 作成までが Claude の役割。
+
+### リリース（バージョニング）
+- **CalVer `YYYY.MM.patch`**（Misskey 準拠、例 `2026.05.0`）。
+- `develop` → `main` を手動マージした後、`main` にタグ `YYYY.MM.patch` を打ってリリース。**タグ push は許可**。
+
+### コミット規約
+- **Conventional Commits**。type 例: `feat` / `fix` / `docs` / `refactor` / `test` / `perf` / `chore` / `ci` / `docker` / `deps`。
+- 1 行目: `type(scope): 要約`。本文に理由。Claude 作業分は末尾に `Co-Authored-By: Claude ...`。
+
+### git hooks（`.githooks/`, `core.hooksPath` で有効化）
+- **`pre-push`**: `main` への直接 push を拒否（**タグ push と develop は許可**）。
+- **`pre-commit`**: `main` ブランチ上での直接コミットを拒否。
+- 有効化（クローン後に一度）: `git config core.hooksPath .githooks`。リモートの branch protection と二重で守る。
+
+### CI / 自動化（`.github/`）
+- **CI** (`ci.yml`): `cargo fmt --check` / `clippy -D warnings` / `test`。`main`・`develop` の push と PR。required status check = `ci`。`Cargo.toml` が無い間はスキップして緑（M1 で本稼働）。
+- **CodeQL** (`codeql.yml`): Rust SAST（`build-mode: none`）。`.rs`/`Cargo.*` 変更時と週次。
+- **Dependency Review** (`dependency-review.yml`): high 以上で fail、GPL/AGPL/SSPL を deny（MIT 維持）。
+- **Claude PR レビュー** (`claude-review.yml`): `anthropics/claude-code-action@v1`、認証 **`secrets.CLAUDE_CODE_OAUTH_TOKEN`**。PR 自動 + `@claude` メンション、verdict 付き top-level コメントを必ず投稿。
+- **Dependabot** (`dependabot.yml`): `cargo`/`github-actions`/`docker` を週次更新。
+- **アラート**: Dependabot alerts / 自動セキュリティ修正 / secret scanning + push protection 有効化済み。
+
+### 要設定の secret
+- **`CLAUDE_CODE_OAUTH_TOKEN`** — Claude PR レビュー用。`gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo nananek/sakurasato`（iikanji と同じ値でOK）。
+
+---
+
+## 12. 実装マイルストーン
 
 1. workspace 初期化、`docker-compose` 雛形、distroless/rootless Dockerfile、設定ローダ。
 2. `sqlx` マイグレーション（actor / note / follow / delivery_queue / emoji / reaction）、core 型。
@@ -226,7 +267,7 @@ cargo run -p sakurasato-tui
 
 ---
 
-## 12. 検証（エンドツーエンド）
+## 13. 検証（エンドツーエンド）
 
 - `docker compose up` で postgres / versitygw / media-proxy / server が **非 root・read-only fs** で起動することを確認。
 - WebFinger 解決: `curl 'https://<host>/.well-known/webfinger?resource=acct:<user>@<host>'` が actor を返す。

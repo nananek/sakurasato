@@ -1,0 +1,16 @@
+# Rust
+/target
+**/target
+**/*.rs.bk
+
+# Claude Code (local session state)
+.claude/
+
+# Env / secrets
+.env
+*.env
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
