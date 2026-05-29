@@ -30,6 +30,7 @@ pub(crate) mod cavage;
 pub(crate) mod digest;
 pub(crate) mod keyid;
 pub(crate) mod rfc9421;
+pub(crate) mod sign_request;
 
 use self::keyid::KeyKind;
 
@@ -213,13 +214,6 @@ pub(crate) struct RequestContext<'a> {
     pub body: &'a [u8],
 }
 
-/// 検証用の "現在時刻" を注入できるよう関数化。テストでは固定時刻を渡せる。
-pub(crate) type ClockFn = fn() -> SystemTime;
-
-fn system_now() -> SystemTime {
-    SystemTime::now()
-}
-
 /// DB から引いた `ActorRow` の鍵を使って、digest / clock skew / 署名を
 /// 実際に検証する。
 ///
@@ -230,15 +224,16 @@ pub(crate) fn verify_request_with_actor(
     info: &SignatureInfo,
     actor: &ActorRow,
 ) -> Result<(), SigError> {
-    verify_request_with_actor_at(ctx, info, actor, system_now)
+    verify_request_with_actor_at(ctx, info, actor, SystemTime::now)
 }
 
-/// テスト向け: 現在時刻を注入できる版。
-pub(crate) fn verify_request_with_actor_at(
+/// テスト向け: 現在時刻を注入できる版。`Fn() -> SystemTime` を取るので
+/// 固定値を返すクロージャを `move` で食わせて検証時刻を凍結できる。
+pub(crate) fn verify_request_with_actor_at<F: Fn() -> SystemTime>(
     ctx: &RequestContext<'_>,
     info: &SignatureInfo,
     actor: &ActorRow,
-    now: ClockFn,
+    now: F,
 ) -> Result<(), SigError> {
     match info.scheme {
         SigScheme::Cavage => verify_cavage_with_actor(ctx, info, actor, now()),

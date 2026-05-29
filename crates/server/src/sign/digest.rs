@@ -39,11 +39,8 @@ pub(crate) fn sha256(body: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// cavage 形式 `SHA-256=<base64>` をフォーマットする。
-///
-/// M3b-2 PR2 (アウトバウンド配送) で本格使用予定。PR1 では統合テストの
-/// 署名リクエスト組み立てからのみ使われる。
-#[allow(dead_code, reason = "M3b-2 PR2 のアウトバウンド配送で本格使用")]
+/// cavage 形式 `SHA-256=<base64>` をフォーマットする。アウトバウンド配送で
+/// `Digest:` ヘッダを組み立てる際に使用。
 pub(crate) fn format_cavage(body: &[u8]) -> String {
     format!("SHA-256={}", B64.encode(sha256(body)))
 }

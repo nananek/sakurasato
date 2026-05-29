@@ -7,7 +7,9 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod delivery;
 pub(crate) mod extract;
+pub(crate) mod http_client;
 pub mod init;
 pub mod multikey;
 pub mod routes;

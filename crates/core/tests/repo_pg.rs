@@ -269,6 +269,70 @@ async fn delivery_queue_transitions_to_dead_at_max_attempts(pool: PgPool) -> sql
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delivery_queue_mark_delivered_terminates_row(pool: PgPool) -> sqlx::Result<()> {
+    let sender = repo::actor::insert(&pool, sample_local_actor("ok")).await?;
+    let row = repo::delivery_queue::enqueue(
+        &pool,
+        "https://ok.example/inbox",
+        &serde_json::json!({"type": "Create"}),
+        sender.id,
+    )
+    .await?;
+
+    // 一度失敗 → 失敗状態でも mark_delivered で確定できる (ワーカが N 回目で
+    // 成功するケース)。
+    let later = chrono::Utc::now() + chrono::Duration::seconds(60);
+    repo::delivery_queue::mark_failed(&pool, row.id, "temp glitch", later, 5).await?;
+    repo::delivery_queue::mark_delivered(&pool, row.id).await?;
+    let done = repo::delivery_queue::get_by_id(&pool, row.id)
+        .await?
+        .unwrap();
+    assert_eq!(done.state, "delivered");
+    assert_eq!(done.attempts, 2, "attempts incremented for the success try");
+    assert!(
+        done.last_error.is_none(),
+        "last_error must be cleared on delivered"
+    );
+
+    // 終端状態への二重コールはノーオプ (べき等)。
+    repo::delivery_queue::mark_delivered(&pool, row.id).await?;
+    let still = repo::delivery_queue::get_by_id(&pool, row.id)
+        .await?
+        .unwrap();
+    assert_eq!(still.attempts, 2, "delivered row must not be re-attempted");
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delivery_queue_mark_delivered_skips_dead_rows(pool: PgPool) -> sqlx::Result<()> {
+    // dead に倒したあとに何らかの理由で mark_delivered が誤って呼ばれても、
+    // 状態を巻き戻さないこと (M2 4th review F-1 と対称な保証)。
+    let sender = repo::actor::insert(&pool, sample_local_actor("z")).await?;
+    let row = repo::delivery_queue::enqueue(
+        &pool,
+        "https://dead.example/inbox",
+        &serde_json::json!({"type": "Create"}),
+        sender.id,
+    )
+    .await?;
+    let later = chrono::Utc::now() + chrono::Duration::seconds(60);
+    for _ in 0..2 {
+        repo::delivery_queue::mark_failed(&pool, row.id, "boom", later, 2).await?;
+    }
+    let dead = repo::delivery_queue::get_by_id(&pool, row.id)
+        .await?
+        .unwrap();
+    assert_eq!(dead.state, "dead");
+
+    repo::delivery_queue::mark_delivered(&pool, row.id).await?;
+    let still_dead = repo::delivery_queue::get_by_id(&pool, row.id)
+        .await?
+        .unwrap();
+    assert_eq!(still_dead.state, "dead", "dead row must not be revived");
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn emoji_upsert_rejects_invalid_shortcode(pool: PgPool) -> sqlx::Result<()> {
     let cases = [
         "../escape",

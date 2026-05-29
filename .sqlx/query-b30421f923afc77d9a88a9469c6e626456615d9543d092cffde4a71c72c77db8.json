@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE delivery_queue\n        SET state = 'delivered',\n            attempts = attempts + 1,\n            last_error = NULL,\n            updated_at = now()\n        WHERE id = $1 AND state IN ('pending', 'failed')\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b30421f923afc77d9a88a9469c6e626456615d9543d092cffde4a71c72c77db8"
+}
