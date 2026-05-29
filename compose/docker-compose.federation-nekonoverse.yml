@@ -1,0 +1,185 @@
+# Nekonoverse ↔ sakurasato 連合テスト (M3b-2 PR3)。
+#
+# **Ed25519 検証の主対向**: nekonoverse は FEP-521a Multikey + dual-key
+# (RSA + Ed25519) 完備で、RFC 9421 + Ed25519 経路を本物の他実装相手に
+# 試せる数少ない選択肢の 1 つ (もう 1 つは Mitra)。
+#
+# inline build に github の develop ブランチを使う。初回は backend image の
+# ビルドに数分かかる。
+#
+# 起動: scripts/federation-test/up.sh nekonoverse
+# 停止: scripts/federation-test/down.sh nekonoverse
+
+services:
+  certs:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache openssl >/dev/null 2>&1 && /gen-certs.sh"
+    environment:
+      CERT_DOMAINS: sakurasato,nekonoverse
+    volumes:
+      - certs:/certs
+      - ./federation-test/_common/gen-certs.sh:/gen-certs.sh:ro
+
+  # ── Sakurasato Instance ───────────────────────────────────
+  postgres-sks:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: sakurasato
+      POSTGRES_USER: sakurasato
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U sakurasato
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - nekonoverse-fed
+
+  sakurasato-init:
+    build:
+      context: ..
+      dockerfile: docker/server.Dockerfile
+    image: sakurasato/server:dev
+    command: ["init", "--display-name", "Sakurasato Test"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      postgres-sks:
+        condition: service_healthy
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - nekonoverse-fed
+    restart: "no"
+
+  sakurasato-server:
+    image: sakurasato/server:dev
+    command: ["serve"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - nekonoverse-fed
+
+  nginx-sks:
+    image: nginx:alpine
+    volumes:
+      - ./federation-test/_common/nginx-sakurasato.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      sakurasato-server:
+        condition: service_started
+      certs:
+        condition: service_completed_successfully
+    networks:
+      nekonoverse-fed:
+        aliases:
+          - sakurasato
+
+  # ── Nekonoverse Instance ──────────────────────────────────
+  postgres-neko:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: nekonoverse
+      POSTGRES_USER: nekonoverse
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U nekonoverse
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - nekonoverse-fed
+
+  valkey-neko:
+    image: valkey/valkey:8-alpine
+    healthcheck:
+      test: valkey-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - nekonoverse-fed
+
+  nekonoverse-app:
+    build:
+      context: https://github.com/nekonoverse/nekonoverse.git#develop:backend
+    image: sakurasato-test/nekonoverse:dev
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level info"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nekonoverse:testpass@postgres-neko:5432/nekonoverse
+      VALKEY_URL: valkey://valkey-neko:6379/0
+      DOMAIN: nekonoverse
+      SECRET_KEY: test-secret-key-neko
+      FRONTEND_URL: https://nekonoverse
+      DEBUG: "true"
+      REGISTRATION_OPEN: "true"
+      SKIP_SSL_VERIFY: "true"
+      ALLOW_PRIVATE_NETWORKS: "true"
+    depends_on:
+      postgres-neko:
+        condition: service_healthy
+      valkey-neko:
+        condition: service_healthy
+    healthcheck:
+      test: python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    networks:
+      - nekonoverse-fed
+
+  nekonoverse-worker:
+    image: sakurasato-test/nekonoverse:dev
+    command: python -m app.worker.main
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nekonoverse:testpass@postgres-neko:5432/nekonoverse
+      VALKEY_URL: valkey://valkey-neko:6379/0
+      DOMAIN: nekonoverse
+      SECRET_KEY: test-secret-key-neko
+      FRONTEND_URL: https://nekonoverse
+      DEBUG: "true"
+      REGISTRATION_OPEN: "true"
+      SKIP_SSL_VERIFY: "true"
+      ALLOW_PRIVATE_NETWORKS: "true"
+    depends_on:
+      nekonoverse-app:
+        condition: service_healthy
+    networks:
+      - nekonoverse-fed
+
+  nginx-neko:
+    image: nginx:alpine
+    volumes:
+      - ./federation-test/nekonoverse-federation/nginx-nekonoverse.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      nekonoverse-app:
+        condition: service_healthy
+      certs:
+        condition: service_completed_successfully
+    networks:
+      nekonoverse-fed:
+        aliases:
+          - nekonoverse
+
+volumes:
+  certs:
+
+networks:
+  nekonoverse-fed:
+    driver: bridge

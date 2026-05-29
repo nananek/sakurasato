@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [main, develop]
+    paths-ignore:
+      # 連合テスト compose / scripts / docs は CI 対象外
+      # (重いビルドかつ外部 image に依存)。手動 e2e 専用。
+      - "compose/docker-compose.federation-*.yml"
+      - "compose/federation-test/**"
+      - "scripts/federation-test/**"
   pull_request:
     branches: [main, develop]
+    paths-ignore:
+      - "compose/docker-compose.federation-*.yml"
+      - "compose/federation-test/**"
+      - "scripts/federation-test/**"
 
 permissions:
   contents: read
