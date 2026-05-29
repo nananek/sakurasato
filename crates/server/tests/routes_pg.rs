@@ -358,7 +358,11 @@ async fn outbox_returns_empty_ordered_collection(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn inbox_accepts_post_and_returns_202(pool: PgPool) {
+async fn inbox_rejects_unsigned_post_with_400(pool: PgPool) {
+    // M3a までは placeholder で 202 を返していたが、M3b-2 で署名検証が
+    // extractor として配線された。Signature ヘッダ無しのリクエストは
+    // 「ActivityPub inbox の仕様を満たしていない」として 400 で弾く。
+    // 詳細な署名検証の網羅は crates/server/src/inbox_signature_tests.rs。
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::routes::router(state);
 
@@ -371,5 +375,5 @@ async fn inbox_accepts_post_and_returns_202(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

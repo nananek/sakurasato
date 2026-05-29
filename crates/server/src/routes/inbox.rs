@@ -1,25 +1,46 @@
-//! Inbox endpoints. M3a only accepts the POST and returns 202 (Accepted)
-//! so remote servers learn the inbox exists; verification, parsing, and
-//! handler dispatch land in M3b once HTTP signatures are wired.
+//! Inbox endpoints.
+//!
+//! M3a で受け口 (`POST /inbox`, `POST /users/<name>/inbox`) を 202 で返す
+//! だけのプレースホルダとして開けた。M3b-2 で **HTTP 署名検証**を
+//! [`crate::extract::SignedInboxBody`] extractor に集約し、検証が通った
+//! リクエストのみがこの handler に届く。
+//!
+//! 現段階 (M3b-2) では検証通過後に `tracing::info!` でログを残して 202 を
+//! 返すだけ。Activity ディスパッチ (Follow / Accept / Reject / Create /
+//! Delete 等の本処理) は **M3b-3 以降**で順次実装する。
+//!
+//! 未知 actor (`keyId` が DB に無い) は extractor が 401 を返すため、
+//! Mastodon 系の再送ループに乗る。M3b-3 で remote actor fetch を実装した
+//! あとに自然に検証成立する設計。
 
 use axum::extract::Path;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-pub async fn shared_inbox() -> Response {
-    placeholder()
+use crate::extract::SignedInboxBody;
+
+pub(crate) async fn shared_inbox(signed: SignedInboxBody) -> Response {
+    log_and_accept(&signed, None)
 }
 
-pub async fn user_inbox(Path(_name): Path<String>) -> Response {
-    placeholder()
+pub(crate) async fn user_inbox(Path(name): Path<String>, signed: SignedInboxBody) -> Response {
+    log_and_accept(&signed, Some(name.as_str()))
 }
 
-fn placeholder() -> Response {
-    // 202 Accepted: the activity is queued for processing. Real processing
-    // (signature verification, side-effect application) is wired in M3b.
+fn log_and_accept(signed: &SignedInboxBody, recipient: Option<&str>) -> Response {
+    // body の中身は M3b-3 以降の Activity ディスパッチ実装で JSON パース
+    // するため、ここでは ap_id と scheme のみログに残す。秘密情報は出さない。
+    tracing::info!(
+        actor = %signed.actor.ap_id,
+        scheme = ?signed.scheme,
+        key_kind = ?signed.key_kind,
+        recipient = ?recipient,
+        body_size = signed.body.len(),
+        "inbox accepted (activity dispatch pending in M3b-3)",
+    );
     (
         StatusCode::ACCEPTED,
-        "inbox is online but processing is not yet implemented (M3b)",
+        "accepted; activity dispatch pending (M3b-3)",
     )
         .into_response()
 }
