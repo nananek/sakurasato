@@ -215,6 +215,43 @@ async fn enqueue_rejects_invalid_inbox_url(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn deliver_one_blocks_self_inbox(pool: PgPool) {
+    // 自インスタンス (example.test) の inbox URL を行に入れて
+    // try_deliver_one を呼ぶと、permanent error で弾かれ queue 行は触られない。
+    // M3b-3 の常駐ワーカ化で誤って自分宛 POST のループに入らないことの担保。
+    let sender = repo::actor::insert(&pool, local_actor_with_real_key("alice", "example.test"))
+        .await
+        .unwrap();
+    let activity = serde_json::json!({"type": "Create"});
+
+    let row = delivery::enqueue_activity(
+        &pool,
+        sender.id,
+        "https://example.test/users/alice/inbox",
+        &activity,
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config("example.test"));
+    let err = delivery::try_deliver_one(&state, row.id).await.unwrap_err();
+    assert!(
+        err.to_string().contains("self-delivery"),
+        "expected self-delivery loop block, got: {err}"
+    );
+
+    let after = repo::delivery_queue::get_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.state, "pending",
+        "permanent error must not touch the queue row"
+    );
+    assert_eq!(after.attempts, 0);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn deliver_one_marks_retry_on_non_2xx(pool: PgPool) {
     // 受け側が常に 500 を返すなら retry に倒り、queue 行は failed 状態 +
     // last_error 記録 + attempts インクリメント。

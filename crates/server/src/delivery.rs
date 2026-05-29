@@ -238,6 +238,21 @@ async fn attempt_post(
     // はガードを緩める ── 統合テスト用 inbox を loopback で立てるため。
     // 本番 `from_config` 経由では常に `false` で、ガードはバイパスされない。
     let url = reqwest::Url::parse(&row.inbox_url)?;
+
+    // **自己 inbox 宛の配送ループ防止**: `inbox_url` の host が自インスタンスの
+    // 公開ホスト名と一致する場合は即座に拒否する。M3b-2 段階では CLI 起動の
+    // 1 行 flush なので即時害はないが、M3b-3 で常駐 worker ループにしたあと、
+    // バグや悪意ある DB 書き込みで自分宛行が混入すると無限ループする。
+    // 防御深度として `allow_internal_inbox` のテストフラグに関わらず常に適用する
+    // ── テストでは inbox host を `127.0.0.1` などで立てるので、本番 host
+    // (`example.test` 等) と衝突しない設計になっている。
+    if is_self_delivery(&url, &state.config().server.host) {
+        return Err(AttemptError::BlockedAddress {
+            host: url.host_str().unwrap_or("").to_string(),
+            reason: "self-delivery loop",
+        });
+    }
+
     if !state.allow_internal_inbox()
         && let Some(reason) = inbox_host_blocked(&url)
     {
@@ -264,6 +279,14 @@ async fn attempt_post(
     Ok(response.status())
 }
 
+/// `inbox_url` が自インスタンスの inbox 宛か。HTTP `Host:` ヘッダは
+/// case-insensitive (RFC 9110 §5.1) なので `eq_ignore_ascii_case` で比較する。
+/// ポート違い (本番 host に別ポートを振る運用は想定しないが) も自分扱いで弾く。
+fn is_self_delivery(url: &reqwest::Url, server_host: &str) -> bool {
+    url.host_str()
+        .is_some_and(|h| h.eq_ignore_ascii_case(server_host))
+}
+
 /// `inbox_url` の host が IP literal で内部 / 予約範囲なら、その理由を返す。
 /// ドメイン名 (非 IP literal) は通過させる ── DNS 解決後の判定は media-proxy
 /// の責務 (CLAUDE.md §3)。
@@ -288,9 +311,21 @@ fn ipv4_block_reason(ip: Ipv4Addr) -> Option<&'static str> {
         Some("broadcast")
     } else if ip.is_documentation() {
         Some("documentation")
+    } else if is_ipv4_cgnat(ip) {
+        // RFC 6598 100.64.0.0/10 — CGNAT 共有アドレス空間。クラウド /
+        // コンテナ環境では内部 LB のアドレスに割り当てられることがあり、
+        // POST 先として通すと内部サービスを叩く経路になり得る。Rust
+        // stable に `Ipv4Addr::is_shared` が無いので手動判定する。
+        Some("cgnat-shared")
     } else {
         None
     }
+}
+
+/// RFC 6598 `100.64.0.0/10` (CGNAT) の判定。上位 10 ビットが `0b0110_0100_01`
+/// 固定 (`100.64.0.0` = `0x6440_0000`、マスク `0xFFC0_0000`)。
+fn is_ipv4_cgnat(ip: Ipv4Addr) -> bool {
+    u32::from(ip) & 0xFFC0_0000 == 0x6440_0000
 }
 
 fn ipv6_block_reason(ip: Ipv6Addr) -> Option<&'static str> {
@@ -399,6 +434,30 @@ mod tests {
     }
 
     #[test]
+    fn inbox_blocks_ipv4_cgnat_shared() {
+        // RFC 6598 100.64.0.0/10。クラウド LB の内部側で割り当てられる
+        // 可能性があり、外向き POST 先として通すべきではない。
+        for s in [
+            "http://100.64.0.1/inbox",
+            "http://100.100.0.1/inbox",
+            "http://100.127.255.254/inbox",
+        ] {
+            assert_eq!(inbox_host_blocked(&url(s)), Some("cgnat-shared"), "{s}");
+        }
+    }
+
+    #[test]
+    fn inbox_allows_ipv4_adjacent_to_cgnat() {
+        // 100.63.255.255 と 100.128.0.0 は CGNAT の外なので通す
+        // (どちらも公開 IP として割り当てられている範囲)。境界バグの回帰テスト。
+        assert_eq!(
+            inbox_host_blocked(&url("http://100.63.255.255/inbox")),
+            None
+        );
+        assert_eq!(inbox_host_blocked(&url("http://100.128.0.0/inbox")), None);
+    }
+
+    #[test]
     fn inbox_blocks_ipv4_unspecified_and_broadcast() {
         assert_eq!(
             inbox_host_blocked(&url("http://0.0.0.0/inbox")),
@@ -454,6 +513,38 @@ mod tests {
         // 漏れる。この受け入れ可否は M3b-3 で media-proxy 経路に統合する際
         // に再評価する (PR2 では IP literal のみガードする方針)。
         assert_eq!(inbox_host_blocked(&url("http://localhost/inbox")), None);
+    }
+
+    #[test]
+    fn is_self_delivery_matches_configured_host() {
+        assert!(is_self_delivery(
+            &url("https://example.test/inbox"),
+            "example.test"
+        ));
+        // HTTP Host は case-insensitive (RFC 9110 §5.1)。
+        assert!(is_self_delivery(
+            &url("https://EXAMPLE.test/users/x/inbox"),
+            "example.test"
+        ));
+        // ポート違いも自分扱い (本番運用で別ポートを振る想定はないが、
+        // バグの混入があっても自分宛になり得るので防御深度として弾く)。
+        assert!(is_self_delivery(
+            &url("http://example.test:8080/inbox"),
+            "example.test"
+        ));
+    }
+
+    #[test]
+    fn is_self_delivery_rejects_other_hosts() {
+        assert!(!is_self_delivery(
+            &url("https://other.test/inbox"),
+            "example.test"
+        ));
+        // subdomain は別ホスト扱い。
+        assert!(!is_self_delivery(
+            &url("https://sub.example.test/inbox"),
+            "example.test"
+        ));
     }
 
     #[test]
