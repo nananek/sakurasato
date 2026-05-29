@@ -16,7 +16,8 @@ CREATE TABLE note (
     -- CW / spoiler / summary
     summary             TEXT,
     -- 公開範囲: 'public' / 'unlisted' / 'followers' / 'direct'
-    visibility          TEXT        NOT NULL DEFAULT 'public',
+    visibility          TEXT        NOT NULL DEFAULT 'public'
+                                     CHECK (visibility IN ('public', 'unlisted', 'followers', 'direct')),
     -- NSFW / Sensitive
     sensitive           BOOLEAN     NOT NULL DEFAULT FALSE,
     -- to / cc (URI 配列)。配送・受信フィルタに使う。

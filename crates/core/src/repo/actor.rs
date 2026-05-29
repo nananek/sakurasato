@@ -32,8 +32,8 @@ pub struct NewActor {
 
 /// Insert a new actor and return the persisted row.
 pub async fn insert(pool: &PgPool, new: NewActor) -> sqlx::Result<ActorRow> {
-    let also_known_as_json = serde_json::to_value(&new.also_known_as)
-        .expect("Vec<String> is always serializable to JSON");
+    let also_known_as_json =
+        serde_json::to_value(&new.also_known_as).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
     sqlx::query_as!(
         ActorRow,
         r#"

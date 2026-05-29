@@ -28,8 +28,10 @@ pub struct NewNote {
 }
 
 pub async fn insert(pool: &PgPool, new: NewNote) -> sqlx::Result<NoteRow> {
-    let to_recipients_json = serde_json::to_value(&new.to_recipients).expect("Vec<String> JSON");
-    let cc_recipients_json = serde_json::to_value(&new.cc_recipients).expect("Vec<String> JSON");
+    let to_recipients_json =
+        serde_json::to_value(&new.to_recipients).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    let cc_recipients_json =
+        serde_json::to_value(&new.cc_recipients).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
     sqlx::query_as!(
         NoteRow,
         r#"

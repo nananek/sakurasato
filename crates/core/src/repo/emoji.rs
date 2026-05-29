@@ -20,7 +20,8 @@ pub struct NewLocalEmoji {
 /// Insert a local custom emoji, overwriting any prior entry with the same
 /// shortcode (Misskey import semantics: 「同名は上書き」, CLAUDE.md §5.4).
 pub async fn upsert_local(pool: &PgPool, new: NewLocalEmoji) -> sqlx::Result<EmojiRow> {
-    let aliases_json = serde_json::to_value(&new.aliases).expect("Vec<String> JSON");
+    let aliases_json =
+        serde_json::to_value(&new.aliases).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
     sqlx::query_as!(
         EmojiRow,
         r#"
