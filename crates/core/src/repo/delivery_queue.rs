@@ -64,8 +64,9 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<DeliveryQu
 ///   `state = 'dead'` so the worker will never pick it again.
 /// - Otherwise the row goes back to `state = 'failed'` and the worker
 ///   will re-lease it after `next_attempt_at`.
-/// - Rows that are already `'dead'` are left untouched, so a stale worker
-///   cannot resurrect a retired delivery.
+/// - **Only `pending` / `failed` rows are affected.** `delivered` rows stay
+///   delivered, and `dead` rows stay dead, so a stale or misrouted worker
+///   call cannot revert a terminal state.
 ///
 /// `max_attempts` is parameterised so the worker can tune it (e.g. raise
 /// it temporarily during a known remote outage). Use
@@ -88,7 +89,7 @@ pub async fn mark_failed(
                 ELSE 'failed'
             END,
             updated_at = now()
-        WHERE id = $4 AND state != 'dead'
+        WHERE id = $4 AND state IN ('pending', 'failed')
         "#,
         last_error,
         next_attempt_at,

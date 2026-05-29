@@ -209,6 +209,28 @@ async fn delivery_queue_transitions_to_dead_at_max_attempts(pool: PgPool) -> sql
         Some("boom"),
         "last_error stays from the dead transition"
     );
+
+    // delivered 行も mark_failed では巻き戻されない (M2 4th review F-1)。
+    let happy = repo::delivery_queue::enqueue(
+        &pool,
+        "https://ok.example/inbox",
+        &serde_json::json!({"type": "Create"}),
+        sender.id,
+    )
+    .await?;
+    sqlx::query!(
+        "UPDATE delivery_queue SET state = 'delivered' WHERE id = $1",
+        happy.id
+    )
+    .execute(&pool)
+    .await?;
+    repo::delivery_queue::mark_failed(&pool, happy.id, "stale call", later, 3).await?;
+    let still_delivered = repo::delivery_queue::get_by_id(&pool, happy.id)
+        .await?
+        .unwrap();
+    assert_eq!(still_delivered.state, "delivered");
+    assert_eq!(still_delivered.attempts, 0);
+    assert!(still_delivered.last_error.is_none());
     Ok(())
 }
 
