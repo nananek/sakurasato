@@ -32,7 +32,11 @@ pub struct ActorRow {
     pub following_url: Option<String>,
     pub public_key_id: String,
     pub public_key_pem: String,
-    #[serde(skip_serializing)]
+    /// `#[serde(skip)]` で双方向を遮断する: M4 以降の API レイヤで
+    /// `serde_json::from_value::<ActorRow>(untrusted_json)` 経由で外部 JSON の
+    /// `private_key_pem` が取り込まれるマスアサインメント脆弱性を防ぐ。
+    /// 永続化からの復元は `sqlx::FromRow` が担うので serde を経由する必要はない。
+    #[serde(skip)]
     pub private_key_pem: Option<String>,
     pub also_known_as: Json<Vec<String>>,
     pub moved_to_ap_id: Option<String>,
