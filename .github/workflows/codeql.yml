@@ -7,14 +7,12 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
-      - ".github/workflows/codeql.yml"
   pull_request:
     branches: [main, develop]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
-      - ".github/workflows/codeql.yml"
   schedule:
     - cron: "30 5 * * 1" # 毎週月曜にフルスキャン
 
