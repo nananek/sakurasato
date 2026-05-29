@@ -63,7 +63,14 @@ impl std::fmt::Debug for NewActor {
 }
 
 /// Insert a new actor and return the persisted row.
-pub async fn insert(pool: &PgPool, new: NewActor) -> sqlx::Result<ActorRow> {
+///
+/// Generic over the executor so callers can pass either a `&PgPool`
+/// (default) or a `&mut sqlx::PgConnection` / `&mut Transaction` when the
+/// insert needs to share a transaction with surrounding operations.
+pub async fn insert<'e, E>(executor: E, new: NewActor) -> sqlx::Result<ActorRow>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let also_known_as_json =
         serde_json::to_value(&new.also_known_as).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
     sqlx::query_as!(
@@ -107,7 +114,7 @@ pub async fn insert(pool: &PgPool, new: NewActor) -> sqlx::Result<ActorRow> {
         new.is_local,
         new.actor_type,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -187,4 +194,16 @@ pub async fn mark_fetched(pool: &PgPool, id: i64) -> sqlx::Result<()> {
     .execute(pool)
     .await
     .map(|_| ())
+}
+
+/// Delete an actor by primary key. Used by the `init --force` admin path
+/// when re-issuing the local signing key (notes/follows cascade).
+pub async fn delete_by_id<'e, E>(executor: E, id: i64) -> sqlx::Result<u64>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    Ok(sqlx::query!("DELETE FROM actor WHERE id = $1", id)
+        .execute(executor)
+        .await?
+        .rows_affected())
 }

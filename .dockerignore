@@ -9,3 +9,5 @@ docker/
 docker-compose*.yml
 .env
 *.env
+# Build secrets live next to the compose file; never bake them into images.
+secrets/*.txt

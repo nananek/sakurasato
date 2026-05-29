@@ -11,10 +11,12 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY config ./config
+COPY migrations ./migrations
+COPY .sqlx ./.sqlx
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target,id=sakurasato-media-proxy-target \
-    cargo build --release --target x86_64-unknown-linux-musl -p sakurasato-media-proxy && \
+    SQLX_OFFLINE=true cargo build --release --target x86_64-unknown-linux-musl -p sakurasato-media-proxy && \
     cp target/x86_64-unknown-linux-musl/release/sakurasato-media-proxy /sakurasato-media-proxy
 
 # ---- runtime ----
