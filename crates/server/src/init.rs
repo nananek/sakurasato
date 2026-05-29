@@ -3,6 +3,7 @@ use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::OsRng;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use sakurasato_core::{Config, MIGRATOR, repo};
+use tokio::task;
 use tracing::{info, warn};
 
 use crate::cli::InitArgs;
@@ -28,39 +29,42 @@ pub async fn run(config: Config, args: InitArgs) -> anyhow::Result<()> {
     let host = state.config().server.host.clone();
     let ap_id = state.local_actor_ap_id(&username);
 
-    if let Some(existing) = repo::actor::get_by_ap_id(state.pool(), &ap_id)
+    let existing = repo::actor::get_by_ap_id(state.pool(), &ap_id)
         .await
-        .context("check for existing actor")?
-    {
-        if !args.force {
-            info!(
-                ap_id = %existing.ap_id,
-                "local actor already exists — pass --force to re-key (destructive)",
-            );
-            return Ok(());
-        }
+        .context("check for existing actor")?;
+    if existing.is_some() && !args.force {
+        info!(
+            ap_id = %ap_id,
+            "local actor already exists — pass --force to re-key (destructive)",
+        );
+        return Ok(());
+    }
+    if existing.is_some() {
         warn!(
-            ap_id = %existing.ap_id,
+            ap_id = %ap_id,
             "--force requested: re-keying the local actor will break federation with anyone who cached the old public key",
         );
-        repo::actor::delete_by_id(state.pool(), existing.id)
-            .await
-            .context("delete previous local actor")?;
     }
 
     info!(bits = RSA_BITS, "generating RSA signing key");
-    let mut rng = OsRng;
-    let private_key = RsaPrivateKey::new(&mut rng, RSA_BITS)
-        .map_err(|e| anyhow!("failed to generate RSA key: {e}"))?;
-    let public_key = RsaPublicKey::from(&private_key);
-
-    let private_pem = private_key
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|e| anyhow!("encode private key as PKCS#8 PEM: {e}"))?
-        .to_string();
-    let public_pem = public_key
-        .to_public_key_pem(LineEnding::LF)
-        .map_err(|e| anyhow!("encode public key as SPKI PEM: {e}"))?;
+    // RSA 鍵生成は数秒の CPU バウンド処理なので、Tokio ランタイムスレッドを
+    // ブロックしないように spawn_blocking でオフロードする。
+    let (private_pem, public_pem) = task::spawn_blocking(|| -> anyhow::Result<_> {
+        let mut rng = OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, RSA_BITS)
+            .map_err(|e| anyhow!("failed to generate RSA key: {e}"))?;
+        let public_key = RsaPublicKey::from(&private_key);
+        let private_pem = private_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .map_err(|e| anyhow!("encode private key as PKCS#8 PEM: {e}"))?
+            .to_string();
+        let public_pem = public_key
+            .to_public_key_pem(LineEnding::LF)
+            .map_err(|e| anyhow!("encode public key as SPKI PEM: {e}"))?;
+        Ok((private_pem, public_pem))
+    })
+    .await
+    .context("RSA keygen task panicked")??;
 
     let new = repo::actor::NewActor {
         ap_id: ap_id.clone(),
@@ -84,9 +88,18 @@ pub async fn run(config: Config, args: InitArgs) -> anyhow::Result<()> {
         actor_type: "Person".into(),
     };
 
-    let inserted = repo::actor::insert(state.pool(), new)
+    // 既存削除と新規挿入は同一トランザクションで実行する。途中でクラッシュ
+    // しても actor を消したまま終わる事故を防ぐ。
+    let mut tx = state.pool().begin().await.context("begin transaction")?;
+    if let Some(prev) = existing.as_ref() {
+        repo::actor::delete_by_id(&mut *tx, prev.id)
+            .await
+            .context("delete previous local actor")?;
+    }
+    let inserted = repo::actor::insert(&mut *tx, new)
         .await
         .context("insert local actor")?;
+    tx.commit().await.context("commit init transaction")?;
     info!(
         id = inserted.id,
         ap_id = %inserted.ap_id,
