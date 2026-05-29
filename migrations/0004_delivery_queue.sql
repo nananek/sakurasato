@@ -17,7 +17,8 @@ CREATE TABLE delivery_queue (
     -- 直近の失敗理由 (デバッグ用)
     last_error      TEXT,
     -- 'pending' / 'delivered' / 'failed' (一時失敗、再試行待ち) / 'dead' (最大試行超過)
-    state           TEXT        NOT NULL DEFAULT 'pending',
+    state           TEXT        NOT NULL DEFAULT 'pending'
+                                 CHECK (state IN ('pending', 'delivered', 'failed', 'dead')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

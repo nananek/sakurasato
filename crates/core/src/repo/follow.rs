@@ -6,7 +6,7 @@
 
 use sqlx::PgPool;
 
-use crate::model::FollowRow;
+use crate::model::{FollowRow, FollowState};
 
 pub async fn insert_pending(
     pool: &PgPool,
@@ -42,10 +42,10 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Fol
     .await
 }
 
-pub async fn set_state(pool: &PgPool, id: i64, state: &str) -> sqlx::Result<()> {
+pub async fn set_state(pool: &PgPool, id: i64, state: FollowState) -> sqlx::Result<()> {
     sqlx::query!(
         "UPDATE follow SET state = $1, updated_at = now() WHERE id = $2",
-        state,
+        state.as_str(),
         id,
     )
     .execute(pool)

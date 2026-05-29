@@ -10,7 +10,12 @@ use sqlx::FromRow;
 use sqlx::types::Json;
 
 /// Row of the `actor` table.
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+///
+/// `private_key_pem` is intentionally excluded from `Serialize` and redacted
+/// in `Debug` so the local actor's signing key cannot leak via the local
+/// API (M4) or `tracing::debug!(?actor)` calls. Mirrors the same protection
+/// applied to [`crate::config::StorageConfig::secret_access_key`].
+#[derive(Clone, FromRow, Serialize, Deserialize)]
 pub struct ActorRow {
     pub id: i64,
     pub ap_id: String,
@@ -27,6 +32,7 @@ pub struct ActorRow {
     pub following_url: Option<String>,
     pub public_key_id: String,
     pub public_key_pem: String,
+    #[serde(skip_serializing)]
     pub private_key_pem: Option<String>,
     pub also_known_as: Json<Vec<String>>,
     pub moved_to_ap_id: Option<String>,
@@ -35,6 +41,39 @@ pub struct ActorRow {
     pub fetched_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for ActorRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorRow")
+            .field("id", &self.id)
+            .field("ap_id", &self.ap_id)
+            .field("preferred_username", &self.preferred_username)
+            .field("host", &self.host)
+            .field("display_name", &self.display_name)
+            .field("summary", &self.summary)
+            .field("icon_url", &self.icon_url)
+            .field("image_url", &self.image_url)
+            .field("inbox_url", &self.inbox_url)
+            .field("shared_inbox_url", &self.shared_inbox_url)
+            .field("outbox_url", &self.outbox_url)
+            .field("followers_url", &self.followers_url)
+            .field("following_url", &self.following_url)
+            .field("public_key_id", &self.public_key_id)
+            .field("public_key_pem", &self.public_key_pem)
+            .field(
+                "private_key_pem",
+                &self.private_key_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .field("also_known_as", &self.also_known_as)
+            .field("moved_to_ap_id", &self.moved_to_ap_id)
+            .field("is_local", &self.is_local)
+            .field("actor_type", &self.actor_type)
+            .field("fetched_at", &self.fetched_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 /// Row of the `note` table.

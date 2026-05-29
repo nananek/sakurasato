@@ -68,6 +68,28 @@ async fn actor_round_trip(pool: PgPool) -> sqlx::Result<()> {
     repo::actor::mark_fetched(&pool, inserted.id).await?;
     let refetched = repo::actor::get_by_id(&pool, inserted.id).await?.unwrap();
     assert!(refetched.fetched_at.is_some());
+
+    // 秘密鍵が Debug / Serialize 経由で漏れないことを担保する (M2 レビュー指摘)。
+    let debug_repr = format!("{refetched:?}");
+    assert!(
+        debug_repr.contains("private_key_pem: Some(\"<redacted>\")"),
+        "private_key_pem must be redacted in Debug, got: {debug_repr}"
+    );
+    assert!(
+        !debug_repr.contains("BEGIN PRIVATE KEY"),
+        "private key body leaked into Debug: {debug_repr}"
+    );
+
+    let json = serde_json::to_string(&refetched).unwrap();
+    assert!(
+        !json.contains("private_key_pem"),
+        "private_key_pem must be skipped in Serialize, got: {json}"
+    );
+    assert!(
+        !json.contains("BEGIN PRIVATE KEY"),
+        "private key body leaked into JSON: {json}"
+    );
+
     Ok(())
 }
 
@@ -114,7 +136,7 @@ async fn follow_state_transitions(pool: PgPool) -> sqlx::Result<()> {
             .await?;
     assert_eq!(follow.state, FollowState::Pending.as_str());
 
-    repo::follow::set_state(&pool, follow.id, FollowState::Accepted.as_str()).await?;
+    repo::follow::set_state(&pool, follow.id, FollowState::Accepted).await?;
     let updated = repo::follow::get_by_ap_id(&pool, &follow.ap_id)
         .await?
         .unwrap();

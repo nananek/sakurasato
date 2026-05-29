@@ -9,7 +9,8 @@ CREATE TABLE follow (
     follower_actor_id BIGINT      NOT NULL REFERENCES actor(id) ON DELETE CASCADE,
     followed_actor_id BIGINT      NOT NULL REFERENCES actor(id) ON DELETE CASCADE,
     -- 'pending' (相手の Accept 待ち) / 'accepted' / 'rejected'
-    state             TEXT        NOT NULL DEFAULT 'pending',
+    state             TEXT        NOT NULL DEFAULT 'pending'
+                                   CHECK (state IN ('pending', 'accepted', 'rejected')),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (follower_actor_id, followed_actor_id)
