@@ -113,7 +113,7 @@ services:
       DB_PASS: testpass
       DB_NAME: pleroma
     volumes:
-      - ./federation-test/pleroma-federation/pleroma-config.exs:/data/config.exs
+      - ./federation-test/pleroma-federation/pleroma-config.exs:/data/config.exs:ro
       - ./federation-test/pleroma-federation/pleroma-entrypoint.sh:/custom-entrypoint.sh:ro
       - certs:/certs:ro
     depends_on:

@@ -116,6 +116,7 @@ PR3 マージ時点では sakurasato の Follow / Accept ハンドラは未実�
 - 安定性が impl 側 image の更新タイミングに引きずられる
 - nekonoverse でも同様に CI 外で運用
 
-`.github/workflows/ci.yml` と `codeql.yml` の `paths-ignore` に
-`compose/federation-*.yml` と `scripts/federation-test/**` を追加して
-PR がトリガーしないようにしている。
+`.github/workflows/ci.yml` の `paths-ignore` に `compose/docker-compose.federation-*.yml`
+/ `compose/federation-test/**` / `scripts/federation-test/**` を追加して PR が CI を
+トリガーしないようにしている。`codeql.yml` は元から `**/*.rs` と `**/Cargo.*` の
+`paths` 制限で `compose/` を対象外にしているため変更不要。

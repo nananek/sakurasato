@@ -101,7 +101,9 @@ services:
       - mitra-fed
 
   mitra-app:
-    image: bleakfuture0/mitra:latest
+    # 再現性のためタグ固定。`latest` だと再 up で異なるバージョンが引かれる。
+    # 上げる場合は https://hub.docker.com/r/bleakfuture0/mitra/tags
+    image: bleakfuture0/mitra:v5.4.0
     entrypoint: ["/custom-entrypoint.sh"]
     environment:
       CONFIG_PATH: /etc/mitra/config.yaml

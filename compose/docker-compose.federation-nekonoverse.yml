@@ -116,6 +116,9 @@ services:
 
   nekonoverse-app:
     build:
+      # ブランチ先端を引く。記録時点 (2026-05-29) の develop HEAD は
+      # b7a8cc1ec23291bdfd54cbda8ea93c0a644b018b。ビルド結果が再現しなく
+      # なった場合はここで SHA 固定 (`#<sha>:backend`) に切り替える。
       context: https://github.com/nekonoverse/nekonoverse.git#develop:backend
     image: sakurasato-test/nekonoverse:dev
     command: >

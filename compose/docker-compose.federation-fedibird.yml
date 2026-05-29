@@ -117,6 +117,9 @@ services:
 
   fedibird-web:
     build:
+      # 記録時点 (2026-05-29) の fedibird ブランチ HEAD は
+      # 9f256801ad8e88165b9d90806c225d1ee4fa5af7。再現しなくなった場合は
+      # `#<sha>` で SHA 固定する。
       context: https://github.com/fedibird/mastodon.git#fedibird
       dockerfile_inline: |
         FROM docker.io/ruby:3.2.8-slim-bookworm AS build
