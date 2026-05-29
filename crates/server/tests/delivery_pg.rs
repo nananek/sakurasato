@@ -196,6 +196,25 @@ async fn deliver_one_signs_and_succeeds(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn enqueue_rejects_invalid_inbox_url(pool: PgPool) {
+    // 空文字列・非 URL・非 http(s) スキームを DB に書き込ませない。
+    let sender = repo::actor::insert(&pool, local_actor_with_real_key("c", "example.test"))
+        .await
+        .unwrap();
+    let activity = serde_json::json!({"type": "Create"});
+
+    for bad in ["", "not-a-url", "file:///etc/passwd", "javascript:alert(1)"] {
+        let err = delivery::enqueue_activity(&pool, sender.id, bad, &activity)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("inbox_url"),
+            "{bad:?} must be rejected with an inbox_url error, got: {err}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn deliver_one_marks_retry_on_non_2xx(pool: PgPool) {
     // 受け側が常に 500 を返すなら retry に倒り、queue 行は failed 状態 +
     // last_error 記録 + attempts インクリメント。

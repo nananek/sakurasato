@@ -1,8 +1,15 @@
 //! 外向き HTTP クライアント (`reqwest::Client`)。
 //!
 //! 主な用途は **M3b-2 PR2 のアウトバウンド配送** — 自インスタンスから
-//! `/inbox` 等の外部 `ActivityPub` サーバへの POST。M3b-3 以降では media-proxy
-//! や remote actor fetch にも生クライアントを共有させる予定。
+//! `/inbox` 等の外部 `ActivityPub` サーバへの POST。
+//!
+//! **外部 URL の取得 (`GET`) には使わない**。CLAUDE.md §3 / §5.3 で
+//! 「外部 URL 取得は必ず media-proxy 経由」と定めており、SSRF 対策・
+//! CIDR allowlist・redirect 再検証は media-proxy 側の責務 [[CLAUDE.md §5.3]]。
+//! M3b-3 以降で remote actor fetch / OGP 取得を実装する際も、server からは
+//! **media-proxy への Unix ソケット呼び出し**にこのクライアントは使わず、
+//! 専用の hyper クライアント (or `tokio::net::UnixStream` 経由) を別に用意する
+//! 想定。本クライアントを生 `reqwest` のまま `GET` に流用してはいけない。
 //!
 //! # 安全側に倒した設定
 //!

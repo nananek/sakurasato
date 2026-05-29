@@ -17,6 +17,7 @@
 //! M3b-3 で正式化するが、PR2 でも `mark_failed` を呼ぶ以上は何らかの値を
 //! 入れる必要がある。`2^attempts` 分 (上限 1 時間) の指数で当面しのぐ。
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -81,13 +82,30 @@ pub async fn run(config: sakurasato_core::Config, args: DeliverArgs) -> anyhow::
 ///
 /// 重複排除や宛先展開 (`shared_inbox` 集約等) は M3b-3 の責務。PR2 では
 /// 「指定 inbox URL に 1 行 push する」 だけの最小 API。
+///
+/// `inbox_url` は `url::Url::parse` で事前検証する ── DB に投入される文字列が
+/// 後段の `reqwest::Url::parse` で必ず通る形であることをここで保証する。
+/// 空文字列・`http`/`https` 以外のスキーム・host 欠落はここで弾く。
 pub async fn enqueue_activity(
     pool: &PgPool,
     sender_actor_id: i64,
     inbox_url: &str,
     activity: &JsonValue,
-) -> sqlx::Result<DeliveryQueueRow> {
-    repo::delivery_queue::enqueue(pool, inbox_url, activity, sender_actor_id).await
+) -> anyhow::Result<DeliveryQueueRow> {
+    let url = reqwest::Url::parse(inbox_url)
+        .with_context(|| format!("invalid inbox_url {inbox_url:?}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!(
+            "inbox_url scheme must be http or https, got {:?}",
+            url.scheme()
+        );
+    }
+    if url.host_str().is_none() {
+        bail!("inbox_url must have a host component");
+    }
+    repo::delivery_queue::enqueue(pool, inbox_url, activity, sender_actor_id)
+        .await
+        .map_err(Into::into)
 }
 
 /// 指定 queue id を 1 回試行する。
@@ -149,14 +167,13 @@ pub async fn try_deliver_one(state: &AppState, queue_id: i64) -> anyhow::Result<
             )
             .await
         }
-        Err(AttemptError::Sign(e)) => {
-            // 署名できない (秘密鍵が無い等) のは状態 / 設定の不整合で、
-            // retry しても直らない恒久障害。queue 行は触らずに上位へ返し、
-            // CLI ユーザに即座に気付かせる ── 自動で `dead` に倒すよりも
-            // 原因を表示するほうが M3b-2 段階では役立つ。M3b-3 で
-            // worker ループ化したときに「permanent failure」分類で
-            // `dead` に倒す予定。
-            Err(anyhow!("outbound signing failed: {e}"))
+        Err(err) if err.is_permanent() => {
+            // 永続エラー (signing 失敗 / URL 不正 / 内部宛先) は retry しても
+            // 直らない。queue 行は触らずに上位へ返し、CLI ユーザに即座に
+            // 気付かせる ── 自動で `dead` に倒すよりも原因を表示するほうが
+            // M3b-2 段階では役立つ。M3b-3 で worker ループ化したときに
+            // 「permanent failure」分類として `dead` に倒す予定。
+            Err(anyhow!("outbound delivery refused: {err}"))
         }
         Err(AttemptError::Transport(transport_err)) => {
             warn!(queue_id, error = %transport_err, "delivery transport error");
@@ -168,17 +185,36 @@ pub async fn try_deliver_one(state: &AppState, queue_id: i64) -> anyhow::Result<
             )
             .await
         }
+        // 上の `is_permanent` で Sign / InvalidUrl / BlockedAddress は処理済み。
+        // ここに到達するパスは無いが、`match` の網羅性チェックを満たすため
+        // 残しておく (将来 Transport 系の variant を増やしたときの安全網)。
+        Err(other) => Err(anyhow!("outbound delivery refused: {other}")),
     }
 }
 
-/// `attempt_post` のエラー二分。署名失敗 (恒久) と HTTP transport 失敗
-/// (一時) を呼び出し側で区別するため。
+/// `attempt_post` のエラー分類。永続エラー (`Sign` / `InvalidUrl` /
+/// `BlockedAddress`) と一時エラー (`Transport`) を呼び出し側で区別するため。
 #[derive(Debug, Error)]
 enum AttemptError {
     #[error("signing failed: {0}")]
     Sign(#[from] sign_request::SignOutboundError),
+    #[error("invalid inbox URL: {0}")]
+    InvalidUrl(#[from] url::ParseError),
+    #[error("inbox host {host:?} is in a blocked address range ({reason})")]
+    BlockedAddress { host: String, reason: &'static str },
     #[error("transport: {0}")]
     Transport(#[from] reqwest::Error),
+}
+
+impl AttemptError {
+    /// 恒久エラーかどうか。`true` の場合はリトライしても無駄なので、
+    /// queue 行は触らずに上位 (CLI) に伝播させる。
+    fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::Sign(_) | Self::InvalidUrl(_) | Self::BlockedAddress { .. }
+        )
+    }
 }
 
 /// 1 回 POST を撃つだけのヘルパ。
@@ -187,11 +223,35 @@ async fn attempt_post(
     row: &DeliveryQueueRow,
     sender: &ActorRow,
 ) -> Result<StatusCode, AttemptError> {
+    // **SSRF 最小ガード**: `inbox_url` を解析し、host が private / loopback /
+    // link-local / reserved の IP literal なら配送を拒否する。これは
+    // 「攻撃者が DB 書き込みで `http://192.168.0.1/admin` のような行を
+    // 仕込んでも内部サービスを叩けない」ことを担保する最小防御。
+    //
+    // 完全な SSRF 対策 (DNS 解決後の再検証 / CIDR allowlist / 自前 connector
+    // による socket-level チェック) は CLAUDE.md §3 が「外部 URL 取得は
+    // 必ず media-proxy 経由」と定めている通り、本体ではなく media-proxy 側で
+    // 行う。M3b-3 で remote actor fetch を実装する際に media-proxy 配送経路へ
+    // 統合する想定。
+    //
+    // [`AppState::allow_internal_inbox`] が `true` の場合 (テスト経路のみ)
+    // はガードを緩める ── 統合テスト用 inbox を loopback で立てるため。
+    // 本番 `from_config` 経由では常に `false` で、ガードはバイパスされない。
+    let url = reqwest::Url::parse(&row.inbox_url)?;
+    if !state.allow_internal_inbox()
+        && let Some(reason) = inbox_host_blocked(&url)
+    {
+        return Err(AttemptError::BlockedAddress {
+            host: url.host_str().unwrap_or("").to_string(),
+            reason,
+        });
+    }
+
     let body = serde_json::to_vec(&row.activity.0).expect("Value is always JSON-serializable");
 
     let mut req = state
         .http_client()
-        .post(&row.inbox_url)
+        .post(url)
         // Mastodon / Misskey / Pleroma 全部受理する Content-Type。
         // `application/ld+json; profile=...` でもよいが、最大互換は本値。
         .header("content-type", "application/activity+json")
@@ -202,6 +262,66 @@ async fn attempt_post(
 
     let response = state.http_client().execute(req).await?;
     Ok(response.status())
+}
+
+/// `inbox_url` の host が IP literal で内部 / 予約範囲なら、その理由を返す。
+/// ドメイン名 (非 IP literal) は通過させる ── DNS 解決後の判定は media-proxy
+/// の責務 (CLAUDE.md §3)。
+fn inbox_host_blocked(url: &reqwest::Url) -> Option<&'static str> {
+    match url.host()? {
+        url::Host::Ipv4(ip) => ipv4_block_reason(ip),
+        url::Host::Ipv6(ip) => ipv6_block_reason(ip),
+        url::Host::Domain(_) => None,
+    }
+}
+
+fn ipv4_block_reason(ip: Ipv4Addr) -> Option<&'static str> {
+    if ip.is_loopback() {
+        Some("loopback")
+    } else if ip.is_private() {
+        Some("private")
+    } else if ip.is_link_local() {
+        Some("link-local")
+    } else if ip.is_unspecified() {
+        Some("unspecified")
+    } else if ip.is_broadcast() {
+        Some("broadcast")
+    } else if ip.is_documentation() {
+        Some("documentation")
+    } else {
+        None
+    }
+}
+
+fn ipv6_block_reason(ip: Ipv6Addr) -> Option<&'static str> {
+    if ip.is_loopback() {
+        return Some("loopback");
+    }
+    if ip.is_unspecified() {
+        return Some("unspecified");
+    }
+    if ip.is_multicast() {
+        return Some("multicast");
+    }
+    let segs = ip.segments();
+    // fe80::/10 — link-local unicast
+    if (segs[0] & 0xffc0) == 0xfe80 {
+        return Some("link-local");
+    }
+    // fc00::/7 — unique local
+    if (segs[0] & 0xfe00) == 0xfc00 {
+        return Some("unique-local");
+    }
+    // 2001:db8::/32 — documentation
+    if segs[0] == 0x2001 && segs[1] == 0x0db8 {
+        return Some("documentation");
+    }
+    // IPv4-mapped IPv6 (`::ffff:a.b.c.d`) — 埋め込まれた IPv4 が内部範囲
+    // なら同様に弾く。`to_ipv4_mapped` は Rust 1.63+ で安定。
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return ipv4_block_reason(v4);
+    }
+    None
 }
 
 /// `mark_failed` を呼び、`Retry` か `Dead` を返す。
@@ -244,6 +364,108 @@ fn compute_backoff(now: DateTime<Utc>, attempts: i32) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn inbox_blocks_ipv4_loopback() {
+        assert_eq!(
+            inbox_host_blocked(&url("http://127.0.0.1/inbox")),
+            Some("loopback")
+        );
+    }
+
+    #[test]
+    fn inbox_blocks_ipv4_private_ranges() {
+        // RFC 1918 の 10/8, 172.16/12, 192.168/16。
+        for s in [
+            "http://10.0.0.1/inbox",
+            "http://172.16.5.5/inbox",
+            "http://192.168.1.1/inbox",
+        ] {
+            assert_eq!(inbox_host_blocked(&url(s)), Some("private"), "{s}");
+        }
+    }
+
+    #[test]
+    fn inbox_blocks_ipv4_link_local_and_metadata() {
+        // 169.254.0.0/16 はクラウドメタデータ (169.254.169.254) を含む。
+        assert_eq!(
+            inbox_host_blocked(&url("http://169.254.169.254/latest/meta-data/")),
+            Some("link-local")
+        );
+    }
+
+    #[test]
+    fn inbox_blocks_ipv4_unspecified_and_broadcast() {
+        assert_eq!(
+            inbox_host_blocked(&url("http://0.0.0.0/inbox")),
+            Some("unspecified")
+        );
+        assert_eq!(
+            inbox_host_blocked(&url("http://255.255.255.255/inbox")),
+            Some("broadcast")
+        );
+    }
+
+    #[test]
+    fn inbox_blocks_ipv6_loopback_and_link_local() {
+        assert_eq!(
+            inbox_host_blocked(&url("http://[::1]/inbox")),
+            Some("loopback")
+        );
+        assert_eq!(
+            inbox_host_blocked(&url("http://[fe80::1]/inbox")),
+            Some("link-local")
+        );
+        assert_eq!(
+            inbox_host_blocked(&url("http://[fc00::1]/inbox")),
+            Some("unique-local")
+        );
+    }
+
+    #[test]
+    fn inbox_blocks_ipv4_mapped_ipv6_private() {
+        // ::ffff:192.168.1.1 — IPv4-mapped IPv6 で private を仕込んでも弾く。
+        assert_eq!(
+            inbox_host_blocked(&url("http://[::ffff:c0a8:0101]/inbox")),
+            Some("private")
+        );
+    }
+
+    #[test]
+    fn inbox_allows_public_ipv4_literal() {
+        // 公開 IP literal は通す (実運用上稀だがホワイトリストにする必要なし)。
+        assert_eq!(inbox_host_blocked(&url("http://1.1.1.1/inbox")), None);
+    }
+
+    #[test]
+    fn inbox_allows_domain_name() {
+        // ドメイン名は DNS 解決の責務を持つ media-proxy 側にゆだねるため通す。
+        assert_eq!(
+            inbox_host_blocked(&url("https://mastodon.example/inbox")),
+            None
+        );
+        // 文字列 "localhost" を直接書いても、ここでは domain 扱いで通る ──
+        // 攻撃面を絞るなら media-proxy 側で reject されるべき。Rust の
+        // url crate は "localhost" を Ipv4 にしないため、本ガード単独では
+        // 漏れる。この受け入れ可否は M3b-3 で media-proxy 経路に統合する際
+        // に再評価する (PR2 では IP literal のみガードする方針)。
+        assert_eq!(inbox_host_blocked(&url("http://localhost/inbox")), None);
+    }
+
+    #[test]
+    fn attempt_error_permanent_classification() {
+        let ssrf = AttemptError::BlockedAddress {
+            host: "127.0.0.1".into(),
+            reason: "loopback",
+        };
+        assert!(ssrf.is_permanent());
+        let bad = AttemptError::InvalidUrl(url::ParseError::EmptyHost);
+        assert!(bad.is_permanent());
+    }
 
     #[test]
     fn backoff_grows_exponentially_until_cap() {
