@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# main ブランチ上での直接コミットを禁止する (develop で作業する)。
+set -euo pipefail
+
+branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo "")"
+
+if [ "${branch}" = "main" ]; then
+  echo "✖ main 上での直接コミットは禁止です。'git switch develop' で切り替えてください。" >&2
+  exit 1
+fi
+
+exit 0

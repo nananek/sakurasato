@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# main への直接 push を禁止する (PR 経由のみ)。
+# タグ push (refs/tags/*) と develop への push は許可 (CalVer リリース用)。
+set -euo pipefail
+
+protected_ref="refs/heads/main"
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  if [ "${remote_ref}" = "${protected_ref}" ]; then
+    echo "✖ main への直接 push は禁止です。develop → main の PR 経由でマージしてください。" >&2
+    echo "  (タグ push と develop への push は許可されています)" >&2
+    exit 1
+  fi
+done
+
+exit 0
