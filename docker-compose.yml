@@ -1,7 +1,8 @@
 # Sakurasato 本番想定 compose。
-# 方針 (CLAUDE.md §6, §7):
-#   - server だけが外部公開（リバースプロキシ経由 443 を想定）。
-#   - 外部 egress を許可するのは media-proxy のみ。
+# 方針 (CLAUDE.md §3 / §6 / §7):
+#   - server は外部公開 (リバースプロキシ経由 443 を想定) + AP 配送と
+#     remote actor fetch の egress を持つ (暫定、Issue #23)。M6 で再評価。
+#   - 外部 GET (画像 / OGP) の egress は media-proxy のみ。
 #   - postgres と versitygw は内部ネットからのみ到達可。
 #   - 全コンテナ非 root・read-only fs・cap_drop ALL・no-new-privileges。
 #   - シークレットは compose secrets で注入。
@@ -121,9 +122,13 @@ services:
       # 形に切り替える (例: bind mount + 事前 chown、または UDS forwarder)。
       - local_sock:/run/sakurasato-local
     networks:
-      # server は外部 egress を持たない (internal のみ)。配送は media-proxy 経由。
-      # 公開は外側のリバースプロキシ (caddy 等) が担当する。
+      # 暫定 (Issue #23 / CLAUDE.md §3): ActivityPub 配送と remote actor fetch は
+      # server から直接外部 (HTTPS POST / GET) に出る設計。Mastodon / Misskey /
+      # Pleroma も server 直配送が業界標準で、配送経路を media-proxy に通す利点が
+      # 限定的なため。受け取るレスポンスは JSON のみで画像デコードを伴わない。
+      # M6 (media-proxy 実装) 時に再評価する。
       - internal
+      - egress
 
 networks:
   internal:

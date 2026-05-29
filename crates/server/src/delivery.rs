@@ -193,7 +193,8 @@ pub async fn try_deliver_one(state: &AppState, queue_id: i64) -> anyhow::Result<
 }
 
 /// `attempt_post` のエラー分類。永続エラー (`Sign` / `InvalidUrl` /
-/// `BlockedAddress`) と一時エラー (`Transport`) を呼び出し側で区別するため。
+/// `BlockedAddress` / `Serialize`) と一時エラー (`Transport`) を呼び出し側で
+/// 区別するため。
 #[derive(Debug, Error)]
 enum AttemptError {
     #[error("signing failed: {0}")]
@@ -202,6 +203,11 @@ enum AttemptError {
     InvalidUrl(#[from] url::ParseError),
     #[error("inbox host {host:?} is in a blocked address range ({reason})")]
     BlockedAddress { host: String, reason: &'static str },
+    /// `serde_json::Value` のシリアライズ失敗。`Value` 型なら通常起き得ないが、
+    /// `expect` で panic させると M3b-3 で常駐 worker ループに移行したあとに
+    /// プロセスを落とすリスクが顕在化する。permanent 扱いで `dead` に倒す。
+    #[error("activity JSON serialization failed: {0}")]
+    Serialize(#[from] serde_json::Error),
     #[error("transport: {0}")]
     Transport(#[from] reqwest::Error),
 }
@@ -212,7 +218,7 @@ impl AttemptError {
     fn is_permanent(&self) -> bool {
         matches!(
             self,
-            Self::Sign(_) | Self::InvalidUrl(_) | Self::BlockedAddress { .. }
+            Self::Sign(_) | Self::InvalidUrl(_) | Self::BlockedAddress { .. } | Self::Serialize(_)
         )
     }
 }
@@ -262,7 +268,10 @@ async fn attempt_post(
         });
     }
 
-    let body = serde_json::to_vec(&row.activity.0).expect("Value is always JSON-serializable");
+    // `serde_json::Value` のシリアライズは実質失敗しないが、`expect` だと
+    // 常駐 worker ループ化後にプロセス落ちのリスクが残る。`Serialize` variant
+    // で permanent 扱い (`dead` に倒す) に伝播する (#22)。
+    let body = serde_json::to_vec(&row.activity.0)?;
 
     let mut req = state
         .http_client()
@@ -287,15 +296,43 @@ fn is_self_delivery(url: &reqwest::Url, server_host: &str) -> bool {
         .is_some_and(|h| h.eq_ignore_ascii_case(server_host))
 }
 
-/// `inbox_url` の host が IP literal で内部 / 予約範囲なら、その理由を返す。
-/// ドメイン名 (非 IP literal) は通過させる ── DNS 解決後の判定は media-proxy
+/// `inbox_url` の host が IP literal で内部 / 予約範囲、または
+/// ループバックに必ず解決される予約ドメインなら、その理由を返す。
+/// それ以外のドメイン名は通過させる ── DNS 解決後の判定は media-proxy
 /// の責務 (CLAUDE.md §3)。
 fn inbox_host_blocked(url: &reqwest::Url) -> Option<&'static str> {
     match url.host()? {
         url::Host::Ipv4(ip) => ipv4_block_reason(ip),
         url::Host::Ipv6(ip) => ipv6_block_reason(ip),
-        url::Host::Domain(_) => None,
+        url::Host::Domain(d) => domain_block_reason(d),
     }
+}
+
+/// ループバック確定のドメイン名なら、その理由を返す。
+///
+/// RFC 6761 §6.3 が `localhost.` および `.localhost.` 配下の名前を
+/// ループバック専用として予約している ── DNS 解決を待たずにここで弾く。
+/// `localhost.localdomain` は古い Linux ディストリの慣習名で、`/etc/hosts`
+/// で 127.0.0.1 に張られていることが多いため同様に拒否する。
+///
+/// それ以外のドメイン名は通過させ、media-proxy 側の DNS 解決後の
+/// CIDR allowlist で判定するのが本来の責務分担 (CLAUDE.md §3)。
+fn domain_block_reason(domain: &str) -> Option<&'static str> {
+    // 末尾の `.` (FQDN 表記) を剥がしてから比較する。HTTP 仕様 (RFC 9110
+    // §4.2.3) で host は大文字小文字を区別しないため `eq_ignore_ascii_case`。
+    let trimmed = domain.trim_end_matches('.');
+    if trimmed.eq_ignore_ascii_case("localhost")
+        || trimmed.eq_ignore_ascii_case("localhost.localdomain")
+    {
+        return Some("localhost-domain");
+    }
+    // `*.localhost` 配下 (RFC 6761) — 配下の名前は必ず loopback に解決される
+    // ことが保証されているので、確実に弾ける。
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.ends_with(".localhost") {
+        return Some("localhost-domain");
+    }
+    None
 }
 
 fn ipv4_block_reason(ip: Ipv4Addr) -> Option<&'static str> {
@@ -502,17 +539,53 @@ mod tests {
 
     #[test]
     fn inbox_allows_domain_name() {
-        // ドメイン名は DNS 解決の責務を持つ media-proxy 側にゆだねるため通す。
+        // 通常のドメイン名は DNS 解決の責務を持つ media-proxy 側にゆだねる。
         assert_eq!(
             inbox_host_blocked(&url("https://mastodon.example/inbox")),
             None
         );
-        // 文字列 "localhost" を直接書いても、ここでは domain 扱いで通る ──
-        // 攻撃面を絞るなら media-proxy 側で reject されるべき。Rust の
-        // url crate は "localhost" を Ipv4 にしないため、本ガード単独では
-        // 漏れる。この受け入れ可否は M3b-3 で media-proxy 経路に統合する際
-        // に再評価する (PR2 では IP literal のみガードする方針)。
-        assert_eq!(inbox_host_blocked(&url("http://localhost/inbox")), None);
+        // 名前に `localhost` を含んでも、TLD が `localhost` でなければ通す。
+        // 例: `mylocalhost.example` や `localhost.example.com` は False positive
+        // にしない (前者は実在しうる、後者は localhost という名前のサブドメイン)。
+        assert_eq!(
+            inbox_host_blocked(&url("https://mylocalhost.example/inbox")),
+            None
+        );
+        assert_eq!(
+            inbox_host_blocked(&url("https://localhost.example.com/inbox")),
+            None
+        );
+    }
+
+    #[test]
+    fn inbox_blocks_localhost_domain() {
+        // RFC 6761 §6.3 が `localhost.` を予約しており、必ず loopback に
+        // 解決される。IP literal の loopback 遮断と同等の意味合いを持つので、
+        // domain でも明示拒否する (#21)。
+        assert_eq!(
+            inbox_host_blocked(&url("http://localhost/inbox")),
+            Some("localhost-domain")
+        );
+        // 大文字小文字混在も同様 (RFC 9110 §4.2.3)。
+        assert_eq!(
+            inbox_host_blocked(&url("http://LOCALHOST/inbox")),
+            Some("localhost-domain")
+        );
+        // `*.localhost` も慣習的に loopback (mDNS / systemd-resolved 等で
+        // 127.0.0.1 に解決される)。
+        assert_eq!(
+            inbox_host_blocked(&url("http://app.localhost/inbox")),
+            Some("localhost-domain")
+        );
+        assert_eq!(
+            inbox_host_blocked(&url("http://a.b.localhost/inbox")),
+            Some("localhost-domain")
+        );
+        // 古い Linux ディストリの `/etc/hosts` でループバックに張られる名前。
+        assert_eq!(
+            inbox_host_blocked(&url("http://localhost.localdomain/inbox")),
+            Some("localhost-domain")
+        );
     }
 
     #[test]
@@ -556,6 +629,11 @@ mod tests {
         assert!(ssrf.is_permanent());
         let bad = AttemptError::InvalidUrl(url::ParseError::EmptyHost);
         assert!(bad.is_permanent());
+        // `Serialize` も permanent — `Value` 由来の to_vec はまず失敗しないが、
+        // 万一起きたら retry で直る性質のエラーではない (#22)。
+        let serde_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let ser = AttemptError::Serialize(serde_err);
+        assert!(ser.is_permanent());
     }
 
     #[test]
