@@ -56,6 +56,19 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 # Multikey (FEP-521a) のための multibase encode。
 multibase = "0.9"
 http = "1"
+# M3b-2 HTTP 署名 (cavage RSA-SHA256 + RFC 9421 Ed25519) で使うクレート群。
+# base64: Signature / Digest の base64 標準・URL safe 双方をサポート。
+# httpdate: cavage の `Date` ヘッダ (IMF-fixdate) パース。
+# indexmap: RFC 9421 の Signature-Input は covered components の順序が
+#   署名 base に直結するため、順序保持マップが必要。
+# sha2: Digest / Content-Digest の SHA-256 計算 (rsa crate 経由ではなく明示)。
+# subtle: 署名値 / digest 比較を定数時間で行うため。
+base64 = "0.22"
+httpdate = "1"
+indexmap = "2"
+# `oid` feature は rsa::pkcs1v15::SigningKey<Sha256> が `AssociatedOid` を要求するため必要。
+sha2 = { version = "0.10", features = ["oid"] }
+subtle = "2"
 
 [profile.release]
 lto = "thin"

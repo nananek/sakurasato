@@ -7,8 +7,13 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub(crate) mod extract;
 pub mod init;
 pub mod multikey;
 pub mod routes;
 pub mod serve;
+pub(crate) mod sign;
 pub mod state;
+
+#[cfg(test)]
+mod inbox_signature_tests;
