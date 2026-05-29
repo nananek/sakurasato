@@ -12,6 +12,24 @@ permissions:
 jobs:
   ci:
     runs-on: ubuntu-latest
+
+    # M2 から sqlx 統合テスト用に postgres を立ち上げる。
+    # SQLX_OFFLINE=true でも `#[sqlx::test]` はランタイムで実 DB を必要とする。
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: sakurasato
+          POSTGRES_PASSWORD: sakurasato
+          POSTGRES_DB: sakurasato
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sakurasato -d sakurasato"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
     steps:
       - uses: actions/checkout@v6
 
@@ -41,10 +59,15 @@ jobs:
 
       - name: clippy
         if: steps.cargo.outputs.present == 'true'
+        env:
+          SQLX_OFFLINE: "true"
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: test
         if: steps.cargo.outputs.present == 'true'
         env:
+          # offline 用 .sqlx キャッシュは PR と一緒にコミットされる。
           SQLX_OFFLINE: "true"
+          # runtime での #[sqlx::test] が使う接続文字列。
+          DATABASE_URL: "postgres://sakurasato:sakurasato@localhost:5432/sakurasato"
         run: cargo test --workspace

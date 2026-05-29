@@ -1,8 +1,15 @@
 # 開発用 overlay。`docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build` で使う。
 # 本番との差分:
-#   - postgres / versitygw をホストへポート公開してデバッグ可能に。
+#   - internal ネットの isolation を解除し、postgres / versitygw を 127.0.0.1
+#     にポート公開してホストから sqlx 等で触れるようにする。
+#     本番では internal: true のまま使うこと (CLAUDE.md §6, §7)。
 #   - server を外部公開 (8080) してリバースプロキシなしでも触れるように。
 #   - tracing ログを debug に。
+
+networks:
+  internal:
+    # 本番では internal: true で外部不可達。dev では host からの直接接続を許可。
+    internal: false
 
 services:
   postgres:

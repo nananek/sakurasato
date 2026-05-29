@@ -1,0 +1,138 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO delivery_queue (inbox_url, activity, sender_actor_id)\n        VALUES ($1, $2, $3)\n        RETURNING\n            id, inbox_url,\n            activity as \"activity: Json<JsonValue>\",\n            sender_actor_id, attempts, next_attempt_at, last_error, state,\n            created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "inbox_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "inbox_url"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "activity: Json<JsonValue>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "activity"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "sender_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "sender_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "attempts"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "next_attempt_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "next_attempt_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "last_error",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "last_error"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0f6c65271785b8084ca2b842809149bf7ced946716986bd09d30adf416cc36f0"
+}
