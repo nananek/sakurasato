@@ -66,7 +66,8 @@
 ```
 
 - **server だけが外部公開**（リバースプロキシ経由で 443）。
-- **外部への egress（リモートメディア取得・OGP）は media-proxy のみに許可**。
+- **外部 GET（リモートメディア取得・OGP）は media-proxy のみに許可**。本体 server は信頼できないバイト列をデコードしない。
+- **外部 POST（ActivityPub 配送 / remote actor fetch）は当面 server から直接行う**（暫定）。Mastodon / Misskey / Pleroma も server 直配送が業界標準で、配送経路を media-proxy に通す利点は限定的なため。これは M6 で media-proxy を実装した時点で再評価する選択（[Issue #23](https://github.com/nananek/sakurasato/issues/23)）。再評価項目: (a) 配送の中継プロトコル設計、(b) remote actor fetch の SSRF 多層防御、(c) server のネットワーク露出面のさらなる削減。
 - postgres / versitygw は内部ネットのみ。TUI はコンテナ外でホスト端末から Unix ソケット接続。
 
 ---
@@ -124,7 +125,7 @@ sakurasato/
   3. OGP/summary 取得
   4. **アップロード画像のサニタイズ**（再エンコードで埋め込みペイロード除去・EXIF/位置情報などメタデータ除去）
 - **本体は生ファイルをデコードしない。** 必ず media-proxy 経由でサニタイズ済みデータのみ扱う。
-- **隔離**: 本体とは Unix ソケット（または内部ネットのみ）で通信し、外部公開なし。**egress を許可するのはこのコンテナだけ**。`mem_limit` を設定し、信頼できない入力のデコードが暴走しても OOM kill で本体に波及させない。
+- **隔離**: 本体とは Unix ソケット（または内部ネットのみ）で通信し、外部公開なし。**信頼できないバイト列の取得とデコードを担当するのはこのコンテナだけ**。`mem_limit` を設定し、信頼できない入力のデコードが暴走しても OOM kill で本体に波及させない。なお ActivityPub の配送 POST と remote actor fetch は暫定的に server 直で行う（§3 / [Issue #23](https://github.com/nananek/sakurasato/issues/23)）── 受領レスポンスは JSON のみで画像デコードを伴わないため。
 - nekonoverse の `media-proxy-rs`（変換専用・ソケット限定・512M）と `summary-proxy`（SSRF 対策）の役割を Rust の一コンテナに統合。必要なら変換と取得をさらに分割可能な構成にしておく。
 
 ### 5.4 絵文字（Misskey 形式 zip インポート）
@@ -141,8 +142,8 @@ sakurasato/
 |---|---|---|---|
 | `postgres` | `postgres:18-alpine` | 内部のみ | データ volume |
 | `versitygw` | `versity/versitygw` | 内部のみ | POSIX volume バックエンド、S3 プロトコル提供 |
-| `media-proxy` | distroless/static（自作） | 内部のみ・**egress 許可** | `mem_limit` 設定、本体とソケット通信 |
-| `server` | distroless/static（自作） | リバースプロキシ経由で外部 | TUI 用 Unix ソケットをホストへマウント |
+| `media-proxy` | distroless/static（自作） | 内部のみ・**egress 許可（外部 GET / 画像取得）** | `mem_limit` 設定、本体とソケット通信 |
+| `server` | distroless/static（自作） | リバースプロキシ経由で外部 ＋ **egress 許可（AP 配送 POST / remote actor fetch、暫定 #23）** | TUI 用 Unix ソケットをホストへマウント |
 | `proxy`(任意) | caddy 等 | 443 | 連合に必須の TLS 終端 |
 
 TUI クライアントはコンテナ外（ホスト端末）で実行し、マウントされた Unix ソケットへ接続。
@@ -155,9 +156,9 @@ TUI クライアントはコンテナ外（ホスト端末）で実行し、マ�
 - **rootless**: 非 root UID で実行（`USER nonroot` / 数値 UID）。
 - `read_only: true`（root fs）＋ 必要箇所のみ `tmpfs`(/tmp)。
 - `cap_drop: [ALL]`、`security_opt: ["no-new-privileges:true"]`。
-- **ネットワーク分離**: media-proxy 以外の egress を絞る（internal network）。versitygw・postgres は内部ネットのみ。
+- **ネットワーク分離**: versitygw・postgres は内部ネットのみ。**media-proxy は外部 GET（画像 / OGP）の egress を持つ**。**server は AP 配送 POST と remote actor fetch のみ外部に egress を持つ**（暫定、§3 / [Issue #23](https://github.com/nananek/sakurasato/issues/23)）── M6 で再評価。
 - **シークレット**: compose secrets / 環境変数（postgres・S3 認証）。HTTP 署名鍵は CLI 生成で安全に保管（DB 内 or マウントした鍵ファイル、パーミッション 600）。
-- **危険な入力の隔離**: 画像デコード・外部 URL 取得は必ず media-proxy 側。server は信頼できないバイト列を直接デコードしない。
+- **危険な入力の隔離**: 画像デコード・外部 GET は必ず media-proxy 側。server は信頼できないバイト列を直接デコードしない（AP 配送と actor fetch のレスポンスは JSON のみで扱う）。
 
 ---
 
