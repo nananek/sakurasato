@@ -10,7 +10,7 @@ CI 外の手動 e2e 用 compose 一式。sakurasato の HTTP 署名検証 (受�
 | `mastodon` | `ghcr.io/mastodon/mastodon:v4.3` | cavage RSA-SHA256 主対向 | 公式 image。`bob/Password1234!` |
 | `misskey` | `misskey/misskey:2025.2.1` | cavage RSA-SHA256 検証 | 初回起動時に Web UI で admin 作成 |
 | `pleroma` | `ghcr.io/explodingcamera/pleroma:stable` | cavage RSA-SHA256 検証 | 登録 open。Web UI から登録 |
-| `mitra` | `bleakfuture0/mitra:latest` | **RFC 9421 + Ed25519** | FEP-521a Multikey 対応。`bob/password123` |
+| `mitra` | `bleakfuture0/mitra:v5.4.0` | **RFC 9421 + Ed25519** | FEP-521a Multikey 対応。`bob/password123` |
 | `fedibird` | inline build (`#fedibird` ブランチ) | Mastodon fork の cavage RSA | 初回ビルド 30 分強 |
 | `nekonoverse` | inline build (`#develop`) | **RFC 9421 + Ed25519** 主対向 | dual-key 完備、自実装ペア |
 
