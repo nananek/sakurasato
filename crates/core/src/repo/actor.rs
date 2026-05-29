@@ -188,3 +188,12 @@ pub async fn mark_fetched(pool: &PgPool, id: i64) -> sqlx::Result<()> {
     .await
     .map(|_| ())
 }
+
+/// Delete an actor by primary key. Used by the `init --force` admin path
+/// when re-issuing the local signing key (notes/follows cascade).
+pub async fn delete_by_id(pool: &PgPool, id: i64) -> sqlx::Result<u64> {
+    Ok(sqlx::query!("DELETE FROM actor WHERE id = $1", id)
+        .execute(pool)
+        .await?
+        .rows_affected())
+}

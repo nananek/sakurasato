@@ -44,6 +44,12 @@ percent-encoding = "2"
 url = "2"
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "macros", "chrono", "uuid", "json", "derive", "migrate"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+clap = { version = "4", features = ["derive"] }
+rsa = "0.9"
+http = "1"
 
 [profile.release]
 lto = "thin"
