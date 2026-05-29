@@ -69,6 +69,12 @@ indexmap = "2"
 # `oid` feature は rsa::pkcs1v15::SigningKey<Sha256> が `AssociatedOid` を要求するため必要。
 sha2 = { version = "0.10", features = ["oid"] }
 subtle = "2"
+# M3b-2 PR2 アウトバウンド配送で使う HTTP クライアント。
+# rustls-tls-native-roots: OpenSSL を引かず distroless で動かすため rustls + OS の root store。
+# json: serde_json::Value をボディに使える .json() を有効化。
+# http2: keep-alive と多重化で連合配送のレイテンシを抑える。
+# default-features = false にして native-tls / cookies / blocking 等の不要機能を切る。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "http2"] }
 
 [profile.release]
 lto = "thin"

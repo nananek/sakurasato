@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use reqwest::Client;
 use sakurasato_core::Config;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+
+use crate::http_client;
 
 #[derive(Clone, Debug)]
 pub struct AppState(Arc<Inner>);
@@ -12,6 +15,7 @@ pub struct AppState(Arc<Inner>);
 struct Inner {
     config: Config,
     pool: PgPool,
+    http: Client,
 }
 
 impl AppState {
@@ -27,13 +31,18 @@ impl AppState {
             .connect(&url)
             .await
             .context("connect to PostgreSQL")?;
-        Ok(Self::from_pool(pool, config))
+        let http = http_client::build_client()?;
+        Ok(Self(Arc::new(Inner { config, pool, http })))
     }
 
     /// Build the state from an already-prepared pool. Used by integration
     /// tests where `#[sqlx::test]` supplies a per-test pool.
     pub fn from_pool(pool: PgPool, config: Config) -> Self {
-        Self(Arc::new(Inner { config, pool }))
+        // テストでも reqwest::Client は同等の builder で組む。テストは外向き
+        // HTTP を撃たない (`mockito` か `#[ignore]` で隔離) ので Client が
+        // ホスト DNS を引いてしまうことは無い。
+        let http = http_client::build_client().expect("reqwest builder is infallible in tests");
+        Self(Arc::new(Inner { config, pool, http }))
     }
 
     pub fn config(&self) -> &Config {
@@ -42,6 +51,13 @@ impl AppState {
 
     pub fn pool(&self) -> &PgPool {
         &self.0.pool
+    }
+
+    /// Shared outbound HTTP client. Cloning is cheap (the inner state is
+    /// `Arc`-wrapped by `reqwest` itself), so callers may clone freely if
+    /// they need to spawn detached delivery tasks.
+    pub fn http_client(&self) -> &Client {
+        &self.0.http
     }
 
     /// Compute the canonical AP actor `id` URI for `username` against the

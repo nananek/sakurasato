@@ -56,6 +56,28 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<DeliveryQu
     .await
 }
 
+/// Mark a delivery row as successfully delivered.
+///
+/// Only `pending` / `failed` rows are touched, so a delayed worker call can't
+/// move a row out of a terminal state (`delivered` / `dead`). This is the
+/// success-side counterpart to [`mark_failed`].
+pub async fn mark_delivered(pool: &PgPool, id: i64) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE delivery_queue
+        SET state = 'delivered',
+            attempts = attempts + 1,
+            last_error = NULL,
+            updated_at = now()
+        WHERE id = $1 AND state IN ('pending', 'failed')
+        "#,
+        id,
+    )
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 /// Mark a delivery as failed and schedule the next attempt.
 ///
 /// Behaviour:

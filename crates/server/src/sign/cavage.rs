@@ -21,19 +21,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use http::HeaderMap;
 use rsa::RsaPublicKey;
-use rsa::pkcs1v15::{Signature, VerifyingKey};
-use rsa::pkcs8::DecodePublicKey;
-use rsa::signature::Verifier;
+use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
+use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
+use rsa::signature::{SignatureEncoding, Signer, Verifier};
 use sha2::Sha256;
 use thiserror::Error;
-
-// 送信側 (PR2) でのみ使う import 群。
-#[cfg(test)]
-use rsa::pkcs1v15::SigningKey;
-#[cfg(test)]
-use rsa::pkcs8::DecodePrivateKey;
-#[cfg(test)]
-use rsa::signature::{SignatureEncoding, Signer};
 
 #[derive(Debug, Error)]
 pub(crate) enum ParseError {
@@ -69,9 +61,7 @@ pub(crate) enum VerifyError {
     BadSignature(#[from] rsa::signature::Error),
 }
 
-/// 送信側のエラー型。M3b-2 PR2 のアウトバウンド配送と単体/統合テストで
-/// 使用。PR1 では `sign_rsa_sha256` の戻り値型としてのみ存在 (test 限定)。
-#[cfg(test)]
+/// 送信側のエラー型。M3b-2 PR2 のアウトバウンド配送で使用。
 #[derive(Debug, Error)]
 pub(crate) enum SignError {
     #[error("private key PEM is invalid: {0}")]
@@ -219,7 +209,6 @@ pub(crate) fn verify_rsa_sha256(
 
 /// RSA-SHA256 で署名 base に署名し、生バイトを返す。送信側 (M3b-2 PR2) と
 /// インバウンドテストで使用。
-#[cfg(test)]
 pub(crate) fn sign_rsa_sha256(
     signature_base: &[u8],
     rsa_private_pem: &str,

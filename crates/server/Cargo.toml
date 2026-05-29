@@ -39,6 +39,7 @@ httpdate.workspace = true
 indexmap.workspace = true
 sha2.workspace = true
 subtle.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 sakurasato-core = { workspace = true }

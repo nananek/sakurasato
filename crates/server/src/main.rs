@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use sakurasato_core::Config;
-use sakurasato_server::{cli, init, serve};
+use sakurasato_server::{cli, delivery, init, serve};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -28,5 +28,6 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         cli::Command::Serve => serve::run(config).await,
         cli::Command::Init(args) => init::run(config, args).await,
+        cli::Command::Deliver(args) => delivery::run(config, args).await,
     }
 }
