@@ -9,7 +9,11 @@ local_api_socket = "/run/sakurasato/local.sock"
 user = "me"
 
 [database]
-url = "postgres://sakurasato:sakurasato@postgres:5432/sakurasato"
+# `{password}` プレースホルダは起動時に `password_file` の中身で置換される。
+# password_file 未設定で `{password}` が残っていると Config::load 後の
+# resolved_url() がエラーを返す。
+url = "postgres://sakurasato:{password}@postgres:5432/sakurasato"
+# password_file = "/run/secrets/postgres_password"
 
 [storage]
 # versitygw は非公開。compose 内部ネットからのみ到達する。
@@ -17,6 +21,7 @@ endpoint = "http://versitygw:7070"
 bucket = "sakurasato"
 region = "us-east-1"
 access_key_id = "sakurasato"
+# CHANGE-ME: 本番では必ず compose secret か KMS 経由で差し替えること。
 secret_access_key = "sakurasato-change-me"
 
 [media_proxy]

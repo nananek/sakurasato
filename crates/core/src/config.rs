@@ -35,8 +35,38 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DatabaseConfig {
-    /// `PostgreSQL` connection URL.
+    /// `PostgreSQL` connection URL. May contain the literal placeholder
+    /// `{password}` which is substituted at runtime with the contents of
+    /// [`Self::password_file`].
     pub url: String,
+    /// Optional path to a file containing the database password. When set,
+    /// its contents (with surrounding whitespace trimmed) replace
+    /// `{password}` in [`Self::url`]. Required when the URL contains the
+    /// placeholder.
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+}
+
+impl DatabaseConfig {
+    /// Resolve the connection URL, substituting `{password}` from
+    /// [`Self::password_file`] when present.
+    pub fn resolved_url(&self) -> anyhow::Result<String> {
+        if !self.url.contains("{password}") {
+            return Ok(self.url.clone());
+        }
+        let path = self.password_file.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "database.url contains {{password}} placeholder but database.password_file is unset"
+            )
+        })?;
+        let raw = std::fs::read_to_string(path).map_err(|err| {
+            anyhow::anyhow!(
+                "failed to read database password_file {}: {err}",
+                path.display()
+            )
+        })?;
+        Ok(self.url.replace("{password}", raw.trim()))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -91,7 +121,7 @@ local_api_socket = "/run/sakurasato/local.sock"
 user = "me"
 
 [database]
-url = "postgres://sakurasato@postgres:5432/sakurasato"
+url = "postgres://sakurasato:{password}@postgres:5432/sakurasato"
 
 [storage]
 endpoint = "http://versitygw:7070"
@@ -118,8 +148,55 @@ max_pixels = 33554432
             assert_eq!(cfg.server.host, "example.test");
             assert_eq!(
                 cfg.database.url,
-                "postgres://sakurasato@postgres:5432/sakurasato"
+                "postgres://sakurasato:{password}@postgres:5432/sakurasato"
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolved_url_returns_as_is_without_placeholder() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env(
+                "SAKURASATO_DATABASE__URL",
+                "postgres://u:p@postgres:5432/sakurasato",
+            );
+            let cfg = Config::load(&path, None).unwrap();
+            assert_eq!(
+                cfg.database.resolved_url().unwrap(),
+                "postgres://u:p@postgres:5432/sakurasato"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolved_url_substitutes_password_from_file() {
+        Jail::expect_with(|jail| {
+            let dir = jail.directory().to_path_buf();
+            let pw_path = dir.join("pw.txt");
+            std::fs::write(&pw_path, "s3cret\n").unwrap();
+            let path = write_default(jail);
+            jail.set_env(
+                "SAKURASATO_DATABASE__PASSWORD_FILE",
+                pw_path.to_str().unwrap(),
+            );
+            let cfg = Config::load(&path, None).unwrap();
+            assert_eq!(
+                cfg.database.resolved_url().unwrap(),
+                "postgres://sakurasato:s3cret@postgres:5432/sakurasato"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolved_url_errors_when_placeholder_unmet() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            let cfg = Config::load(&path, None).unwrap();
+            assert!(cfg.database.resolved_url().is_err());
             Ok(())
         });
     }

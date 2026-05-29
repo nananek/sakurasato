@@ -3,7 +3,7 @@
 # /data を 65534:65534 で作っておけば、新規 named volume に対して
 # docker がその所有権ごと初期化してくれる (既存 volume は影響なし)。
 
-FROM versity/versitygw:latest
+FROM versity/versitygw:v1.4.1
 
 USER root
 RUN mkdir -p /data && chown -R 65534:65534 /data

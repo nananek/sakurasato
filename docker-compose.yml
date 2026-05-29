@@ -102,13 +102,18 @@ services:
       media-proxy:
         condition: service_started
     environment:
-      SAKURASATO_DATABASE__URL: "postgres://sakurasato@postgres:5432/sakurasato"
+      SAKURASATO_DATABASE__URL: "postgres://sakurasato:{password}@postgres:5432/sakurasato"
+      SAKURASATO_DATABASE__PASSWORD_FILE: "/run/secrets/postgres_password"
       SAKURASATO_STORAGE__ENDPOINT: "http://versitygw:7070"
       SAKURASATO_MEDIA_PROXY__SOCKET: "/run/sakurasato/media.sock"
-      SAKURASATO_SERVER__LOCAL_API_SOCKET: "/run/sakurasato/local.sock"
+      # TUI (ホスト端末) が ./run 経由で触れる位置に socket を作る。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: "/run/sakurasato-local/local.sock"
+    secrets:
+      - postgres_password
     volumes:
+      # media-proxy と共有する Unix socket (内部通信専用)。
       - media_sock:/run/sakurasato
-      # TUI クライアント (ホスト端末) から接続するためのローカル API ソケット。
+      # TUI クライアント (ホスト端末) から接続するためのローカル API ソケット領域。
       - ./run:/run/sakurasato-local
     networks:
       # server は外部 egress を持たない (internal のみ)。配送は media-proxy 経由。
