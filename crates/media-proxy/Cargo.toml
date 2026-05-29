@@ -1,0 +1,23 @@
+[package]
+name = "sakurasato-media-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sakurasato-media-proxy"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+sakurasato-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

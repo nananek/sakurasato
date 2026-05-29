@@ -1,0 +1,33 @@
+# Sakurasato 既定設定。
+# 環境変数 SAKURASATO_<SECTION>__<KEY> で個別に上書きできる。
+# 例: SAKURASATO_SERVER__HOST=example.com
+
+[server]
+host = "localhost"
+bind = "0.0.0.0:8080"
+local_api_socket = "/run/sakurasato/local.sock"
+user = "me"
+
+[database]
+# `{password}` プレースホルダは起動時に `password_file` の中身で置換される。
+# password_file 未設定で `{password}` が残っていると Config::load 後の
+# resolved_url() がエラーを返す。
+url = "postgres://sakurasato:{password}@postgres:5432/sakurasato"
+# password_file = "/run/secrets/postgres_password"
+
+[storage]
+# versitygw は非公開。compose 内部ネットからのみ到達する。
+endpoint = "http://versitygw:7070"
+bucket = "sakurasato"
+region = "us-east-1"
+access_key_id = "sakurasato"
+# CHANGE-ME: secret_access_key はプレースホルダ。本番は必ず
+# secret_access_key_file (= /run/secrets/...) か KMS 経由で差し替え、
+# この値を読まれない構成にすること。
+secret_access_key = "sakurasato-change-me"
+# secret_access_key_file = "/run/secrets/s3_secret_key"
+
+[media_proxy]
+socket = "/run/sakurasato/media.sock"
+max_bytes = 26214400      # 25 MiB
+max_pixels = 33554432     # 8192 * 4096 相当
