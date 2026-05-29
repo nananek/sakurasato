@@ -217,8 +217,10 @@ async fn enqueue_rejects_invalid_inbox_url(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn deliver_one_blocks_self_inbox(pool: PgPool) {
     // 自インスタンス (example.test) の inbox URL を行に入れて
-    // try_deliver_one を呼ぶと、permanent error で弾かれ queue 行は触られない。
-    // M3b-3 の常駐ワーカ化で誤って自分宛 POST のループに入らないことの担保。
+    // try_deliver_one を呼ぶと、permanent error で `dead` に倒されて
+    // anyhow Err も返る。M3b-3 round-2 F1 で worker ループの無限リトライ
+    // を防ぐため pending → dead 直行に変更。M3b-3 の常駐ワーカ化で
+    // 誤って自分宛 POST のループに入らないことの担保。
     let sender = repo::actor::insert(&pool, local_actor_with_real_key("alice", "example.test"))
         .await
         .unwrap();
@@ -239,16 +241,30 @@ async fn deliver_one_blocks_self_inbox(pool: PgPool) {
         err.to_string().contains("self-delivery"),
         "expected self-delivery loop block, got: {err}"
     );
+    assert!(
+        err.to_string().contains("moved to 'dead'"),
+        "permanent error must report dead transition, got: {err}"
+    );
 
     let after = repo::delivery_queue::get_by_id(&pool, row.id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        after.state, "pending",
-        "permanent error must not touch the queue row"
+        after.state, "dead",
+        "permanent error must move the queue row to 'dead' (round-2 F1)"
     );
+    // attempts は mark_dead では増やさない (即時 dead 遷移なので attempts は
+    // 関係ない)。retry を経た上での dead と区別する。
     assert_eq!(after.attempts, 0);
+    assert!(
+        after
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("self-delivery")),
+        "dead 行の last_error に永続エラー理由が残る: {:?}",
+        after.last_error,
+    );
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

@@ -78,6 +78,31 @@ pub async fn mark_delivered(pool: &PgPool, id: i64) -> sqlx::Result<()> {
     .map(|_| ())
 }
 
+/// Mark a delivery as permanently dead with the given failure reason.
+///
+/// Use this when the failure is known to be non-recoverable (signing failure,
+/// SSRF guard hit, JSON serialization failure, etc.) so the queue row should
+/// never be retried. `attempts` is not incremented — the row goes straight
+/// from `pending` / `failed` to `dead` regardless of `max_attempts`.
+/// Terminal rows (`delivered` / `dead`) are not touched, so a delayed worker
+/// call cannot revert state.
+pub async fn mark_dead(pool: &PgPool, id: i64, last_error: &str) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE delivery_queue
+        SET state = 'dead',
+            last_error = $1,
+            updated_at = now()
+        WHERE id = $2 AND state IN ('pending', 'failed')
+        "#,
+        last_error,
+        id,
+    )
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 /// Mark a delivery as failed and schedule the next attempt.
 ///
 /// Behaviour:

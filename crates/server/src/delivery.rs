@@ -168,12 +168,21 @@ pub async fn try_deliver_one(state: &AppState, queue_id: i64) -> anyhow::Result<
             .await
         }
         Err(err) if err.is_permanent() => {
-            // 永続エラー (signing 失敗 / URL 不正 / 内部宛先) は retry しても
-            // 直らない。queue 行は触らずに上位へ返し、CLI ユーザに即座に
-            // 気付かせる ── 自動で `dead` に倒すよりも原因を表示するほうが
-            // M3b-2 段階では役立つ。M3b-3 で worker ループ化したときに
-            // 「permanent failure」分類として `dead` に倒す予定。
-            Err(anyhow!("outbound delivery refused: {err}"))
+            // 永続エラー (signing 失敗 / URL 不正 / 内部宛先 / JSON
+            // シリアライズ) は retry しても直らない。即座に `dead` に倒し、
+            // M3b-3 の常駐 worker ループが `pending` 行を再取得しても同じ
+            // 行を永遠にリトライしないようにする (round-2 review F1)。
+            // anyhow Err は引き続き返すので CLI 側はエラー詳細を stderr に
+            // 出せる。`mark_dead` 自身が失敗した場合 (DB 障害) はその DB
+            // エラーを優先して伝えたいので、context を付けて伝播する。
+            let reason = err.to_string();
+            repo::delivery_queue::mark_dead(state.pool(), queue_id, &reason)
+                .await
+                .context("mark_dead after permanent failure")?;
+            warn!(queue_id, error = %err, "permanent failure; moved to 'dead'");
+            Err(anyhow!(
+                "outbound delivery refused (moved to 'dead'): {err}"
+            ))
         }
         Err(AttemptError::Transport(transport_err)) => {
             warn!(queue_id, error = %transport_err, "delivery transport error");
@@ -185,9 +194,14 @@ pub async fn try_deliver_one(state: &AppState, queue_id: i64) -> anyhow::Result<
             )
             .await
         }
-        // 上の `is_permanent` で Sign / InvalidUrl / BlockedAddress は処理済み。
-        // ここに到達するパスは無いが、`match` の網羅性チェックを満たすため
-        // 残しておく (将来 Transport 系の variant を増やしたときの安全網)。
+        // 上の `is_permanent` で Sign / InvalidUrl / BlockedAddress / Serialize
+        // は処理済み、`Transport` も直前のアームで処理済み。現時点ではここに
+        // 到達するパスは無い。
+        //
+        // **`AttemptError` に新しい variant を追加するときは必ず明示的なアーム
+        // を上に追加すること**。ここに落ちると retry 経路を踏まないため、新規
+        // 一時エラー (例: `RateLimit`) を誤って永続失敗扱いしてしまう
+        // (round-2 review F4)。
         Err(other) => Err(anyhow!("outbound delivery refused: {other}")),
     }
 }
@@ -308,12 +322,17 @@ fn inbox_host_blocked(url: &reqwest::Url) -> Option<&'static str> {
     }
 }
 
-/// ループバック確定のドメイン名なら、その理由を返す。
+/// ループバックまたは LAN 内に解決される可能性のあるドメイン名なら、その
+/// 理由を返す。
 ///
 /// RFC 6761 §6.3 が `localhost.` および `.localhost.` 配下の名前を
 /// ループバック専用として予約している ── DNS 解決を待たずにここで弾く。
 /// `localhost.localdomain` は古い Linux ディストリの慣習名で、`/etc/hosts`
 /// で 127.0.0.1 に張られていることが多いため同様に拒否する。
+/// RFC 6762 (mDNS) の `.local` TLD は Avahi / systemd-resolved が動く
+/// 環境で LAN 内の任意ホストに解決されるため、server が egress を持つ
+/// 暫定構成 (#23) では SSRF ベクタになり得る — これも遮断する (round-2
+/// review F2)。
 ///
 /// それ以外のドメイン名は通過させ、media-proxy 側の DNS 解決後の
 /// CIDR allowlist で判定するのが本来の責務分担 (CLAUDE.md §3)。
@@ -331,6 +350,18 @@ fn domain_block_reason(domain: &str) -> Option<&'static str> {
     let lower = trimmed.to_ascii_lowercase();
     if lower.ends_with(".localhost") {
         return Some("localhost-domain");
+    }
+    // RFC 6762 mDNS の `.local` TLD — LAN 内の任意ホストに解決されるため、
+    // `postgres.local` のような内部サービス名宛の POST を許すと SSRF に
+    // なる。完全一致 (`local` 単独) も TLD 直指定として弾く。
+    //
+    // `lower` は to_ascii_lowercase 済みなので、`ends_with` は実質的に
+    // 大文字小文字を区別しない比較になっている。clippy の
+    // `case_sensitive_file_extension_comparisons` は `.local` を拡張子と
+    // 誤検知するため allow する。
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    if lower == "local" || lower.ends_with(".local") {
+        return Some("mdns-local");
     }
     None
 }
@@ -586,6 +617,41 @@ mod tests {
             inbox_host_blocked(&url("http://localhost.localdomain/inbox")),
             Some("localhost-domain")
         );
+    }
+
+    #[test]
+    fn inbox_blocks_mdns_local_tld() {
+        // RFC 6762 mDNS — `.local` は LAN 内の任意ホストに解決される。
+        // server が egress を持つ暫定構成 (#23) で内部サービス名 (postgres.local
+        // 等) 宛の POST が SSRF にならないよう遮断する (round-2 F2)。
+        assert_eq!(
+            inbox_host_blocked(&url("http://postgres.local/inbox")),
+            Some("mdns-local")
+        );
+        assert_eq!(
+            inbox_host_blocked(&url("http://server.lan.local/inbox")),
+            Some("mdns-local")
+        );
+        assert_eq!(
+            inbox_host_blocked(&url("http://LOCAL/inbox")),
+            Some("mdns-local")
+        );
+    }
+
+    #[test]
+    fn inbox_allows_non_local_tlds() {
+        // `local` を含む通常 TLD は false positive にしない。
+        // `localhost.com` や `mylocal.example` 等の実在しうる名前で動作確認。
+        assert_eq!(
+            inbox_host_blocked(&url("https://localhost.com/inbox")),
+            None
+        );
+        assert_eq!(
+            inbox_host_blocked(&url("https://mylocal.example/inbox")),
+            None
+        );
+        // `.locally` のような末尾は `.local` 後方一致にマッチさせない。
+        assert_eq!(inbox_host_blocked(&url("https://site.locally/inbox")), None);
     }
 
     #[test]

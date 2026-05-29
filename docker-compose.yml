@@ -134,7 +134,9 @@ networks:
   internal:
     internal: true
   egress:
-    # media-proxy 専用の外向きネット。デフォルトの bridge と同じく外に出られる。
+    # 外向き bridge ネット。`media-proxy` (外部 GET / 画像取得) と `server`
+    # (AP 配送 POST / remote actor fetch、暫定 #23) が参加する。
+    # CLAUDE.md §3 / §6 / §7 の方針と整合。M6 で `server` の参加可否を再評価する。
     driver: bridge
 
 volumes:
