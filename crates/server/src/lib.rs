@@ -9,6 +9,7 @@
 pub mod cli;
 pub mod delivery;
 pub(crate) mod dispatch;
+pub mod emoji_import;
 pub(crate) mod extract;
 pub(crate) mod http_client;
 pub mod init;
