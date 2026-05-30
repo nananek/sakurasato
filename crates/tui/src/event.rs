@@ -63,6 +63,17 @@ pub enum Action {
     PickerCancel,
     /// M7: 直近の添付を 1 件外す (compose focus 中)。
     PopAttachment,
+    /// M8 PR3: タイムラインで選択中の Note に対するリアクション送信プロンプトを
+    /// 開く。`note_id` を後段で確定するため、ペイロードは載せない。
+    OpenReactionPrompt,
+    /// プロンプト中の文字入力。
+    ReactionPromptInsertChar(char),
+    /// プロンプト中の Backspace。
+    ReactionPromptBackspace,
+    /// プロンプト中の Enter ── 入力済み content を `POST /api/v1/reactions` へ。
+    ReactionPromptSubmit,
+    /// プロンプト中の Esc ── キャンセル。
+    ReactionPromptCancel,
 }
 
 /// crossterm イベント → Action。
@@ -92,6 +103,7 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::Compose => translate_compose_key(k),
         Focus::Help => translate_help_key(k),
         Focus::Picker => translate_picker_key(k),
+        Focus::ReactionPrompt => translate_reaction_prompt_key(k),
     }
 }
 
@@ -115,6 +127,9 @@ fn translate_timeline_key(k: KeyEvent) -> Action {
         (KeyCode::Char('A'), _) => Action::OpenPicker(PickerMode::Avatar),
         (KeyCode::Char('H'), _) => Action::OpenPicker(PickerMode::Header),
         (KeyCode::Char(';'), m) if m.is_empty() => Action::OpenPicker(PickerMode::Attachment),
+        // M8 PR3: e = react ─ 選択中の Note にリアクションを付けるための
+        // プロンプトを開く。
+        (KeyCode::Char('e'), m) if m.is_empty() => Action::OpenReactionPrompt,
         _ => Action::Noop,
     }
 }
@@ -168,6 +183,17 @@ fn translate_picker_key(k: KeyEvent) -> Action {
         (KeyCode::Backspace, _) => Action::PickerParent,
         // `.` で隠しファイルトグル ── vim の :set hidden! 風。
         (KeyCode::Char('.'), m) if m.is_empty() => Action::PickerToggleHidden,
+        _ => Action::Noop,
+    }
+}
+
+fn translate_reaction_prompt_key(k: KeyEvent) -> Action {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Esc => Action::ReactionPromptCancel,
+        KeyCode::Enter => Action::ReactionPromptSubmit,
+        KeyCode::Backspace => Action::ReactionPromptBackspace,
+        KeyCode::Char(c) if !ctrl => Action::ReactionPromptInsertChar(c),
         _ => Action::Noop,
     }
 }
@@ -281,6 +307,57 @@ mod tests {
         assert!(matches!(
             translate(Event::Key(k), Focus::Timeline),
             Action::Noop,
+        ));
+    }
+
+    #[test]
+    fn timeline_e_opens_reaction_prompt() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('e'), KeyModifiers::NONE)),
+                Focus::Timeline,
+            ),
+            Action::OpenReactionPrompt,
+        ));
+    }
+
+    #[test]
+    fn reaction_prompt_keys_route_correctly() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Esc, KeyModifiers::NONE)),
+                Focus::ReactionPrompt,
+            ),
+            Action::ReactionPromptCancel,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)),
+                Focus::ReactionPrompt,
+            ),
+            Action::ReactionPromptSubmit,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('a'), KeyModifiers::NONE)),
+                Focus::ReactionPrompt,
+            ),
+            Action::ReactionPromptInsertChar('a'),
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Backspace, KeyModifiers::NONE)),
+                Focus::ReactionPrompt,
+            ),
+            Action::ReactionPromptBackspace,
+        ));
+        // Ctrl-C は ReactionPrompt focus でも Quit に勝つ。
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Focus::ReactionPrompt,
+            ),
+            Action::Quit,
         ));
     }
 

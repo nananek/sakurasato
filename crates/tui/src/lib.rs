@@ -45,6 +45,7 @@ pub mod event;
 pub mod image_cache;
 pub mod picker;
 pub mod preview;
+pub mod reaction_prompt;
 pub mod runtime;
 pub mod sse;
 pub mod theme;

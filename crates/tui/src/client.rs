@@ -207,6 +207,43 @@ impl LocalApi {
         Ok(bytes)
     }
 
+    /// `POST /api/v1/reactions` ── ローカル user が自分の Note にリアクション
+    /// を付ける (M8 PR3)。`content` は `:foo:` 形式 (ローカル emoji) または
+    /// Unicode emoji。失敗時は `ApiError::Status` (400/404 など) を伝播する。
+    pub async fn create_reaction(
+        &self,
+        note_id: i64,
+        content: &str,
+    ) -> Result<ReactionResponse, ApiError> {
+        let body = serde_json::to_vec(&CreateReactionRequest {
+            note_id,
+            content: content.to_string(),
+        })?;
+        let request = self
+            .request_builder(Method::POST, "/api/v1/reactions")?
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// `DELETE /api/v1/reactions/{id}` ── 自分のリアクションを取り消す (M8 PR3)。
+    pub async fn delete_reaction(&self, reaction_id: i64) -> Result<(), ApiError> {
+        let path = format!("/api/v1/reactions/{reaction_id}");
+        let request = self
+            .request_builder(Method::DELETE, &path)?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body_string(resp.into_body()).await.unwrap_or_default();
+            return Err(ApiError::Status { status, body });
+        }
+        Ok(())
+    }
+
     /// `GET /api/v1/stream` を生 Incoming のまま返す。SSE は呼び出し側
     /// ([`crate::sse`]) で `eventsource-stream` に流す。
     pub async fn open_stream(&self) -> Result<hyper::Response<Incoming>, ApiError> {
@@ -347,6 +384,25 @@ pub struct TimelineNote {
     pub in_reply_to_note_id: Option<i64>,
     pub published_at: chrono::DateTime<chrono::Utc>,
     pub is_local: bool,
+    /// M8 PR3: 受領したリアクション集計 (`content` 単位)。古い server (M7 以前)
+    /// と通信した場合は `default` で空 Vec になる。
+    #[serde(default)]
+    pub reactions: Vec<ReactionSummary>,
+}
+
+/// `TimelineNote.reactions` の 1 要素。`server::local_api::timeline::ReactionSummaryDto`
+/// と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReactionSummary {
+    pub content: String,
+    pub count: i64,
+    #[serde(default)]
+    pub emoji_image_url: Option<String>,
+    #[serde(default)]
+    pub emoji_media_type: Option<String>,
+    /// `Some(true)` = local emoji、`Some(false)` = remote、`None` = Unicode。
+    #[serde(default)]
+    pub emoji_is_local: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -425,6 +481,23 @@ pub struct ProfileResponse {
     pub queued_deliveries: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateReactionRequest {
+    pub note_id: i64,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReactionResponse {
+    pub id: i64,
+    pub ap_id: String,
+    pub note_id: i64,
+    pub content: String,
+    #[serde(default)]
+    pub emoji_id: Option<i64>,
+    pub queued_deliveries: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateNoteResponse {
     pub id: i64,
@@ -494,6 +567,9 @@ impl NoteCreatedPayload {
             in_reply_to_note_id: None,
             published_at: self.published_at,
             is_local: false,
+            // SSE は reactions を運ばない (= 新規 Note は初期状態リアクション 0)。
+            // 既存 Note へのリアクション増減は M9 で SSE 拡張する想定。
+            reactions: Vec::new(),
         }
     }
 }
