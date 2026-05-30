@@ -36,7 +36,8 @@ pub enum PickerMode {
 }
 
 impl PickerMode {
-    /// `POST /api/v1/media` の `kind` クエリ文字列。
+    /// `POST /api/v1/media` の `kind` クエリ文字列。サーバ受理は
+    /// `avatar|header|attachment` の 3 値固定 ([`crate::client::upload_media`])。
     pub fn as_kind(self) -> &'static str {
         match self {
             Self::Avatar => "avatar",
@@ -45,12 +46,10 @@ impl PickerMode {
         }
     }
 
+    /// UI 表示用ラベル。今は `as_kind` と同値だが、将来 `添付` のように
+    /// ローカライズしたいときに分岐させる用に別関数で持つ。
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Avatar => "avatar",
-            Self::Header => "header",
-            Self::Attachment => "attachment",
-        }
+        self.as_kind()
     }
 }
 

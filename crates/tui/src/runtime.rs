@@ -411,7 +411,7 @@ async fn apply_action(
                 p.toggle_hidden();
             }
         }
-        Action::PickerCancel => close_picker(app),
+        Action::PickerCancel => close_picker(app, false),
         Action::PopAttachment => {
             if let Some(att) = app.compose.pop_attachment() {
                 app.set_status(
@@ -445,12 +445,17 @@ fn open_picker(app: &mut App, mode: PickerMode) {
     );
 }
 
-fn close_picker(app: &mut App) {
+/// `keep_compose = true` のときはピッカ閉じて Compose に戻る。Attachment
+/// モードでキャンセル / 完了したときに使う ── ピッカ前の入力中だった本文
+/// を失わないため (PR #43 review Minor)。
+fn close_picker(app: &mut App, keep_compose: bool) {
+    let mode = app.picker.as_ref().map(|p| p.mode);
     app.picker = None;
-    // 元のフォーカス先: attachment なら compose、avatar/header なら timeline。
-    // 簡単のためいつでも timeline に戻す (compose 状態は保持されるので、
-    // ユーザが `n` で開き直せばよい)。
-    app.focus = Focus::Timeline;
+    app.focus = if keep_compose || matches!(mode, Some(PickerMode::Attachment)) {
+        Focus::Compose
+    } else {
+        Focus::Timeline
+    };
 }
 
 fn picker_activate(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<UploadOutcome>) {
@@ -482,11 +487,8 @@ fn picker_activate(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<Uploa
                 StatusKind::Info,
                 None,
             );
-            close_picker(app);
-            // For attachment, return to compose so the user can keep typing.
-            if mode == PickerMode::Attachment {
-                app.focus = Focus::Compose;
-            }
+            // close_picker は attachment モードなら自動で Compose に戻る。
+            close_picker(app, false);
             let api = api.clone();
             let tx = upload_tx.clone();
             tokio::spawn(async move {
@@ -497,6 +499,14 @@ fn picker_activate(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<Uploa
     }
 }
 
+/// アップロード前の TUI 側ファイルサイズ上限 (25 MiB)。`config/default.toml`
+/// の `media_proxy.max_bytes` (= 25 MiB) と揃える。本来 TUI は config を
+/// 持たないので決め打ち ── server 側で同値の上限が再チェックされるため、
+/// この値より大きく見積もって TUI が拒否しないケースが出ても安全に 413 で
+/// 返る。但し 4GiB 動画を誤選択した際に TUI ホストプロセスが OOM する事故
+/// を避けるため、ローカルで弾く方が UX 上望ましい (PR #43 review Medium)。
+const MAX_UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
+
 /// バックグラウンドアップロードの本体。bytes を読み、`POST /api/v1/media`、
 /// 必要なら `PATCH /api/v1/actor/profile` まで叩いて結果を返す。
 async fn run_upload(
@@ -505,6 +515,28 @@ async fn run_upload(
     path: std::path::PathBuf,
     label: String,
 ) -> UploadOutcome {
+    // ファイルを読む **前** にメタデータで上限チェック。`tokio::fs::read`
+    // はサイズ無制限に Vec に積むので、4 GiB 動画を選んでも握り込んで
+    // しまう。`MAX_UPLOAD_BYTES` で先に弾く (= server 側 `max_bytes` と
+    // 二重防御)。
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.len() > MAX_UPLOAD_BYTES => {
+            return UploadOutcome::Failed {
+                kind: mode,
+                message: format!(
+                    "file too large: {} bytes (max {MAX_UPLOAD_BYTES})",
+                    meta.len()
+                ),
+            };
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return UploadOutcome::Failed {
+                kind: mode,
+                message: format!("stat {}: {err}", path.display()),
+            };
+        }
+    }
     let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
         Err(err) => {
@@ -594,10 +626,10 @@ fn handle_upload_outcome(app: &mut App, outcome: UploadOutcome) {
         } => {
             // whoami をローカル更新しておく ── サーバへ再 whoami しなくても
             // すぐ UI に反映される (アバターウィジェット等)。
-            if let Some(url) = icon_url.clone() {
+            if let Some(url) = icon_url {
                 app.whoami.icon_url = Some(url);
             }
-            if let Some(url) = image_url.clone() {
+            if let Some(url) = image_url {
                 app.whoami.image_url = Some(url);
             }
             app.set_status(
