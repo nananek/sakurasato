@@ -459,13 +459,13 @@ fn verify_rfc9421_with_actor(
                 .as_deref()
                 .ok_or(SigError::ActorMissingKey(KeyKind::Ed25519))?;
             rfc9421::verify_ed25519(base.as_bytes(), &sig_bytes, pem)
-                .map_err(|_| SigError::BadSignature)
+                .map_err(|e| map_rfc9421_verify_err(KeyKind::Ed25519, &e))
         }
         KeyKind::Rsa => {
             let sig_b64 =
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sig_bytes);
             cavage::verify_rsa_sha256(base.as_bytes(), &sig_b64, &actor.public_key_pem)
-                .map_err(|_| SigError::BadSignature)
+                .map_err(|e| map_cavage_verify_err(KeyKind::Rsa, &e))
         }
         KeyKind::Other => Err(SigError::UnsupportedKeyKind(KeyKind::Other)),
     }
