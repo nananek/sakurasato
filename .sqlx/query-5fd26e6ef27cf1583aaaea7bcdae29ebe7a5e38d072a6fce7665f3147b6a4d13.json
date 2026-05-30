@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            content as \"content!\",\n            COUNT(*) as \"count!\",\n            MAX(emoji_id) as \"any_emoji_id: i64\"\n        FROM reaction\n        WHERE note_id = $1\n        GROUP BY content\n        ORDER BY MIN(created_at)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "content!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "reaction",
+            "name": "content"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "any_emoji_id: i64",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "5fd26e6ef27cf1583aaaea7bcdae29ebe7a5e38d072a6fce7665f3147b6a4d13"
+}

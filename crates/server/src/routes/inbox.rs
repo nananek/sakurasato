@@ -5,9 +5,9 @@
 //! 制御を渡す。
 //!
 //! 本 handler は body を [`crate::dispatch`] に流し、F3 actor 一致検証と
-//! `type` 別ハンドラ (Follow / Accept / Reject) を実行する。
-//! `Create`/`Note` / `Like` / `Update` / `Delete` / `Move` / `EmojiReact` は
-//! M3b-3 以降の追加 PR で順次。
+//! `type` 別ハンドラ (Follow / Accept / Reject / Like / `EmojiReact` / Undo) を
+//! 実行する。`Create`/`Note` / `Update` / `Delete` / `Move` / `Announce` は
+//! 後続 PR で順次。
 //!
 //! 未対応 Activity 型は 202 で受け流す ── 相手の再送ループに乗せないため。
 

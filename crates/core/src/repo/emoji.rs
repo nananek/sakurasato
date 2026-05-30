@@ -87,3 +87,76 @@ pub async fn get_local_by_shortcode(
     .fetch_optional(pool)
     .await
 }
+
+/// Remote custom emoji の upsert 入力 (M8 PR2)。
+///
+/// `image_url` は連合先サーバの実 URL (= `Emoji.icon.url`)。本 PR では
+/// 取得・キャッシュは行わず URL のまま `image_key` に格納する ── M9 で
+/// media-proxy 経由のキャッシュに切り替える想定 (CLAUDE.md §5.4)。
+#[derive(Debug, Clone)]
+pub struct NewRemoteEmoji {
+    pub shortcode: String,
+    /// `Emoji.id` (= AP URI)。`name` だけだと衝突しうるので一意キーは `ap_id`。
+    pub ap_id: String,
+    /// `Emoji.id` のホスト。`null` は不可 (= remote はホスト必須)。
+    pub host: String,
+    pub image_url: String,
+    pub media_type: String,
+}
+
+/// Remote emoji を upsert する。`ap_id` をキーに同じ AP URI なら同じ行を
+/// 返す ── 同じ remote 絵文字を別 reaction で何度学習しても 1 行で済む。
+pub async fn upsert_remote(pool: &PgPool, new: NewRemoteEmoji) -> sqlx::Result<EmojiRow> {
+    if !is_valid_shortcode(&new.shortcode) {
+        return Err(sqlx::Error::Protocol(format!(
+            "invalid emoji shortcode {:?}; must match [a-zA-Z0-9_-]{{1,64}}",
+            new.shortcode
+        )));
+    }
+    if new.host.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "remote emoji host must not be empty".into(),
+        ));
+    }
+    sqlx::query_as!(
+        EmojiRow,
+        r#"
+        INSERT INTO emoji (shortcode, host, category, aliases, image_key, media_type, ap_id, is_local)
+        VALUES ($1, $2, NULL, '[]'::jsonb, $3, $4, $5, FALSE)
+        ON CONFLICT (ap_id) DO UPDATE SET
+            shortcode = EXCLUDED.shortcode,
+            host = EXCLUDED.host,
+            image_key = EXCLUDED.image_key,
+            media_type = EXCLUDED.media_type,
+            updated_at = now()
+        RETURNING
+            id, shortcode, host, category,
+            aliases as "aliases: Json<Vec<String>>",
+            image_key, media_type, ap_id, is_local, created_at, updated_at
+        "#,
+        new.shortcode,
+        new.host,
+        new.image_url,
+        new.media_type,
+        new.ap_id,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// `ap_id` で 1 行引く。Remote emoji の存在チェック用。
+pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<EmojiRow>> {
+    sqlx::query_as!(
+        EmojiRow,
+        r#"
+        SELECT
+            id, shortcode, host, category,
+            aliases as "aliases: Json<Vec<String>>",
+            image_key, media_type, ap_id, is_local, created_at, updated_at
+        FROM emoji WHERE ap_id = $1
+        "#,
+        ap_id,
+    )
+    .fetch_optional(pool)
+    .await
+}
