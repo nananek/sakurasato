@@ -124,6 +124,58 @@ impl LocalApi {
         decode_json(resp).await
     }
 
+    /// `POST /api/v1/media?kind=...[&alt=...]` ── M7 アップロード経路。
+    ///
+    /// raw バイト列を `application/octet-stream` で送り、server 側で
+    /// media-proxy サニタイズ → versitygw 格納 → DB 登録までを行う。
+    /// 戻り値は `media.id` 等を含む JSON。
+    ///
+    /// **`kind`**: `"avatar"` / `"header"` / `"attachment"` のいずれか。
+    /// **`alt`**: 添付時の代替テキスト (a11y)。`None` で省略可。
+    pub async fn upload_media(
+        &self,
+        kind: &str,
+        alt: Option<&str>,
+        body: Vec<u8>,
+    ) -> Result<MediaResponse, ApiError> {
+        // クエリ文字列は **必ず await 前に確定** させる ── `Serializer` は
+        // 内部に `Cow<'_, [u8]>` を持つため `Send` ではない。スコープを
+        // 限定して `String` だけを残すよう block で囲む。
+        let path = {
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query.append_pair("kind", kind);
+            if let Some(a) = alt
+                && !a.is_empty()
+            {
+                query.append_pair("alt", a);
+            }
+            format!("/api/v1/media?{}", query.finish())
+        };
+        let request = self
+            .request_builder(Method::POST, &path)?
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// `PATCH /api/v1/actor/profile` ── M7 プロフィール更新。
+    ///
+    /// `display_name` / `summary` / `icon_media_id` / `image_media_id` を
+    /// 個別に設定するか、`clear_*` フラグで明示クリアする。サーバ側で
+    /// Update Activity が followers に送出される。
+    pub async fn patch_profile(&self, req: &ProfileUpdate) -> Result<ProfileResponse, ApiError> {
+        let body = serde_json::to_vec(req)?;
+        let request = self
+            .request_builder(Method::PATCH, "/api/v1/actor/profile")?
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
     /// `GET /api/v1/media/proxy?url=...&variant=...` ── server 経由 (=
     /// media-proxy 経由) でアバター等の画像を取得する (M6 / Issue #36)。
     ///
@@ -310,6 +362,67 @@ pub struct CreateNoteRequest {
     pub language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_reply_to_ap_id: Option<String>,
+    /// M7: 添付メディア `media.id` の配列。空配列は省略する。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_ids: Vec<i64>,
+}
+
+/// `POST /api/v1/media` のレスポンス。`server::local_api::media::MediaResponse`
+/// と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaResponse {
+    pub id: i64,
+    pub storage_key: String,
+    pub url: String,
+    pub media_type: String,
+    pub width: i32,
+    pub height: i32,
+    pub byte_size: i64,
+    pub kind: String,
+    #[serde(default)]
+    pub alt_text: Option<String>,
+}
+
+/// `PATCH /api/v1/actor/profile` のリクエスト。`server::local_api::profile::ProfileUpdate`
+/// と対称形。`clear_*` フラグは「明示的に NULL を書く」指示。
+#[derive(Debug, Clone, Default, Serialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "4 clear_* フラグは optional field の null 指示 ── server 側と同形を保つ"
+)]
+pub struct ProfileUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_display_name: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_summary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_media_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_icon: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_media_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_image: bool,
+}
+
+/// `PATCH /api/v1/actor/profile` のレスポンス。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProfileResponse {
+    pub ap_id: String,
+    pub preferred_username: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<String>,
+    pub queued_deliveries: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -454,15 +567,60 @@ mod tests {
             sensitive: None,
             language: None,
             in_reply_to_ap_id: None,
+            attachment_ids: Vec::new(),
         };
         let json = serde_json::to_value(&req).unwrap();
         let obj = json.as_object().unwrap();
-        // 設定したフィールドだけ JSON に乗る。
+        // 設定したフィールドだけ JSON に乗る。空 Vec の attachment_ids も省略。
         assert!(obj.contains_key("content"));
         assert!(obj.contains_key("visibility"));
         assert!(!obj.contains_key("summary"));
         assert!(!obj.contains_key("sensitive"));
         assert!(!obj.contains_key("language"));
         assert!(!obj.contains_key("in_reply_to_ap_id"));
+        assert!(!obj.contains_key("attachment_ids"));
+    }
+
+    #[test]
+    fn create_note_request_includes_attachment_ids() {
+        let req = CreateNoteRequest {
+            content: "hi".into(),
+            summary: None,
+            visibility: None,
+            sensitive: None,
+            language: None,
+            in_reply_to_ap_id: None,
+            attachment_ids: vec![1, 2],
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["attachment_ids"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn profile_update_serializes_only_set_fields() {
+        let req = ProfileUpdate {
+            display_name: Some("ありす".into()),
+            ..ProfileUpdate::default()
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(
+            obj.get("display_name").and_then(|v| v.as_str()),
+            Some("ありす")
+        );
+        assert!(!obj.contains_key("clear_display_name"));
+        assert!(!obj.contains_key("summary"));
+        assert!(!obj.contains_key("icon_media_id"));
+    }
+
+    #[test]
+    fn profile_update_emits_clear_flags() {
+        let req = ProfileUpdate {
+            clear_icon: true,
+            ..ProfileUpdate::default()
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["clear_icon"], serde_json::json!(true));
+        assert!(json.as_object().unwrap().get("icon_media_id").is_none());
     }
 }

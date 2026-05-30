@@ -60,6 +60,7 @@ async fn create_note_round_trips() -> anyhow::Result<()> {
         sensitive: Some(false),
         language: None,
         in_reply_to_ap_id: None,
+        attachment_ids: Vec::new(),
     };
     let resp = api.create_note(&req).await?;
     assert_eq!(resp.id, 99);
@@ -79,6 +80,7 @@ async fn http_400_is_surfaced_as_status_error() -> anyhow::Result<()> {
         sensitive: None,
         language: None,
         in_reply_to_ap_id: None,
+        attachment_ids: Vec::new(),
     };
     let err = api.create_note(&req).await.unwrap_err();
     assert!(format!("{err}").contains("400"), "expected 400 in {err}");

@@ -23,10 +23,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::TuiOptions;
 use crate::app::{App, Focus, StatusKind};
-use crate::client::{ApiError, CreateNoteRequest, LocalApi, StreamEvent};
-use crate::compose::Visibility;
+use crate::client::{
+    ApiError, CreateNoteRequest, LocalApi, MediaResponse, ProfileUpdate, StreamEvent,
+};
+use crate::compose::{AttachmentRef, Visibility};
 use crate::event::{Action, translate};
 use crate::image_cache::ImageCache;
+use crate::picker::{Activation, FilePicker, PickerMode};
 use crate::sse;
 use crate::theme::Theme;
 use crate::ui;
@@ -37,6 +40,32 @@ type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 /// 1 ループあたりの待ち上限。これより長く何も起きないと `tick` が走る
 /// (= 一時 status メッセージの TTL 消去等)。
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// M7: アップロードタスクがメインループに返す結果。
+///
+/// `mpsc::Sender` で `runtime::main_loop` の `tokio::select!` に流す。
+/// SSE と同じく非同期で来るので、`apply_action` が直接 `await` で待つのでは
+/// なく、`tokio::spawn` して完了を別経路で受ける。
+#[derive(Debug)]
+enum UploadOutcome {
+    /// 添付アップロード成功。compose の attachment 列に追加する。
+    AttachmentReady {
+        media: MediaResponse,
+        label: String,
+    },
+    /// アバター更新成功。`PATCH /api/v1/actor/profile` も済み済みで、whoami
+    /// の `icon_url` を更新する。
+    ProfileUpdated {
+        icon_url: Option<String>,
+        image_url: Option<String>,
+        queued: usize,
+        kind: PickerMode,
+    },
+    Failed {
+        kind: PickerMode,
+        message: String,
+    },
+}
 
 /// メイン関数。`main.rs` から呼ぶ唯一のエントリ。
 pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
@@ -81,8 +110,17 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
     };
     // M6: 画像取得は LocalApi 経由で server → media-proxy に委譲する。
     // ImageCache は API クライアントを clone して持つ (Arc 同等のコスト)。
-    let images = ImageCache::new(picker, Some(api.clone()));
-    let mut app = App::new(options.theme.clone(), whoami, socket_label, images);
+    let images = ImageCache::new(picker.clone(), Some(api.clone()));
+    // M7: ファイルピッカ用ローカル画像プレビュー。Picker は同じ端末向けの
+    // ものを共有する (端末問い合わせを 2 度するのを避ける)。
+    let previews = crate::preview::PreviewCache::new(picker);
+    let mut app = App::new(
+        options.theme.clone(),
+        whoami,
+        socket_label,
+        images,
+        previews,
+    );
 
     // 初回タイムライン取得。
     match api.timeline_home(None, options.page_size).await {
@@ -103,6 +141,10 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
     let sse_api = api.clone();
     let sse_task = tokio::spawn(async move { sse::run(sse_api, sse_tx).await });
 
+    // M7: アップロード結果を main_loop に戻すチャネル。capacity は 8 程度で
+    // 十分 (= 同時アップロードは picker UX 的に 1 件 / 時々 2 件)。
+    let (upload_tx, mut upload_rx) = mpsc::channel::<UploadOutcome>(8);
+
     let mut terminal = init_terminal()?;
     let mut event_stream = EventStream::new();
     let mut last_rects = ui::PanelRects::default();
@@ -114,6 +156,8 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
         options.page_size,
         &mut event_stream,
         &mut sse_rx,
+        &mut upload_rx,
+        &upload_tx,
         &mut last_rects,
     )
     .await;
@@ -125,6 +169,7 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
     result
 }
 
+#[allow(clippy::too_many_arguments, reason = "TUI mainloop は依存が多い")]
 async fn main_loop(
     terminal: &mut TuiTerminal,
     app: &mut App,
@@ -132,6 +177,8 @@ async fn main_loop(
     page_size: i64,
     events: &mut EventStream,
     sse_rx: &mut mpsc::Receiver<StreamEvent>,
+    upload_rx: &mut mpsc::Receiver<UploadOutcome>,
+    upload_tx: &mpsc::Sender<UploadOutcome>,
     last_rects: &mut ui::PanelRects,
 ) -> anyhow::Result<()> {
     // ratatui に描画。最初の 1 frame。
@@ -150,7 +197,7 @@ async fn main_loop(
 
             maybe_evt = events.next() => {
                 match maybe_evt {
-                    Some(Ok(evt)) => handle_event(evt, app, api, page_size, last_rects).await,
+                    Some(Ok(evt)) => handle_event(evt, app, api, page_size, last_rects, upload_tx).await,
                     Some(Err(e)) => {
                         warn!(?e, "terminal event stream error");
                     }
@@ -168,6 +215,11 @@ async fn main_loop(
                     None => {
                         debug!("SSE channel closed");
                     }
+                }
+            }
+            maybe_upload = upload_rx.recv() => {
+                if let Some(outcome) = maybe_upload {
+                    handle_upload_outcome(app, outcome);
                 }
             }
             () = tokio::time::sleep(TICK_INTERVAL) => {
@@ -193,9 +245,10 @@ async fn handle_event(
     api: &LocalApi,
     page_size: i64,
     rects: &ui::PanelRects,
+    upload_tx: &mpsc::Sender<UploadOutcome>,
 ) {
     let action = translate(event, app.focus);
-    apply_action(action, app, api, page_size, rects).await;
+    apply_action(action, app, api, page_size, rects, upload_tx).await;
 }
 
 #[allow(clippy::too_many_lines, reason = "single dispatcher for all actions")]
@@ -205,6 +258,7 @@ async fn apply_action(
     api: &LocalApi,
     page_size: i64,
     rects: &ui::PanelRects,
+    upload_tx: &mpsc::Sender<UploadOutcome>,
 ) {
     match action {
         Action::Noop => {}
@@ -323,6 +377,242 @@ async fn apply_action(
         Action::MouseClick(col, row) => {
             handle_click(app, rects, col, row);
         }
+        Action::OpenPicker(mode) => open_picker(app, mode),
+        Action::PickerNext => {
+            if let Some(p) = app.picker.as_mut() {
+                p.select_next();
+            }
+        }
+        Action::PickerPrev => {
+            if let Some(p) = app.picker.as_mut() {
+                p.select_prev();
+            }
+        }
+        Action::PickerPageDown => {
+            if let Some(p) = app.picker.as_mut() {
+                let h = rects.picker_list.height.saturating_sub(2).max(1) as usize;
+                p.page_down(h);
+            }
+        }
+        Action::PickerPageUp => {
+            if let Some(p) = app.picker.as_mut() {
+                let h = rects.picker_list.height.saturating_sub(2).max(1) as usize;
+                p.page_up(h);
+            }
+        }
+        Action::PickerActivate => picker_activate(app, api, upload_tx),
+        Action::PickerParent => {
+            if let Some(p) = app.picker.as_mut() {
+                p.go_parent();
+            }
+        }
+        Action::PickerToggleHidden => {
+            if let Some(p) = app.picker.as_mut() {
+                p.toggle_hidden();
+            }
+        }
+        Action::PickerCancel => close_picker(app),
+        Action::PopAttachment => {
+            if let Some(att) = app.compose.pop_attachment() {
+                app.set_status(
+                    format!("detached: {}", att.label),
+                    StatusKind::Info,
+                    Some(Duration::from_secs(2)),
+                );
+            }
+        }
+    }
+}
+
+fn open_picker(app: &mut App, mode: PickerMode) {
+    // attachment ピッカは compose 上限を先に弾く ── ユーザを picker に入れて
+    // から「上限超え」と知らせるより UX が良い。
+    if mode == PickerMode::Attachment && app.compose.attachments_full() {
+        app.set_status(
+            "attachments full (max 4)",
+            StatusKind::Warning,
+            Some(Duration::from_secs(3)),
+        );
+        return;
+    }
+    let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    app.picker = Some(FilePicker::new(mode, start));
+    app.focus = Focus::Picker;
+    app.set_status(
+        format!("file picker: {} (Enter=select, Esc=cancel)", mode.label()),
+        StatusKind::Info,
+        Some(Duration::from_secs(4)),
+    );
+}
+
+fn close_picker(app: &mut App) {
+    app.picker = None;
+    // 元のフォーカス先: attachment なら compose、avatar/header なら timeline。
+    // 簡単のためいつでも timeline に戻す (compose 状態は保持されるので、
+    // ユーザが `n` で開き直せばよい)。
+    app.focus = Focus::Timeline;
+}
+
+fn picker_activate(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<UploadOutcome>) {
+    let Some(picker) = app.picker.as_mut() else {
+        return;
+    };
+    let mode = picker.mode;
+    match picker.activate() {
+        Activation::Noop | Activation::Descended => {}
+        Activation::Selected(path) => {
+            // attachment はこのタイミングで上限再確認 (picker 開閉中に他経路で
+            // 添付が増えることは無いが、二重押下対策で念のため)。
+            if mode == PickerMode::Attachment && app.compose.attachments_full() {
+                app.set_status(
+                    "attachments full (max 4)",
+                    StatusKind::Warning,
+                    Some(Duration::from_secs(3)),
+                );
+                return;
+            }
+            let label = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("(file)")
+                .to_string();
+            app.pending_uploads = app.pending_uploads.saturating_add(1);
+            app.set_status(
+                format!("uploading {label} as {}...", mode.label()),
+                StatusKind::Info,
+                None,
+            );
+            close_picker(app);
+            // For attachment, return to compose so the user can keep typing.
+            if mode == PickerMode::Attachment {
+                app.focus = Focus::Compose;
+            }
+            let api = api.clone();
+            let tx = upload_tx.clone();
+            tokio::spawn(async move {
+                let outcome = run_upload(api, mode, path, label).await;
+                let _ = tx.send(outcome).await;
+            });
+        }
+    }
+}
+
+/// バックグラウンドアップロードの本体。bytes を読み、`POST /api/v1/media`、
+/// 必要なら `PATCH /api/v1/actor/profile` まで叩いて結果を返す。
+async fn run_upload(
+    api: LocalApi,
+    mode: PickerMode,
+    path: std::path::PathBuf,
+    label: String,
+) -> UploadOutcome {
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(err) => {
+            return UploadOutcome::Failed {
+                kind: mode,
+                message: format!("read {}: {err}", path.display()),
+            };
+        }
+    };
+    let media = match api.upload_media(mode.as_kind(), None, bytes).await {
+        Ok(m) => m,
+        Err(err) => {
+            return UploadOutcome::Failed {
+                kind: mode,
+                message: format!("upload: {err}"),
+            };
+        }
+    };
+    match mode {
+        PickerMode::Attachment => UploadOutcome::AttachmentReady { media, label },
+        PickerMode::Avatar => {
+            let req = ProfileUpdate {
+                icon_media_id: Some(media.id),
+                ..ProfileUpdate::default()
+            };
+            match api.patch_profile(&req).await {
+                Ok(resp) => UploadOutcome::ProfileUpdated {
+                    icon_url: resp.icon_url,
+                    image_url: resp.image_url,
+                    queued: resp.queued_deliveries,
+                    kind: mode,
+                },
+                Err(err) => UploadOutcome::Failed {
+                    kind: mode,
+                    message: format!("profile patch: {err}"),
+                },
+            }
+        }
+        PickerMode::Header => {
+            let req = ProfileUpdate {
+                image_media_id: Some(media.id),
+                ..ProfileUpdate::default()
+            };
+            match api.patch_profile(&req).await {
+                Ok(resp) => UploadOutcome::ProfileUpdated {
+                    icon_url: resp.icon_url,
+                    image_url: resp.image_url,
+                    queued: resp.queued_deliveries,
+                    kind: mode,
+                },
+                Err(err) => UploadOutcome::Failed {
+                    kind: mode,
+                    message: format!("profile patch: {err}"),
+                },
+            }
+        }
+    }
+}
+
+fn handle_upload_outcome(app: &mut App, outcome: UploadOutcome) {
+    app.pending_uploads = app.pending_uploads.saturating_sub(1);
+    match outcome {
+        UploadOutcome::AttachmentReady { media, label } => {
+            let added = app.compose.add_attachment(AttachmentRef {
+                media_id: media.id,
+                label: label.clone(),
+            });
+            if added {
+                app.set_status(
+                    format!("attached {label} ({}x{})", media.width, media.height),
+                    StatusKind::Success,
+                    Some(Duration::from_secs(3)),
+                );
+            } else {
+                app.set_status(
+                    "attachments full (max 4); upload discarded",
+                    StatusKind::Warning,
+                    Some(Duration::from_secs(4)),
+                );
+            }
+        }
+        UploadOutcome::ProfileUpdated {
+            icon_url,
+            image_url,
+            queued,
+            kind,
+        } => {
+            // whoami をローカル更新しておく ── サーバへ再 whoami しなくても
+            // すぐ UI に反映される (アバターウィジェット等)。
+            if let Some(url) = icon_url.clone() {
+                app.whoami.icon_url = Some(url);
+            }
+            if let Some(url) = image_url.clone() {
+                app.whoami.image_url = Some(url);
+            }
+            app.set_status(
+                format!("{} updated ({queued} delivered)", kind.label()),
+                StatusKind::Success,
+                Some(Duration::from_secs(4)),
+            );
+        }
+        UploadOutcome::Failed { kind, message } => {
+            app.set_status(
+                format!("{} upload failed: {message}", kind.label()),
+                StatusKind::Error,
+                Some(Duration::from_secs(8)),
+            );
+        }
     }
 }
 
@@ -378,6 +668,7 @@ async fn submit_note(app: &mut App, api: &LocalApi) {
         sensitive: Some(app.compose.sensitive()),
         language: None,
         in_reply_to_ap_id: None,
+        attachment_ids: app.compose.attachment_ids(),
     };
     match api.create_note(&req).await {
         Ok(resp) => {

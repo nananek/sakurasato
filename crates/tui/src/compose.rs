@@ -61,6 +61,15 @@ impl FromStr for Visibility {
     }
 }
 
+/// 投稿に添付するメディアの最小情報。`POST /api/v1/notes` の
+/// `attachment_ids` に積む id と、UI 表示用ラベル (= ファイル名/サイズ) を持つ。
+#[derive(Debug, Clone)]
+pub struct AttachmentRef {
+    pub media_id: i64,
+    /// UI バッジ用の短いラベル。ファイル名がそのまま入る想定。
+    pub label: String,
+}
+
 /// 投稿エディタの状態。
 #[derive(Debug, Clone)]
 pub struct Compose {
@@ -77,7 +86,13 @@ pub struct Compose {
     visibility: Visibility,
     /// `content` 最大文字数 (chars 単位)。server 既定 5000 と揃える。
     pub max_chars: usize,
+    /// M7: 添付メディア。`submit` 時に `attachment_ids` として送る。最大件数
+    /// は server 側 (`ATTACHMENT_MAX = 4`) と合わせる。
+    attachments: Vec<AttachmentRef>,
 }
+
+/// 添付の最大件数 (= server 側 `ATTACHMENT_MAX`)。Mastodon と揃え。
+pub const ATTACHMENT_MAX: usize = 4;
 
 impl Default for Compose {
     fn default() -> Self {
@@ -89,6 +104,7 @@ impl Default for Compose {
             sensitive: false,
             visibility: Visibility::Public,
             max_chars: 5000,
+            attachments: Vec::new(),
         }
     }
 }
@@ -140,6 +156,34 @@ impl Compose {
         self.cw.clear();
         self.editing_cw = false;
         self.sensitive = false;
+        self.attachments.clear();
+    }
+
+    pub fn attachments(&self) -> &[AttachmentRef] {
+        &self.attachments
+    }
+
+    pub fn attachment_ids(&self) -> Vec<i64> {
+        self.attachments.iter().map(|a| a.media_id).collect()
+    }
+
+    pub fn attachments_full(&self) -> bool {
+        self.attachments.len() >= ATTACHMENT_MAX
+    }
+
+    /// 添付を 1 件追加。上限を超える場合は `false` を返す (= 呼び出し側で
+    /// status バーに警告を出す)。
+    pub fn add_attachment(&mut self, attachment: AttachmentRef) -> bool {
+        if self.attachments_full() {
+            return false;
+        }
+        self.attachments.push(attachment);
+        true
+    }
+
+    /// 末尾の添付を 1 件外す。空なら `None`。
+    pub fn pop_attachment(&mut self) -> Option<AttachmentRef> {
+        self.attachments.pop()
     }
 
     /// 1 文字挿入。`max_chars` を超える挿入は無視する (= UI 側でハイライト
@@ -412,5 +456,45 @@ mod tests {
         assert_eq!(c.cursor(), 3); // start of "cd"
         c.move_line_end();
         assert_eq!(c.cursor(), 5);
+    }
+
+    #[test]
+    fn attachments_respect_max_and_clear_resets_them() {
+        let mut c = Compose::new();
+        for i in 0..ATTACHMENT_MAX {
+            let added = c.add_attachment(AttachmentRef {
+                media_id: i64::try_from(i).unwrap(),
+                label: format!("x{i}"),
+            });
+            assert!(added, "should accept {i}-th attachment");
+        }
+        // 5 件目は上限超過で拒否。
+        assert!(c.attachments_full());
+        let denied = c.add_attachment(AttachmentRef {
+            media_id: 99,
+            label: "x".into(),
+        });
+        assert!(!denied);
+        // clear で attachments も空に。
+        assert_eq!(c.attachments().len(), ATTACHMENT_MAX);
+        c.clear();
+        assert!(c.attachments().is_empty());
+        assert!(!c.attachments_full());
+    }
+
+    #[test]
+    fn pop_attachment_returns_last() {
+        let mut c = Compose::new();
+        c.add_attachment(AttachmentRef {
+            media_id: 1,
+            label: "a".into(),
+        });
+        c.add_attachment(AttachmentRef {
+            media_id: 2,
+            label: "b".into(),
+        });
+        let popped = c.pop_attachment().unwrap();
+        assert_eq!(popped.media_id, 2);
+        assert_eq!(c.attachment_ids(), vec![1]);
     }
 }

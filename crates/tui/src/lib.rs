@@ -43,6 +43,8 @@ pub mod client;
 pub mod compose;
 pub mod event;
 pub mod image_cache;
+pub mod picker;
+pub mod preview;
 pub mod runtime;
 pub mod sse;
 pub mod theme;

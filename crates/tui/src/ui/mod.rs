@@ -44,6 +44,9 @@ pub struct PanelRects {
     pub timeline_rows: ScrollHits,
     pub compose: Rect,
     pub help: Option<Rect>,
+    /// M7: ピッカ表示中はリスト部分の矩形 (= PageDown/Up の高さ算出用)。
+    /// 非表示時は zero rect。
+    pub picker_list: Rect,
 }
 
 /// タイムラインのスクロール可能領域内に並んだ note の行位置をビット圧縮せず
@@ -77,11 +80,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         None
     };
 
+    // M7: ピッカは画面中央 overlay。Help と同じ層に出すので Help と排他的に
+    // しなくてもいいが、両方同時に出ると操作が混乱するので Picker focus 時
+    // は Help は描かない設計 (= 上で focus == Help のときだけ render_help)。
+    let picker_list = if app.focus == Focus::Picker {
+        render_picker(frame, area, app)
+    } else {
+        Rect::default()
+    };
+
     PanelRects {
         timeline: timeline_area,
         timeline_rows: rows,
         compose: compose_area,
         help: help_area,
+        picker_list,
     }
 }
 
@@ -424,6 +437,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::Timeline => "timeline",
         Focus::Compose => "compose",
         Focus::Help => "help",
+        Focus::Picker => "picker",
     };
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -446,6 +460,23 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(palette.muted),
         ),
     ];
+    if app.pending_uploads > 0 {
+        spans.push(Span::raw("  │  "));
+        spans.push(Span::styled(
+            format!("↑{}", app.pending_uploads),
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let att_count = app.compose.attachments().len();
+    if att_count > 0 {
+        spans.push(Span::raw("  │  "));
+        spans.push(Span::styled(
+            format!("attach:{att_count}"),
+            Style::default().fg(palette.accent),
+        ));
+    }
     if let Some(s) = &app.status {
         let color = match s.kind {
             StatusKind::Info => palette.foreground,
@@ -507,6 +538,9 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "o", "load more (older)"),
         help_entry(palette, "t", "cycle theme"),
         help_entry(palette, "q / Esc", "quit"),
+        help_entry(palette, "A", "upload avatar"),
+        help_entry(palette, "H", "upload header"),
+        help_entry(palette, ";", "attach image (picker)"),
         Line::from(""),
         Line::from(Span::styled("compose", help_section(palette))),
         help_entry(palette, "Enter", "insert newline"),
@@ -514,7 +548,16 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "Ctrl-W", "toggle CW field"),
         help_entry(palette, "Ctrl-V", "cycle visibility"),
         help_entry(palette, "Ctrl-S", "toggle sensitive"),
+        help_entry(palette, "Ctrl-A", "attach image (picker)"),
+        help_entry(palette, "Ctrl-D", "detach last attachment"),
         help_entry(palette, "Esc", "leave compose"),
+        Line::from(""),
+        Line::from(Span::styled("file picker", help_section(palette))),
+        help_entry(palette, "j / k", "select next / prev"),
+        help_entry(palette, "Enter", "descend / select file"),
+        help_entry(palette, "Backspace", "go to parent"),
+        help_entry(palette, ".", "toggle hidden files"),
+        help_entry(palette, "Esc / q", "cancel picker"),
         Line::from(""),
         Line::from(Span::styled(
             "press ? again to close",
@@ -543,6 +586,195 @@ fn help_entry(palette: &Palette, key: &str, desc: &str) -> Line<'static> {
         ),
         Span::styled(desc.to_string(), Style::default().fg(palette.foreground)),
     ])
+}
+
+/// M7: ファイルピッカの描画。中央に大きめの overlay を出して、左にエントリ
+/// リスト、右にプレビューを並べる。返り値はリスト矩形 (= PageDown/Up の
+/// 高さ算出用に runtime に戻す)。
+#[allow(
+    clippy::many_single_char_names,
+    reason = "矩形 w/h/x/y は ratatui 慣習"
+)]
+fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) -> Rect {
+    let Some(picker) = app.picker.as_ref() else {
+        return Rect::default();
+    };
+    let palette = &app.theme.palette;
+
+    // 全画面 overlay (= 端末の 8 割) を使う。
+    let w = area.width.saturating_sub(4).max(40);
+    let h = area.height.saturating_sub(4).max(15);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let title = format!(
+        "  picker — {} :: {}  ",
+        picker.mode.label(),
+        picker.cwd.display()
+    );
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.accent))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    frame.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    // 左 (リスト) と右 (プレビュー) に半々 split。
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(inner);
+    let list_area = cols[0];
+    let preview_area = cols[1];
+
+    render_picker_list(frame, list_area, picker, palette);
+    render_picker_preview(frame, preview_area, picker, app, palette);
+
+    list_area
+}
+
+fn render_picker_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    picker: &crate::picker::FilePicker,
+    palette: &Palette,
+) {
+    let visible = area.height as usize;
+    if picker.entries.is_empty() {
+        let msg = picker
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "(empty directory)".into());
+        let p = Paragraph::new(Line::from(Span::styled(
+            msg,
+            Style::default().fg(palette.muted),
+        )));
+        frame.render_widget(p, area);
+        return;
+    }
+    let top = picker.selected.saturating_sub(visible / 2);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible);
+    for (i, entry) in picker.entries.iter().enumerate().skip(top).take(visible) {
+        let marker = if i == picker.selected { "▍ " } else { "  " };
+        let kind = if entry.is_dir { "[d]" } else { "[f]" };
+        let style = if i == picker.selected {
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else if entry.is_dir {
+            Style::default().fg(palette.accent)
+        } else {
+            Style::default().fg(palette.foreground)
+        };
+        let display = format!("{marker}{kind} {}", entry.name);
+        lines.push(Line::from(Span::styled(display, style)));
+    }
+    if picker.truncated {
+        lines.push(Line::from(Span::styled(
+            "  … (truncated)".to_string(),
+            Style::default().fg(palette.warning),
+        )));
+    }
+    let p = Paragraph::new(lines);
+    frame.render_widget(p, area);
+}
+
+fn render_picker_preview(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    picker: &crate::picker::FilePicker,
+    app: &App,
+    palette: &Palette,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let Some(current) = picker.current() else {
+        return;
+    };
+    // メタデータ 3 行を上に書き、残りをプレビュー画像 (あれば) に使う。
+    let head_lines = vec![
+        Line::from(Span::styled(
+            format!("  {}", current.name),
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", current.path.display()),
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(Span::styled(
+            if current.is_dir {
+                "  (directory)".to_string()
+            } else {
+                match std::fs::metadata(&current.path) {
+                    Ok(m) => format!("  size: {} bytes", m.len()),
+                    Err(err) => format!("  stat error: {err}"),
+                }
+            },
+            Style::default().fg(palette.foreground),
+        )),
+        Line::from(""),
+    ];
+    let head_height = u16::try_from(head_lines.len())
+        .unwrap_or(4)
+        .min(area.height);
+    let head_rect = Rect::new(area.x, area.y, area.width, head_height);
+    let preview_rect = Rect::new(
+        area.x,
+        area.y + head_height,
+        area.width,
+        area.height.saturating_sub(head_height),
+    );
+    let p = Paragraph::new(head_lines).wrap(Wrap { trim: false });
+    frame.render_widget(p, head_rect);
+
+    if current.is_dir {
+        return;
+    }
+
+    if !app.previews.enabled() {
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            "  (preview disabled)",
+            Style::default().fg(palette.muted),
+        )));
+        frame.render_widget(placeholder, preview_rect);
+        return;
+    }
+
+    // ensure (= fetch trigger) は副作用つき。`app` は不変参照だが、ensure
+    // 自身は内部 Mutex で書き換える。
+    app.previews.ensure(&current.path, preview_rect);
+    if let Some(proto) = app.previews.get(&current.path) {
+        let widget = Image::new(proto.as_ref());
+        frame.render_widget(widget, preview_rect);
+    } else {
+        // 取得中 / 失敗。失敗理由を出す。
+        let msg = match app.previews.state(&current.path) {
+            Some(crate::preview::PreviewState::Failed { reason, .. }) => {
+                format!("  preview failed: {reason}")
+            }
+            _ => "  loading preview…".to_string(),
+        };
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            msg,
+            Style::default().fg(palette.muted),
+        )));
+        frame.render_widget(placeholder, preview_rect);
+    }
 }
 
 fn border_style(palette: &Palette, focused: bool) -> Style {
