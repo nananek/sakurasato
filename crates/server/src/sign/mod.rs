@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime};
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
 use http::HeaderMap;
 use sakurasato_core::model::ActorRow;
 use thiserror::Error;
@@ -97,6 +98,8 @@ pub(crate) enum SigError {
     UnknownActor,
     #[error("actor has no public key of the requested kind ({0:?})")]
     ActorMissingKey(KeyKind),
+    #[error("actor's stored public key PEM did not parse ({0:?})")]
+    ActorKeyUnparseable(KeyKind),
     #[error("keyId fragment is not supported ({0:?})")]
     UnsupportedKeyKind(KeyKind),
     #[error("alg parameter does not match keyId kind")]
@@ -131,6 +134,7 @@ impl SigError {
             | Self::BadSignature
             | Self::UnknownActor
             | Self::ActorMissingKey(_)
+            | Self::ActorKeyUnparseable(_)
             | Self::UnsupportedKeyKind(_)
             | Self::AlgMismatch => SigErrorClass::Unauthorized,
             Self::Internal => SigErrorClass::Internal,
@@ -271,9 +275,14 @@ fn verify_cavage_with_actor(
     actor: &ActorRow,
     now: SystemTime,
 ) -> Result<(), SigError> {
-    // cavage は keyId 規約から RSA 一択。Ed25519 は RFC 9421 経路を期待。
-    if info.key_kind != KeyKind::Rsa {
-        return Err(SigError::UnsupportedKeyKind(info.key_kind));
+    // cavage は伝統的に RSA-SHA256 が de-facto。Nekonoverse が「cavage 形式の
+    // `Signature` ヘッダに Ed25519 鍵 (`#ed25519-key`) を載せて送ってくる」
+    // ケースに合わせて Ed25519 もサポートする (RFC 9421 への upgrade は別軸)。
+    // `KeyKind::Other` は #main-key / #ed25519-key 以外の fragment で、運用上
+    // 解釈できないので reject する。
+    match info.key_kind {
+        KeyKind::Rsa | KeyKind::Ed25519 => {}
+        KeyKind::Other => return Err(SigError::UnsupportedKeyKind(info.key_kind)),
     }
 
     let sig_header = header_value(ctx.headers, "signature")?;
@@ -314,9 +323,53 @@ fn verify_cavage_with_actor(
     )
     .map_err(|e| map_base_err(&e))?;
 
-    // public_key_pem は actor テーブルで NOT NULL なので unwrap 相当。
-    cavage::verify_rsa_sha256(base.as_bytes(), parsed.signature_b64, &actor.public_key_pem)
-        .map_err(|_| SigError::BadSignature)
+    // key_kind に応じて RSA-SHA256 / Ed25519 をディスパッチ。signature base
+    // の組み立て規則は cavage の同じ仕様で共通。
+    match info.key_kind {
+        KeyKind::Rsa => {
+            // public_key_pem は actor テーブルで NOT NULL なので unwrap 相当。
+            cavage::verify_rsa_sha256(base.as_bytes(), parsed.signature_b64, &actor.public_key_pem)
+                .map_err(|e| map_cavage_verify_err(KeyKind::Rsa, &e))
+        }
+        KeyKind::Ed25519 => {
+            // Ed25519 鍵を持たない actor (RSA のみ公開) なら 401 で落とす。
+            let pem = actor
+                .ed25519_public_key_pem
+                .as_deref()
+                .ok_or(SigError::ActorMissingKey(KeyKind::Ed25519))?;
+            let sig_bytes = base64::engine::general_purpose::STANDARD
+                .decode(parsed.signature_b64)
+                .map_err(|_| SigError::BadSignature)?;
+            rfc9421::verify_ed25519(base.as_bytes(), &sig_bytes, pem)
+                .map_err(|e| map_rfc9421_verify_err(KeyKind::Ed25519, &e))
+        }
+        // Other は上のガードで既に弾いてある。到達不能。
+        KeyKind::Other => unreachable!("KeyKind::Other rejected at entry"),
+    }
+}
+
+/// `cavage::verify_rsa_sha256` のエラーを `SigError` にマップする。
+///
+/// `BadKey` (PEM parse 失敗) を黙って `BadSignature` に潰すと、actor 側の鍵
+/// 表現に互換問題があったとき (Pleroma の `publicKeyPem` 末尾 `\n\n` 等) に
+/// 「署名不一致」と区別できないので、別エラーで返す。
+fn map_cavage_verify_err(kind: KeyKind, err: &cavage::VerifyError) -> SigError {
+    match err {
+        cavage::VerifyError::BadKey(_) => SigError::ActorKeyUnparseable(kind),
+        cavage::VerifyError::BadBase64(_) | cavage::VerifyError::BadSignature(_) => {
+            SigError::BadSignature
+        }
+    }
+}
+
+/// `rfc9421::verify_ed25519` のエラーを `SigError` にマップする。
+fn map_rfc9421_verify_err(kind: KeyKind, err: &rfc9421::VerifyError) -> SigError {
+    match err {
+        rfc9421::VerifyError::BadKey(_) => SigError::ActorKeyUnparseable(kind),
+        rfc9421::VerifyError::BadBase64(_)
+        | rfc9421::VerifyError::BadLength(_)
+        | rfc9421::VerifyError::BadSignature => SigError::BadSignature,
+    }
 }
 
 fn verify_rfc9421_with_actor(

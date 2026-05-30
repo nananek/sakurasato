@@ -173,6 +173,39 @@ fn build_cavage_post_with_covered(
     req
 }
 
+/// cavage signature ヘッダに Ed25519 鍵を載せた POST inbox を組み立てる。
+/// nekonoverse 20260524-1 等が送ってくる形 (`#ed25519-key` keyId +
+/// `algorithm="ed25519"` + base は cavage と同一規則) を再現する。
+fn build_cavage_ed25519_post(
+    body: &[u8],
+    ed25519_priv_pem: &str,
+    keyid: &str,
+    date: &str,
+) -> Request<Body> {
+    let path = "/inbox";
+    let digest_value = digest::format_cavage(body);
+    let mut req = Request::post(path)
+        .header("host", HOST)
+        .header("date", date)
+        .header("digest", &digest_value)
+        .header("content-type", "application/activity+json")
+        .body(Body::from(body.to_vec()))
+        .unwrap();
+    let covered: &[&str] = &["(request-target)", "host", "date", "digest"];
+    let headers = headers_to_map(&req);
+    let base = cavage::build_signature_base("POST", path, covered, &headers, None, None).unwrap();
+    let sig_bytes = rfc9421::sign_ed25519(base.as_bytes(), ed25519_priv_pem).unwrap();
+    let sig_b64 = B64.encode(sig_bytes);
+    let headers_param = covered.join(" ");
+    let sig_header = format!(
+        "keyId=\"{keyid}\",algorithm=\"ed25519\",headers=\"{headers_param}\",signature=\"{sig_b64}\""
+    );
+    let name = HeaderName::from_static("signature");
+    req.headers_mut()
+        .insert(name, HeaderValue::from_str(&sig_header).unwrap());
+    req
+}
+
 /// RFC 9421 + Ed25519 で POST inbox リクエストを組み立てる (default covered)。
 fn build_rfc9421_post(
     body: &[u8],
@@ -275,6 +308,60 @@ async fn cavage_rsa_valid_signature_is_accepted(pool: PgPool) {
         resp.status(),
         StatusCode::ACCEPTED,
         "cavage RSA should pass"
+    );
+}
+
+/// 回帰 ([sakurasato#39](https://github.com/nananek/sakurasato/issues/39)):
+/// 実 nekonoverse は cavage 形式の `Signature:` ヘッダに `#ed25519-key` を
+/// 載せて POST してくる。sakurasato は cavage → RSA 一択だった時代に
+/// `UnsupportedKeyKind(Ed25519)` で 401 を返していたが、cavage + Ed25519 も
+/// 検証パスに通す。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn cavage_ed25519_valid_signature_is_accepted(pool: PgPool) {
+    let (_rsa_priv, rsa_pub) = fresh_rsa();
+    let (ed_priv, ed_pub) = fresh_ed25519();
+    repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let signer = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}");
+    let body = minimal_body_for(&signer);
+    let keyid = format!("{signer}#ed25519-key");
+    let req = build_cavage_ed25519_post(&body, &ed_priv, &keyid, &now_http_date());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "cavage with Ed25519 keyId should pass"
+    );
+}
+
+/// 回帰: actor の Ed25519 鍵が未設定 (RSA only actor) で、それ宛てに
+/// cavage Ed25519 が来た場合は 401 (`ActorMissingKey`) を返す ── 「Ed25519
+/// 鍵が無いのに ed25519 で署名している」は信頼境界の問題なので、Ed25519
+/// 経路を許可しても actor 側に鍵が無ければ依然として拒否しないといけない。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn cavage_ed25519_without_actor_ed_key_is_rejected(pool: PgPool) {
+    let (_rsa_priv, rsa_pub) = fresh_rsa();
+    let (ed_priv, _ed_pub) = fresh_ed25519();
+    // build_remote_actor で ed25519_public_key_pem は None。
+    repo::actor::insert(&pool, build_remote_actor(&rsa_pub, None))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let signer = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}");
+    let body = minimal_body_for(&signer);
+    let keyid = format!("{signer}#ed25519-key");
+    let req = build_cavage_ed25519_post(&body, &ed_priv, &keyid, &now_http_date());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "cavage Ed25519 against RSA-only actor should be 401"
     );
 }
 

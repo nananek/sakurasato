@@ -194,12 +194,17 @@ fn collect_header(headers: &HeaderMap, name: &str) -> Result<String, BaseError> 
 }
 
 /// RSA-SHA256 (RSASSA-PKCS1-v1_5) で署名 base を検証する。
+///
+/// `rsa_public_pem` の前後 whitespace は内部で `.trim()` する: Pleroma 2.5.5
+/// 等の実装は `publicKeyPem` 末尾に `\n\n` を入れて送ってくることがあり、
+/// `rsa::pkcs8` の PEM parser はこれを `PreEncapsulationBoundary` で拒否する
+/// ので、保存側で trim していても二重で防御する。
 pub(crate) fn verify_rsa_sha256(
     signature_base: &[u8],
     signature_b64: &str,
     rsa_public_pem: &str,
 ) -> Result<(), VerifyError> {
-    let public_key = RsaPublicKey::from_public_key_pem(rsa_public_pem)?;
+    let public_key = RsaPublicKey::from_public_key_pem(rsa_public_pem.trim())?;
     let verifier = VerifyingKey::<Sha256>::new(public_key);
     let sig_bytes = B64.decode(signature_b64)?;
     let sig = Signature::try_from(sig_bytes.as_slice())?;
@@ -413,5 +418,34 @@ mod tests {
             verify_rsa_sha256(b"base", "!!!notbase64!!!", &pub_pem).unwrap_err(),
             VerifyError::BadBase64(_)
         ));
+    }
+
+    /// 回帰: Pleroma 2.5.5 が `publicKey.publicKeyPem` を末尾 `\n\n` で
+    /// 送ってくるケース。`rsa::pkcs8` の PEM parser は trailing newline 二重に
+    /// 厳しく、対応していないと `PreEncapsulationBoundary` で reject されて
+    /// 署名検証が `BadKey` → 上位で `BadSignature` にマスクされてしまう。
+    /// この入力で verify が通ることを保証する (= 該当 `\n\n` を内部 trim する
+    /// 防御を確認)。
+    ///
+    /// データは 2026-05-30 の実 Pleroma → sakurasato Follow から採取
+    /// ([sakurasato#38](https://github.com/nananek/sakurasato/issues/38))。
+    #[test]
+    fn verify_accepts_pleroma_style_pem_with_double_trailing_newline() {
+        use base64::Engine as _;
+        let base = base64::engine::general_purpose::STANDARD
+            .decode("KHJlcXVlc3QtdGFyZ2V0KTogcG9zdCAvdXNlcnMvbWUvaW5ib3gKY29udGVudC1sZW5ndGg6IDM2MgpkYXRlOiBTYXQsIDMwIE1heSAyMDI2IDExOjIzOjEyIEdNVApkaWdlc3Q6IFNIQS0yNTY9dTFzWnVLVlgrZHc1NWZHZG1jT3BPN3I0aFdKdllKUW5BMkhrblVaMVcxdz0KaG9zdDogc2FrdXJhc2F0bw==")
+            .unwrap();
+        let sig_b64 = "N2fsNx4l8Qr7deTrrBCMGOxim4ShVKoIaVR4n85HkMmIeRbb9QB+xcTcxJ8WBqoel0yBkn3weZ0JP1NuBt3giaMCzRjPM+ZUVEbZCn5y/K+wpNzWcayAFH7tiLnUHFQnKzQOw+ZkIcUvIqIR6adsxM74gKWBgGZfL7jK0GghaSS07+aLwB88olcrLM6jaL4I5uAv5m3kFP9pYJCKvofXlH1fe5r9wBdN8MSPl5/GtuTDD5LPYW1jBZDSfe93fLfoHXdng/sX1Irn6DHWaWuVtMUy6SlOfNKG90mGPXFAXXHxJMvhlHj3GMGTJOL/TIcj1r2kD/NFVcRlcKkHjRdveA==";
+        // Pleroma が送ってきた PEM をそのまま (末尾 `\n\n` 込み) で投げる。
+        let pleroma_pem = "-----BEGIN PUBLIC KEY-----\n\
+            MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqbO6eu7kXAeiEiUZ6joq\n\
+            9Kt8aR5Q96aMSFL+wkxY/Ny9qNcF2dZ73roJi0rtbMcmWIbiXoyC3t+wHvZK9YZ2\n\
+            chemq3ULKxmpkZz9rMig9CHDYQJmkjeeoamPlNunGOD20lLHWwggNWs5y5qgweRD\n\
+            Kw1Bgl2+SfNY/WBJfLH86wdqfxRhCUtBJ5qgs322eO5rGaYs051whEdyKTfXmp+g\n\
+            qjqoqOYBe2CzpPWrknk1JVcRNULA1xcSxIhr5ycEd8vBDpM4yKpuygHlbGh5t4/5\n\
+            qaZOZWrQIxHaEQVyCNCP8V/6jOFMhPuFVP+DP+u2wCCDwin3CL3GHlx4UcUdAb+n\n\
+            0QIDAQAB\n\
+            -----END PUBLIC KEY-----\n\n";
+        verify_rsa_sha256(&base, sig_b64, pleroma_pem).unwrap();
     }
 }
