@@ -124,6 +124,37 @@ impl LocalApi {
         decode_json(resp).await
     }
 
+    /// `GET /api/v1/media/proxy?url=...&variant=...` ── server 経由 (=
+    /// media-proxy 経由) でアバター等の画像を取得する (M6 / Issue #36)。
+    ///
+    /// 戻り値の `Bytes` は media-proxy が再エンコードした WebP。TUI は受信
+    /// バイト列を信頼してデコード/プロトコル変換するだけで OK ──
+    /// `image` crate の脆弱性が万一あっても、(1) media-proxy 側で 1 度デコード
+    /// 済み、(2) WebP の単純な形に再エンコード済み、(3) サイズ上限と画素数
+    /// 上限を強制済み、という多層防御が掛かっている。
+    pub async fn fetch_proxy_image(&self, url: &str, variant: &str) -> Result<Bytes, ApiError> {
+        // `url` の値には `?` / `&` / `=` / `%` 等が含まれうるので
+        // form_urlencoded で必ず percent-encode する ── 生のまま format!
+        // すると同パラメータが分解されたり 400 を貰ったりする。
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("url", url)
+            .append_pair("variant", variant)
+            .finish();
+        let path = format!("/api/v1/media/proxy?{query}");
+        let request = self
+            .request_builder(Method::GET, &path)?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        let status = resp.status();
+        let bytes = read_body_bytes(resp.into_body()).await?;
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            return Err(ApiError::Status { status, body });
+        }
+        Ok(bytes)
+    }
+
     /// `GET /api/v1/stream` を生 Incoming のまま返す。SSE は呼び出し側
     /// ([`crate::sse`]) で `eventsource-stream` に流す。
     pub async fn open_stream(&self) -> Result<hyper::Response<Incoming>, ApiError> {

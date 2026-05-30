@@ -79,7 +79,9 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
         info!("TUI: images disabled by --no-images");
         None
     };
-    let images = ImageCache::new(picker);
+    // M6: 画像取得は LocalApi 経由で server → media-proxy に委譲する。
+    // ImageCache は API クライアントを clone して持つ (Arc 同等のコスト)。
+    let images = ImageCache::new(picker, Some(api.clone()));
     let mut app = App::new(options.theme.clone(), whoami, socket_label, images);
 
     // 初回タイムライン取得。

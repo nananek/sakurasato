@@ -2,26 +2,28 @@
 //!
 //! TUI はタイムラインに乗ったアバター URL を見るたびに本キャッシュへ
 //! `ensure()` で問い合わせる。未取得なら fetch task を `tokio::spawn` し、
-//! ダウンロード → デコード → [`ratatui_image::Picker`] でプロトコル化して
-//! `LruCache` に積む。再描画時は同じ URL を `get()` で引いて Image widget へ。
+//! ローカル API (= server → media-proxy 経由) でバイト列を取り、
+//! [`image::ImageReader`] でデコード後 [`ratatui_image::Picker`] で
+//! プロトコル化して `LruCache` に積む。再描画時は同じ URL を `get()` で
+//! 引いて Image widget へ。
 //!
-//! # セキュリティ方針
+//! # M6 で変わったこと (Issue #36 解消)
 //!
-//! - 取得先は **任意のリモート URL** (= 連合相手の actor.icon が指す HTTP URL)。
-//!   TUI はユーザのホスト上で走るため server コンテナの egress 制限の外なので、
-//!   ここで多層防御を入れないと SSRF で LAN/クラウドメタデータが漏れる。
-//! - **SSRF**: `sakurasato_core::net_guard::host_blocked` で IP literal /
-//!   localhost / .local / private 帯域 / 169.254.x.x (IMDS) 等を遮断する。
-//!   **リダイレクト追従の各ステップでも再検証**する (`reqwest::redirect::Policy::custom`)。
-//! - **スキーマ制限**: `http` / `https` 以外は弾く (`file://` / `data:` を禁止)。
-//! - **取得サイズ上限**: `MAX_BYTES = 4 MiB`。`Content-Length` チェックに加え、
-//!   ストリーミングで累計を数えて越えたら abort (= chunked / gzip でも有効)。
-//! - **ピクセル上限**: `image::Limits` で `max_image_width` / `max_image_height` /
-//!   `max_alloc` を設定。decompression bomb 防御。
-//! - **タイムアウト**: 10 秒。
-//! - 画像 decode は本クライアント (TUI) で行う ── server 本体ではしない。
-//!   `image` crate は CVE 履歴が知られているが、本クライアントが独立プロセスで
-//!   走る限り server には波及しない (CLAUDE.md §7)。
+//! 以前 (M5 PR2) は TUI ホストプロセスから直接 HTTPS GET していた。
+//! M6 では本キャッシュは **ローカル API しか叩かない**:
+//!
+//! 1. TUI → server `/api/v1/media/proxy` (Unix socket, Bearer 認証)
+//! 2. server → media-proxy (Unix socket)
+//! 3. media-proxy → 外部 GET
+//! 4. media-proxy が WebP に再エンコードして返す
+//!
+//! 利点:
+//! - **SSRF**: TUI ホストプロセスから外向き接続が消える ── LAN / クラウド
+//!   IMDS / DNS rebinding が media-proxy の隔離コンテナだけに閉じる。
+//! - **デコード爆弾耐性**: media-proxy が一度 decode し、サイズ・画素数を
+//!   絞った WebP に再エンコードしてから返す。TUI 側の `image` crate は
+//!   信頼済みバイト列だけ食う ── ただし多層防御として `image::Limits` は
+//!   従来通り掛けたまま。
 //!
 //! # スレッドモデル
 //!
@@ -35,7 +37,6 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
 use image::ImageReader;
 use lru::LruCache;
 use ratatui::layout::{Rect, Size};
@@ -45,18 +46,19 @@ use ratatui_image::protocol::Protocol;
 use sakurasato_core::net_guard::host_blocked;
 use tracing::{debug, warn};
 
-/// 1 アバターの取得サイズ上限。
-const MAX_BYTES: usize = 4 * 1024 * 1024;
-/// 取得タイムアウト。
-const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::client::LocalApi;
+
 /// `Failed` 後に同じ URL を再試行可能にするまでの cool-down。
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// LRU 容量。お一人様 TUI なので 64 ホスト分くらいで十分。
 const CACHE_CAP: usize = 64;
-/// 画像の最大幅/高さ (ピクセル)。アバターはサムネ用途なので 4096x4096 で十分。
-/// decompression bomb (`100000x100000` のような巨大解像度宣言) を image crate
-/// のデコード前段で弾く。
+/// 画像の最大幅/高さ (ピクセル)。media-proxy 側で `variant=avatar` は
+/// 256x256 上限になっているが、多層防御として TUI 側でも decode 時に制限を
+/// 掛ける ── server 経路を経ない攻撃 (= 別経路でキャッシュに突っ込まれる
+/// 可能性) は無いが、image crate の Limits は常時オンが正しい運用。
 const MAX_IMAGE_DIMENSION: u32 = 4096;
+/// media-proxy に頼むバリアント (アバター用)。
+const AVATAR_VARIANT: &str = "avatar";
 
 /// キャッシュ entry の状態。
 ///
@@ -91,13 +93,14 @@ impl std::fmt::Debug for ImageState {
 pub struct ImageCache {
     inner: Arc<Mutex<LruCache<String, ImageState>>>,
     picker: Option<Arc<Picker>>,
-    http: reqwest::Client,
+    api: Option<LocalApi>,
 }
 
 impl std::fmt::Debug for ImageCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImageCache")
             .field("picker_initialized", &self.picker.is_some())
+            .field("api_attached", &self.api.is_some())
             .field("entries", &self.entry_count())
             .finish_non_exhaustive()
     }
@@ -105,44 +108,20 @@ impl std::fmt::Debug for ImageCache {
 
 impl ImageCache {
     /// 新しいキャッシュ。`picker` が `None` のときは画像表示無効化モード
-    /// (= ensure / get が no-op)。HTTP クライアント構築に失敗した場合も
-    /// 画像無効化モードに落とす (= TLS 設定の沈黙的フォールバック禁止)。
-    pub fn new(picker: Option<Picker>) -> Self {
-        // リダイレクトポリシ: 最大 3 回 + 各 hop で SSRF allowlist 再検証。
-        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 3 {
-                return attempt.error("too many redirects (>3)");
-            }
-            if let Some(reason) = host_blocked(attempt.url()) {
-                return attempt.error(format!("redirect to blocked host ({reason})"));
-            }
-            attempt.follow()
-        });
-        let http = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
-            .user_agent(concat!("sakurasato-tui/", env!("CARGO_PKG_VERSION")))
-            .redirect(redirect_policy)
-            .build();
-        let (http, picker) = match http {
-            Ok(c) => (c, picker),
-            Err(err) => {
-                // rustls の初期化失敗等。silently デフォルト client に落ちると
-                // TLS 検証が緩む可能性があるので、画像取得を諦める方が安全。
-                warn!(?err, "TUI: reqwest client build failed; disabling images");
-                (reqwest::Client::new(), None)
-            }
-        };
+    /// (= ensure / get が no-op)。`api` も渡されていないと取得経路が無いので
+    /// 同じく無効化扱いになる。
+    pub fn new(picker: Option<Picker>, api: Option<LocalApi>) -> Self {
         let cap = NonZeroUsize::new(CACHE_CAP).expect("non-zero cap");
         Self {
             inner: Arc::new(Mutex::new(LruCache::new(cap))),
             picker: picker.map(Arc::new),
-            http,
+            api,
         }
     }
 
-    /// 画像表示が有効か (= `Picker` が利用可能か)。
+    /// 画像表示が有効か (= `Picker` と `LocalApi` が両方利用可能か)。
     pub fn enabled(&self) -> bool {
-        self.picker.is_some()
+        self.picker.is_some() && self.api.is_some()
     }
 
     /// 現在のエントリ数 (テスト/診断用)。
@@ -163,12 +142,12 @@ impl ImageCache {
     /// `size` はターゲット領域 (= avatar セル数)。Picker は `font_size` を
     /// 使って実ピクセル換算する。
     pub fn ensure(&self, url: &str, size: Rect) {
-        let Some(picker) = self.picker.clone() else {
+        let (Some(picker), Some(api)) = (self.picker.clone(), self.api.clone()) else {
             return;
         };
-        let Some(_vetted) = vet_url(url) else {
+        if vet_url(url).is_none() {
             return;
-        };
+        }
         let needs_fetch = {
             let Ok(mut cache) = self.inner.lock() else {
                 return;
@@ -186,10 +165,9 @@ impl ImageCache {
             return;
         }
         let inner = self.inner.clone();
-        let http = self.http.clone();
         let url_owned = url.to_string();
         tokio::spawn(async move {
-            let outcome = fetch_and_decode(&http, &url_owned, &picker, size).await;
+            let outcome = fetch_and_decode(&api, &url_owned, &picker, size).await;
             let Ok(mut cache) = inner.lock() else {
                 return;
             };
@@ -213,7 +191,11 @@ impl ImageCache {
 }
 
 /// URL が画像取得に許容できるか。スキーム制限 + SSRF allowlist の両方を通す。
-/// 通過すれば `Some(parsed)` を返し、callers がそのまま `reqwest` に渡す。
+/// 通過すれば `Some(parsed)` を返す。
+///
+/// **多層防御**: 実 SSRF 検査は media-proxy で再度行うが、ここでも弾く
+/// ことで「無駄な UDS 往復」を節約する。CLAUDE.md §7 でも「同じガード
+/// 関数を全経路から呼ぶ」原則。
 fn vet_url(raw: &str) -> Option<url::Url> {
     let parsed = url::Url::parse(raw).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -230,47 +212,23 @@ fn vet_url(raw: &str) -> Option<url::Url> {
 }
 
 async fn fetch_and_decode(
-    http: &reqwest::Client,
+    api: &LocalApi,
     url: &str,
     picker: &Picker,
     size: Rect,
 ) -> Result<Protocol, String> {
     let target = Size::new(size.width, size.height);
     let parsed = vet_url(url).ok_or_else(|| "blocked URL".to_string())?;
-    debug!(url = %parsed, "fetch avatar");
-    let resp = http
-        .get(parsed)
-        .send()
-        .await
-        .map_err(|e| format!("request: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    if let Some(len) = resp.content_length()
-        && usize::try_from(len).unwrap_or(usize::MAX) > MAX_BYTES
-    {
-        return Err(format!("Content-Length {len} exceeds {MAX_BYTES}"));
-    }
-    // chunked / gzip 等ヘッダ無しの転送に備え、ストリームで累計バイト数を
-    // 数えながら受信。`MAX_BYTES` を超えた瞬間に切断 (= 全部メモリに展開
-    // してから後段で reject という最悪パターンを避ける)。
-    let mut stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("read body: {e}"))?;
-        if buf.len() + chunk.len() > MAX_BYTES {
-            return Err(format!(
-                "body exceeds limit during stream ({}>{MAX_BYTES})",
-                buf.len() + chunk.len()
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-    }
+    debug!(url = %parsed, "fetch avatar via local API");
 
-    // `image` crate でフォーマット推定 + デコード。`with_guessed_format` は
-    // バイトの magic を見て jpg/png/webp/gif を分ける。失敗時はそのまま伝搬。
-    // `Limits` で巨大画像のピクセル展開を抑制する (= decompression bomb 対策)。
-    let mut reader = ImageReader::new(std::io::Cursor::new(buf))
+    let bytes = api
+        .fetch_proxy_image(parsed.as_str(), AVATAR_VARIANT)
+        .await
+        .map_err(|e| format!("media-proxy: {e}"))?;
+
+    // media-proxy 経由のバイト列はすでに WebP 再エンコード済みだが、
+    // 多層防御として decompression bomb 防御の `Limits` は掛けたままにする。
+    let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("guess format: {e}"))?;
     let mut limits = image::Limits::no_limits();
@@ -318,7 +276,7 @@ mod tests {
 
     #[test]
     fn disabled_cache_is_noop() {
-        let cache = ImageCache::new(None);
+        let cache = ImageCache::new(None, None);
         assert!(!cache.enabled());
         cache.ensure("https://example.com/a.png", Rect::new(0, 0, 3, 2));
         assert_eq!(cache.entry_count(), 0);

@@ -1,0 +1,59 @@
+//! Sakurasato media-proxy: 隔離コンテナの実装本体。
+//!
+//! CLAUDE.md §5.3 / §7 で「外部 URL 取得と画像デコードはこのコンテナでだけ」
+//! と定めた責務を、Unix socket 上の小さな HTTP API として実装する。
+//!
+//! # エンドポイント
+//!
+//! - `POST /v1/image/fetch` — リモート URL から画像を取得 / デコード / 指定
+//!   バリアントへリサイズ / `WebP` 再エンコード。レスポンスは安全化済みの
+//!   バイト列。
+//! - `POST /v1/image/sanitize` — アップロード由来の生バイト列を受け取り、
+//!   再エンコードで埋め込みペイロードと EXIF を落として返す。M7 (TUI からの
+//!   アイコン/添付アップロード) で使う。
+//! - `GET /healthz` — Liveness 用。常に `200 OK`。
+//!
+//! # 設計方針
+//!
+//! - `axum::serve` の listener は **Unix socket** のみ。本コンテナは TCP を
+//!   開かない (`docker-compose.yml` の内部ネットでも `expose` しない)。
+//! - サイズ上限: `max_bytes` (config) でダウンロード / 受信本文を頭打ち。
+//! - SSRF: [`sakurasato_core::net_guard::host_blocked`] と redirect ごとの
+//!   再検証を [`http_client`] にまとめる。
+//! - 出力フォーマット: `image/webp`。EXIF などのメタデータは入らない。
+//! - エラー JSON は [`error::ApiError`] で統一する (`{ "error": "...", "reason": "..." }`)。
+
+#![forbid(unsafe_code)]
+
+pub mod error;
+pub mod fetch;
+pub mod http_client;
+pub mod image_pipeline;
+pub mod sanitize;
+pub mod state;
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::routing::{get, post};
+use tower_http::trace::TraceLayer;
+
+pub use state::ProxyState;
+
+/// Sakurasato media-proxy のルータを構築する。
+///
+/// `state` は出来上がった [`ProxyState`] を `Arc` で共有する。テストは
+/// 同関数を直接呼び、`tower::ServiceExt::oneshot` で叩く。
+pub fn router(state: Arc<ProxyState>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/image/fetch", post(fetch::handle))
+        .route("/v1/image/sanitize", post(sanitize::handle))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// `GET /healthz` — 常に `200 OK`。本体 (server) からの起動検査用。
+async fn healthz() -> &'static str {
+    "ok"
+}
