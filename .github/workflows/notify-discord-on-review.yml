@@ -29,6 +29,11 @@ jobs:
       github.event.comment.user.login == 'claude[bot]' &&
       contains(github.event.comment.body, 'verdict')
     runs-on: ubuntu-latest
+    # 二重防御: webhook が長期間応答しないケースで runner が GH の既定
+    # 6 時間タイムアウトまで占有されないよう、ジョブ側で 5 分に絞る。
+    # ステップ内 curl にも --max-time を入れるが、jq / その他で固まった
+    # 場合の保険として。
+    timeout-minutes: 5
     steps:
       - name: Parse verdict and post to Discord
         env:
@@ -56,34 +61,55 @@ jobs:
             exit 0
           fi
 
-          # approve / request-changes / block を判定。
-          # block は本リポのレビュー指示で使われる verdict (旧 reject 相当)。
-          # reject も保険として OR で拾う。
-          if echo "$verdict_line" | grep -iqE 'approve'; then
-            verdict_kind="approve"
-            verdict_label="✅ approve"
-            color=5763719   # green
-          elif echo "$verdict_line" | grep -iqE 'request[- ]?changes'; then
-            verdict_kind="request-changes"
-            verdict_label="🟠 request-changes"
-            color=15105570  # orange
-          elif echo "$verdict_line" | grep -iqE 'block|reject'; then
-            verdict_kind="block"
-            verdict_label="🔴 block"
-            color=15548997  # red
-          else
-            verdict_kind="other"
-            # 異常に長い verdict_line が description に入り Discord API の
-            # 4096 文字制限に当たらないよう先頭 100 文字に切り詰め。
-            verdict_label="❔ $(printf '%s' "$verdict_line" | cut -c1-100)"
-            color=10070709  # grey
-          fi
+          # PR #32 round-1 🔴 Finding 1: `verdict:` 以降のキーワード部分だけ
+          # 抽出してから種別判定する。元の `grep 'approve'` は本文に "approve"
+          # が含まれる任意の verdict (例: "verdict: request-changes — 〜
+          # approve 〜") を緑通知扱いしてしまうため。
+          verdict_keyword=$(printf '%s' "$verdict_line" \
+            | sed -E 's/^(\*\*)?verdict[: *]+//I' \
+            | tr -d '*' \
+            | awk '{print $1}')
+          echo "Extracted verdict keyword: '$verdict_keyword'"
+
+          # 抽出後はキーワード自体に対する完全一致 (case-insensitive) で判定。
+          # `block` は本リポのレビュー指示で使われる verdict (旧 reject 相当)。
+          # reject も保険として拾う。
+          case "$(printf '%s' "$verdict_keyword" | tr '[:upper:]' '[:lower:]')" in
+            approve)
+              verdict_kind="approve"
+              verdict_label="✅ approve"
+              color=5763719   # green
+              ;;
+            request-changes|request_changes|requestchanges)
+              verdict_kind="request-changes"
+              verdict_label="🟠 request-changes"
+              color=15105570  # orange
+              ;;
+            block|reject)
+              verdict_kind="block"
+              verdict_label="🔴 block"
+              color=15548997  # red
+              ;;
+            *)
+              verdict_kind="other"
+              # 異常に長い verdict_line が description に入り Discord API の
+              # 4096 文字制限に当たらないよう先頭 100 文字に切り詰め。
+              verdict_label="❔ $(printf '%s' "$verdict_line" | cut -c1-100)"
+              color=10070709  # grey
+              ;;
+          esac
 
           echo "Verdict: $verdict_kind"
 
+          # PR #32 round-1 🟡 Finding 3 対応: Discord embed `title` は 256 文字
+          # 上限。GitHub PR タイトルが長いと API が 400 を返して通知が静かに
+          # 消えるので、念のため Discord 制限内に収めておく。
+          title_raw="PR #${PR_NUMBER}: ${PR_TITLE}"
+          title="${title_raw:0:256}"
+
           # Discord embed payload (jq でエスケープ)
           payload=$(jq -nc \
-            --arg title "PR #${PR_NUMBER}: ${PR_TITLE}" \
+            --arg title "$title" \
             --arg url "$PR_URL" \
             --arg label "$verdict_label" \
             --arg author "$PR_AUTHOR" \
@@ -103,13 +129,24 @@ jobs:
               }]
             }')
 
+          # PR #32 round-1 🟠 Finding 2 対応: --connect-timeout / --max-time
+          # を必ず指定し、Discord 側が応答しない場合に runner を 6 時間占有
+          # しないようにする。ジョブ側の `timeout-minutes: 5` と二重に守る。
           # Discord に POST (失敗は echo するが workflow を fail させない)
-          http_code=$(curl -sS -o /tmp/discord-response.txt -w '%{http_code}' \
+          http_code=$(curl -sS --connect-timeout 5 --max-time 15 \
+            -o /tmp/discord-response.txt -w '%{http_code}' \
             -H "Content-Type: application/json" \
             -X POST -d "$payload" \
             "$DISCORD_WEBHOOK") || true
           echo "Discord webhook responded with HTTP $http_code"
+          # PR #32 round-1 🟡 Finding 4 対応: curl が `-o` でファイルを作る前に
+          # 失敗するエッジケース (runner で /tmp が制限される等) でも `cat` が
+          # `set -e` を発火させないよう、存在チェック + `|| true` で吸収する。
           if [ "$http_code" != "204" ] && [ "$http_code" != "200" ]; then
             echo "Response body:"
-            cat /tmp/discord-response.txt
+            if [ -f /tmp/discord-response.txt ]; then
+              cat /tmp/discord-response.txt || true
+            else
+              echo "(no response body — curl failed before writing to /tmp)"
+            fi
           fi
