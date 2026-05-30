@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT COALESCE(a.shared_inbox_url, a.inbox_url) AS \"inbox_url!\"\n        FROM follow f\n        JOIN actor a ON a.id = f.follower_actor_id\n        WHERE f.followed_actor_id = $1 AND f.state = 'accepted'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "inbox_url!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2c4459a7cfe5a3cd7e011362027a2c3e5db3dab5a0a764724dd1c4d9f83b5f5f"
+}

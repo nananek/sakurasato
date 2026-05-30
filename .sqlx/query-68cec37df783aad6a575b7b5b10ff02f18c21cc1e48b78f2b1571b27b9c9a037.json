@@ -1,0 +1,282 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,\n            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,\n            n.to_recipients as \"to_recipients: Json<Vec<String>>\",\n            n.cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            n.attachments as \"attachments: Json<JsonValue>\",\n            n.tags as \"tags: Json<JsonValue>\",\n            n.is_local, n.url, n.published_at, n.created_at, n.updated_at,\n            a.ap_id AS actor_ap_id,\n            a.preferred_username AS actor_preferred_username,\n            a.display_name AS actor_display_name\n        FROM note n\n        JOIN actor a ON a.id = n.actor_id\n        WHERE\n            n.visibility <> 'direct'\n            AND (\n                n.actor_id = $1\n                OR n.actor_id IN (\n                    SELECT followed_actor_id\n                    FROM follow\n                    WHERE follower_actor_id = $1 AND state = 'accepted'\n                )\n            )\n            AND ($2::BIGINT IS NULL OR n.id < $2)\n        ORDER BY n.id DESC\n        LIMIT $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ap_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "content",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "content"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "language",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "language"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "in_reply_to_ap_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "in_reply_to_ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "in_reply_to_note_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "in_reply_to_note_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "summary",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "summary"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "visibility",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "visibility"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "sensitive",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "sensitive"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "to_recipients: Json<Vec<String>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "to_recipients"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "cc_recipients: Json<Vec<String>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "cc_recipients"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "attachments: Json<JsonValue>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "attachments"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "tags: Json<JsonValue>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "is_local",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "is_local"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "url"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "published_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "published_at"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "actor_ap_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "actor_preferred_username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "preferred_username"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "actor_display_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "display_name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "68cec37df783aad6a575b7b5b10ff02f18c21cc1e48b78f2b1571b27b9c9a037"
+}

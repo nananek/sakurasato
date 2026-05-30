@@ -2436,6 +2436,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "futures-util",
  "http 1.4.1",
  "http-body-util",
  "httpdate",
@@ -2451,6 +2452,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tower",
  "tower-http",
  "tracing",
@@ -3088,6 +3090,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -10,19 +10,19 @@
 //! - Bearer トークンが第二の壁。CLI で発行し、SHA-256 hex を DB に格納。
 //!   ([`crate::token`])
 //!
-//! ## M4 PR1 でのルート
+//! ## ルート (M4 PR2 までに揃ったもの)
 //!
-//! - `GET /api/v1/whoami` ── 認証成功確認 + ローカル actor の最小サマリ。
-//!   秘密鍵は当然返さない。
-//!
-//! REST 本体 (タイムライン読み) / SSE / POST notes は M4 PR2。
+//! - `GET /api/v1/whoami` ── 認証確認 + ローカル actor サマリ (PR1)
+//! - `GET /api/v1/timeline/home` ── home timeline 一覧 (PR2)
+//! - `POST /api/v1/notes` ── Note 作成 + Create Activity 配送 (PR2)
+//! - `GET /api/v1/stream` ── SSE で新規 Note を購読 (PR2)
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::Context;
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 use tokio::net::UnixListener;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
@@ -30,11 +30,17 @@ use tracing::warn;
 use crate::state::AppState;
 
 pub mod auth;
+pub mod notes;
+pub mod stream;
+pub mod timeline;
 pub mod whoami;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/whoami", get(whoami::handle))
+        .route("/api/v1/timeline/home", get(timeline::home))
+        .route("/api/v1/notes", post(notes::create))
+        .route("/api/v1/stream", get(stream::handle))
         // 全 `/api/v1/*` に Bearer 認証を要求する。`from_fn_with_state` で
         // middleware に `AppState` を渡し、`api_token` lookup に使う。
         .layer(axum::middleware::from_fn_with_state(
