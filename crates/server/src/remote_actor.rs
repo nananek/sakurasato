@@ -325,10 +325,15 @@ fn parse_public_key(pk: &JsonValue) -> Result<(String, String), FetchError> {
         .and_then(JsonValue::as_str)
         .ok_or_else(|| FetchError::Malformed("publicKey has no string `id`".into()))?
         .to_string();
+    // Pleroma 2.5.5 は `publicKeyPem` を末尾 `\n\n` で送ってくる。`rsa::pkcs8`
+    // は `PreEncapsulationBoundary` で拒否するので、保存前に外周の whitespace
+    // を落として canonicalize する。`trim()` は ASCII 空白 + LF/CR/Tab だけを
+    // 削るので、PEM 本体 (Base64 + `-----BEGIN/END-----` 行) を壊さない。
     let pem = pk
         .get("publicKeyPem")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| FetchError::Malformed("publicKey has no `publicKeyPem`".into()))?
+        .trim()
         .to_string();
     Ok((id, pem))
 }

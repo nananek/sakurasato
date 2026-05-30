@@ -376,12 +376,16 @@ fn collect_header(headers: &HeaderMap, name: &str) -> Result<String, BaseError> 
 }
 
 /// Ed25519 (RFC 8032) で signature base を検証する。
+///
+/// `ed25519_public_pem` の前後 whitespace は内部で `.trim()` する: 一部実装
+/// (Pleroma の RSA PEM と同じ流れ) が PEM 末尾に余分な `\n` を入れて送って
+/// くるケースに耐える。
 pub(crate) fn verify_ed25519(
     signature_base: &[u8],
     signature_bytes: &[u8],
     ed25519_public_pem: &str,
 ) -> Result<(), VerifyError> {
-    let vk = VerifyingKey::from_public_key_pem(ed25519_public_pem)?;
+    let vk = VerifyingKey::from_public_key_pem(ed25519_public_pem.trim())?;
     let sig_array: [u8; 64] = signature_bytes
         .try_into()
         .map_err(|_| VerifyError::BadLength(signature_bytes.len()))?;
