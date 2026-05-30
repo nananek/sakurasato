@@ -1,8 +1,11 @@
 # Sakurasato 本番想定 compose。
 # 方針 (CLAUDE.md §3 / §6 / §7):
 #   - server は外部公開 (リバースプロキシ経由 443 を想定) + AP 配送と
-#     remote actor fetch の egress を持つ (暫定、Issue #23)。M6 で再評価。
-#   - 外部 GET (画像 / OGP) の egress は media-proxy のみ。
+#     remote actor fetch の egress を持つ (暫定、Issue #23)。M6 完了後も
+#     この 2 経路は server 直のまま (= 配送 POST と remote actor JSON GET は
+#     画像デコードを伴わない JSON 通信のみで、media-proxy 経由化の利得が薄い)。
+#   - 外部 GET (画像 / OGP) の egress は media-proxy のみ。M6 で TUI のアバター
+#     取得経路も `/api/v1/media/proxy` → media-proxy に切り替わった (Issue #36)。
 #   - postgres と versitygw は内部ネットからのみ到達可。
 #   - 全コンテナ非 root・read-only fs・cap_drop ALL・no-new-privileges。
 #   - シークレットは compose secrets で注入。
@@ -126,7 +129,8 @@ services:
       # server から直接外部 (HTTPS POST / GET) に出る設計。Mastodon / Misskey /
       # Pleroma も server 直配送が業界標準で、配送経路を media-proxy に通す利点が
       # 限定的なため。受け取るレスポンスは JSON のみで画像デコードを伴わない。
-      # M6 (media-proxy 実装) 時に再評価する。
+      # M6 完了 (画像取得は media-proxy 経由に切替済み) でも本方針は維持。
+      # 配送経路自体の隔離は M10 セキュリティ硬化で再評価する。
       - internal
       - egress
 
@@ -134,9 +138,9 @@ networks:
   internal:
     internal: true
   egress:
-    # 外向き bridge ネット。`media-proxy` (外部 GET / 画像取得) と `server`
-    # (AP 配送 POST / remote actor fetch、暫定 #23) が参加する。
-    # CLAUDE.md §3 / §6 / §7 の方針と整合。M6 で `server` の参加可否を再評価する。
+    # 外向き bridge ネット。`media-proxy` (外部 GET / 画像取得 / OGP) と
+    # `server` (AP 配送 POST / remote actor fetch、暫定 #23) が参加する。
+    # CLAUDE.md §3 / §6 / §7 の方針と整合。
     driver: bridge
 
 volumes:

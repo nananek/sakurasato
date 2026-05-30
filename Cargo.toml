@@ -135,6 +135,17 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # LRU は実用十分な小さい実装。`lru` crate は put/get が O(1)。
 lru = "0.16"
 
+# ── M6 media-proxy ─────────────────────────────────────────────────
+# media-proxy は本体 server とは別バイナリ (= 別プロセス + 別 docker container)
+# として動かし、外部 GET と画像デコードという危険な処理だけを引き受ける。
+# 本体 (`crates/server`) には `image` を引き込まない契約は維持する。
+#
+# media-proxy 内部:
+#   - axum を使って Unix socket 上で HTTP/1.1 を listen する
+#     (axum 0.8 は `serve` API で listener を受け取れる)
+#   - reqwest で外部 GET (workspace 既定の rustls-tls-native-roots)
+#   - image で decode / resize / WebP 再エンコード
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

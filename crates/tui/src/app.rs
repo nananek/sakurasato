@@ -238,7 +238,7 @@ mod tests {
             Theme::default(),
             whoami(),
             "test".into(),
-            ImageCache::new(None),
+            ImageCache::new(None, None),
         )
     }
 

@@ -51,10 +51,9 @@ eventsource-stream.workspace = true
 ratatui-image.workspace = true
 image.workspace = true
 lru.workspace = true
-# Avatar fetch は HTTPS の公開エンドポイントへ行くので reqwest を使う (Unix socket
-# は hyperlocal、画像 fetch は reqwest と分離)。rustls + http2 で distroless 互換。
-# `stream` feature でストリーミング受信 (= 累計サイズ上限チェック) を有効化。
-reqwest = { workspace = true, features = ["stream"] }
+# M6 で reqwest dep を撤去 (Issue #36 解消): アバター取得は LocalApi 経由で
+# server → media-proxy に委譲するため、TUI 側に外向き HTTPS クライアントは
+# 持たない。UDS への HTTP/1.1 は hyperlocal で完結する。
 
 [dev-dependencies]
 tempfile = "3"

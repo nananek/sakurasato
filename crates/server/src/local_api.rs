@@ -10,12 +10,14 @@
 //! - Bearer トークンが第二の壁。CLI で発行し、SHA-256 hex を DB に格納。
 //!   ([`crate::token`])
 //!
-//! ## ルート (M4 PR2 までに揃ったもの)
+//! ## ルート
 //!
-//! - `GET /api/v1/whoami` ── 認証確認 + ローカル actor サマリ (PR1)
-//! - `GET /api/v1/timeline/home` ── home timeline 一覧 (PR2)
-//! - `POST /api/v1/notes` ── Note 作成 + Create Activity 配送 (PR2)
-//! - `GET /api/v1/stream` ── SSE で新規 Note を購読 (PR2)
+//! - `GET /api/v1/whoami` ── 認証確認 + ローカル actor サマリ (M4 PR1)
+//! - `GET /api/v1/timeline/home` ── home timeline 一覧 (M4 PR2)
+//! - `POST /api/v1/notes` ── Note 作成 + Create Activity 配送 (M4 PR2)
+//! - `GET /api/v1/stream` ── SSE で新規 Note を購読 (M4 PR2)
+//! - `GET /api/v1/media/proxy?url=&variant=` ── TUI 用画像プロキシ。
+//!   media-proxy 経由で外部 URL を取得 (M6, Issue #36 解消)
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -30,6 +32,7 @@ use tracing::warn;
 use crate::state::AppState;
 
 pub mod auth;
+pub mod media_proxy;
 pub mod notes;
 pub mod stream;
 pub mod timeline;
@@ -41,6 +44,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/timeline/home", get(timeline::home))
         .route("/api/v1/notes", post(notes::create))
         .route("/api/v1/stream", get(stream::handle))
+        // M6: TUI 用画像プロキシ。media-proxy 経由で外部 URL を取得する。
+        .route("/api/v1/media/proxy", get(media_proxy::handle))
         // 全 `/api/v1/*` に Bearer 認証を要求する。`from_fn_with_state` で
         // middleware に `AppState` を渡し、`api_token` lookup に使う。
         .layer(axum::middleware::from_fn_with_state(

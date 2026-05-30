@@ -12,6 +12,7 @@ use tokio::sync::broadcast;
 
 use crate::http_client;
 use crate::local_api::stream::{TIMELINE_CHANNEL_CAPACITY, TimelineEvent};
+use crate::media_proxy_client::MediaProxyClient;
 
 #[derive(Clone, Debug)]
 pub struct AppState(Arc<Inner>);
@@ -52,6 +53,14 @@ struct Inner {
     /// ネットワークに到達しないようにする。テストは必要な actor を予め
     /// `repo::actor::insert` で seed しておく契約。
     enable_remote_fetch: bool,
+    /// media-proxy への UDS クライアント (M6)。
+    ///
+    /// 本体は外部画像のデコードをしない契約 (CLAUDE.md §7) なので、
+    /// `GET /api/v1/media/proxy?url=...` のようなクライアント向け経路は
+    /// 必ずこれを通す。実体は `hyperlocal` ベースの hyper クライアント。
+    /// テスト経路 (`from_pool`) でも構築する ── socket が無くてもクライアント
+    /// 構築自体は通る (= 初回 fetch で接続エラー)。
+    media_proxy: MediaProxyClient,
 }
 
 impl AppState {
@@ -69,6 +78,7 @@ impl AppState {
             .context("connect to PostgreSQL")?;
         let http = http_client::build_client()?;
         let s3 = build_s3_client(&config)?;
+        let media_proxy = MediaProxyClient::new(config.media_proxy.socket.clone());
         let (timeline_tx, _) = broadcast::channel(TIMELINE_CHANNEL_CAPACITY);
         Ok(Self(Arc::new(Inner {
             config,
@@ -78,6 +88,7 @@ impl AppState {
             timeline_tx,
             allow_internal_inbox: false,
             enable_remote_fetch: true,
+            media_proxy,
         })))
     }
 
@@ -92,6 +103,7 @@ impl AppState {
         // GET /media/<key> を叩くテストはコネクション失敗で 500 を返すだけ。
         let s3 =
             build_s3_client(&config).expect("aws-sdk-s3 builder is infallible from static creds");
+        let media_proxy = MediaProxyClient::new(config.media_proxy.socket.clone());
         let (timeline_tx, _) = broadcast::channel(TIMELINE_CHANNEL_CAPACITY);
         Self(Arc::new(Inner {
             config,
@@ -101,6 +113,7 @@ impl AppState {
             timeline_tx,
             allow_internal_inbox: true,
             enable_remote_fetch: false,
+            media_proxy,
         }))
     }
 
@@ -140,6 +153,12 @@ impl AppState {
     /// /media/{key}); writes arrive with media uploads in M4 PR2 / M7.
     pub fn s3_client(&self) -> &S3Client {
         &self.0.s3
+    }
+
+    /// media-proxy へ UDS 越しに HTTP を喋るクライアント (M6)。`AppState`
+    /// と同じく Arc 化された inner なので clone は cheap。
+    pub fn media_proxy(&self) -> &MediaProxyClient {
+        &self.0.media_proxy
     }
 
     /// SSE 配信用 broadcast sender。POST notes / 受信 Note dispatch から

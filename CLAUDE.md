@@ -67,7 +67,8 @@
 
 - **server だけが外部公開**（リバースプロキシ経由で 443）。
 - **外部 GET（リモートメディア取得・OGP）は media-proxy のみに許可**。本体 server は信頼できないバイト列をデコードしない。
-- **外部 POST（ActivityPub 配送 / remote actor fetch）は当面 server から直接行う**（暫定）。Mastodon / Misskey / Pleroma も server 直配送が業界標準で、配送経路を media-proxy に通す利点は限定的なため。これは M6 で media-proxy を実装した時点で再評価する選択（[Issue #23](https://github.com/nananek/sakurasato/issues/23)）。再評価項目: (a) 配送の中継プロトコル設計、(b) remote actor fetch の SSRF 多層防御、(c) server のネットワーク露出面のさらなる削減。
+- **外部 POST（ActivityPub 配送 / remote actor fetch）は当面 server から直接行う**（暫定）。Mastodon / Misskey / Pleroma も server 直配送が業界標準で、配送経路を media-proxy に通す利点は限定的なため。これは M6 で media-proxy を実装した時点で再評価する選択（[Issue #23](https://github.com/nananek/sakurasato/issues/23)）。**M6 完了時点で本方針を維持**（配送 POST と remote actor fetch のレスポンスは JSON のみで画像デコードを伴わず、media-proxy 経由化の利得が薄い）。配送経路自体の隔離は M10 セキュリティ硬化で再評価。
+- **外部 GET（リモートメディア / OGP）は media-proxy のみ**。M6 で TUI のアバター取得経路も `/api/v1/media/proxy` 経由 → media-proxy に切り替え済み（[Issue #36](https://github.com/nananek/sakurasato/issues/36) 解消）── TUI ホストプロセスから直接外向き接続が出なくなり、ホスト LAN / クラウド IMDS への SSRF 表面が縮小。
 - postgres / versitygw は内部ネットのみ。TUI はコンテナ外でホスト端末から Unix ソケット接続。
 
 ---
@@ -127,6 +128,13 @@ sakurasato/
 - **本体は生ファイルをデコードしない。** 必ず media-proxy 経由でサニタイズ済みデータのみ扱う。
 - **隔離**: 本体とは Unix ソケット（または内部ネットのみ）で通信し、外部公開なし。**信頼できないバイト列の取得とデコードを担当するのはこのコンテナだけ**。`mem_limit` を設定し、信頼できない入力のデコードが暴走しても OOM kill で本体に波及させない。なお ActivityPub の配送 POST と remote actor fetch は暫定的に server 直で行う（§3 / [Issue #23](https://github.com/nananek/sakurasato/issues/23)）── 受領レスポンスは JSON のみで画像デコードを伴わないため。
 - nekonoverse の `media-proxy-rs`（変換専用・ソケット限定・512M）と `summary-proxy`（SSRF 対策）の役割を Rust の一コンテナに統合。必要なら変換と取得をさらに分割可能な構成にしておく。
+
+#### M6 実装スコープ（現在）
+- `POST /v1/image/fetch` — リモート URL を取得 → デコード → variant にリサイズ → WebP 再エンコード。SSRF 検査 + redirect ごとの再検証 + `image::Limits`（画素数上限）+ ストリーミング受信での `max_bytes` 強制。
+- `POST /v1/image/sanitize` — 受け取ったバイト列を変換パイプラインに通して再エンコード。M7 アップロードで使う。
+- `GET /healthz` — liveness。
+- `Variant`: `avatar` (256x256) / `thumbnail` (320x320) / `preview` (1280x1280) / `header` (1500x500)。
+- OGP/summary 取得は本 milestone では未実装（呼び出し側が無いため）。M9 もしくは M8 で必要に応じて追加。
 
 ### 5.4 絵文字（Misskey 形式 zip インポート）
 - **zip 構造**: トップレベル `meta.json`（`metaVersion`/`host`/`exportedAt`/`emojis[]`）＋画像ファイル。

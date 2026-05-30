@@ -13,6 +13,7 @@ pub(crate) mod extract;
 pub(crate) mod http_client;
 pub mod init;
 pub mod local_api;
+pub mod media_proxy_client;
 pub mod multikey;
 pub(crate) mod net_guard;
 pub(crate) mod remote_actor;

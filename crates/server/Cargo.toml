@@ -45,6 +45,15 @@ reqwest.workspace = true
 url.workspace = true
 aws-sdk-s3.workspace = true
 aws-credential-types.workspace = true
+# M6: media-proxy への UDS HTTP/1.1 クライアント。TUI が server を叩くために
+# 使っているのと同じスタック (hyperlocal + hyper-util + hyper)。
+# 信頼境界外の URL を直接 fetch しないため、本クライアントは「media-proxy
+# 専用の UDS 通信」だけに使う。`reqwest` の `Client` は別途 AP 配送に残す。
+hyperlocal.workspace = true
+hyper-util.workspace = true
+hyper.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 sakurasato-core = { workspace = true }
