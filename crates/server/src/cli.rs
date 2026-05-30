@@ -29,6 +29,8 @@ pub enum Command {
     Deliver(DeliverArgs),
     /// Manage local API tokens (Bearer auth for the Unix-socket API).
     Token(TokenArgs),
+    /// Manage custom emojis (M8).
+    Emoji(EmojiArgs),
 }
 
 #[derive(Debug, Args)]
@@ -84,4 +86,27 @@ pub struct TokenRevokeArgs {
     /// `api_token.id` from `sakurasato token list`.
     #[arg(long)]
     pub id: i64,
+}
+
+#[derive(Debug, Args)]
+pub struct EmojiArgs {
+    #[command(subcommand)]
+    pub command: EmojiCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EmojiCommand {
+    /// Import a Misskey-format emoji zip (`meta.json` + image files).
+    ///
+    /// 既存 shortcode は **上書き** される (CLAUDE.md §5.4)。本コマンドは
+    /// 画像バイト列を server 本体ではデコードせず、`media-proxy` の
+    /// `/v1/image/sanitize` 経由で再エンコードしてから versitygw に書く ──
+    /// CLAUDE.md §7 の隔離方針を維持するため。
+    Import(EmojiImportArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EmojiImportArgs {
+    /// Path to a Misskey-format emoji zip.
+    pub zip: PathBuf,
 }

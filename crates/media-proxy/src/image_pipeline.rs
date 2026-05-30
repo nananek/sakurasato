@@ -10,6 +10,7 @@
 //! - `thumbnail` — 320x320 上限
 //! - `preview` — 1280x1280 上限
 //! - `header` — 1500x500 上限 (Mastodon バナーサイズ)
+//! - `emoji` — 128x128 上限 (Misskey 互換、`tag: Emoji.icon` で連合される)
 //!
 //! 上限以下の画像はそのまま、上限を超えるものは **アスペクト比を保ったまま**
 //! 縮小する。出力は常に WebP (lossy, quality 80)。WebP に統一する利点:
@@ -54,6 +55,12 @@ pub enum Variant {
     Thumbnail,
     Preview,
     Header,
+    /// カスタム絵文字 (M8)。Misskey の `emojis/<shortcode>.png` は実物が
+    /// 128px 以下のものが多く、本実装も 128x128 ボックスに揃える。
+    /// アニメーション GIF/APNG/animated WebP は現状の `image` crate での
+    /// 再エンコード経路がフレームを 1 枚に落とすため、初回フレームのみ
+    /// 残る (M8 PR1 のスコープ。CLAUDE.md M9 で再評価)。
+    Emoji,
 }
 
 impl Variant {
@@ -64,6 +71,7 @@ impl Variant {
             Self::Thumbnail => (320, 320),
             Self::Preview => (1280, 1280),
             Self::Header => (1500, 500),
+            Self::Emoji => (128, 128),
         }
     }
 }
@@ -220,6 +228,27 @@ mod tests {
         let out = process(&png, Variant::Header, 16_000_000).unwrap();
         assert!(out.width <= 1500);
         assert!(out.height <= 500);
+    }
+
+    #[test]
+    fn emoji_box_is_128() {
+        // Misskey サーバ由来の絵文字は 128px 前後が多い ─ 大きい入力は
+        // アスペクト比保ったまま 128 ボックスに収める。
+        let png = png_bytes(512, 256);
+        let out = process(&png, Variant::Emoji, 1_000_000).unwrap();
+        assert!(out.width <= 128);
+        assert!(out.height <= 128);
+        // 2:1 のアスペクト比保持 (高さは幅の半分)。
+        assert_eq!(out.height * 2, out.width);
+    }
+
+    #[test]
+    fn emoji_small_input_passes_through() {
+        let png = png_bytes(64, 64);
+        let out = process(&png, Variant::Emoji, 1_000_000).unwrap();
+        assert_eq!(out.width, 64);
+        assert_eq!(out.height, 64);
+        assert_eq!(out.content_type, "image/webp");
     }
 
     #[test]

@@ -149,6 +149,15 @@ lru = "0.16"
 #   - reqwest で外部 GET (workspace 既定の rustls-tls-native-roots)
 #   - image で decode / resize / WebP 再エンコード
 
+# ── M8 emoji zip インポート ────────────────────────────────────────
+# Misskey 形式 zip (meta.json + 画像群) を server CLI で取り込むために使う。
+# - `default-features = false` で aes / bzip2 / lzma / zstd / xz といった
+#   暗号化・レアな圧縮形式を切り、Misskey export が使う素の (= deflate のみ)
+#   zip を扱える最小構成にする。
+# - `deflate-flate2-zlib-rs` は pure-Rust の zlib 実装 (zlib-rs) を使い、
+#   OpenSSL / native zlib を引かない (distroless 互換を維持)。
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

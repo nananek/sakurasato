@@ -55,6 +55,9 @@ hyper-util.workspace = true
 hyper.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
+# M8: Misskey 形式 zip インポート CLI。raw bytes は decode せず media-proxy
+# `/v1/image/sanitize` に流す ── `image` クレートは引き込まない契約 (CLAUDE.md §7)。
+zip.workspace = true
 
 [dev-dependencies]
 sakurasato-core = { workspace = true }
