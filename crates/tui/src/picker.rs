@@ -58,6 +58,11 @@ pub struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
+    /// ファイルサイズ (bytes)。`try_read_dir` で `DirEntry::metadata` から
+    /// 取得する。stat 失敗 / ディレクトリは `None`。render 時に同期 stat を
+    /// 走らせると tokio メインスレッドをブロックするので、ここで事前に
+    /// キャッシュしておく (PR #43 round-2 review Medium 対応)。
+    pub size: Option<u64>,
 }
 
 impl Entry {
@@ -68,6 +73,7 @@ impl Entry {
                 .parent()
                 .map_or_else(|| path.to_path_buf(), Path::to_path_buf),
             is_dir: true,
+            size: None,
         }
     }
 }
@@ -167,10 +173,20 @@ impl FilePicker {
             }
             // file_type は symlink を fail-open に扱う (= 通常 file/dir として判定)。
             let is_dir = dent.file_type().is_ok_and(|t| t.is_dir());
+            // ファイルサイズは render 前に読んでキャッシュ。`DirEntry::metadata`
+            // は OS によっては readdir で得た値をそのまま使う最適化があるので、
+            // `fs::metadata` を別途呼ぶより安い。失敗時は None で渡し UI 側で
+            // "(unknown size)" を出す。ディレクトリは概念的に size 無し。
+            let size = if is_dir {
+                None
+            } else {
+                dent.metadata().ok().map(|m| m.len())
+            };
             entries.push(Entry {
                 name,
                 path: dent.path(),
                 is_dir,
+                size,
             });
         }
         self.truncated = truncated;
@@ -328,5 +344,27 @@ mod tests {
         assert_eq!(PickerMode::Avatar.as_kind(), "avatar");
         assert_eq!(PickerMode::Header.as_kind(), "header");
         assert_eq!(PickerMode::Attachment.as_kind(), "attachment");
+    }
+
+    #[test]
+    fn file_size_cached_in_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        // dog.jpg は 0 バイト (touch されたのみ)。
+        let picker = FilePicker::new(PickerMode::Attachment, tmp.path().join("photos"));
+        let dog = picker
+            .entries
+            .iter()
+            .find(|e| e.name == "dog.jpg")
+            .expect("dog.jpg should be listed");
+        assert!(!dog.is_dir);
+        assert_eq!(dog.size, Some(0), "size should be stat'd at read_dir time");
+        // ディレクトリ (..  / cats) は size: None。
+        let parent = &picker.entries[0];
+        assert_eq!(parent.name, "..");
+        assert_eq!(parent.size, None);
+        let cats = picker.entries.iter().find(|e| e.name == "cats").unwrap();
+        assert!(cats.is_dir);
+        assert_eq!(cats.size, None);
     }
 }

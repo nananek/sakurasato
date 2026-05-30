@@ -85,6 +85,11 @@ impl PreviewCache {
         }
     }
 
+    /// 端末の画像プロトコル対応有無のみを返す。
+    ///
+    /// **TODO (M9)**: 視覚刺激抑制モードの要素別 on/off (`config/themes/*.toml`
+    /// の `previews` トグル想定) と AND を取って返す。`ImageCache` 側も
+    /// 同じ trait で suppression を反映する設計に揃える予定 (CLAUDE.md §5.2)。
     pub fn enabled(&self) -> bool {
         self.picker.is_some()
     }

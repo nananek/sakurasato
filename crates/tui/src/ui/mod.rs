@@ -717,13 +717,14 @@ fn render_picker_preview(
             Style::default().fg(palette.muted),
         )),
         Line::from(Span::styled(
+            // size は picker::try_read_dir で事前に stat 済み (= render は
+            // I/O フリー)。Some(0) も Some(n) と同形で表示する。
             if current.is_dir {
                 "  (directory)".to_string()
+            } else if let Some(n) = current.size {
+                format!("  size: {n} bytes")
             } else {
-                match std::fs::metadata(&current.path) {
-                    Ok(m) => format!("  size: {} bytes", m.len()),
-                    Err(err) => format!("  stat error: {err}"),
-                }
+                "  size: (unknown)".to_string()
             },
             Style::default().fg(palette.foreground),
         )),
