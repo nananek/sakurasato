@@ -67,7 +67,7 @@ base64 = "0.22"
 httpdate = "1"
 indexmap = "2"
 # `oid` feature は rsa::pkcs1v15::SigningKey<Sha256> が `AssociatedOid` を要求するため必要。
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
 subtle = "2"
 # M3b-2 PR2 アウトバウンド配送で使う HTTP クライアント。
 # rustls-tls-native-roots: OpenSSL を引かず distroless で動かすため rustls + OS の root store。
