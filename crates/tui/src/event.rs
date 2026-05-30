@@ -10,6 +10,7 @@ use crossterm::event::{
 };
 
 use crate::app::Focus;
+use crate::picker::PickerMode;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -45,6 +46,23 @@ pub enum Action {
     Scroll(i32),
     /// マウス左クリック。座標 (col, row) を渡し、runtime 側でパネル判定する。
     MouseClick(u16, u16),
+    /// M7: ファイルピッカを開く。timeline / compose から発行。
+    OpenPicker(PickerMode),
+    /// M7: ピッカ内ナビゲーション。
+    PickerNext,
+    PickerPrev,
+    PickerPageDown,
+    PickerPageUp,
+    /// Enter ── ディレクトリ降りる / ファイル選択 (= upload kick)。
+    PickerActivate,
+    /// Backspace ── 親に上る。
+    PickerParent,
+    /// `.` ── 隠しファイル表示トグル。
+    PickerToggleHidden,
+    /// Esc ── ピッカを閉じる。
+    PickerCancel,
+    /// M7: 直近の添付を 1 件外す (compose focus 中)。
+    PopAttachment,
 }
 
 /// crossterm イベント → Action。
@@ -73,6 +91,7 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::Timeline => translate_timeline_key(k),
         Focus::Compose => translate_compose_key(k),
         Focus::Help => translate_help_key(k),
+        Focus::Picker => translate_picker_key(k),
     }
 }
 
@@ -90,6 +109,12 @@ fn translate_timeline_key(k: KeyEvent) -> Action {
         (KeyCode::Char('o'), m) if m.is_empty() => Action::LoadMore,
         (KeyCode::Char('n'), m) if m.is_empty() => Action::EnterCompose,
         (KeyCode::Char('t'), m) if m.is_empty() => Action::CycleTheme,
+        // M7: A = avatar, H = header, ; = attachment ─ いずれもファイル
+        // ピッカを当該モードで開く。小文字キーは timeline ナビと衝突
+        // するため Shift 付き / `;` を採用。
+        (KeyCode::Char('A'), _) => Action::OpenPicker(PickerMode::Avatar),
+        (KeyCode::Char('H'), _) => Action::OpenPicker(PickerMode::Header),
+        (KeyCode::Char(';'), m) if m.is_empty() => Action::OpenPicker(PickerMode::Attachment),
         _ => Action::Noop,
     }
 }
@@ -109,6 +134,10 @@ fn translate_compose_key(k: KeyEvent) -> Action {
         KeyCode::Char('w') if ctrl => Action::ToggleCw,
         KeyCode::Char('s') if ctrl => Action::ToggleSensitive,
         KeyCode::Char('v') if ctrl => Action::CycleVisibility,
+        // M7: Ctrl-A で添付ピッカを開く。`a` 単独は本文に挿入されるので Ctrl 必須。
+        KeyCode::Char('a') if ctrl => Action::OpenPicker(PickerMode::Attachment),
+        // M7: Ctrl-D で末尾の添付を 1 件外す (compose に居ながらの取り消し)。
+        KeyCode::Char('d') if ctrl => Action::PopAttachment,
         KeyCode::Backspace => Action::Backspace,
         KeyCode::Delete => Action::DeleteForward,
         KeyCode::Left => Action::MoveLeft,
@@ -123,6 +152,22 @@ fn translate_compose_key(k: KeyEvent) -> Action {
 fn translate_help_key(k: KeyEvent) -> Action {
     match k.code {
         KeyCode::Esc | KeyCode::Char('?' | 'q') => Action::ToggleHelp,
+        _ => Action::Noop,
+    }
+}
+
+fn translate_picker_key(k: KeyEvent) -> Action {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => Action::PickerCancel,
+        (KeyCode::Char('q'), m) if m.is_empty() => Action::PickerCancel,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::PickerNext,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::PickerPrev,
+        (KeyCode::PageDown, _) => Action::PickerPageDown,
+        (KeyCode::PageUp, _) => Action::PickerPageUp,
+        (KeyCode::Enter, _) => Action::PickerActivate,
+        (KeyCode::Backspace, _) => Action::PickerParent,
+        // `.` で隠しファイルトグル ── vim の :set hidden! 風。
+        (KeyCode::Char('.'), m) if m.is_empty() => Action::PickerToggleHidden,
         _ => Action::Noop,
     }
 }

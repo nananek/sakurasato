@@ -48,9 +48,11 @@ pub enum Focus {
     Timeline,
     Compose,
     Help,
+    /// M7: ファイルピッカ。`App::picker` が `Some` のときだけ取りうる。
+    Picker,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct App {
     pub theme: Theme,
     pub whoami: Whoami,
@@ -72,10 +74,23 @@ pub struct App {
     /// 画像 (アバター) キャッシュ。`Picker` 取得失敗時は無効化された Cache が
     /// 入る (= ensure / get が no-op になり、UI もテキスト専用に落ちる)。
     pub images: ImageCache,
+    /// M7: ファイルピッカ。`Focus::Picker` 中のみ表示される。
+    pub picker: Option<crate::picker::FilePicker>,
+    /// M7: ローカル画像プレビューキャッシュ (picker 表示時に使用)。
+    pub previews: crate::preview::PreviewCache,
+    /// M7: 進行中のアップロードジョブ数。0 でも picker を閉じてよい。
+    /// UI のステータスバーに `↑ N` として出す。
+    pub pending_uploads: u32,
 }
 
 impl App {
-    pub fn new(theme: Theme, whoami: Whoami, socket_label: String, images: ImageCache) -> Self {
+    pub fn new(
+        theme: Theme,
+        whoami: Whoami,
+        socket_label: String,
+        images: ImageCache,
+        previews: crate::preview::PreviewCache,
+    ) -> Self {
         Self {
             theme,
             whoami,
@@ -90,6 +105,9 @@ impl App {
             should_quit: false,
             socket_label,
             images,
+            picker: None,
+            previews,
+            pending_uploads: 0,
         }
     }
 
@@ -239,6 +257,7 @@ mod tests {
             whoami(),
             "test".into(),
             ImageCache::new(None, None),
+            crate::preview::PreviewCache::new(None),
         )
     }
 
