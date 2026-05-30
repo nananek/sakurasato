@@ -473,26 +473,23 @@ async fn stream_emits_note_created_event_after_post(pool: PgPool) {
     let body = stream_resp.into_body();
     let mut stream = BodyStream::new(body);
 
-    // POST notes を fire-and-forget。stream に届くまで waitin。
-    let app_post = app.clone();
-    let raw_post = raw.clone();
-    tokio::spawn(async move {
-        // SSE subscriber が `Sender::subscribe()` を呼ぶより前に publish しない
-        // よう、少しだけ間を空ける。100ms あれば axum の router 経由 + subscribe
-        // が完了する。
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let req_body = serde_json::json!({"content": "broadcast me"});
-        let _ = app_post
-            .oneshot(
-                Request::post("/api/v1/notes")
-                    .header(header::AUTHORIZATION, format!("Bearer {raw_post}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-    });
+    // ここで `stream_resp` は既に解決済み (= `stream::handle` が
+    // `Sender::subscribe()` を呼び終えて Response を返した状態)。
+    // よって `Receiver` は broadcast channel に登録済みで、
+    // この後 publish される event は確実に受信される。POST を
+    // spawn せず直列に撃ち、sleep 同期を完全に排除する (PR #33 review #3)。
+    let req_body = serde_json::json!({"content": "broadcast me"});
+    let post_resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_resp.status(), StatusCode::CREATED);
 
     // SSE フレームを最大 2 秒間待ち、`note.created` を見つけたら通過。
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

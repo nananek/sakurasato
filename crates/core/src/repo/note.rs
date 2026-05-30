@@ -105,7 +105,10 @@ where
     .map(|_| ())
 }
 
-pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<NoteRow>> {
+pub async fn get_by_ap_id<'e, E>(executor: E, ap_id: &str) -> sqlx::Result<Option<NoteRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as!(
         NoteRow,
         r#"
@@ -121,7 +124,7 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Not
         "#,
         ap_id,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 

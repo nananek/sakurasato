@@ -222,8 +222,12 @@ async fn persist_note(
         }
     };
 
+    // reply 先 Note 行検索は **insert と同じ tx 内** で行う。`get_by_ap_id`
+    // を `state.pool()` で叩くと別接続になり、insert 直前の race window で
+    // ローカル投稿の自己 reply が拾えない可能性がある。Tx 内で揃えると
+    // read-after-write 整合性も担保される (PR #33 review #1)。
     let in_reply_to_note_id = if let Some(ref reply_uri) = req.in_reply_to_ap_id {
-        match repo::note::get_by_ap_id(state.pool(), reply_uri).await {
+        match repo::note::get_by_ap_id(&mut *tx, reply_uri).await {
             Ok(Some(row)) => Some(row.id),
             Ok(None) => None,
             Err(err) => {
@@ -268,6 +272,9 @@ async fn persist_note(
         host = state.config().server.host,
         id = inserted.id,
     );
+    // 現状は `ap_id == url` が常に同値。将来、カスタムドメインや短縮 URL を
+    // 導入したときに分岐できるよう、`set_ap_id_and_url` は 2 引数で受ける
+    // 形にしてある (PR #33 review #2)。
     if let Err(err) =
         repo::note::set_ap_id_and_url(&mut *tx, inserted.id, &canonical_url, &canonical_url).await
     {
