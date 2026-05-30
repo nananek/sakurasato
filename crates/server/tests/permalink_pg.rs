@@ -176,6 +176,60 @@ async fn permalink_404_for_remote_note(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn permalink_returns_ap_json_when_accept_activitystreams(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let id = insert_note(&pool, actor.id, "example.test", "n1", "hello world", true).await;
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/notes/{id}"))
+                .header(header::ACCEPT, "application/activity+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+    assert_eq!(ct, "application/activity+json");
+
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["type"], "Note");
+    assert_eq!(json["content"], "hello world");
+    assert_eq!(json["attributedTo"], "https://example.test/users/alice");
+    assert_eq!(
+        json["id"],
+        format!("https://example.test/notes/n1"),
+        "AP id must equal stored ap_id: {json}",
+    );
+    // ld+json (profile 付き) でも JSON が返る。
+    let resp2 = app
+        .oneshot(
+            Request::get(format!("/notes/{id}"))
+                .header(
+                    header::ACCEPT,
+                    r#"application/ld+json; profile="https://www.w3.org/ns/activitystreams""#,
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    assert_eq!(
+        resp2.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/activity+json"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn permalink_renders_local_note_with_escaped_content(pool: PgPool) {
     let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
         .await

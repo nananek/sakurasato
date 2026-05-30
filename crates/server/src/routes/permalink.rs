@@ -15,23 +15,29 @@
 //!
 //! ## Content negotiation
 //!
-//! `Accept: application/activity+json` (AP fetcher が要求するヘッダ) は
-//! **PR1 では扱わず HTML を返す**。AP Note JSON は M4 PR2 (POST notes +
-//! Create 配送) と合わせて入れる ── ローカル発信 Note を生成する経路が
-//! 無い PR1 で AP JSON だけ提供しても整合性が取れないため。
+//! `Accept: application/activity+json` (および `application/ld+json`) を
+//! 受けたら AP Note JSON を返し、それ以外 (typical browser) には HTML を
+//! 返す。AP fetcher が `note.ap_id` を解決したときに 404 を返すと連合相手
+//! が `Create` の object を引けず、再送ループが止まらない原因になるため、
+//! PR2 で AP JSON 兼用化を入れる。
 
 use std::fmt::Write as _;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use sakurasato_core::model::NoteRow;
+use sakurasato_core::model::{ActorRow, NoteRow};
 use sakurasato_core::repo;
+use serde_json::{Value as JsonValue, json};
 
 use crate::state::AppState;
 
-pub async fn handle(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+pub async fn handle(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Response {
     let note = match repo::note::get_by_id(state.pool(), id).await {
         Ok(Some(row)) if row.is_local => row,
         // 未知 / remote note は 404。remote のパーマリンクは別ドメインに
@@ -59,6 +65,16 @@ pub async fn handle(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         }
     };
 
+    if wants_activity_json(&headers) {
+        let body = render_ap_note(&note, &actor);
+        let mut response = (StatusCode::OK, axum::Json(body)).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/activity+json"),
+        );
+        return response;
+    }
+
     let html = render_html(
         &note,
         &actor.preferred_username,
@@ -70,6 +86,69 @@ pub async fn handle(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
     response
+}
+
+/// `Accept` ヘッダが AP JSON 系を要求しているか判定する。
+///
+/// AP fetcher (Mastodon / Misskey 等) は `application/activity+json` または
+/// `application/ld+json; profile="https://www.w3.org/ns/activitystreams"` を
+/// 送ってくる。ブラウザは `text/html` (+ `*/*`) なので AP 判定しない。
+///
+/// 全部の Accept ヘッダ要素を見て、AP 系の media-type が含まれていれば
+/// JSON を返す。`*/*` 単独や `text/html` 含みは HTML 扱い。
+fn wants_activity_json(headers: &HeaderMap) -> bool {
+    let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    for part in accept.split(',') {
+        let media = part
+            .split(';')
+            .next()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if media == "application/activity+json" || media == "application/ld+json" {
+            return true;
+        }
+    }
+    false
+}
+
+/// `Note` を AP JSON-LD として組み立てる。
+///
+/// `to` / `cc` は DB に永続化済みの `to_recipients` / `cc_recipients` を
+/// そのまま使う ── POST `/api/v1/notes` で組み立てた値と完全に同じ。
+/// 受信した remote note の場合も DB の to/cc がそのまま流れる。
+fn render_ap_note(note: &NoteRow, actor: &ActorRow) -> JsonValue {
+    let published = note
+        .published_at
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut body = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "type": "Note",
+        "id": note.ap_id,
+        "attributedTo": actor.ap_id,
+        "content": note.content,
+        "to": note.to_recipients.0,
+        "cc": note.cc_recipients.0,
+        "published": published,
+        "sensitive": note.sensitive,
+        "url": note.url.clone().unwrap_or_else(|| note.ap_id.clone()),
+    });
+    if let Some(s) = note.summary.as_deref()
+        && !s.is_empty()
+    {
+        body["summary"] = JsonValue::String(s.into());
+    }
+    if let Some(lang) = note.language.as_deref()
+        && !lang.is_empty()
+    {
+        body["contentMap"] = json!({ lang: note.content });
+    }
+    if let Some(reply) = note.in_reply_to_ap_id.as_deref() {
+        body["inReplyTo"] = JsonValue::String(reply.into());
+    }
+    body
 }
 
 fn render_html(note: &NoteRow, username: &str, display_name: Option<&str>) -> Body {
@@ -152,6 +231,53 @@ fn escape_attr(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn wants_activity_json_true_for_ap_accept() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/activity+json"),
+        );
+        assert!(wants_activity_json(&h));
+
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::ACCEPT,
+            HeaderValue::from_static(
+                r#"application/ld+json; profile="https://www.w3.org/ns/activitystreams""#,
+            ),
+        );
+        assert!(wants_activity_json(&h));
+
+        // Mastodon が複数 media-type を並べた場合も拾えること。
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/html, application/activity+json;q=0.9"),
+        );
+        assert!(wants_activity_json(&h));
+    }
+
+    #[test]
+    fn wants_activity_json_false_for_browser() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/html,application/xhtml+xml,*/*;q=0.8"),
+        );
+        assert!(!wants_activity_json(&h));
+
+        // Accept ヘッダ無しはブラウザの素っ気ない GET 相当 → HTML 扱い。
+        let empty = HeaderMap::new();
+        assert!(!wants_activity_json(&empty));
+
+        // `*/*` だけは HTML 側に振る (連合 fetcher は明示 AP 系を載せる慣習)。
+        let mut h = HeaderMap::new();
+        h.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+        assert!(!wants_activity_json(&h));
+    }
 
     #[test]
     fn escape_text_handles_html_specials() {

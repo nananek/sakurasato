@@ -38,6 +38,12 @@ serde_json = { version = "1", features = ["raw_value"] }
 toml = "0.8"
 figment = { version = "0.10", features = ["toml", "env"] }
 tokio = { version = "1", features = ["full"] }
+# M4 PR2 SSE: broadcast::Receiver を futures::Stream に変換するヘルパ。
+# `sync` feature で `BroadcastStream` (= `Stream<Item = Result<T, _>>`) が入る。
+tokio-stream = { version = "0.1", features = ["sync"] }
+# axum SSE では Stream を扱うため futures::StreamExt 由来の adapter が必要。
+# `std` で十分 (no_std は使わない)。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 percent-encoding = "2"

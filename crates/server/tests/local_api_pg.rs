@@ -211,6 +211,315 @@ async fn whoami_404_when_local_actor_missing(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+// ============================================================
+// M4 PR2 — timeline / POST notes / SSE
+// ============================================================
+
+async fn insert_local_note(
+    pool: &PgPool,
+    actor_id: i64,
+    host: &str,
+    suffix: &str,
+    content: &str,
+) -> i64 {
+    let ap_id = format!("https://{host}/notes/{suffix}");
+    let row = repo::note::insert(
+        pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id,
+            actor_id,
+            content: content.into(),
+            language: Some("ja".into()),
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: true,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    row.id
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_home_503_when_local_actor_missing(pool: PgPool) {
+    // local actor 未 init の状態。認証通過 → 503 を返す。
+    let raw = issue_token(&pool, "tui-laptop").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/timeline/home")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_home_returns_local_and_followed_notes(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+    let mut carol = common::sample_local_actor("carol", "other.test");
+    carol.is_local = false;
+    carol.private_key_pem = None;
+    carol.ed25519_private_key_pem = None;
+    let carol = repo::actor::insert(&pool, carol).await.unwrap();
+
+    // alice -> bob は accepted、alice -> carol は pending。carol の投稿は出ない。
+    let bob_follow_ap_id = format!("{}/follows/bob-by-alice", me.ap_id);
+    let row = repo::follow::upsert_pending(&pool, &bob_follow_ap_id, me.id, bob.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+    let carol_follow_ap_id = format!("{}/follows/carol-by-alice", me.ap_id);
+    let _ = repo::follow::upsert_pending(&pool, &carol_follow_ap_id, me.id, carol.id)
+        .await
+        .unwrap();
+
+    let mine = insert_local_note(&pool, me.id, "example.test", "n1", "hi from alice").await;
+    let bobs = insert_local_note(&pool, bob.id, "remote.test", "n2", "hi from bob").await;
+    let carols_invisible =
+        insert_local_note(&pool, carol.id, "other.test", "n3", "carol pending").await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/timeline/home")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let notes = json["notes"].as_array().unwrap();
+    let ids: Vec<i64> = notes.iter().map(|n| n["id"].as_i64().unwrap()).collect();
+    assert!(ids.contains(&mine), "alice's own note must appear: {ids:?}");
+    assert!(ids.contains(&bobs), "bob's note must appear: {ids:?}");
+    assert!(
+        ids.iter().all(|id| *id != carols_invisible),
+        "carol (pending follow) must not appear: {ids:?}",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_persists_and_enqueues(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    // 1 人だけ follower (= remote actor で shared_inbox 持ち) を仕込む。
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    bob.shared_inbox_url = Some("https://remote.test/inbox".into());
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+    // bob が alice を follow している → 配送先は bob の shared_inbox。
+    let f_ap_id = "https://remote.test/follows/alice-by-bob".to_string();
+    let row = repo::follow::upsert_pending(&pool, &f_ap_id, bob.id, me.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({
+        "content": "hello world",
+        "visibility": "public",
+        "language": "en",
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let loc = resp.headers().get(header::LOCATION).unwrap();
+    assert!(loc.to_str().unwrap().starts_with("/notes/"));
+    let json = read_json(resp).await;
+    assert_eq!(json["content"], "hello world");
+    assert_eq!(json["visibility"], "public");
+    assert_eq!(json["queued_deliveries"], 1);
+    let id = json["id"].as_i64().unwrap();
+    // ap_id が canonical URL に書き直されていること。
+    assert_eq!(
+        json["ap_id"],
+        serde_json::Value::String(format!("https://example.test/notes/{id}"))
+    );
+
+    // delivery_queue に 1 行積まれ、宛先が bob の shared_inbox であること。
+    let inbox_count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) AS \"c!\" FROM delivery_queue WHERE inbox_url = $1",
+        "https://remote.test/inbox",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(inbox_count, 1);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_rejects_empty_content(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"content": "   "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_rejects_direct_visibility(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({"content": "x", "visibility": "direct"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn stream_emits_note_created_event_after_post(pool: PgPool) {
+    use http_body_util::BodyStream;
+    use tokio_stream::StreamExt as _;
+
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    // SSE を開いてから別タスクで POST を撃つ。subscriber が登録された後に
+    // publish が走ることを保証するため、まず stream を await して body を
+    // 取得→読み込み開始、その後 publisher を spawn する。
+    let stream_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/stream")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_resp.status(), StatusCode::OK);
+    let ct = stream_resp.headers().get(header::CONTENT_TYPE).unwrap();
+    assert!(
+        ct.to_str().unwrap().starts_with("text/event-stream"),
+        "SSE content-type: {ct:?}",
+    );
+
+    let body = stream_resp.into_body();
+    let mut stream = BodyStream::new(body);
+
+    // ここで `stream_resp` は既に解決済み (= `stream::handle` が
+    // `Sender::subscribe()` を呼び終えて Response を返した状態)。
+    // よって `Receiver` は broadcast channel に登録済みで、
+    // この後 publish される event は確実に受信される。POST を
+    // spawn せず直列に撃ち、sleep 同期を完全に排除する (PR #33 review #3)。
+    let req_body = serde_json::json!({"content": "broadcast me"});
+    let post_resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_resp.status(), StatusCode::CREATED);
+
+    // SSE フレームを最大 2 秒間待ち、`note.created` を見つけたら通過。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut buf = String::new();
+    let mut found = false;
+    while std::time::Instant::now() < deadline {
+        let Some(chunk) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+                .await
+                .ok()
+                .flatten()
+        else {
+            continue;
+        };
+        let frame = match chunk {
+            Ok(f) => f,
+            Err(err) => panic!("stream error: {err:?}"),
+        };
+        // BodyStream::next() yields hyper::body::Frame; we only care about data.
+        if let Ok(data) = frame.into_data() {
+            buf.push_str(std::str::from_utf8(&data).unwrap_or(""));
+            if buf.contains("event: note.created") && buf.contains("broadcast me") {
+                found = true;
+                break;
+            }
+        }
+    }
+    assert!(found, "SSE did not receive note.created event: {buf}");
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn token_revoke_invalidates_existing_token(pool: PgPool) {
     repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))

@@ -8,8 +8,10 @@ use reqwest::Client;
 use sakurasato_core::Config;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tokio::sync::broadcast;
 
 use crate::http_client;
+use crate::local_api::stream::{TIMELINE_CHANNEL_CAPACITY, TimelineEvent};
 
 #[derive(Clone, Debug)]
 pub struct AppState(Arc<Inner>);
@@ -19,6 +21,14 @@ struct Inner {
     config: Config,
     pool: PgPool,
     http: Client,
+    /// SSE (`GET /api/v1/stream`) を購読しているクライアントに新規 Note 等を
+    /// 配るための tokio broadcast channel。受信者ごとに `Sender::subscribe()`
+    /// で `Receiver` を取り、ハンドラが axum SSE Event に変換して流す。
+    ///
+    /// capacity を超えるとラギング (`RecvError::Lagged`) で古い順に drop
+    /// される ── SSE 接続が一時的に詰まっても publisher (POST notes 等) は
+    /// ブロックしない設計。capacity は [`TIMELINE_CHANNEL_CAPACITY`] を参照。
+    timeline_tx: broadcast::Sender<TimelineEvent>,
     /// versitygw (S3 互換) 向けクライアント。`from_config` は config から
     /// `access_key` / `secret_access_key` / endpoint / region を読んで構築し、
     /// `from_pool` (テスト) はダミー endpoint で構築する ── 本物の S3 に
@@ -59,11 +69,13 @@ impl AppState {
             .context("connect to PostgreSQL")?;
         let http = http_client::build_client()?;
         let s3 = build_s3_client(&config)?;
+        let (timeline_tx, _) = broadcast::channel(TIMELINE_CHANNEL_CAPACITY);
         Ok(Self(Arc::new(Inner {
             config,
             pool,
             http,
             s3,
+            timeline_tx,
             allow_internal_inbox: false,
             enable_remote_fetch: true,
         })))
@@ -80,11 +92,13 @@ impl AppState {
         // GET /media/<key> を叩くテストはコネクション失敗で 500 を返すだけ。
         let s3 =
             build_s3_client(&config).expect("aws-sdk-s3 builder is infallible from static creds");
+        let (timeline_tx, _) = broadcast::channel(TIMELINE_CHANNEL_CAPACITY);
         Self(Arc::new(Inner {
             config,
             pool,
             http,
             s3,
+            timeline_tx,
             allow_internal_inbox: true,
             enable_remote_fetch: false,
         }))
@@ -126,6 +140,16 @@ impl AppState {
     /// /media/{key}); writes arrive with media uploads in M4 PR2 / M7.
     pub fn s3_client(&self) -> &S3Client {
         &self.0.s3
+    }
+
+    /// SSE 配信用 broadcast sender。POST notes / 受信 Note dispatch から
+    /// `send(event)` を呼び、`GET /api/v1/stream` ハンドラが
+    /// [`broadcast::Sender::subscribe`] で `Receiver` を取って消費する。
+    ///
+    /// 受信者が居ない状態で送ると [`broadcast::Sender::send`] は `Err` を返すが、
+    /// publisher 側は気にせず無視する設計 (SSE を誰も購読していないのは正常)。
+    pub fn timeline_sender(&self) -> &broadcast::Sender<TimelineEvent> {
+        &self.0.timeline_tx
     }
 }
 
