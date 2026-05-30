@@ -18,6 +18,7 @@ mod tests {
         // 0001 actor / 0002 note / 0003 follow / 0004 delivery_queue
         // 0005 emoji / 0006 reaction
         // 0007 actor_ed25519 (M3b: デュアル鍵)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 7);
+        // 0008 api_token (M4: ローカル API Bearer 認証)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 8);
     }
 }

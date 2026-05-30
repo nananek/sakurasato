@@ -27,6 +27,8 @@ pub enum Command {
     /// hand-fire delivery rows from local federation tests (M3b-3 will
     /// replace this with a resident worker loop).
     Deliver(DeliverArgs),
+    /// Manage local API tokens (Bearer auth for the Unix-socket API).
+    Token(TokenArgs),
 }
 
 #[derive(Debug, Args)]
@@ -50,4 +52,36 @@ pub struct DeliverArgs {
     /// the queue to keep the surface tiny.
     #[arg(long)]
     pub queue_id: i64,
+}
+
+#[derive(Debug, Args)]
+pub struct TokenArgs {
+    #[command(subcommand)]
+    pub command: TokenCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// Issue a new token and print the raw value once to stdout. This is
+    /// the only time the raw token is shown — the DB only stores its hash.
+    Issue(TokenIssueArgs),
+    /// List existing tokens (id / name / created / `last_used`). The raw
+    /// token is intentionally not re-printed; reissue via `revoke` + `issue`.
+    List,
+    /// Hard-delete a token by id (from `list`).
+    Revoke(TokenRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TokenIssueArgs {
+    /// Human-readable label (e.g. "tui-laptop"). Duplicates are allowed.
+    #[arg(long)]
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct TokenRevokeArgs {
+    /// `api_token.id` from `sakurasato token list`.
+    #[arg(long)]
+    pub id: i64,
 }

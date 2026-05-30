@@ -1,0 +1,227 @@
+//! M4 PR1 統合テスト: `GET /notes/{id}` (Note パーマリンク HTML)。
+//!
+//! - 未知 id / remote-only note は 404。
+//! - 既知 local note は 200 + `text/html; charset=utf-8`、本文に HTML escape
+//!   された content が含まれる (PR1 はサニタイザ未実装で content も escape)。
+
+#![forbid(unsafe_code)]
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use http_body_util::BodyExt;
+use sakurasato_core::model::Visibility;
+use sakurasato_core::repo;
+use sqlx::PgPool;
+use tower::ServiceExt;
+
+mod common {
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::pkcs8::EncodePublicKey;
+    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+    use rsa::rand_core::OsRng;
+    use sakurasato_core::repo::actor::NewActor;
+
+    pub(super) fn sample_local_actor(username: &str, host: &str) -> NewActor {
+        let ap_id = format!("https://{host}/users/{username}");
+        NewActor {
+            ap_id: ap_id.clone(),
+            preferred_username: username.into(),
+            host: host.into(),
+            display_name: Some("Alice".into()),
+            summary: Some("hello".into()),
+            icon_url: None,
+            image_url: None,
+            inbox_url: format!("{ap_id}/inbox"),
+            shared_inbox_url: Some(format!("https://{host}/inbox")),
+            outbox_url: Some(format!("{ap_id}/outbox")),
+            followers_url: Some(format!("{ap_id}/followers")),
+            following_url: Some(format!("{ap_id}/following")),
+            public_key_id: format!("{ap_id}#main-key"),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----".into(),
+            private_key_pem: Some(
+                "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----".into(),
+            ),
+            ed25519_public_key_id: Some(format!("{ap_id}#ed25519-key")),
+            ed25519_public_key_pem: Some(sample_ed25519_public_pem()),
+            ed25519_private_key_pem: Some(
+                "-----BEGIN PRIVATE KEY-----\nMOCK-ED\n-----END PRIVATE KEY-----".into(),
+            ),
+            also_known_as: vec![],
+            moved_to_ap_id: None,
+            is_local: true,
+            actor_type: "Person".into(),
+        }
+    }
+
+    pub(super) fn sample_remote_actor(username: &str, host: &str) -> NewActor {
+        let mut a = sample_local_actor(username, host);
+        a.is_local = false;
+        // remote actor は秘密鍵を持たない。
+        a.private_key_pem = None;
+        a.ed25519_private_key_pem = None;
+        a
+    }
+
+    fn sample_ed25519_public_pem() -> String {
+        let signing = SigningKey::generate(&mut OsRng);
+        signing
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap()
+    }
+}
+
+fn make_config(host: &str) -> sakurasato_core::Config {
+    sakurasato_core::Config {
+        server: sakurasato_core::config::ServerConfig {
+            host: host.into(),
+            bind: "127.0.0.1:0".into(),
+            local_api_socket: "/tmp/sakurasato.sock".into(),
+            user: "alice".into(),
+        },
+        database: sakurasato_core::config::DatabaseConfig {
+            url: "unused-by-tests".into(),
+            password_file: None,
+        },
+        storage: sakurasato_core::config::StorageConfig {
+            endpoint: "http://localhost".into(),
+            bucket: "b".into(),
+            region: "us-east-1".into(),
+            access_key_id: "k".into(),
+            secret_access_key: "s".into(),
+            secret_access_key_file: None,
+        },
+        media_proxy: sakurasato_core::config::MediaProxyConfig {
+            socket: "/tmp/x".into(),
+            max_bytes: 1024,
+            max_pixels: 1024,
+        },
+    }
+}
+
+async fn insert_note(
+    pool: &PgPool,
+    actor_id: i64,
+    host: &str,
+    ap_suffix: &str,
+    content: &str,
+    is_local: bool,
+) -> i64 {
+    let ap_id = format!("https://{host}/notes/{ap_suffix}");
+    let row = repo::note::insert(
+        pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id,
+            actor_id,
+            content: content.into(),
+            language: Some("ja".into()),
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    row.id
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn permalink_404_for_unknown_id(pool: PgPool) {
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(Request::get("/notes/999999").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn permalink_404_for_remote_note(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, common::sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let id = insert_note(
+        &pool,
+        actor.id,
+        "remote.test",
+        "n1",
+        "remote content",
+        false,
+    )
+    .await;
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/notes/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn permalink_renders_local_note_with_escaped_content(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    // 攻撃者の content を想定: `<script>` が escape されずに出ると XSS。
+    let id = insert_note(
+        &pool,
+        actor.id,
+        "example.test",
+        "n1",
+        "<script>alert('x')</script>",
+        true,
+    )
+    .await;
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/notes/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+    assert_eq!(ct, "text/html; charset=utf-8");
+
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = std::str::from_utf8(&body).unwrap();
+
+    // content は HTML escape されている (M4 PR1 はサニタイザ未実装)。
+    assert!(
+        html.contains("&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;"),
+        "escaped content not found: {html}"
+    );
+    // 生 `<script>` が出ていないこと (XSS regression テスト)。
+    assert!(
+        !html.contains("<script>alert"),
+        "raw <script> leaked: {html}"
+    );
+    // actor へのリンクが入っていること。
+    assert!(
+        html.contains(r#"<a href="/users/alice""#),
+        "actor link missing: {html}"
+    );
+}

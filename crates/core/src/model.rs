@@ -176,6 +176,40 @@ pub struct ReactionRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Row of the `api_token` table (M4 PR1).
+///
+/// `token_hash` is the SHA-256 hex of the raw token; the raw value is never
+/// stored. The hash is itself sensitive enough — anyone with read access to
+/// this column could replay the token if they also obtained the original
+/// value — so we omit it from `Serialize` (defence-in-depth against
+/// accidentally rendering an `ApiTokenRow` through the local API) and
+/// redact it in `Debug` so `tracing::debug!(?row)` calls cannot leak it.
+#[derive(Clone, FromRow, Deserialize)]
+pub struct ApiTokenRow {
+    pub id: i64,
+    pub name: String,
+    /// `#[serde(skip)]` mirrors the protection applied to
+    /// [`ActorRow::private_key_pem`]: prevents external JSON from injecting
+    /// a `token_hash` via `serde_json::from_value::<ApiTokenRow>(...)` and
+    /// prevents accidental rendering through the local API.
+    #[serde(skip)]
+    pub token_hash: String,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for ApiTokenRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiTokenRow")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("token_hash", &"<redacted>")
+            .field("last_used_at", &self.last_used_at)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
 /// Visibility enum (mirrors the `note.visibility` column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

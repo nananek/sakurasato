@@ -75,6 +75,17 @@ subtle = "2"
 # http2: keep-alive と多重化で連合配送のレイテンシを抑える。
 # default-features = false にして native-tls / cookies / blocking 等の不要機能を切る。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "http2"] }
+# M4 PR1 メディア配信 (`GET /media/<key>`) で versitygw に S3 GET を投げるための SDK。
+# behavior-version-latest: aws-sdk 1.x で Config::build() 時に呼び出さなくても
+#   既定挙動を最新に揃える。
+# rt-tokio: tokio ランタイムで動かす (本プロジェクトはこれ一択)。
+# default-https-client: hyper-1 + rustls の組み合わせ — distroless で OpenSSL
+#   が無くても動くようにする。
+# default-features = false にしないと OpenSSL 系を引きうるので明示的に切る。
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+# `aws_sdk_s3::config::Credentials` の根本型。Static credentials を組み立てて
+# `Client::from_conf` に渡すために使う (aws-config を引かず軽く済ます)。
+aws-credential-types = "1"
 
 [profile.release]
 lto = "thin"
