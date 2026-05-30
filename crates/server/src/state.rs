@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use aws_credential_types::Credentials;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::config::{BehaviorVersion, Region};
 use reqwest::Client;
 use sakurasato_core::Config;
 use sqlx::PgPool;
@@ -16,6 +19,12 @@ struct Inner {
     config: Config,
     pool: PgPool,
     http: Client,
+    /// versitygw (S3 互換) 向けクライアント。`from_config` は config から
+    /// `access_key` / `secret_access_key` / endpoint / region を読んで構築し、
+    /// `from_pool` (テスト) はダミー endpoint で構築する ── 本物の S3 に
+    /// 出ていかない契約。`force_path_style` = true は versitygw が path-style
+    /// (`/<bucket>/<key>`) しか受けないため。
+    s3: S3Client,
     /// SSRF ガード ([`crate::net_guard::host_blocked`]) を緩めるかどうか。
     ///
     /// **本番経路 [`AppState::from_config`] は常に `false`** ── 配送ワーカが
@@ -49,10 +58,12 @@ impl AppState {
             .await
             .context("connect to PostgreSQL")?;
         let http = http_client::build_client()?;
+        let s3 = build_s3_client(&config)?;
         Ok(Self(Arc::new(Inner {
             config,
             pool,
             http,
+            s3,
             allow_internal_inbox: false,
             enable_remote_fetch: true,
         })))
@@ -65,10 +76,15 @@ impl AppState {
     /// 統合テスト用 inbox を `127.0.0.1` で立てるため。本番経路には影響しない。
     pub fn from_pool(pool: PgPool, config: Config) -> Self {
         let http = http_client::build_client().expect("reqwest builder is infallible in tests");
+        // テスト経路は実 S3 / versitygw に出ない契約。ダミー endpoint で構築。
+        // GET /media/<key> を叩くテストはコネクション失敗で 500 を返すだけ。
+        let s3 =
+            build_s3_client(&config).expect("aws-sdk-s3 builder is infallible from static creds");
         Self(Arc::new(Inner {
             config,
             pool,
             http,
+            s3,
             allow_internal_inbox: true,
             enable_remote_fetch: false,
         }))
@@ -105,4 +121,41 @@ impl AppState {
     pub fn local_actor_ap_id(&self, username: &str) -> String {
         format!("https://{}/users/{username}", self.0.config.server.host)
     }
+
+    /// S3 client targeting versitygw. Read-only operations (M4 PR1 = GET
+    /// /media/{key}); writes arrive with media uploads in M4 PR2 / M7.
+    pub fn s3_client(&self) -> &S3Client {
+        &self.0.s3
+    }
+}
+
+/// Build an aws-sdk-s3 [`Client`](S3Client) from [`StorageConfig`](sakurasato_core::config::StorageConfig).
+///
+/// - **Static credentials** from `access_key_id` + `resolved_secret_access_key`
+///   (file-backed when configured). No env / credential file lookups so the
+///   server doesn't accidentally pick up an unrelated `~/.aws/credentials`.
+/// - **Endpoint override** to point at versitygw (typically `http://versitygw:7070`).
+/// - **`force_path_style = true`** — versitygw serves `/<bucket>/<key>` only,
+///   not the virtual-hosted `<bucket>.s3....` form.
+/// - **`behavior_version_latest`** — required by aws-sdk-s3 1.x.
+fn build_s3_client(config: &Config) -> anyhow::Result<S3Client> {
+    let secret = config
+        .storage
+        .resolved_secret_access_key()
+        .context("resolve storage secret_access_key")?;
+    let creds = Credentials::new(
+        config.storage.access_key_id.clone(),
+        secret,
+        None,
+        None,
+        "sakurasato-config",
+    );
+    let s3_conf = aws_sdk_s3::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(config.storage.region.clone()))
+        .endpoint_url(config.storage.endpoint.clone())
+        .credentials_provider(creds)
+        .force_path_style(true)
+        .build();
+    Ok(S3Client::from_conf(s3_conf))
 }

@@ -94,3 +94,23 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Not
     .fetch_optional(pool)
     .await
 }
+
+pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> {
+    sqlx::query_as!(
+        NoteRow,
+        r#"
+        SELECT
+            id, ap_id, actor_id, content, language, in_reply_to_ap_id,
+            in_reply_to_note_id, summary, visibility, sensitive,
+            to_recipients as "to_recipients: Json<Vec<String>>",
+            cc_recipients as "cc_recipients: Json<Vec<String>>",
+            attachments as "attachments: Json<JsonValue>",
+            tags as "tags: Json<JsonValue>",
+            is_local, url, published_at, created_at, updated_at
+        FROM note WHERE id = $1
+        "#,
+        id,
+    )
+    .fetch_optional(pool)
+    .await
+}

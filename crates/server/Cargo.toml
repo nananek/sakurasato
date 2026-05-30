@@ -41,6 +41,8 @@ sha2.workspace = true
 subtle.workspace = true
 reqwest.workspace = true
 url.workspace = true
+aws-sdk-s3.workspace = true
+aws-credential-types.workspace = true
 
 [dev-dependencies]
 sakurasato-core = { workspace = true }

@@ -9,6 +9,7 @@
 //! / `reaction`, etc).
 
 pub mod actor;
+pub mod api_token;
 pub mod delivery_queue;
 pub mod emoji;
 pub mod follow;
