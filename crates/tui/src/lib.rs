@@ -42,6 +42,7 @@ pub mod app;
 pub mod client;
 pub mod compose;
 pub mod event;
+pub mod image_cache;
 pub mod runtime;
 pub mod sse;
 pub mod theme;
@@ -57,6 +58,11 @@ pub struct TuiOptions {
     /// テーマ名 (`sakura`/`dark`/`light` の組み込み、または `--theme-file` で
     /// 直接指定したパスの拡張子抜きファイル名)。
     pub theme: theme::Theme,
-    /// 1 ページ分のタイムライン取得件数。`/api/v1/timeline/home?limit=` に渡す。
+    /// 1 ページ分のタイクライン取得件数。`/api/v1/timeline/home?limit=` に渡す。
     pub page_size: i64,
+    /// 画像 (アバター) 表示を有効化する。`false` または terminal が
+    /// 画像プロトコル非対応のときはテキスト専用にフォールバックする。
+    /// M9 で要素別 (添付 / 絵文字 / プレビュー / アバター) の細粒度トグルに
+    /// 拡張する予定だが、PR2 では単一ブール。
+    pub images_enabled: bool,
 }

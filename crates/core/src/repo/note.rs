@@ -159,7 +159,8 @@ pub async fn list_home_timeline(
             n.is_local, n.url, n.published_at, n.created_at, n.updated_at,
             a.ap_id AS actor_ap_id,
             a.preferred_username AS actor_preferred_username,
-            a.display_name AS actor_display_name
+            a.display_name AS actor_display_name,
+            a.icon_url AS actor_icon_url
         FROM note n
         JOIN actor a ON a.id = n.actor_id
         WHERE
@@ -210,6 +211,10 @@ pub struct TimelineEntry {
     pub actor_ap_id: String,
     pub actor_preferred_username: String,
     pub actor_display_name: Option<String>,
+    /// 投稿主のアバター URL。リモート actor は HTTP(S) URL、ローカル actor は
+    /// 自インスタンス上の `/media/...` (M4 で配信開始)。M5 PR2 の TUI 画像表示
+    /// で使う ── 画像取得とデコードは server ではなく TUI 側で行う (CLAUDE.md §7)。
+    pub actor_icon_url: Option<String>,
 }
 
 pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> {

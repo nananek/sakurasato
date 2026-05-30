@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::client::{NoteCreatedPayload, TimelineNote, Whoami};
 use crate::compose::Compose;
+use crate::image_cache::ImageCache;
 use crate::theme::Theme;
 
 /// status line に表示するメッセージの種別。テーマの色 (success / warning /
@@ -68,10 +69,13 @@ pub struct App {
     pub should_quit: bool,
     /// 接続先 socket (status bar 表示用)。
     pub socket_label: String,
+    /// 画像 (アバター) キャッシュ。`Picker` 取得失敗時は無効化された Cache が
+    /// 入る (= ensure / get が no-op になり、UI もテキスト専用に落ちる)。
+    pub images: ImageCache,
 }
 
 impl App {
-    pub fn new(theme: Theme, whoami: Whoami, socket_label: String) -> Self {
+    pub fn new(theme: Theme, whoami: Whoami, socket_label: String, images: ImageCache) -> Self {
         Self {
             theme,
             whoami,
@@ -85,6 +89,7 @@ impl App {
             status: None,
             should_quit: false,
             socket_label,
+            images,
         }
     }
 
@@ -215,6 +220,7 @@ mod tests {
             actor_ap_id: actor.into(),
             actor_preferred_username: "me".into(),
             actor_display_name: None,
+            actor_icon_url: None,
             content: format!("note #{id}"),
             summary: None,
             language: None,
@@ -225,6 +231,15 @@ mod tests {
             published_at: Utc::now(),
             is_local: actor == "https://x.test/users/me",
         }
+    }
+
+    fn new_app() -> App {
+        App::new(
+            Theme::default(),
+            whoami(),
+            "test".into(),
+            ImageCache::new(None),
+        )
     }
 
     fn whoami() -> Whoami {
@@ -243,7 +258,7 @@ mod tests {
 
     #[test]
     fn ingest_note_created_dedupes_by_id() {
-        let mut app = App::new(Theme::default(), whoami(), "test".into());
+        let mut app = new_app();
         app.replace_timeline(vec![note(5, "https://x.test/users/me")], None);
         let payload = NoteCreatedPayload {
             id: 5,
@@ -252,6 +267,7 @@ mod tests {
             actor_ap_id: "https://x.test/users/me".into(),
             actor_preferred_username: "me".into(),
             actor_display_name: None,
+            actor_icon_url: None,
             content: "dup".into(),
             summary: None,
             visibility: "public".into(),
@@ -266,7 +282,7 @@ mod tests {
 
     #[test]
     fn ingest_note_created_marks_local_from_whoami() {
-        let mut app = App::new(Theme::default(), whoami(), "test".into());
+        let mut app = new_app();
         let payload = NoteCreatedPayload {
             id: 9,
             ap_id: "https://x.test/notes/9".into(),
@@ -274,6 +290,7 @@ mod tests {
             actor_ap_id: "https://x.test/users/me".into(),
             actor_preferred_username: "me".into(),
             actor_display_name: None,
+            actor_icon_url: None,
             content: "x".into(),
             summary: None,
             visibility: "public".into(),
@@ -287,7 +304,7 @@ mod tests {
 
     #[test]
     fn select_next_clamped_at_end() {
-        let mut app = App::new(Theme::default(), whoami(), "t".into());
+        let mut app = new_app();
         app.replace_timeline(
             vec![
                 note(3, "https://x.test/users/me"),
@@ -303,7 +320,7 @@ mod tests {
 
     #[test]
     fn ensure_visible_scrolls_top() {
-        let mut app = App::new(Theme::default(), whoami(), "t".into());
+        let mut app = new_app();
         app.replace_timeline(
             (0..50)
                 .map(|i| note(50 - i, "https://x.test/users/me"))
@@ -320,7 +337,7 @@ mod tests {
 
     #[test]
     fn status_expires_after_ttl() {
-        let mut app = App::new(Theme::default(), whoami(), "t".into());
+        let mut app = new_app();
         app.set_status("hi", StatusKind::Info, Some(Duration::from_millis(1)));
         std::thread::sleep(Duration::from_millis(5));
         app.tick();

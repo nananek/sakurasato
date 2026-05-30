@@ -145,6 +145,7 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         actor_ap_id: local_actor.ap_id.clone(),
         actor_preferred_username: local_actor.preferred_username.clone(),
         actor_display_name: local_actor.display_name.clone(),
+        actor_icon_url: local_actor.icon_url.clone(),
         content: req.content.clone(),
         summary: prepared.summary.clone(),
         visibility: visibility.as_str().to_string(),

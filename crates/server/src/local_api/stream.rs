@@ -64,6 +64,9 @@ pub struct NoteCreatedPayload {
     pub actor_ap_id: String,
     pub actor_preferred_username: String,
     pub actor_display_name: Option<String>,
+    /// 投稿主のアバター URL (= [`super::timeline::TimelineNote::actor_icon_url`] と同じ)。
+    /// SSE で先頭挿入された行も初回ロードと同じ avatar 表示パスを通すために載せる。
+    pub actor_icon_url: Option<String>,
     pub content: String,
     pub summary: Option<String>,
     pub visibility: String,

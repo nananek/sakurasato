@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,\n            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,\n            n.to_recipients as \"to_recipients: Json<Vec<String>>\",\n            n.cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            n.attachments as \"attachments: Json<JsonValue>\",\n            n.tags as \"tags: Json<JsonValue>\",\n            n.is_local, n.url, n.published_at, n.created_at, n.updated_at,\n            a.ap_id AS actor_ap_id,\n            a.preferred_username AS actor_preferred_username,\n            a.display_name AS actor_display_name\n        FROM note n\n        JOIN actor a ON a.id = n.actor_id\n        WHERE\n            n.visibility <> 'direct'\n            AND (\n                n.actor_id = $1\n                OR n.actor_id IN (\n                    SELECT followed_actor_id\n                    FROM follow\n                    WHERE follower_actor_id = $1 AND state = 'accepted'\n                )\n            )\n            AND ($2::BIGINT IS NULL OR n.id < $2)\n        ORDER BY n.id DESC\n        LIMIT $3\n        ",
+  "query": "\n        SELECT\n            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,\n            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,\n            n.to_recipients as \"to_recipients: Json<Vec<String>>\",\n            n.cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            n.attachments as \"attachments: Json<JsonValue>\",\n            n.tags as \"tags: Json<JsonValue>\",\n            n.is_local, n.url, n.published_at, n.created_at, n.updated_at,\n            a.ap_id AS actor_ap_id,\n            a.preferred_username AS actor_preferred_username,\n            a.display_name AS actor_display_name,\n            a.icon_url AS actor_icon_url\n        FROM note n\n        JOIN actor a ON a.id = n.actor_id\n        WHERE\n            n.visibility <> 'direct'\n            AND (\n                n.actor_id = $1\n                OR n.actor_id IN (\n                    SELECT followed_actor_id\n                    FROM follow\n                    WHERE follower_actor_id = $1 AND state = 'accepted'\n                )\n            )\n            AND ($2::BIGINT IS NULL OR n.id < $2)\n        ORDER BY n.id DESC\n        LIMIT $3\n        ",
   "describe": {
     "columns": [
       {
@@ -244,6 +244,17 @@
             "name": "display_name"
           }
         }
+      },
+      {
+        "ordinal": 22,
+        "name": "actor_icon_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "icon_url"
+          }
+        }
       }
     ],
     "parameters": {
@@ -275,8 +286,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "68cec37df783aad6a575b7b5b10ff02f18c21cc1e48b78f2b1571b27b9c9a037"
+  "hash": "4fb890eb07f61ae066c4f4d33eaefb890a954e9bdeefc5f6a9250ce05bd6f9aa"
 }

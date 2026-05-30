@@ -10,10 +10,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyEventState, KeyModifiers,
-};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -29,6 +26,7 @@ use crate::app::{App, Focus, StatusKind};
 use crate::client::{ApiError, CreateNoteRequest, LocalApi, StreamEvent};
 use crate::compose::Visibility;
 use crate::event::{Action, translate};
+use crate::image_cache::ImageCache;
 use crate::sse;
 use crate::theme::Theme;
 use crate::ui;
@@ -58,7 +56,31 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
     );
 
     let socket_label = api.socket().display().to_string();
-    let mut app = App::new(options.theme.clone(), whoami, socket_label);
+
+    // Picker は端末を実際に問い合わせる (escape sequence 送出 → 応答待ち)。
+    // alt screen / raw mode に切り替える **前** に呼ぶのが穏当 ── 失敗しても
+    // 画像表示は単に無効化するだけで TUI は続行する。Kitty 等で `?` を出すと
+    // Foot や非対応端末では即座に Err になり、grace-degrade する。
+    let picker = if options.images_enabled {
+        match ratatui_image::picker::Picker::from_query_stdio() {
+            Ok(p) => {
+                info!(?p, "TUI: ratatui-image picker initialized");
+                Some(p)
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "TUI: failed to query terminal graphics; images disabled"
+                );
+                None
+            }
+        }
+    } else {
+        info!("TUI: images disabled by --no-images");
+        None
+    };
+    let images = ImageCache::new(picker);
+    let mut app = App::new(options.theme.clone(), whoami, socket_label, images);
 
     // 初回タイムライン取得。
     match api.timeline_home(None, options.page_size).await {
@@ -431,18 +453,6 @@ fn restore_terminal(terminal: &mut TuiTerminal) -> anyhow::Result<()> {
     .context("leave alternate screen + mouse capture")?;
     terminal.show_cursor().context("show cursor")?;
     Ok(())
-}
-
-// `KeyEvent` の helper を `event.rs` に閉じ込めると不便なので、ここで public。
-// テストで `EventStream` の代わりに `KeyEvent` を生で投げる経路に使う。
-#[allow(dead_code)]
-pub(crate) fn key_event(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-    KeyEvent {
-        code,
-        modifiers: mods,
-        kind: KeyEventKind::Press,
-        state: KeyEventState::NONE,
-    }
 }
 
 #[cfg(test)]
