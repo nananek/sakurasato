@@ -268,6 +268,7 @@ mod tests {
             scheme: SigScheme::Cavage,
             key_id: actor.public_key_id.clone(),
             key_kind: KeyKind::Rsa,
+            label: None,
         };
         let headers: HeaderMap = req.headers().clone();
         let ctx = RequestContext {
@@ -345,6 +346,7 @@ mod tests {
             scheme: SigScheme::Cavage,
             key_id: actor.public_key_id.clone(),
             key_kind: KeyKind::Rsa,
+            label: None,
         };
         let headers: HeaderMap = req.headers().clone();
         let ctx = RequestContext {
