@@ -97,6 +97,25 @@ pub async fn actor_json(State(state): State<AppState>, Path(name): Path<String>)
         }
     };
 
+    let json = build_actor_json(&row);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/activity+json"),
+    );
+    (headers, Json(json)).into_response()
+}
+
+/// `ActorRow` から `ActivityPub` actor JSON を組み立てる。
+///
+/// M3a 以来 `actor_json` ハンドラ専用だったが、M7 で **Update Activity** の
+/// `object` フィールドにも actor JSON を載せる必要が出たので、ハンドラ外
+/// から再利用できるように切り出した。
+///
+/// `row.private_key_pem` は **常に** レスポンスに含めない (公開鍵側だけ載せる)。
+/// 呼び出し側は `ActorJson` → `serde_json::to_value(..)` で `object` に
+/// 埋め込める。
+pub fn build_actor_json(row: &sakurasato_core::model::ActorRow) -> ActorJson {
     // Ed25519 鍵が登録されていれば assertionMethod に Multikey として並べる。
     // PEM パース失敗は 500 にせず、警告ログを残して omit する: RSA だけでも
     // 連合は機能するし、500 で actor 取得が永続的に壊れるよりはマシ。
@@ -133,42 +152,36 @@ pub async fn actor_json(State(state): State<AppState>, Path(name): Path<String>)
         ));
     }
 
-    let json = ActorJson {
+    ActorJson {
         context,
-        actor_type: row.actor_type,
+        actor_type: row.actor_type.clone(),
         id: row.ap_id.clone(),
-        preferred_username: row.preferred_username,
-        name: row.display_name,
-        summary: row.summary,
-        inbox: row.inbox_url,
-        outbox: row.outbox_url,
-        followers: row.followers_url,
-        following: row.following_url,
+        preferred_username: row.preferred_username.clone(),
+        name: row.display_name.clone(),
+        summary: row.summary.clone(),
+        inbox: row.inbox_url.clone(),
+        outbox: row.outbox_url.clone(),
+        followers: row.followers_url.clone(),
+        following: row.following_url.clone(),
         public_key: PublicKey {
-            id: row.public_key_id,
+            id: row.public_key_id.clone(),
             owner: row.ap_id.clone(),
-            public_key_pem: row.public_key_pem,
+            public_key_pem: row.public_key_pem.clone(),
         },
         assertion_method,
-        icon: row.icon_url.map(|url| MediaAttachment {
+        icon: row.icon_url.clone().map(|url| MediaAttachment {
             media_type: "Image",
             url,
         }),
-        image: row.image_url.map(|url| MediaAttachment {
+        image: row.image_url.clone().map(|url| MediaAttachment {
             media_type: "Image",
             url,
         }),
-        also_known_as: row.also_known_as.0,
-        moved_to: row.moved_to_ap_id,
+        also_known_as: row.also_known_as.0.clone(),
+        moved_to: row.moved_to_ap_id.clone(),
         endpoints: row
             .shared_inbox_url
+            .clone()
             .map(|url| Endpoints { shared_inbox: url }),
-    };
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/activity+json"),
-    );
-    (headers, Json(json)).into_response()
+    }
 }

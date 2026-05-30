@@ -34,19 +34,23 @@ use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use sakurasato_core::model::{ActorRow, Visibility};
+use sakurasato_core::model::{ActorRow, MediaRow, Visibility};
 use sakurasato_core::repo;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use tracing::{error, warn};
 
 use crate::delivery;
+use crate::local_api::media::build_media_url;
 use crate::local_api::stream::{NoteCreatedPayload, TimelineEvent};
 use crate::state::AppState;
 
 const CONTENT_MAX: usize = 5_000;
 const SUMMARY_MAX: usize = 200;
 const PUBLIC_URI: &str = "https://www.w3.org/ns/activitystreams#Public";
+/// 添付の最大件数。Mastodon API の 4 件と揃える ── 連合相手にも違和感が
+/// 出ない値で、お一人様サーバとしても十分。
+const ATTACHMENT_MAX: usize = 4;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateNoteRequest {
@@ -61,6 +65,11 @@ pub struct CreateNoteRequest {
     pub language: Option<String>,
     #[serde(default)]
     pub in_reply_to_ap_id: Option<String>,
+    /// M7: 添付メディアの `media.id` 配列。事前に
+    /// `POST /api/v1/media?kind=attachment` で上げておいた行を指す。
+    /// 重複は除去され、最大 [`ATTACHMENT_MAX`] 件 (Mastodon と揃えて 4)。
+    #[serde(default)]
+    pub attachment_ids: Vec<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,8 +110,16 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         }
     };
 
+    // M7: 添付メディアを先に DB から引いて、所有者・kind・未紐付けを確認する。
+    // 同一 tx で attach するので Vec<MediaRow> をここで握っておき、tx 内で
+    // attach_to_note を呼ぶ。
+    let attachments = match load_attachments(&state, &local_actor, &req.attachment_ids).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
     let published_at = Utc::now();
-    let prepared = PreparedNote::from_request(&req, &local_actor, visibility);
+    let prepared = PreparedNote::from_request(&req, &local_actor, visibility, &attachments, &state);
 
     let Ok(inserted) = persist_note(
         &state,
@@ -111,6 +128,7 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         &prepared,
         visibility,
         published_at,
+        &attachments,
     )
     .await
     else {
@@ -133,6 +151,7 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         req.in_reply_to_ap_id.as_deref(),
         &prepared.to,
         &prepared.cc,
+        &prepared.attachment_documents,
         published_at,
     );
     let queued = enqueue_to_followers(&state, &local_actor, &activity).await;
@@ -183,15 +202,29 @@ struct PreparedNote {
     sensitive: bool,
     to: Vec<String>,
     cc: Vec<String>,
+    /// `note.attachments` JSONB に書き込む AP Document 配列。
+    /// `build_create_activity` にも渡して `Note.attachment` に同値を載せる。
+    attachment_documents: Vec<JsonValue>,
 }
 
 impl PreparedNote {
-    fn from_request(req: &CreateNoteRequest, actor: &ActorRow, visibility: Visibility) -> Self {
+    fn from_request(
+        req: &CreateNoteRequest,
+        actor: &ActorRow,
+        visibility: Visibility,
+        attachments: &[MediaRow],
+        state: &AppState,
+    ) -> Self {
         let followers_url = actor
             .followers_url
             .clone()
             .unwrap_or_else(|| format!("{}/followers", actor.ap_id));
         let (to, cc) = recipients_for(visibility, &followers_url);
+        let host = &state.config().server.host;
+        let attachment_documents = attachments
+            .iter()
+            .map(|m| attachment_document(host, m))
+            .collect();
         Self {
             summary: req
                 .summary
@@ -201,12 +234,97 @@ impl PreparedNote {
             sensitive: req.sensitive.unwrap_or(false),
             to,
             cc,
+            attachment_documents,
         }
     }
 }
 
-/// 入力 → DB 行: tx で `insert` + `set_ap_id_and_url`。成功時は `id`、
-/// 失敗時はログだけ残して `Err(())` (上位は 503 で吸収)。
+/// 1 件の `media` 行を AP の `Document` JSON にする。
+///
+/// AS2 `Document` で `mediaType` + `url` + `name` (alt) を載せる。`width` /
+/// `height` は Mastodon 拡張だが幅広く受け入れられている (Misskey も読む)。
+fn attachment_document(host: &str, m: &MediaRow) -> JsonValue {
+    let mut obj = json!({
+        "type": "Document",
+        "mediaType": m.media_type,
+        "url": build_media_url(host, &m.storage_key),
+        "width": m.width,
+        "height": m.height,
+    });
+    if let Some(alt) = m.alt_text.as_ref()
+        && !alt.is_empty()
+    {
+        obj["name"] = JsonValue::String(alt.clone());
+    }
+    obj
+}
+
+/// 添付メディア id を順序保ったまま `MediaRow` 配列に解決する。
+///
+/// - 重複 id は最初の出現だけ残す ── 同じ画像を 2 回貼る意味は無い。
+/// - 件数上限 [`ATTACHMENT_MAX`] を超えたら 400。
+/// - 各 id について「DB に存在する / 所有者一致 / `note_id IS NULL`」を確認。
+///   `note_id` が既に埋まっていれば「他 Note の添付」なので拒否する。
+async fn load_attachments(
+    state: &AppState,
+    local_actor: &ActorRow,
+    ids: &[i64],
+) -> Result<Vec<MediaRow>, Response> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if ids.len() > ATTACHMENT_MAX {
+        return Err(bad_request("attachment_ids exceeds the 4-item limit"));
+    }
+    // 順序保ったまま dedupe。`Vec::contains` は O(n) だが、N <= 4 なので
+    // HashSet を引かない方が小さく早い。
+    let mut deduped: Vec<i64> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !deduped.contains(id) {
+            deduped.push(*id);
+        }
+    }
+
+    let rows = match repo::media::list_by_ids(state.pool(), &deduped).await {
+        Ok(v) => v,
+        Err(err) => {
+            error!(?err, "POST /api/v1/notes: media lookup failed");
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+    };
+    // 配列 → id 引き map。順序復元のため一旦索引化する。
+    let mut by_id: std::collections::HashMap<i64, MediaRow> =
+        rows.into_iter().map(|m| (m.id, m)).collect();
+    let mut ordered: Vec<MediaRow> = Vec::with_capacity(deduped.len());
+    for id in &deduped {
+        let Some(row) = by_id.remove(id) else {
+            return Err(bad_request_owned(&format!(
+                "attachment media id {id} not found"
+            )));
+        };
+        if row.owner_actor_id != local_actor.id {
+            warn!(
+                media_id = id,
+                owner = row.owner_actor_id,
+                "POST /api/v1/notes: attachment owner mismatch"
+            );
+            return Err(error_with_body(
+                StatusCode::FORBIDDEN,
+                "attachment is not owned by the local actor",
+            ));
+        }
+        if row.note_id.is_some() {
+            return Err(bad_request_owned(&format!(
+                "attachment media id {id} is already attached to another note"
+            )));
+        }
+        ordered.push(row);
+    }
+    Ok(ordered)
+}
+
+/// 入力 → DB 行: tx で `insert` + `set_ap_id_and_url` + (M7) `attach_to_note`。
+/// 成功時は `id`、失敗時はログだけ残して `Err(())` (上位は 503 で吸収)。
 async fn persist_note(
     state: &AppState,
     local_actor: &ActorRow,
@@ -214,6 +332,7 @@ async fn persist_note(
     prepared: &PreparedNote,
     visibility: Visibility,
     published_at: chrono::DateTime<chrono::Utc>,
+    attachments: &[MediaRow],
 ) -> Result<i64, ()> {
     let mut tx = match state.pool().begin().await {
         Ok(tx) => tx,
@@ -253,7 +372,7 @@ async fn persist_note(
         sensitive: prepared.sensitive,
         to_recipients: prepared.to.clone(),
         cc_recipients: prepared.cc.clone(),
-        attachments: JsonValue::Array(vec![]),
+        attachments: JsonValue::Array(prepared.attachment_documents.clone()),
         tags: JsonValue::Array(vec![]),
         is_local: true,
         url: None,
@@ -285,6 +404,30 @@ async fn persist_note(
             "POST /api/v1/notes: set_ap_id_and_url failed"
         );
         return Err(());
+    }
+    // M7: 添付メディア行を `note_id` でこの Note に紐付ける。`attach_to_note`
+    // は所有者一致 + `note_id IS NULL` の行だけ更新するので、`load_attachments`
+    // と二重に保護される (= 検査と更新の間に他リクエストが奪っても rows_affected
+    // で検知できる)。`rows_affected != attachments.len()` なら誰かに横取り
+    // されているので tx ロールバック扱いで失敗にする。
+    if !attachments.is_empty() {
+        let ids: Vec<i64> = attachments.iter().map(|m| m.id).collect();
+        let updated =
+            match repo::media::attach_to_note(&mut *tx, &ids, local_actor.id, inserted.id).await {
+                Ok(n) => n,
+                Err(err) => {
+                    error!(?err, "POST /api/v1/notes: media attach_to_note failed");
+                    return Err(());
+                }
+            };
+        if usize::try_from(updated).unwrap_or(usize::MAX) != attachments.len() {
+            warn!(
+                expected = attachments.len(),
+                actually_attached = updated,
+                "POST /api/v1/notes: attachment race detected; aborting tx"
+            );
+            return Err(());
+        }
     }
     if let Err(err) = tx.commit().await {
         error!(?err, "POST /api/v1/notes: tx commit failed");
@@ -415,6 +558,7 @@ fn build_create_activity(
     in_reply_to: Option<&str>,
     to: &[String],
     cc: &[String],
+    attachments: &[JsonValue],
     published_at: chrono::DateTime<chrono::Utc>,
 ) -> JsonValue {
     let published = published_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -440,6 +584,9 @@ fn build_create_activity(
     if let Some(reply) = in_reply_to {
         note["inReplyTo"] = JsonValue::String(reply.into());
     }
+    if !attachments.is_empty() {
+        note["attachment"] = JsonValue::Array(attachments.to_vec());
+    }
 
     json!({
         "@context": "https://www.w3.org/ns/activitystreams",
@@ -454,6 +601,10 @@ fn build_create_activity(
 }
 
 fn bad_request(reason: &'static str) -> Response {
+    error_with_body(StatusCode::BAD_REQUEST, reason)
+}
+
+fn bad_request_owned(reason: &str) -> Response {
     error_with_body(StatusCode::BAD_REQUEST, reason)
 }
 

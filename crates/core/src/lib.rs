@@ -20,6 +20,7 @@ mod tests {
         // 0005 emoji / 0006 reaction
         // 0007 actor_ed25519 (M3b: デュアル鍵)
         // 0008 api_token (M4: ローカル API Bearer 認証)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 8);
+        // 0009 media (M7: アップロードメディアのメタデータ)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 9);
     }
 }

@@ -210,6 +210,30 @@ impl std::fmt::Debug for ApiTokenRow {
     }
 }
 
+/// Row of the `media` table (M7).
+///
+/// `media-proxy` でサニタイズ後に versitygw へ格納された画像メタデータ。
+/// `storage_key` は `media/<sha256>.webp` 形式で、`GET /media/{key}` に
+/// そのまま渡る (`routes::media::handle`)。
+///
+/// `kind` は 'avatar' / 'header' / 'attachment' のいずれか (`CHECK` 制約)。
+/// `note_id` は添付として紐付いた Note。NULL は未紐付け。
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct MediaRow {
+    pub id: i64,
+    pub storage_key: String,
+    pub media_type: String,
+    pub width: i32,
+    pub height: i32,
+    pub byte_size: i64,
+    pub kind: String,
+    pub alt_text: Option<String>,
+    pub owner_actor_id: i64,
+    pub note_id: Option<i64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Visibility enum (mirrors the `note.visibility` column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

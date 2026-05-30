@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE media\n        SET note_id = $1, updated_at = now()\n        WHERE id = ANY($2)\n          AND owner_actor_id = $3\n          AND note_id IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8Array",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "decf121219b860c96024fcee1769575bd18a823dda998b560f76b83f8f9f8e46"
+}
