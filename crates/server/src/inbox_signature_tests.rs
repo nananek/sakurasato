@@ -246,6 +246,17 @@ fn now_http_date() -> String {
     httpdate::fmt_http_date(std::time::SystemTime::now())
 }
 
+/// 検証成功 → dispatch でも 202 で受理されるよう、F3 ([`crate::dispatch::verify_body_actor`])
+/// を満たす最小 body を組み立てる。
+///
+/// `type` は M3b-3 PR2 で未実装の `Announce` を使う ── dispatch の default
+/// アームに落ちて handler を経由せず 202 で返るので、local actor の seed が
+/// 不要 (= ここでのテストはあくまで「署名検証が通って handler に届く」だけ
+/// を確認する)。
+fn minimal_body_for(signer_ap_id: &str) -> Vec<u8> {
+    format!(r#"{{"type":"Announce","actor":"{signer_ap_id}"}}"#).into_bytes()
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn cavage_rsa_valid_signature_is_accepted(pool: PgPool) {
     let (priv_pem, pub_pem) = fresh_rsa();
@@ -255,9 +266,10 @@ async fn cavage_rsa_valid_signature_is_accepted(pool: PgPool) {
     let state = AppState::from_pool(pool, make_config());
     let app = router(state);
 
-    let body = br#"{"type":"Follow"}"#;
-    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#main-key");
-    let req = build_cavage_post(body, &priv_pem, &keyid, &now_http_date(), None);
+    let signer = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}");
+    let body = minimal_body_for(&signer);
+    let keyid = format!("{signer}#main-key");
+    let req = build_cavage_post(&body, &priv_pem, &keyid, &now_http_date(), None);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
@@ -277,9 +289,10 @@ async fn rfc9421_ed25519_valid_signature_is_accepted(pool: PgPool) {
     let state = AppState::from_pool(pool, make_config());
     let app = router(state);
 
-    let body = br#"{"type":"Follow"}"#;
-    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#ed25519-key");
-    let req = build_rfc9421_post(body, &ed_priv, &keyid, &now_http_date());
+    let signer = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}");
+    let body = minimal_body_for(&signer);
+    let keyid = format!("{signer}#ed25519-key");
+    let req = build_rfc9421_post(&body, &ed_priv, &keyid, &now_http_date());
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
@@ -423,17 +436,18 @@ async fn user_inbox_path_also_verifies_signature(pool: PgPool) {
     let state = AppState::from_pool(pool, make_config());
     let app = router(state);
 
-    let body = br#"{"type":"Follow"}"#;
-    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#main-key");
+    let signer = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}");
+    let body = minimal_body_for(&signer);
+    let keyid = format!("{signer}#main-key");
     let path = "/users/alice/inbox";
     let date = now_http_date();
-    let digest_value = digest::format_cavage(body);
+    let digest_value = digest::format_cavage(&body);
     let req_partial = Request::post(path)
         .header("host", HOST)
         .header("date", &date)
         .header("digest", &digest_value)
         .header("content-type", "application/activity+json")
-        .body(Body::from(body.to_vec()))
+        .body(Body::from(body.clone()))
         .unwrap();
     let req_headers = req_partial.headers().clone();
     let covered = ["(request-target)", "host", "date", "digest"];

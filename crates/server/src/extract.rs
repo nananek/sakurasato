@@ -20,6 +20,7 @@ use axum::http::Request;
 use sakurasato_core::model::ActorRow;
 use sakurasato_core::repo;
 
+use crate::remote_actor;
 use crate::sign::{self, RequestContext, SigError, SigScheme, keyid};
 use crate::state::AppState;
 
@@ -62,20 +63,44 @@ where
         // 2. 署名スキームと keyId を抽出 (DB アクセスなし)。
         let info = sign::extract_signature_info(&headers)?;
 
-        // 3. keyId → ap_id を取り出して actor を引く。未知なら 401。
+        // 3. keyId → ap_id を取り出して actor を引く。M3b-3 PR2 以降は
+        // DB に無い場合 remote から fetch して upsert を試みる。
+        // DB エラーと「actor が存在しない」を分離 (F6): DB 障害なら
+        // 503 を返して Mastodon 系の長めのリトライ保持に乗せる。
         let parsed_keyid =
             keyid::parse(&info.key_id).map_err(|e| SigError::KeyIdMalformed(e.to_string()))?;
-        // DB エラーと「actor が存在しない」を分離 (F6): DB 障害なら
-        // 503 を返して Mastodon 系の長めのリトライ保持に乗せる。actor が
-        // 居ないだけなら 401 で再送ループに乗せ、M3b-3 の remote fetch で
-        // 補完されるのを待つ。
-        let actor = repo::actor::get_by_ap_id(state.pool(), parsed_keyid.ap_id)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, ap_id = %parsed_keyid.ap_id, "DB error during actor lookup");
-                SigError::Internal
-            })?
-            .ok_or(SigError::UnknownActor)?;
+        let ap_id = parsed_keyid.ap_id;
+        let actor = match repo::actor::get_by_ap_id(state.pool(), ap_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) if !state.enable_remote_fetch() => {
+                // テスト経路 (`AppState::from_pool`) では remote fetch を
+                // 無効化する ── 統合テストが実 DNS / 実ネットワークに到達
+                // しないようにするため。未知 keyId は即 401 で再送ループに
+                // 乗せる (PR1 と同じ挙動)。
+                return Err(SigError::UnknownActor);
+            }
+            Ok(None) => {
+                // 未知 actor → remote fetch を試みる。SSRF ガード・redirect
+                // 拒否・size 上限は [`remote_actor`] が責任を持つ。失敗は
+                // 401 (UnknownActor) に倒して Mastodon の再送ループに乗せる。
+                tracing::info!(ap_id, "actor not in DB; attempting remote fetch");
+                match remote_actor::fetch_and_upsert_for_signature(state, ap_id).await {
+                    Ok(row) => row,
+                    Err(remote_actor::FetchError::Db(e)) => {
+                        tracing::error!(error = %e, ap_id, "DB error during remote actor upsert");
+                        return Err(SigError::Internal);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, ap_id, "remote actor fetch failed");
+                        return Err(SigError::UnknownActor);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, ap_id, "DB error during actor lookup");
+                return Err(SigError::Internal);
+            }
+        };
 
         // 4. target_uri と path_and_query を組み立てる。
         let path_and_query = uri
