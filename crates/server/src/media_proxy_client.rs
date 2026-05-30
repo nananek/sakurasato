@@ -84,6 +84,12 @@ pub struct ProcessedImage {
     /// `Content-Type` ヘッダ。常に `image/webp` だが、media-proxy 側の挙動
     /// 変更に追従できるよう型に持つ。
     pub content_type: String,
+    /// 変換後の幅 (px)。media-proxy が `X-Output-Width` で返した値。
+    /// パースできなかったときは `None`。M7 のアップロード経路ではメタデータ
+    /// として DB に保存する。
+    pub width: Option<u32>,
+    /// 変換後の高さ (px)。`width` と同じく `X-Output-Height` 由来。
+    pub height: Option<u32>,
 }
 
 impl MediaProxyClient {
@@ -125,7 +131,6 @@ impl MediaProxyClient {
 
     /// `POST /v1/image/sanitize` — 受け取ったバイト列を再エンコードして返す。
     /// M7 (アップロード) で使う想定。
-    #[allow(dead_code)] // M7 で server::routes::upload から呼ぶ。
     pub async fn sanitize_image(
         &self,
         bytes: Bytes,
@@ -167,6 +172,8 @@ impl MediaProxyClient {
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        let width = header_u32(resp.headers(), "x-output-width");
+        let height = header_u32(resp.headers(), "x-output-height");
         let bytes = read_limited_body(resp.into_body()).await?;
 
         if !status.is_success() {
@@ -192,8 +199,15 @@ impl MediaProxyClient {
         Ok(ProcessedImage {
             bytes,
             content_type,
+            width,
+            height,
         })
     }
+}
+
+/// HTTP ヘッダから `u32` を引き出す。欠如 / パース失敗時は `None`。
+fn header_u32(headers: &http::HeaderMap, name: &str) -> Option<u32> {
+    headers.get(name)?.to_str().ok()?.parse().ok()
 }
 
 async fn read_limited_body(body: Incoming) -> Result<Bytes, MediaProxyError> {

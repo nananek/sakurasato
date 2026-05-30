@@ -217,6 +217,54 @@ pub async fn mark_fetched(pool: &PgPool, id: i64) -> sqlx::Result<()> {
     .map(|_| ())
 }
 
+/// Update the editable profile fields of a local actor (M7).
+///
+/// `display_name` / `summary` / `icon_url` / `image_url` のうち `Some` を
+/// 渡したフィールドだけ書き換える。`None` は「触らない」を意味する
+/// (= NULL を入れたいときは `Some(None)` を渡す ─ そのため Option<Option<...>>)。
+///
+/// 返り値は更新後の actor 行。
+pub async fn update_profile(
+    pool: &PgPool,
+    id: i64,
+    display_name: Option<Option<String>>,
+    summary: Option<Option<String>>,
+    icon_url: Option<Option<String>>,
+    image_url: Option<Option<String>>,
+) -> sqlx::Result<crate::model::ActorRow> {
+    sqlx::query_as!(
+        crate::model::ActorRow,
+        r#"
+        UPDATE actor SET
+            display_name = CASE WHEN $2::BOOLEAN THEN $3 ELSE display_name END,
+            summary      = CASE WHEN $4::BOOLEAN THEN $5 ELSE summary      END,
+            icon_url     = CASE WHEN $6::BOOLEAN THEN $7 ELSE icon_url     END,
+            image_url    = CASE WHEN $8::BOOLEAN THEN $9 ELSE image_url    END,
+            updated_at   = now()
+        WHERE id = $1
+        RETURNING
+            id, ap_id, preferred_username, host, display_name, summary,
+            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
+            followers_url, following_url, public_key_id, public_key_pem,
+            private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
+            also_known_as as "also_known_as: Json<Vec<String>>",
+            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+        "#,
+        id,
+        display_name.is_some(),
+        display_name.flatten(),
+        summary.is_some(),
+        summary.flatten(),
+        icon_url.is_some(),
+        icon_url.flatten(),
+        image_url.is_some(),
+        image_url.flatten(),
+    )
+    .fetch_one(pool)
+    .await
+}
+
 /// Delete an actor by primary key. Used by the `init --force` admin path
 /// when re-issuing the local signing key (notes/follows cascade).
 pub async fn delete_by_id<'e, E>(executor: E, id: i64) -> sqlx::Result<u64>

@@ -18,6 +18,10 @@
 //! - `GET /api/v1/stream` ── SSE で新規 Note を購読 (M4 PR2)
 //! - `GET /api/v1/media/proxy?url=&variant=` ── TUI 用画像プロキシ。
 //!   media-proxy 経由で外部 URL を取得 (M6, Issue #36 解消)
+//! - `POST /api/v1/media?kind=&alt=` ── 画像アップロード。media-proxy で
+//!   サニタイズ後 versitygw に格納し、`media` 行を作る (M7)
+//! - `PATCH /api/v1/actor/profile` ── アバター/ヘッダ/表示名等の更新 +
+//!   Update Activity 配送 (M7)
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -32,13 +36,21 @@ use tracing::warn;
 use crate::state::AppState;
 
 pub mod auth;
+pub mod media;
 pub mod media_proxy;
 pub mod notes;
+pub mod profile;
 pub mod stream;
 pub mod timeline;
 pub mod whoami;
 
 pub fn router(state: AppState) -> Router {
+    // M7: 画像アップロードはサニタイズ前段で media-proxy.max_bytes に達する
+    // 想定の大きいバイト列を受ける。axum の DefaultBodyLimit (= 2 MiB) を
+    // 当該ルートだけ拡張する。`media.upload` ハンドラ自身も上限を再確認
+    // するので、ここは max_bytes と同じ値に揃えればよい。
+    let upload_max = usize::try_from(state.config().media_proxy.max_bytes).unwrap_or(usize::MAX);
+
     Router::new()
         .route("/api/v1/whoami", get(whoami::handle))
         .route("/api/v1/timeline/home", get(timeline::home))
@@ -46,6 +58,19 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/stream", get(stream::handle))
         // M6: TUI 用画像プロキシ。media-proxy 経由で外部 URL を取得する。
         .route("/api/v1/media/proxy", get(media_proxy::handle))
+        // M7: メディアアップロード。サニタイズ済みバイト列を versitygw に
+        // 格納し、`media` 行を作る。`DefaultBodyLimit::max` でこのルートだけ
+        // 上限を拡張する (= 他ルートは 2 MiB 既定のまま)。
+        .route(
+            "/api/v1/media",
+            post(media::upload).layer(axum::extract::DefaultBodyLimit::max(upload_max)),
+        )
+        // M7: 自プロフィール (display_name / summary / icon / image) の更新と
+        // Update Activity 連合送出。
+        .route(
+            "/api/v1/actor/profile",
+            axum::routing::patch(profile::patch),
+        )
         // 全 `/api/v1/*` に Bearer 認証を要求する。`from_fn_with_state` で
         // middleware に `AppState` を渡し、`api_token` lookup に使う。
         .layer(axum::middleware::from_fn_with_state(

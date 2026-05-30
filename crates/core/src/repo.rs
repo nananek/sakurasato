@@ -13,5 +13,6 @@ pub mod api_token;
 pub mod delivery_queue;
 pub mod emoji;
 pub mod follow;
+pub mod media;
 pub mod note;
 pub mod reaction;
