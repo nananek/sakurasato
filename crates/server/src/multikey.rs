@@ -12,11 +12,11 @@
 //! 出力例: `"z6MkpTHR8VNsBxYAAWHut2Geadd9jSruqfoEYxXRdtmU8nWB"` (32-byte 公開鍵
 //! + 2-byte prefix を base58btc, multibase prefix `z`)。
 
-use anyhow::Context;
-#[cfg(test)]
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::DecodePublicKey;
+use ed25519_dalek::pkcs8::EncodePublicKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 
 /// multicodec の "ed25519-pub" コード `0xED` を unsigned varint で表現したもの。
 const ED25519_MULTICODEC_PREFIX: [u8; 2] = [0xed, 0x01];
@@ -37,10 +37,21 @@ fn ed25519_bytes_to_multibase(pubkey: &[u8; 32]) -> String {
     multibase::encode(multibase::Base::Base58Btc, &payload)
 }
 
-/// Reverse of [`ed25519_pem_to_multibase`] — テストヘルパ。本体コードからは
-/// 使わないが、生成した multibase 値が同じ鍵を表現していることを単体テスト
-/// で検証するために置いておく。
-#[cfg(test)]
+/// Multikey の `publicKeyMultibase` を Ed25519 公開鍵 (PKCS#8 SPKI PEM) に
+/// 変換する。`ed25519-pub` (`0xED 0x01`) 以外の codec は拒否する。
+///
+/// remote actor JSON の FEP-521a `assertionMethod` から Ed25519 鍵を受け取る
+/// ためのエントリポイント。M3b-3 PR2 で remote actor fetch から呼ばれる。
+pub fn multibase_to_ed25519_pem(s: &str) -> anyhow::Result<String> {
+    let bytes = multibase_to_ed25519_bytes(s)?;
+    let verifying =
+        VerifyingKey::from_bytes(&bytes).context("ed25519 public key bytes are invalid")?;
+    verifying
+        .to_public_key_pem(LineEnding::LF)
+        .context("encode ed25519 public key as SPKI PEM")
+}
+
+/// Multikey の `publicKeyMultibase` を生 32-byte 公開鍵 に分解する。
 fn multibase_to_ed25519_bytes(s: &str) -> anyhow::Result<[u8; 32]> {
     let (base, payload) = multibase::decode(s).context("decode multibase")?;
     if base != multibase::Base::Base58Btc {

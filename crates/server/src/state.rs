@@ -16,7 +16,7 @@ struct Inner {
     config: Config,
     pool: PgPool,
     http: Client,
-    /// SSRF ガード (`delivery::inbox_host_blocked`) を緩めるかどうか。
+    /// SSRF ガード ([`crate::net_guard::host_blocked`]) を緩めるかどうか。
     ///
     /// **本番経路 [`AppState::from_config`] は常に `false`** ── 配送ワーカが
     /// `http://127.0.0.1/admin` のような内部宛先に POST するのを遮断する。
@@ -25,6 +25,14 @@ struct Inner {
     /// loopback を許可しないとテスト不能。本番 `from_config` を通る限り
     /// 常に false 固定なので、CLI / serve 経路で内部宛先が通る経路は無い。
     allow_internal_inbox: bool,
+    /// 未知 actor 到来時に remote から actor JSON を fetch するかどうか。
+    ///
+    /// **本番経路 `from_config` は `true`** ── 受信 inbox で未知 keyId が
+    /// 来たら CLAUDE.md §3 暫定で server 直 fetch する。
+    /// **テスト経路 `from_pool` は `false`** ── 統合テストで実 DNS / 実
+    /// ネットワークに到達しないようにする。テストは必要な actor を予め
+    /// `repo::actor::insert` で seed しておく契約。
+    enable_remote_fetch: bool,
 }
 
 impl AppState {
@@ -46,6 +54,7 @@ impl AppState {
             pool,
             http,
             allow_internal_inbox: false,
+            enable_remote_fetch: true,
         })))
     }
 
@@ -61,6 +70,7 @@ impl AppState {
             pool,
             http,
             allow_internal_inbox: true,
+            enable_remote_fetch: false,
         }))
     }
 
@@ -82,6 +92,12 @@ impl AppState {
     /// SSRF ガードを緩めるか。本番 (`from_config`) は常に `false`。
     pub(crate) fn allow_internal_inbox(&self) -> bool {
         self.0.allow_internal_inbox
+    }
+
+    /// 未知 actor 到来時に remote fetch を試みるか。本番 (`from_config`)
+    /// は `true`、テスト (`from_pool`) は `false`。
+    pub(crate) fn enable_remote_fetch(&self) -> bool {
+        self.0.enable_remote_fetch
     }
 
     /// Compute the canonical AP actor `id` URI for `username` against the

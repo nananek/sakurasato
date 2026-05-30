@@ -17,7 +17,6 @@
 //! M3b-3 で正式化するが、PR2 でも `mark_failed` を呼ぶ以上は何らかの値を
 //! 入れる必要がある。`2^attempts` 分 (上限 1 時間) の指数で当面しのぐ。
 
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -31,8 +30,11 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::cli::DeliverArgs;
+use crate::net_guard;
 use crate::sign::sign_request;
 use crate::state::AppState;
+
+pub mod worker;
 
 /// 1 回の配送試行の結果。CLI / 将来のワーカループが状態を表示するために使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,13 +262,12 @@ async fn attempt_post(
     let url = reqwest::Url::parse(&row.inbox_url)?;
 
     // **自己 inbox 宛の配送ループ防止**: `inbox_url` の host が自インスタンスの
-    // 公開ホスト名と一致する場合は即座に拒否する。M3b-2 段階では CLI 起動の
-    // 1 行 flush なので即時害はないが、M3b-3 で常駐 worker ループにしたあと、
-    // バグや悪意ある DB 書き込みで自分宛行が混入すると無限ループする。
+    // 公開ホスト名と一致する場合は即座に拒否する。M3b-3 で常駐 worker ループに
+    // したあと、バグや悪意ある DB 書き込みで自分宛行が混入すると無限ループする。
     // 防御深度として `allow_internal_inbox` のテストフラグに関わらず常に適用する
     // ── テストでは inbox host を `127.0.0.1` などで立てるので、本番 host
     // (`example.test` 等) と衝突しない設計になっている。
-    if is_self_delivery(&url, &state.config().server.host) {
+    if net_guard::is_self_host(&url, &state.config().server.host) {
         return Err(AttemptError::BlockedAddress {
             host: url.host_str().unwrap_or("").to_string(),
             reason: "self-delivery loop",
@@ -274,7 +275,7 @@ async fn attempt_post(
     }
 
     if !state.allow_internal_inbox()
-        && let Some(reason) = inbox_host_blocked(&url)
+        && let Some(reason) = net_guard::host_blocked(&url)
     {
         return Err(AttemptError::BlockedAddress {
             host: url.host_str().unwrap_or("").to_string(),
@@ -300,131 +301,6 @@ async fn attempt_post(
 
     let response = state.http_client().execute(req).await?;
     Ok(response.status())
-}
-
-/// `inbox_url` が自インスタンスの inbox 宛か。HTTP `Host:` ヘッダは
-/// case-insensitive (RFC 9110 §5.1) なので `eq_ignore_ascii_case` で比較する。
-/// ポート違い (本番 host に別ポートを振る運用は想定しないが) も自分扱いで弾く。
-fn is_self_delivery(url: &reqwest::Url, server_host: &str) -> bool {
-    url.host_str()
-        .is_some_and(|h| h.eq_ignore_ascii_case(server_host))
-}
-
-/// `inbox_url` の host が IP literal で内部 / 予約範囲、または
-/// ループバックに必ず解決される予約ドメインなら、その理由を返す。
-/// それ以外のドメイン名は通過させる ── DNS 解決後の判定は media-proxy
-/// の責務 (CLAUDE.md §3)。
-fn inbox_host_blocked(url: &reqwest::Url) -> Option<&'static str> {
-    match url.host()? {
-        url::Host::Ipv4(ip) => ipv4_block_reason(ip),
-        url::Host::Ipv6(ip) => ipv6_block_reason(ip),
-        url::Host::Domain(d) => domain_block_reason(d),
-    }
-}
-
-/// ループバックまたは LAN 内に解決される可能性のあるドメイン名なら、その
-/// 理由を返す。
-///
-/// RFC 6761 §6.3 が `localhost.` および `.localhost.` 配下の名前を
-/// ループバック専用として予約している ── DNS 解決を待たずにここで弾く。
-/// `localhost.localdomain` は古い Linux ディストリの慣習名で、`/etc/hosts`
-/// で 127.0.0.1 に張られていることが多いため同様に拒否する。
-/// RFC 6762 (mDNS) の `.local` TLD は Avahi / systemd-resolved が動く
-/// 環境で LAN 内の任意ホストに解決されるため、server が egress を持つ
-/// 暫定構成 (#23) では SSRF ベクタになり得る — これも遮断する (round-2
-/// review F2)。
-///
-/// それ以外のドメイン名は通過させ、media-proxy 側の DNS 解決後の
-/// CIDR allowlist で判定するのが本来の責務分担 (CLAUDE.md §3)。
-fn domain_block_reason(domain: &str) -> Option<&'static str> {
-    // 末尾の `.` (FQDN 表記) を剥がしてから比較する。HTTP 仕様 (RFC 9110
-    // §4.2.3) で host は大文字小文字を区別しないため `eq_ignore_ascii_case`。
-    let trimmed = domain.trim_end_matches('.');
-    if trimmed.eq_ignore_ascii_case("localhost")
-        || trimmed.eq_ignore_ascii_case("localhost.localdomain")
-    {
-        return Some("localhost-domain");
-    }
-    // `*.localhost` 配下 (RFC 6761) — 配下の名前は必ず loopback に解決される
-    // ことが保証されているので、確実に弾ける。
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.ends_with(".localhost") {
-        return Some("localhost-domain");
-    }
-    // RFC 6762 mDNS の `.local` TLD — LAN 内の任意ホストに解決されるため、
-    // `postgres.local` のような内部サービス名宛の POST を許すと SSRF に
-    // なる。完全一致 (`local` 単独) も TLD 直指定として弾く。
-    //
-    // `lower` は to_ascii_lowercase 済みなので、`ends_with` は実質的に
-    // 大文字小文字を区別しない比較になっている。clippy の
-    // `case_sensitive_file_extension_comparisons` は `.local` を拡張子と
-    // 誤検知するため allow する。
-    #[allow(clippy::case_sensitive_file_extension_comparisons)]
-    if lower == "local" || lower.ends_with(".local") {
-        return Some("mdns-local");
-    }
-    None
-}
-
-fn ipv4_block_reason(ip: Ipv4Addr) -> Option<&'static str> {
-    if ip.is_loopback() {
-        Some("loopback")
-    } else if ip.is_private() {
-        Some("private")
-    } else if ip.is_link_local() {
-        Some("link-local")
-    } else if ip.is_unspecified() {
-        Some("unspecified")
-    } else if ip.is_broadcast() {
-        Some("broadcast")
-    } else if ip.is_documentation() {
-        Some("documentation")
-    } else if is_ipv4_cgnat(ip) {
-        // RFC 6598 100.64.0.0/10 — CGNAT 共有アドレス空間。クラウド /
-        // コンテナ環境では内部 LB のアドレスに割り当てられることがあり、
-        // POST 先として通すと内部サービスを叩く経路になり得る。Rust
-        // stable に `Ipv4Addr::is_shared` が無いので手動判定する。
-        Some("cgnat-shared")
-    } else {
-        None
-    }
-}
-
-/// RFC 6598 `100.64.0.0/10` (CGNAT) の判定。上位 10 ビットが `0b0110_0100_01`
-/// 固定 (`100.64.0.0` = `0x6440_0000`、マスク `0xFFC0_0000`)。
-fn is_ipv4_cgnat(ip: Ipv4Addr) -> bool {
-    u32::from(ip) & 0xFFC0_0000 == 0x6440_0000
-}
-
-fn ipv6_block_reason(ip: Ipv6Addr) -> Option<&'static str> {
-    if ip.is_loopback() {
-        return Some("loopback");
-    }
-    if ip.is_unspecified() {
-        return Some("unspecified");
-    }
-    if ip.is_multicast() {
-        return Some("multicast");
-    }
-    let segs = ip.segments();
-    // fe80::/10 — link-local unicast
-    if (segs[0] & 0xffc0) == 0xfe80 {
-        return Some("link-local");
-    }
-    // fc00::/7 — unique local
-    if (segs[0] & 0xfe00) == 0xfc00 {
-        return Some("unique-local");
-    }
-    // 2001:db8::/32 — documentation
-    if segs[0] == 0x2001 && segs[1] == 0x0db8 {
-        return Some("documentation");
-    }
-    // IPv4-mapped IPv6 (`::ffff:a.b.c.d`) — 埋め込まれた IPv4 が内部範囲
-    // なら同様に弾く。`to_ipv4_mapped` は Rust 1.63+ で安定。
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return ipv4_block_reason(v4);
-    }
-    None
 }
 
 /// `mark_failed` を呼び、`Retry` か `Dead` を返す。
@@ -467,224 +343,6 @@ fn compute_backoff(now: DateTime<Utc>, attempts: i32) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn url(s: &str) -> reqwest::Url {
-        reqwest::Url::parse(s).unwrap()
-    }
-
-    #[test]
-    fn inbox_blocks_ipv4_loopback() {
-        assert_eq!(
-            inbox_host_blocked(&url("http://127.0.0.1/inbox")),
-            Some("loopback")
-        );
-    }
-
-    #[test]
-    fn inbox_blocks_ipv4_private_ranges() {
-        // RFC 1918 の 10/8, 172.16/12, 192.168/16。
-        for s in [
-            "http://10.0.0.1/inbox",
-            "http://172.16.5.5/inbox",
-            "http://192.168.1.1/inbox",
-        ] {
-            assert_eq!(inbox_host_blocked(&url(s)), Some("private"), "{s}");
-        }
-    }
-
-    #[test]
-    fn inbox_blocks_ipv4_link_local_and_metadata() {
-        // 169.254.0.0/16 はクラウドメタデータ (169.254.169.254) を含む。
-        assert_eq!(
-            inbox_host_blocked(&url("http://169.254.169.254/latest/meta-data/")),
-            Some("link-local")
-        );
-    }
-
-    #[test]
-    fn inbox_blocks_ipv4_cgnat_shared() {
-        // RFC 6598 100.64.0.0/10。クラウド LB の内部側で割り当てられる
-        // 可能性があり、外向き POST 先として通すべきではない。
-        for s in [
-            "http://100.64.0.1/inbox",
-            "http://100.100.0.1/inbox",
-            "http://100.127.255.254/inbox",
-        ] {
-            assert_eq!(inbox_host_blocked(&url(s)), Some("cgnat-shared"), "{s}");
-        }
-    }
-
-    #[test]
-    fn inbox_allows_ipv4_adjacent_to_cgnat() {
-        // 100.63.255.255 と 100.128.0.0 は CGNAT の外なので通す
-        // (どちらも公開 IP として割り当てられている範囲)。境界バグの回帰テスト。
-        assert_eq!(
-            inbox_host_blocked(&url("http://100.63.255.255/inbox")),
-            None
-        );
-        assert_eq!(inbox_host_blocked(&url("http://100.128.0.0/inbox")), None);
-    }
-
-    #[test]
-    fn inbox_blocks_ipv4_unspecified_and_broadcast() {
-        assert_eq!(
-            inbox_host_blocked(&url("http://0.0.0.0/inbox")),
-            Some("unspecified")
-        );
-        assert_eq!(
-            inbox_host_blocked(&url("http://255.255.255.255/inbox")),
-            Some("broadcast")
-        );
-    }
-
-    #[test]
-    fn inbox_blocks_ipv6_loopback_and_link_local() {
-        assert_eq!(
-            inbox_host_blocked(&url("http://[::1]/inbox")),
-            Some("loopback")
-        );
-        assert_eq!(
-            inbox_host_blocked(&url("http://[fe80::1]/inbox")),
-            Some("link-local")
-        );
-        assert_eq!(
-            inbox_host_blocked(&url("http://[fc00::1]/inbox")),
-            Some("unique-local")
-        );
-    }
-
-    #[test]
-    fn inbox_blocks_ipv4_mapped_ipv6_private() {
-        // ::ffff:192.168.1.1 — IPv4-mapped IPv6 で private を仕込んでも弾く。
-        assert_eq!(
-            inbox_host_blocked(&url("http://[::ffff:c0a8:0101]/inbox")),
-            Some("private")
-        );
-    }
-
-    #[test]
-    fn inbox_allows_public_ipv4_literal() {
-        // 公開 IP literal は通す (実運用上稀だがホワイトリストにする必要なし)。
-        assert_eq!(inbox_host_blocked(&url("http://1.1.1.1/inbox")), None);
-    }
-
-    #[test]
-    fn inbox_allows_domain_name() {
-        // 通常のドメイン名は DNS 解決の責務を持つ media-proxy 側にゆだねる。
-        assert_eq!(
-            inbox_host_blocked(&url("https://mastodon.example/inbox")),
-            None
-        );
-        // 名前に `localhost` を含んでも、TLD が `localhost` でなければ通す。
-        // 例: `mylocalhost.example` や `localhost.example.com` は False positive
-        // にしない (前者は実在しうる、後者は localhost という名前のサブドメイン)。
-        assert_eq!(
-            inbox_host_blocked(&url("https://mylocalhost.example/inbox")),
-            None
-        );
-        assert_eq!(
-            inbox_host_blocked(&url("https://localhost.example.com/inbox")),
-            None
-        );
-    }
-
-    #[test]
-    fn inbox_blocks_localhost_domain() {
-        // RFC 6761 §6.3 が `localhost.` を予約しており、必ず loopback に
-        // 解決される。IP literal の loopback 遮断と同等の意味合いを持つので、
-        // domain でも明示拒否する (#21)。
-        assert_eq!(
-            inbox_host_blocked(&url("http://localhost/inbox")),
-            Some("localhost-domain")
-        );
-        // 大文字小文字混在も同様 (RFC 9110 §4.2.3)。
-        assert_eq!(
-            inbox_host_blocked(&url("http://LOCALHOST/inbox")),
-            Some("localhost-domain")
-        );
-        // `*.localhost` も慣習的に loopback (mDNS / systemd-resolved 等で
-        // 127.0.0.1 に解決される)。
-        assert_eq!(
-            inbox_host_blocked(&url("http://app.localhost/inbox")),
-            Some("localhost-domain")
-        );
-        assert_eq!(
-            inbox_host_blocked(&url("http://a.b.localhost/inbox")),
-            Some("localhost-domain")
-        );
-        // 古い Linux ディストリの `/etc/hosts` でループバックに張られる名前。
-        assert_eq!(
-            inbox_host_blocked(&url("http://localhost.localdomain/inbox")),
-            Some("localhost-domain")
-        );
-    }
-
-    #[test]
-    fn inbox_blocks_mdns_local_tld() {
-        // RFC 6762 mDNS — `.local` は LAN 内の任意ホストに解決される。
-        // server が egress を持つ暫定構成 (#23) で内部サービス名 (postgres.local
-        // 等) 宛の POST が SSRF にならないよう遮断する (round-2 F2)。
-        assert_eq!(
-            inbox_host_blocked(&url("http://postgres.local/inbox")),
-            Some("mdns-local")
-        );
-        assert_eq!(
-            inbox_host_blocked(&url("http://server.lan.local/inbox")),
-            Some("mdns-local")
-        );
-        assert_eq!(
-            inbox_host_blocked(&url("http://LOCAL/inbox")),
-            Some("mdns-local")
-        );
-    }
-
-    #[test]
-    fn inbox_allows_non_local_tlds() {
-        // `local` を含む通常 TLD は false positive にしない。
-        // `localhost.com` や `mylocal.example` 等の実在しうる名前で動作確認。
-        assert_eq!(
-            inbox_host_blocked(&url("https://localhost.com/inbox")),
-            None
-        );
-        assert_eq!(
-            inbox_host_blocked(&url("https://mylocal.example/inbox")),
-            None
-        );
-        // `.locally` のような末尾は `.local` 後方一致にマッチさせない。
-        assert_eq!(inbox_host_blocked(&url("https://site.locally/inbox")), None);
-    }
-
-    #[test]
-    fn is_self_delivery_matches_configured_host() {
-        assert!(is_self_delivery(
-            &url("https://example.test/inbox"),
-            "example.test"
-        ));
-        // HTTP Host は case-insensitive (RFC 9110 §5.1)。
-        assert!(is_self_delivery(
-            &url("https://EXAMPLE.test/users/x/inbox"),
-            "example.test"
-        ));
-        // ポート違いも自分扱い (本番運用で別ポートを振る想定はないが、
-        // バグの混入があっても自分宛になり得るので防御深度として弾く)。
-        assert!(is_self_delivery(
-            &url("http://example.test:8080/inbox"),
-            "example.test"
-        ));
-    }
-
-    #[test]
-    fn is_self_delivery_rejects_other_hosts() {
-        assert!(!is_self_delivery(
-            &url("https://other.test/inbox"),
-            "example.test"
-        ));
-        // subdomain は別ホスト扱い。
-        assert!(!is_self_delivery(
-            &url("https://sub.example.test/inbox"),
-            "example.test"
-        ));
-    }
 
     #[test]
     fn attempt_error_permanent_classification() {

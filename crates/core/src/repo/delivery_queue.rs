@@ -39,6 +39,36 @@ pub async fn enqueue(
     .await
 }
 
+/// Pick up to `limit` due rows from the queue.
+///
+/// "Due" means `state IN ('pending', 'failed')` and `next_attempt_at <= now()`.
+/// Returns rows ordered by `next_attempt_at` ascending so the oldest backlog
+/// is drained first.
+///
+/// **No locking / atomic claim** — the M3b-3 single-process worker loop runs
+/// one instance, so concurrent claim races are not a concern. M4+ (when a
+/// SSE-based worker is split out) will need `FOR UPDATE SKIP LOCKED`.
+pub async fn pick_due(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<DeliveryQueueRow>> {
+    sqlx::query_as!(
+        DeliveryQueueRow,
+        r#"
+        SELECT
+            id, inbox_url,
+            activity as "activity: Json<JsonValue>",
+            sender_actor_id, attempts, next_attempt_at, last_error, state,
+            created_at, updated_at
+        FROM delivery_queue
+        WHERE state IN ('pending', 'failed')
+          AND next_attempt_at <= now()
+        ORDER BY next_attempt_at ASC
+        LIMIT $1
+        "#,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<DeliveryQueueRow>> {
     sqlx::query_as!(
         DeliveryQueueRow,

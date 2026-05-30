@@ -8,10 +8,13 @@
 
 pub mod cli;
 pub mod delivery;
+pub(crate) mod dispatch;
 pub(crate) mod extract;
 pub(crate) mod http_client;
 pub mod init;
 pub mod multikey;
+pub(crate) mod net_guard;
+pub mod remote_actor;
 pub mod routes;
 pub mod serve;
 pub(crate) mod sign;
