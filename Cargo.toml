@@ -120,7 +120,9 @@ eventsource-stream = "0.2"
 # ratatui-image: Kitty / Sixel / iTerm2 / unicode-half fallback の自動検出と
 # `Image` widget。Picker::from_query_stdio() で端末問い合わせを行う。
 # crossterm 0.29 とバージョンを合わせる (ratatui-image 11 系は ratatui 0.30 + crossterm 0.29 を要求)。
-ratatui-image = "11"
+# `default-features = false` で `chafa-dyn` を切る ── libchafa の system 依存を
+# 引かないため。代わりに `crossterm` + `image-defaults` を明示。
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 # `image` crate (= ratatui-image が内部で使うものに揃える)。Avatar デコードの
 # ために server 本体ではなく TUI クライアントで使う ── 信頼できないバイト列を
 # server コンテナで decode しない設計 (CLAUDE.md §7) は維持される。
