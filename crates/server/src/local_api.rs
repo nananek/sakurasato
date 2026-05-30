@@ -22,6 +22,9 @@
 //!   サニタイズ後 versitygw に格納し、`media` 行を作る (M7)
 //! - `PATCH /api/v1/actor/profile` ── アバター/ヘッダ/表示名等の更新 +
 //!   Update Activity 配送 (M7)
+//! - `POST /api/v1/reactions` ── ローカル Note へのリアクション作成 + EmojiReact/Like
+//!   配送 (M8 PR2)
+//! - `DELETE /api/v1/reactions/{id}` ── 自分のリアクション取消 + Undo 配送 (M8 PR2)
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -40,6 +43,7 @@ pub mod media;
 pub mod media_proxy;
 pub mod notes;
 pub mod profile;
+pub mod reactions;
 pub mod stream;
 pub mod timeline;
 pub mod whoami;
@@ -70,6 +74,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/actor/profile",
             axum::routing::patch(profile::patch),
+        )
+        // M8: ローカル user が自分の Note にリアクションを付けて連合先に通知。
+        // POST = 作成 (EmojiReact / Like)、DELETE = 取り消し (Undo)。
+        .route("/api/v1/reactions", post(reactions::create))
+        .route(
+            "/api/v1/reactions/{id}",
+            axum::routing::delete(reactions::delete),
         )
         // 全 `/api/v1/*` に Bearer 認証を要求する。`from_fn_with_state` で
         // middleware に `AppState` を渡し、`api_token` lookup に使う。

@@ -501,3 +501,151 @@ async fn reaction_insert_and_delete(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(deleted, 1);
     Ok(())
 }
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn reaction_insert_or_get_is_idempotent(pool: PgPool) -> sqlx::Result<()> {
+    let author = repo::actor::insert(&pool, sample_local_actor("io1")).await?;
+    let reactor = repo::actor::insert(&pool, sample_local_actor("io2")).await?;
+    let note = repo::note::insert(
+        &pool,
+        repo::note::NewNote {
+            ap_id: "https://example.test/notes/io".into(),
+            actor_id: author.id,
+            content: "hi".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: true,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await?;
+    // 同じ ap_id を 2 回 → 同じ行が返る (= リトライ安全)。
+    let a =
+        repo::reaction::insert_or_get(&pool, "https://x.test/r/a", note.id, reactor.id, "👍", None)
+            .await?;
+    let b =
+        repo::reaction::insert_or_get(&pool, "https://x.test/r/a", note.id, reactor.id, "👍", None)
+            .await?;
+    assert_eq!(a.id, b.id);
+
+    // 別 ap_id だが natural key (note, actor, content) が衝突 → 既存行を返す。
+    let c =
+        repo::reaction::insert_or_get(&pool, "https://x.test/r/b", note.id, reactor.id, "👍", None)
+            .await?;
+    assert_eq!(a.id, c.id);
+    // 既存行が返るので ap_id は最初のもの (= "/r/a") のまま。
+    assert_eq!(c.ap_id, "https://x.test/r/a");
+
+    // 別 content なら新規行。
+    let d =
+        repo::reaction::insert_or_get(&pool, "https://x.test/r/c", note.id, reactor.id, "🎉", None)
+            .await?;
+    assert_ne!(a.id, d.id);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn reaction_count_by_note_groups_by_content(pool: PgPool) -> sqlx::Result<()> {
+    let author = repo::actor::insert(&pool, sample_local_actor("ct1")).await?;
+    let r1 = repo::actor::insert(&pool, sample_local_actor("ct2")).await?;
+    let r2 = repo::actor::insert(&pool, sample_local_actor("ct3")).await?;
+    let note = repo::note::insert(
+        &pool,
+        repo::note::NewNote {
+            ap_id: "https://example.test/notes/ct".into(),
+            actor_id: author.id,
+            content: "hi".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: true,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await?;
+    repo::reaction::insert(&pool, "https://x.test/r/1", note.id, r1.id, "👍", None).await?;
+    repo::reaction::insert(&pool, "https://x.test/r/2", note.id, r2.id, "👍", None).await?;
+    repo::reaction::insert(&pool, "https://x.test/r/3", note.id, r1.id, "🎉", None).await?;
+
+    let counts = repo::reaction::count_by_note(&pool, note.id).await?;
+    // 👍 が 2 件、🎉 が 1 件。ordering は MIN(created_at) で第一に挿入したもの順。
+    assert_eq!(counts.len(), 2);
+    assert_eq!(counts[0].content, "👍");
+    assert_eq!(counts[0].count, 2);
+    assert_eq!(counts[1].content, "🎉");
+    assert_eq!(counts[1].count, 1);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn emoji_upsert_remote_is_idempotent_by_ap_id(pool: PgPool) -> sqlx::Result<()> {
+    let first = repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "blob".into(),
+            ap_id: "https://misskey.io/emojis/blob".into(),
+            host: "misskey.io".into(),
+            image_url: "https://misskey.io/files/blob.png".into(),
+            media_type: "image/png".into(),
+        },
+    )
+    .await?;
+    assert!(!first.is_local);
+    assert_eq!(first.host.as_deref(), Some("misskey.io"));
+
+    // 同じ ap_id で再投入 → 同じ行を更新して返す。
+    let second = repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "blob".into(),
+            ap_id: "https://misskey.io/emojis/blob".into(),
+            host: "misskey.io".into(),
+            image_url: "https://misskey.io/files/blob2.png".into(),
+            media_type: "image/webp".into(),
+        },
+    )
+    .await?;
+    assert_eq!(first.id, second.id);
+    assert_eq!(second.image_key, "https://misskey.io/files/blob2.png");
+    assert_eq!(second.media_type, "image/webp");
+
+    // get_by_ap_id でも引ける。
+    let got = repo::emoji::get_by_ap_id(&pool, "https://misskey.io/emojis/blob").await?;
+    assert_eq!(got.map(|r| r.id), Some(first.id));
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn emoji_upsert_remote_rejects_empty_host(pool: PgPool) -> sqlx::Result<()> {
+    let err = repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "blob".into(),
+            ap_id: "https://misskey.io/emojis/blob".into(),
+            host: String::new(),
+            image_url: "https://misskey.io/files/blob.png".into(),
+            media_type: "image/png".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{err}").contains("host"));
+    Ok(())
+}
