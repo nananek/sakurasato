@@ -7,8 +7,9 @@
 //! のみ (Mastodon 系で受理される最大公約数)。Ed25519 送出は M3b-3 以降。
 //!
 //! 公開エントリ:
-//! - [`extract_signature_info`] : 鍵 lookup 前の段階。スキーム判定と
-//!   keyId 抽出のみ。DB アクセスせず純粋に headers だけ見る
+//! - [`extract_signature_infos`] : 鍵 lookup 前の段階。スキーム判定と
+//!   keyId 抽出のみ。DB アクセスせず純粋に headers だけ見る。RFC 9421 の
+//!   複数ラベルは順序を保って全件返す
 //! - [`verify_request_with_actor`] : DB から引いた `ActorRow` の鍵を
 //!   使い、digest / clock skew / 署名を実際に検証する
 //!
@@ -51,11 +52,16 @@ pub(crate) enum SigScheme {
 
 /// スキーム判定と keyId 抽出だけを行う段階の結果。DB アクセス前に
 /// 使えるので、actor lookup の引数として渡せる。
+///
+/// RFC 9421 の複数ラベル送信に対応するため、ラベル名を保持する。cavage は
+/// 構造的に単一署名なので `label: None`。
 #[derive(Debug, Clone)]
 pub(crate) struct SignatureInfo {
     pub scheme: SigScheme,
     pub key_id: String,
     pub key_kind: KeyKind,
+    /// RFC 9421 ラベル名 (`sig1` 等)。cavage では使わない (`None`)。
+    pub label: Option<String>,
 }
 
 /// 署名検証中に発生したエラー。HTTP レスポンスとして 400 / 401 に対応。
@@ -153,40 +159,58 @@ impl IntoResponse for SigError {
     }
 }
 
-/// 受信ヘッダから署名スキームを判定し、keyId と種別を取り出す。
+/// 受信ヘッダから署名スキームを判定し、keyId と種別を取り出す。複数ラベル
+/// の RFC 9421 ヘッダなら **すべて**のラベルを返す (順序保持)。
 ///
 /// **DB アクセスせず**、純粋に HTTP ヘッダだけを見る。スキーム判定は
 /// `Signature-Input` の有無で行う (Mastodon と Nekonoverse が併用する
 /// 場合でも、Nekonoverse 系は必ず `Signature-Input` を送る運用)。
-pub(crate) fn extract_signature_info(headers: &HeaderMap) -> Result<SignatureInfo, SigError> {
+///
+/// 複数ラベル時は呼び出し側 (`extract.rs`) が順に actor lookup + 検証を
+/// 試み、いずれか一つが成立した時点で受理する。
+pub(crate) fn extract_signature_infos(headers: &HeaderMap) -> Result<Vec<SignatureInfo>, SigError> {
     if headers.contains_key("signature-input") {
         let input_raw = header_value(headers, "signature-input")?;
-        let parsed = rfc9421::parse_signature_input(input_raw)
+        let parsed_all = rfc9421::parse_signature_input_dict(input_raw)
             .map_err(|e| SigError::SignatureMalformed(e.to_string()))?;
-        let key_id = parsed
-            .keyid
-            .ok_or_else(|| SigError::SignatureMalformed("missing keyid parameter".into()))?
-            .to_string();
-        let kind = classify_key_id(&key_id)?;
-        Ok(SignatureInfo {
-            scheme: SigScheme::Rfc9421,
-            key_id,
-            key_kind: kind,
-        })
+        let mut out = Vec::with_capacity(parsed_all.len());
+        for parsed in parsed_all {
+            let key_id = parsed
+                .keyid
+                .ok_or_else(|| SigError::SignatureMalformed("missing keyid parameter".into()))?
+                .to_string();
+            let kind = classify_key_id(&key_id)?;
+            out.push(SignatureInfo {
+                scheme: SigScheme::Rfc9421,
+                key_id,
+                key_kind: kind,
+                label: Some(parsed.label.to_string()),
+            });
+        }
+        Ok(out)
     } else if headers.contains_key("signature") {
         let sig_raw = header_value(headers, "signature")?;
         let parsed = cavage::parse_signature_header(sig_raw)
             .map_err(|e| SigError::SignatureMalformed(e.to_string()))?;
         let key_id = parsed.key_id.to_string();
         let kind = classify_key_id(&key_id)?;
-        Ok(SignatureInfo {
+        Ok(vec![SignatureInfo {
             scheme: SigScheme::Cavage,
             key_id,
             key_kind: kind,
-        })
+            label: None,
+        }])
     } else {
         Err(SigError::SignatureMissing)
     }
+}
+
+/// 単一ラベル前提の旧 API。複数ラベルが届いても最初のラベルだけを返す。
+/// 新規コードは [`extract_signature_infos`] を使うこと。
+#[cfg(test)]
+pub(crate) fn extract_signature_info(headers: &HeaderMap) -> Result<SignatureInfo, SigError> {
+    let mut infos = extract_signature_infos(headers)?;
+    Ok(infos.remove(0))
 }
 
 fn classify_key_id(key_id: &str) -> Result<KeyKind, SigError> {
@@ -303,8 +327,24 @@ fn verify_rfc9421_with_actor(
 ) -> Result<(), SigError> {
     let input_header = header_value(ctx.headers, "signature-input")?;
     let sig_header = header_value(ctx.headers, "signature")?;
-    let parsed = rfc9421::parse_signature_input(input_header)
+    // 複数ラベルに対応するため dict 全体をパースし、info.label と一致する
+    // エントリを取り出す。`info.label` が `None` の場合は単一ラベル前提で
+    // 最初を選ぶ (テスト fixture などで明示的にラベルを持たない構築をした
+    // ケース)。
+    let parsed_all = rfc9421::parse_signature_input_dict(input_header)
         .map_err(|e| SigError::SignatureMalformed(e.to_string()))?;
+    let parsed = match info.label.as_deref() {
+        Some(target) => parsed_all
+            .into_iter()
+            .find(|p| p.label == target)
+            .ok_or_else(|| {
+                SigError::SignatureMalformed(format!("label {target:?} not found in dict"))
+            })?,
+        None => parsed_all
+            .into_iter()
+            .next()
+            .ok_or_else(|| SigError::SignatureMalformed("Signature-Input dict is empty".into()))?,
+    };
 
     // **最小 covered set 強制** (F1+F4): POST inbox では署名が `@method` /
     // `@target-uri` / (`host` か `@authority`) / `content-digest` のすべてに

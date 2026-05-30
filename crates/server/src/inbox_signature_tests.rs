@@ -639,3 +639,183 @@ async fn cavage_unterminated_quoted_keyid_returns_400(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ---- N1: RFC 9421 複数ラベル ------------------------------------------------
+//
+// 2 ラベルを併送する送信側を想定。各ラベルは独立した signature base + 鍵で
+// 署名され、受信側は OR セマンティクスで「いずれか 1 つが検証成立」したら
+// 受理する。実装側は `parse_signature_input_dict` で全ラベルを取り出し、
+// `extract.rs::SignedInboxBody::from_request` のループで順に試行する。
+
+/// RFC 9421 で 2 ラベル併送する POST inbox リクエストを組み立てる。
+///
+/// `(label, keyid, priv_pem, tamper)` ── `tamper=true` のラベルは signature
+/// バイトの末尾 1 バイトを反転させ、その鍵での検証だけが落ちる。これにより
+/// 「先頭が落ちて 2 番目で受理」「両方落ちて 401」シナリオを 1 つのヘルパで
+/// 組める。
+fn build_rfc9421_two_label_post(
+    body: &[u8],
+    date: &str,
+    sig1: (&str, &str, &str, bool),
+    sig2: (&str, &str, &str, bool),
+) -> Request<Body> {
+    let (label1, keyid1, priv1, tamper1) = sig1;
+    let (label2, keyid2, priv2, tamper2) = sig2;
+
+    let path = "/inbox";
+    let target_uri = format!("https://{HOST}{path}");
+    let content_digest = digest::format_content_digest(body);
+    #[allow(clippy::cast_possible_wrap, reason = "test fixture, secs fits in i64")]
+    let created = httpdate::parse_http_date(date)
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut req = Request::post(path)
+        .header("host", HOST)
+        .header("date", date)
+        .header("content-digest", &content_digest)
+        .header("content-type", "application/activity+json")
+        .body(Body::from(body.to_vec()))
+        .unwrap();
+    let headers = headers_to_map(&req);
+
+    let covered = ["@method", "@target-uri", "host", "date", "content-digest"];
+    let covered_quoted = covered
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let sign_one = |keyid: &str, priv_pem: &str, tamper: bool| -> String {
+        let raw_value =
+            format!(r#"({covered_quoted});created={created};keyid="{keyid}";alg="ed25519""#);
+        let base =
+            rfc9421::build_signature_base("POST", &target_uri, &covered, &headers, &raw_value)
+                .unwrap();
+        let mut sig_bytes = rfc9421::sign_ed25519(base.as_bytes(), priv_pem).unwrap();
+        if tamper {
+            sig_bytes[63] ^= 0xFF;
+        }
+        let sig_b64 = B64.encode(sig_bytes);
+        format!("RAW={raw_value}|B64={sig_b64}")
+    };
+
+    let entry1 = sign_one(keyid1, priv1, tamper1);
+    let entry2 = sign_one(keyid2, priv2, tamper2);
+    let (raw1, sig1_b64) = entry1.split_once("|B64=").unwrap();
+    let (raw2, sig2_b64) = entry2.split_once("|B64=").unwrap();
+    let raw1 = raw1.strip_prefix("RAW=").unwrap();
+    let raw2 = raw2.strip_prefix("RAW=").unwrap();
+
+    let input_value = format!("{label1}={raw1}, {label2}={raw2}");
+    let sig_value = format!("{label1}=:{sig1_b64}:, {label2}=:{sig2_b64}:");
+    req.headers_mut().insert(
+        HeaderName::from_static("signature-input"),
+        HeaderValue::from_str(&input_value).unwrap(),
+    );
+    req.headers_mut().insert(
+        HeaderName::from_static("signature"),
+        HeaderValue::from_str(&sig_value).unwrap(),
+    );
+    req
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_multi_label_first_valid_is_accepted(pool: PgPool) {
+    // sig1 = 既知 actor の正しい署名、sig2 = 不正。先頭で受理されて 202。
+    let (rsa_pub, ed_priv, ed_pub) = {
+        let (_, rsa_pub) = fresh_rsa();
+        let (ed_priv, ed_pub) = fresh_ed25519();
+        (rsa_pub, ed_priv, ed_pub)
+    };
+    repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let signer = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}");
+    let body = minimal_body_for(&signer);
+    let keyid_ed = format!("{signer}#ed25519-key");
+    let (other_priv, _other_pub) = fresh_ed25519();
+    let req = build_rfc9421_two_label_post(
+        &body,
+        &now_http_date(),
+        ("sig1", &keyid_ed, &ed_priv, false),
+        // sig2 は同じ keyId で署名し、tamper で落とす → BadSignature
+        ("sig2", &keyid_ed, &other_priv, false),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "multi-label: first valid label should be accepted"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_multi_label_second_valid_when_first_unknown_actor(pool: PgPool) {
+    // sig1 = DB に無い keyId、sig2 = 既知 actor の有効署名。
+    // 先頭が UnknownActor で落ちても 2 番目で受理されて 202。
+    let (rsa_pub, ed_priv, ed_pub) = {
+        let (_, rsa_pub) = fresh_rsa();
+        let (ed_priv, ed_pub) = fresh_ed25519();
+        (rsa_pub, ed_priv, ed_pub)
+    };
+    repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let signer = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}");
+    let body = minimal_body_for(&signer);
+    let keyid_known = format!("{signer}#ed25519-key");
+    let keyid_unknown = "https://other-host.test/users/unknown#ed25519-key".to_string();
+    let (other_priv, _other_pub) = fresh_ed25519();
+    let req = build_rfc9421_two_label_post(
+        &body,
+        &now_http_date(),
+        ("sig1", &keyid_unknown, &other_priv, false),
+        ("sig2", &keyid_known, &ed_priv, false),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "multi-label: should accept when later label verifies"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_multi_label_all_invalid_returns_401(pool: PgPool) {
+    // sig1 = 既知 actor だが署名 tamper、sig2 = 別の既知 actor で署名 tamper。
+    // どのラベルも検証できなければ 401 (BadSignature)。
+    let (rsa_pub, ed_priv, ed_pub) = {
+        let (_, rsa_pub) = fresh_rsa();
+        let (ed_priv, ed_pub) = fresh_ed25519();
+        (rsa_pub, ed_priv, ed_pub)
+    };
+    repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let signer = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}");
+    let body = minimal_body_for(&signer);
+    let keyid_ed = format!("{signer}#ed25519-key");
+    let req = build_rfc9421_two_label_post(
+        &body,
+        &now_http_date(),
+        ("sig1", &keyid_ed, &ed_priv, true),
+        ("sig2", &keyid_ed, &ed_priv, true),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "multi-label: all-failing should return 401"
+    );
+}

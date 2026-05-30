@@ -23,8 +23,10 @@
 //!                      created=1700000000;keyid="...";alg="ed25519"
 //! ```
 //!
-//! M3b-2 では **単一ラベル前提** (Mastodon 系 / Nekonoverse の現実装はすべて
-//! 単一ラベル `sig1` 等)。複数ラベルのディスパッチは将来。
+//! 単一ラベル (Mastodon 系 / `Nekonoverse` の現実装はすべて `sig1` 等の
+//! 1 ラベル) と複数ラベル (`sig1=(...), sig2=(...)`) の両方を扱える。
+//! 複数ラベル時は呼び出し側で順に検証を試み、いずれか一つが成立した時点
+//! で受理する設計 (M3b-3 PR3 で導入)。
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -102,12 +104,50 @@ pub(crate) struct SignatureInput<'a> {
 
 /// `Signature-Input: sig1=("@method" "host");created=...;keyid="..."` をパース。
 ///
-/// 単一ラベルのみサポート (最初の `=` で分割)。
+/// 複数ラベルのヘッダを受け取った場合は **最初のラベル**を返す。複数を
+/// すべて取り出したい場合は [`parse_signature_input_dict`] を使うこと。
+///
+/// 本番経路は [`parse_signature_input_dict`] 側を通る ── このラッパは
+/// 単一ラベル前提の旧テストの後方互換のためだけに残している。
+#[cfg(test)]
 pub(crate) fn parse_signature_input(header: &str) -> Result<SignatureInput<'_>, ParseError> {
+    let mut entries = parse_signature_input_dict(header)?;
+    // dict は空 (`Empty` で先に返している) か 1 件以上を保証している。
+    Ok(entries.remove(0))
+}
+
+/// `Signature-Input` の Dictionary 構造化フィールドをすべてのラベルに対して
+/// パースして返す。ラベル順を保つ (最初に出てきたラベルが先頭)。
+///
+/// 複数ラベルの分割は **トップレベルのカンマ** だけを区切りとみなす:
+/// covered list の括弧 `(...)` 内と、quoted-string `"..."` (`\"` エスケープ
+/// 対応) の中のカンマは区切りに使わない。これを誤ると `keyid` URL の中の
+/// カンマ (現実には稀だが) や `(...)` 内空白で誤分割しうる。
+pub(crate) fn parse_signature_input_dict(
+    header: &str,
+) -> Result<Vec<SignatureInput<'_>>, ParseError> {
     if header.trim().is_empty() {
         return Err(ParseError::Empty);
     }
-    let (label, value) = header
+    let entries = split_dict_entries(header);
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            // 末尾カンマ等の空エントリは無言で許す (HTTP の通例)。
+            continue;
+        }
+        out.push(parse_one_entry(entry)?);
+    }
+    if out.is_empty() {
+        return Err(ParseError::Empty);
+    }
+    Ok(out)
+}
+
+/// `label=(covered);params` 形式の単一エントリをパース。
+fn parse_one_entry(entry: &str) -> Result<SignatureInput<'_>, ParseError> {
+    let (label, value) = entry
         .split_once('=')
         .ok_or(ParseError::Malformed("missing '=' between label and value"))?;
     let label = label.trim();
@@ -166,6 +206,51 @@ pub(crate) fn parse_signature_input(header: &str) -> Result<SignatureInput<'_>, 
         alg,
         raw_value: value_trimmed,
     })
+}
+
+/// Dictionary 構造化フィールドをトップレベルのカンマで分割する。
+///
+/// - `(...)` 内 (covered list) のカンマは区切りに含めない
+/// - `"..."` 内 (quoted parameter value) のカンマも含めない。`\"` で
+///   エスケープされた `"` は quote の終端ではない
+/// - 開きカッコのない無効入力は救援せず、後段の `parse_one_entry` で
+///   `missing '('` として 400 に倒す
+fn split_dict_entries(header: &str) -> Vec<&str> {
+    let bytes = header.as_bytes();
+    let mut out: Vec<&str> = Vec::new();
+    let mut start: usize = 0;
+    let mut paren_depth: i32 = 0;
+    let mut in_quote = false;
+    let mut escape = false;
+    for (i, &c) in bytes.iter().enumerate() {
+        if escape {
+            // 直前が `\` だった場合は中身は無視 (RFC 8941 §3.3.3)。
+            escape = false;
+            continue;
+        }
+        if in_quote {
+            match c {
+                b'\\' => escape = true,
+                b'"' => in_quote = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_quote = true,
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b',' if paren_depth == 0 => {
+                // 全分割点は ASCII バイト境界なので、`header[start..i]` は
+                // 必ず char boundary に着地する。
+                out.push(&header[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&header[start..]);
+    out
 }
 
 /// `("a" "b" "c")` の内側 `"a" "b" "c"` を `["a", "b", "c"]` に分解。
@@ -381,6 +466,85 @@ mod tests {
             parse_signature_input("").unwrap_err(),
             ParseError::Empty
         ));
+    }
+
+    #[test]
+    fn parse_signature_input_dict_returns_multiple_labels() {
+        // sig1, sig2 を併送するハイブリッド送信側を想定。
+        let header = r#"sig1=("@method" "@target-uri");keyid="https://x/u/a#ed25519-key";alg="ed25519", sig2=("@method" "@target-uri" "host" "content-digest");created=1700000000;keyid="https://x/u/a#main-key";alg="rsa-v1_5-sha256""#;
+        let parsed = parse_signature_input_dict(header).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].label, "sig1");
+        assert_eq!(parsed[0].covered, vec!["@method", "@target-uri"]);
+        assert_eq!(parsed[0].keyid, Some("https://x/u/a#ed25519-key"));
+        assert_eq!(parsed[1].label, "sig2");
+        assert_eq!(
+            parsed[1].covered,
+            vec!["@method", "@target-uri", "host", "content-digest"]
+        );
+        assert_eq!(parsed[1].keyid, Some("https://x/u/a#main-key"));
+        assert_eq!(parsed[1].created, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn parse_signature_input_dict_single_label_passthrough() {
+        // 単一ラベル時は dict も 1 件返す ── parse_signature_input と同じ結果。
+        let header = r#"sig1=("@method");keyid="k""#;
+        let parsed = parse_signature_input_dict(header).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].label, "sig1");
+    }
+
+    #[test]
+    fn parse_signature_input_dict_trailing_comma_is_ignored() {
+        let header = r#"sig1=("@method");keyid="k","#;
+        let parsed = parse_signature_input_dict(header).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].label, "sig1");
+    }
+
+    #[test]
+    fn parse_signature_input_dict_ignores_comma_inside_quotes() {
+        // keyid の中にカンマが混入したケース (現実ではほぼ無いが) ──
+        // quoted string 内のカンマは entry separator にしてはいけない。
+        let header = r#"sig1=("@method");keyid="https://x/u/a,b#main-key""#;
+        let parsed = parse_signature_input_dict(header).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].keyid, Some("https://x/u/a,b#main-key"));
+    }
+
+    #[test]
+    fn parse_signature_input_dict_ignores_comma_inside_parens() {
+        // covered list の中のカンマも entry separator にしない (本来は空白
+        // 区切りだが、防御として確認)。`("@method", "host")` は inner-list
+        // としては malformed なので最終的に `BadComponentList` で落ちる ──
+        // 重要なのは **2 件にならない** こと (= entry splitter が paren 内
+        // のカンマで割らない)。
+        let header = r#"sig1=("@method", "host");keyid="k""#;
+        let err = parse_signature_input_dict(header).unwrap_err();
+        assert!(matches!(err, ParseError::BadComponentList));
+    }
+
+    #[test]
+    fn parse_signature_input_dict_rejects_empty() {
+        assert!(matches!(
+            parse_signature_input_dict("").unwrap_err(),
+            ParseError::Empty
+        ));
+        // 空エントリだけが並ぶ場合も Empty (有意な dict が無い)。
+        assert!(matches!(
+            parse_signature_input_dict(",,,").unwrap_err(),
+            ParseError::Empty
+        ));
+    }
+
+    #[test]
+    fn parse_signature_input_returns_first_when_multiple_present() {
+        // 後方互換: 単一ラベル前提の callers は依然として sig1 だけを見る。
+        let header = r#"sig1=("@method");keyid="k1", sig2=("@method");keyid="k2""#;
+        let parsed = parse_signature_input(header).unwrap();
+        assert_eq!(parsed.label, "sig1");
+        assert_eq!(parsed.keyid, Some("k1"));
     }
 
     #[test]
