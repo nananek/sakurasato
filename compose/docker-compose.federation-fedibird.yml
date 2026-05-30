@@ -66,6 +66,10 @@ services:
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
+      # 既定の /run/sakurasato は rootless container では書けない
+      # (M4 PR1 で local API が入った後の compose 漏れ)。federation-test で
+      # TUI は使わないので /tmp 配下に逃がす。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /tmp/sakurasato-local.sock
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       sakurasato-init:

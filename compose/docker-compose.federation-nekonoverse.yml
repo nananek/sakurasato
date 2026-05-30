@@ -65,6 +65,10 @@ services:
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
+      # 既定の /run/sakurasato は rootless container では書けない
+      # (M4 PR1 で local API が入った後の compose 漏れ)。federation-test で
+      # TUI は使わないので /tmp 配下に逃がす。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /tmp/sakurasato-local.sock
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       sakurasato-init:
@@ -115,12 +119,11 @@ services:
       - nekonoverse-fed
 
   nekonoverse-app:
-    build:
-      # ブランチ先端を引く。記録時点 (2026-05-29) の develop HEAD は
-      # b7a8cc1ec23291bdfd54cbda8ea93c0a644b018b。ビルド結果が再現しなく
-      # なった場合はここで SHA 固定 (`#<sha>:backend`) に切り替える。
-      context: https://github.com/nekonoverse/nekonoverse.git#develop:backend
-    image: sakurasato-test/nekonoverse:dev
+    # nekonoverse の docker-publish workflow が tag push 時に publish する
+    # `:latest` を引く。以前は inline build (`#develop:backend` の git context)
+    # を使っていたが、private submodule (`claude-md`) が追加されて buildkit が
+    # `--recurse-submodules` で詰まる事案があり、image pull に切替。
+    image: ghcr.io/nekonoverse/nekonoverse-backend:latest
     command: >
       sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level info"
     environment:
@@ -147,7 +150,9 @@ services:
       - nekonoverse-fed
 
   nekonoverse-worker:
-    image: sakurasato-test/nekonoverse:dev
+    # app と同じ image を使う (元は inline build の dev tag を再利用していたが
+    # ghcr 切替で同じ tag を引く形にした)。
+    image: ghcr.io/nekonoverse/nekonoverse-backend:latest
     command: python -m app.worker.main
     environment:
       DATABASE_URL: postgresql+asyncpg://nekonoverse:testpass@postgres-neko:5432/nekonoverse

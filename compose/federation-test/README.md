@@ -7,12 +7,12 @@ CI 外の手動 e2e 用 compose 一式。sakurasato の HTTP 署名検証 (受�
 
 | impl | image | 主用途 | 備考 |
 |---|---|---|---|
-| `mastodon` | `ghcr.io/mastodon/mastodon:v4.3` | cavage RSA-SHA256 主対向 | 公式 image。`bob/Password1234!` |
-| `misskey` | `misskey/misskey:2025.2.1` | cavage RSA-SHA256 検証 | 初回起動時に Web UI で admin 作成 |
+| `mastodon` | `ghcr.io/mastodon/mastodon:latest` | cavage RSA-SHA256 主対向 | 公式 image。`bob/Password1234!` |
+| `misskey` | `misskey/misskey:latest` | cavage RSA-SHA256 検証 | `POST /api/admin/accounts/create` で admin 作成 (初回のみ無認証で通り、レスポンスの `token` を以降の auth に使う) |
 | `pleroma` | `ghcr.io/explodingcamera/pleroma:stable` | cavage RSA-SHA256 検証 | 登録 open。Web UI から登録 |
-| `mitra` | `bleakfuture0/mitra:v5.4.0` | **RFC 9421 + Ed25519** | FEP-521a Multikey 対応。`bob/password123` |
+| `mitra` | `bleakfuture0/mitra:latest` | **RFC 9421 + Ed25519** | FEP-521a Multikey 対応。`bob/password123` |
 | `fedibird` | inline build (`#fedibird` ブランチ) | Mastodon fork の cavage RSA | 初回ビルド 30 分強 |
-| `nekonoverse` | inline build (`#develop`) | **RFC 9421 + Ed25519** 主対向 | dual-key 完備、自実装ペア |
+| `nekonoverse` | `ghcr.io/nekonoverse/nekonoverse-backend:latest` | **RFC 9421 + Ed25519** 主対向 | dual-key 完備、自実装ペア |
 
 Mastodon / Misskey / Fedibird の公式 actor JSON は `assertionMethod` を
 持たない (= RSA のみ公開) ので、Ed25519 経路を本物相手に試したい場合は
@@ -34,6 +34,21 @@ Mastodon / Misskey / Fedibird の公式 actor JSON は `assertionMethod` を
 `mastodon` を `misskey / pleroma / mitra / fedibird / nekonoverse` の
 いずれかに差し替えて使う。
 
+## 検証はコンテナの中から
+
+各 compose は **ホストに 443 を公開しない** (impl 同士が内部ネット上の DNS
+alias で直接話す)。動作確認は `docker compose ... exec <impl-side>` 経由で
+コンテナの中から `curl` を叩く:
+
+```bash
+docker compose -f compose/docker-compose.federation-mastodon.yml \
+  exec mastodon-web curl -sk \
+  'https://sakurasato/.well-known/webfinger?resource=acct:me@sakurasato'
+```
+
+ホスト側で `--resolve sakurasato:443:127.0.0.1` をやりたい場合は compose に
+`ports: ["443:443"]` を一時的に足す (定常運用には不要)。
+
 ## /etc/hosts
 
 ブラウザから直接触りたい場合のみ追加:
@@ -41,9 +56,6 @@ Mastodon / Misskey / Fedibird の公式 actor JSON は `assertionMethod` を
 ```
 127.0.0.1 sakurasato mastodon misskey pleroma mitra fedibird nekonoverse
 ```
-
-CLI からの `curl` だけで済ますなら `--resolve sakurasato:443:127.0.0.1`
-で十分。
 
 ## アーキテクチャ
 
@@ -76,29 +88,41 @@ OK。
 - `sakurasato-init` (one-shot) が DB migrate + actor 鍵生成
 - `sakurasato-server` (常駐) が `:8080` で待ち受け、`nginx-sks` から proxy
 - 外向き reqwest は `SSL_CERT_FILE=/certs/ca.crt` で test CA を信頼
-- 配送 worker は M3b-2 PR2 時点では未常駐 (`sakurasato deliver --queue-id`
-  で手動 flush)
+- 配送 worker は **常駐** (M3b-3 PR2 以降)。inbox から受領した Follow に
+  対し非同期で Accept を投げ返す。
+- ローカル API ソケットは `/tmp/sakurasato-local.sock` に逃がしている
+  (compose 既定の `/run/sakurasato/` は rootless container では書けない)。
+  federation-test では TUI を使わないので問題なし。
 
 ### <impl> 側
 
 各 impl は test CA を `/usr/local/share/ca-certificates/` にコピーしてから
 本体を起動 (entrypoint)。これで impl → sakurasato の TLS が通る。
 
-## M3b-2 PR3 時点で検証できる範囲
-
-PR3 マージ時点では sakurasato の Follow / Accept ハンドラは未実装
-([[m3b-followup-plan]] 参照)。以下は確認可能:
+## 現状検証できる範囲 (M3b-3 完了後)
 
 - 各 impl から sakurasato actor JSON / WebFinger 取得 → 200 OK
-- 各 impl から sakurasato `/inbox` に Follow POST →
-  cavage RSA 署名検証が通り、**未知 actor として 401**
-  (= 検証ロジックが正しく動いている証拠)
-- nekonoverse / mitra から sakurasato `/inbox` に **Ed25519 署名付き POST** →
-  401 (= RFC 9421 検証パス通過のサイン)
-- 逆方向: `sakurasato deliver --queue-id <id>` で対向 inbox に POST →
-  各 impl のログで cavage RSA-SHA256 受理確認
+- 各 impl から sakurasato `/inbox` に Follow POST → cavage RSA 署名検証 →
+  Follow handler 起動 → Accept キュー投入 → delivery worker が impl inbox に
+  POST → 受理 → impl 側に Follow 関係成立
+- 対応状況 (2026-05-30 時点):
+  - **mastodon / mitra / fedibird / misskey**: 完全相互フォロー成立
+  - **pleroma**: cavage RSA 署名検証で 401 (M3b フォロー対象)
+  - **nekonoverse**: cavage に Ed25519 keyId を載せる流派で sakurasato が
+    拒否 (M3b フォロー対象)
 
-完全な相互フォロー成立は M3b-3 (remote actor fetch + Follow handler) 完了後。
+### Misskey 注意点 (2026.5+)
+
+`meta.federation` のデフォルトが `'none'` (連合無効) に変わったので、
+`up.sh misskey` 後に必ず `setup-misskey.sh` を流す:
+
+```bash
+./scripts/federation-test/up.sh misskey
+./scripts/federation-test/setup-misskey.sh   # admin 作成 + federation 有効化 + 再起動
+```
+
+`setup-misskey.sh` は admin (`alice/Password1234!`) を作成し、
+`UPDATE meta SET federation = 'all'` を流して misskey-app を再起動する。
 
 ## トラブルシュート
 

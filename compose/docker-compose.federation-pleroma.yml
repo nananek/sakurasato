@@ -61,6 +61,10 @@ services:
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
+      # 既定の /run/sakurasato は rootless container では書けない
+      # (M4 PR1 で local API が入った後の compose 漏れ)。federation-test で
+      # TUI は使わないので /tmp 配下に逃がす。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /tmp/sakurasato-local.sock
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       sakurasato-init:
@@ -113,7 +117,9 @@ services:
       DB_PASS: testpass
       DB_NAME: pleroma
     volumes:
-      - ./federation-test/pleroma-federation/pleroma-config.exs:/data/config.exs:ro
+      # NOTE: :ro 不可。explodingcamera/pleroma image の起動スクリプトが
+      # `chown` を試みるため、read-only マウントだと exit 1 で死ぬ。
+      - ./federation-test/pleroma-federation/pleroma-config.exs:/data/config.exs
       - ./federation-test/pleroma-federation/pleroma-entrypoint.sh:/custom-entrypoint.sh:ro
       - certs:/certs:ro
     depends_on:
