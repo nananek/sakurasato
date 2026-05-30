@@ -53,7 +53,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "serde"
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 rsa = "0.9"
 # Ed25519 鍵生成・PEM 入出力。HTTP 署名生成自体は M3b-2 で導入予定。
 # pkcs8 / pem 機能で SigningKey / VerifyingKey の PKCS#8 PEM 入出力を有効化、
@@ -92,6 +92,29 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-ve
 # `aws_sdk_s3::config::Credentials` の根本型。Static credentials を組み立てて
 # `Client::from_conf` に渡すために使う (aws-config を引かず軽く済ます)。
 aws-credential-types = "1"
+
+# ── M5 TUI クライアント ──────────────────────────────────────────────
+# ratatui 0.30 は内部で crossterm 0.29 を引く。crossterm を direct dependency
+# にしているのは event 型 (KeyEvent / MouseEvent) を TUI 本体で扱うため。
+# 必ず ratatui と版を合わせること (cargo tree -i crossterm で検査)。
+ratatui = "0.30"
+# `event-stream` feature で `EventStream` (tokio から poll する非同期版) を有効化。
+# 既定の `events` / `bracketed-paste` / `windows` / `derive-more` も維持する。
+crossterm = { version = "0.29", features = ["event-stream"] }
+# Unix socket 越しの HTTP/1.1 クライアント。hyperlocal が `UnixConnector` を
+# 提供し、`hyper-util::client::legacy::Client` と組み合わせて使う。
+# server の `/api/v1/*` は Unix domain socket + Bearer 認証なのでこれで足りる。
+hyperlocal = "0.9"
+# hyper 1.x クライアント側。`client-legacy` / `http1` は hyperlocal が要求する。
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper = { version = "1", features = ["client", "http1"] }
+# `BoxBody<Bytes, Infallible>` を作るための Empty/Full body 実装。
+http-body-util = "0.1"
+# hyper が body を bytes として返すので追加。
+bytes = "1"
+# SSE (text/event-stream) を futures::Stream<Event> としてパースする。
+# `bytes` feature だけ十分 (= reqwest 同梱版でない素のストリームパーサ)。
+eventsource-stream = "0.2"
 
 [profile.release]
 lto = "thin"
