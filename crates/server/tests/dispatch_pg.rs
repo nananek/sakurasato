@@ -424,9 +424,10 @@ async fn accept_response_marks_follow_accepted(pool: PgPool) {
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn accept_from_unrelated_actor_is_rejected(pool: PgPool) {
-    // 関係ない actor から Accept が来たら 503 (handler が anyhow Err 経由で
-    // Internal を返す)。F3 を通っていても、followed actor と signer の
-    // 紐付けが取れないものは受け付けない。
+    // 関係ない actor から Accept が来たら 401 (`DispatchError::UnrelatedAcceptor`)。
+    // F3 を通っていても、followed actor と signer の紐付けが取れないものは
+    // なりすまし試行として拒否する。503 ではなく 401 を返すことで、悪意ある
+    // actor の Mastodon 系再送ループに乗らずに済む (round-2 review F3)。
     let (local_priv, local_pub) = fresh_rsa();
     let (remote_priv, remote_pub) = fresh_rsa();
     let (evil_priv, evil_pub) = fresh_rsa();
@@ -482,8 +483,8 @@ async fn accept_from_unrelated_actor_is_rejected(pool: PgPool) {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Accept by unrelated actor must be rejected",
+        StatusCode::UNAUTHORIZED,
+        "Accept by unrelated actor must be rejected as auth failure (not 5xx)",
     );
 
     // follow は依然 pending のまま。
@@ -529,6 +530,68 @@ async fn f3_spoofed_body_actor_is_rejected_401(pool: PgPool) {
         resp.status(),
         StatusCode::UNAUTHORIZED,
         "F3 body-actor / signer mismatch must be 401",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_id_host_mismatch_is_rejected(pool: PgPool) {
+    // round-2 F2 回帰: 署名は remote bob、Follow.id は good.example の URL。
+    // F3 で body actor は一致 (= remote bob) を通すが、handler の host 一致
+    // チェックで弾く。これを忘れると `evil.example` の有効署名者が任意の
+    // `good.example/activities/...` を follow_ap_id として DB に混入できる。
+    let (_priv, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    // 署名は remote bob、body の actor も bob (F3 は通る)、
+    // しかし activity id は good.example のホスト。
+    let spoofed_follow_id = "https://good.example/activities/follow-9999";
+    let body = serde_json::json!({
+        "id": spoofed_follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    // anyhow Err 経由なので 503。重要なのは「200/202 にならず DB に行が入らない」こと。
+    assert!(
+        resp.status().is_server_error() || resp.status().is_client_error(),
+        "spoofed Follow id must be rejected, got {}",
+        resp.status(),
+    );
+
+    // follow 行は作られていない。
+    let count = sqlx::query!(
+        "SELECT count(*) as c FROM follow WHERE ap_id = $1",
+        spoofed_follow_id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count.c.unwrap_or(0),
+        0,
+        "spoofed Follow id must not be inserted",
     );
 }
 

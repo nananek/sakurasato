@@ -21,19 +21,41 @@ use sakurasato_core::model::{ActorRow, FollowState};
 use sakurasato_core::repo;
 use serde_json::{Value as JsonValue, json};
 use tracing::{info, warn};
+use url::Url;
 
+use super::DispatchError;
 use crate::delivery;
 use crate::state::AppState;
+
+/// 2 つの `ap_id` URI が同じ host (= 同じインスタンス) を指していることを
+/// 確認する。ホストは大文字小文字を区別せず (RFC 9110 §4.2.3) 比較する。
+///
+/// `kind` はエラーメッセージ用のラベル ("Follow activity id" 等)。
+fn ensure_same_host(other_uri: &str, signer_ap_id: &str, kind: &str) -> anyhow::Result<()> {
+    let other = Url::parse(other_uri)
+        .with_context(|| format!("{kind} {other_uri:?} is not a valid URL"))?;
+    let signer = Url::parse(signer_ap_id)
+        .with_context(|| format!("signer ap_id {signer_ap_id:?} is not a valid URL"))?;
+    let other_host = other.host_str().unwrap_or("");
+    let signer_host = signer.host_str().unwrap_or("");
+    if !other_host.eq_ignore_ascii_case(signer_host) {
+        bail!("{kind} host {other_host:?} does not match signer host {signer_host:?}");
+    }
+    Ok(())
+}
 
 /// 受領 Follow (`signer` → 我々の local actor) の処理。
 ///
 /// 流れ:
-/// 1. body の `object` = 我々の local actor の URI を取り出す。
-/// 2. その local actor を DB から引き、`is_local && actor_type != "Application"`
-///    な actor のみ受け入れる。違えば 400 で拒否 (Application actor は inbox を
-///    持たない設計)。
-/// 3. `repo::follow::upsert_pending` で follow 行を idempotent に作る。
-/// 4. Accept activity を組み立て、`enqueue_activity` で `signer.inbox_url`
+/// 1. body の `id` のホストが署名者のホストと一致することを確認する
+///    (F4 相当)。`evil.example` の有効署名者が `good.example` の活動 ID を
+///    DB に混入させるのを防ぐ。
+/// 2. body の `object` = 我々の local actor の URI を取り出す。
+/// 3. その local actor を DB から引き、`is_local` かつ `Application`
+///    (instance actor) でないものだけ受け入れる。Application actor は
+///    inbox を持たない設計 (M3a で `init` が生成するのは `Person` のみ)。
+/// 4. `repo::follow::upsert_pending` で follow 行を idempotent に作る。
+/// 5. Accept activity を組み立て、`enqueue_activity` で `signer.inbox_url`
 ///    宛に配送キューに積む。常駐 worker がループで送出する (#23 暫定の server
 ///    直配送)。
 pub(crate) async fn handle_follow(
@@ -44,6 +66,13 @@ pub(crate) async fn handle_follow(
     let follow_ap_id = super::extract_activity_id(activity)
         .map_err(|e| anyhow!("Follow has no activity id: {e}"))?
         .to_string();
+
+    // **F4 相当の host 一致検証**: Follow activity の `id` ホストが signer
+    // ホストと一致しなければ拒否。F3 (body actor == signer) と組で
+    // 「他インスタンスの活動 ID を DB に混入される」攻撃を遮断する
+    // (M3b-3 PR2 round-2 review F2)。
+    ensure_same_host(&follow_ap_id, &signer.ap_id, "Follow activity id")?;
+
     let object_uri = super::extract_object_uri(activity)
         .map_err(|e| anyhow!("Follow has no usable `object`: {e}"))?
         .to_string();
@@ -57,6 +86,14 @@ pub(crate) async fn handle_follow(
         bail!(
             "Follow target {} is not a local actor; refusing to accept",
             followed.ap_id
+        );
+    }
+    if followed.actor_type.eq_ignore_ascii_case("Application") {
+        // Application (instance) actor は inbox を持たない設計。
+        // 「サーバ全体に follow する」リクエストは AP 仕様上ありえない。
+        bail!(
+            "Follow target {} is an Application actor; refusing to accept",
+            followed.ap_id,
         );
     }
 
@@ -111,12 +148,14 @@ pub(crate) async fn handle_follow(
 /// 受領 Accept の処理。`object` は元 Follow activity (URI または inline)。
 ///
 /// `object` を URI として扱い、その `ap_id` を持つ follow 行を探して
-/// `state` を `accepted` に倒す。
+/// `state` を `accepted` に倒す。`followed_actor_id != signer.id` の場合は
+/// なりすまし試行として [`DispatchError::UnrelatedAcceptor`] で 401 を返す
+/// (handler の内部失敗 = 503 とは区別する)。
 pub(crate) async fn handle_accept(
     state: &AppState,
     signer: &ActorRow,
     activity: &JsonValue,
-) -> anyhow::Result<()> {
+) -> Result<(), DispatchError> {
     apply_follow_state(state, signer, activity, FollowState::Accepted).await
 }
 
@@ -125,7 +164,7 @@ pub(crate) async fn handle_reject(
     state: &AppState,
     signer: &ActorRow,
     activity: &JsonValue,
-) -> anyhow::Result<()> {
+) -> Result<(), DispatchError> {
     apply_follow_state(state, signer, activity, FollowState::Rejected).await
 }
 
@@ -134,32 +173,35 @@ async fn apply_follow_state(
     signer: &ActorRow,
     activity: &JsonValue,
     new_state: FollowState,
-) -> anyhow::Result<()> {
-    let follow_uri = super::extract_object_uri(activity)
-        .map_err(|e| anyhow!("Accept/Reject has no usable `object`: {e}"))?
-        .to_string();
+) -> Result<(), DispatchError> {
+    let follow_uri = super::extract_object_uri(activity)?.to_string();
 
     let row = repo::follow::get_by_ap_id(state.pool(), &follow_uri)
         .await
-        .context("lookup follow row")?
-        .ok_or_else(|| anyhow!("Accept/Reject references unknown follow {follow_uri}"))?;
+        .with_context(|| format!("lookup follow row by ap_id {follow_uri}"))
+        .map_err(DispatchError::Internal)?
+        .ok_or_else(|| {
+            DispatchError::Malformed(format!(
+                "Accept/Reject references unknown follow {follow_uri}"
+            ))
+        })?;
 
     // **信頼境界**: signer は body の actor 本人であることが F3 で確認
     // 済み。Accept を返してくる正当な actor は、元 Follow の `object`
     // (= 我々が follow したい remote actor) であるはず。`followed_actor_id`
     // が `signer.id` と一致しない Accept/Reject は無関係な actor からの
-    // なりすまし試行なので拒否する。
+    // なりすまし試行 (UnrelatedAcceptor) として 401 で拒否する。
     if row.followed_actor_id != signer.id {
-        bail!(
-            "Accept/Reject signer {} is not the followed actor of follow {}",
-            signer.ap_id,
-            follow_uri,
-        );
+        return Err(DispatchError::UnrelatedAcceptor {
+            signer: signer.ap_id.clone(),
+            follow_ap_id: follow_uri,
+        });
     }
 
     repo::follow::set_state(state.pool(), row.id, new_state)
         .await
-        .with_context(|| format!("set follow {} state to {}", row.id, new_state.as_str()))?;
+        .with_context(|| format!("set follow {} state to {}", row.id, new_state.as_str()))
+        .map_err(DispatchError::Internal)?;
 
     info!(
         follow_id = row.id,

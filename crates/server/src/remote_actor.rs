@@ -54,7 +54,7 @@ const MAX_ACTOR_BYTES: usize = 256 * 1024;
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
-pub enum FetchError {
+pub(crate) enum FetchError {
     #[error("URL is invalid: {0}")]
     InvalidUrl(#[from] url::ParseError),
 
@@ -92,7 +92,7 @@ pub enum FetchError {
 /// `owner` 検査を経て `actor` テーブルに upsert してから `ActorRow` を返す。
 /// [`crate::extract::SignedInboxBody`] が DB 再 lookup を重複させずに済むよう、
 /// 既存行チェックは extractor 側で済ませてから本関数を呼ぶ。
-pub async fn fetch_and_upsert_for_signature(
+pub(crate) async fn fetch_and_upsert_for_signature(
     state: &AppState,
     ap_id: &str,
 ) -> Result<ActorRow, FetchError> {

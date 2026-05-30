@@ -56,6 +56,19 @@ pub(crate) enum DispatchError {
         signer: String,
     },
 
+    /// **Accept/Reject の signer が follow の followed actor と一致しない**:
+    /// 例えば evil.example の actor が他人の follow に対する Accept を
+    /// 送りつけてくるケース。F3 (body actor == signer) を通っていても
+    /// handler 層で `followed_actor_id` 検査をすると `signer.id != followed_actor_id`
+    /// で弾ける。401 で返す ── 503 にすると Mastodon が長めにリトライ保持
+    /// するため、悪意ある actor からの偽 Accept 連投で帯域を奪われる
+    /// (M3b-3 PR2 round-2 review F3)。
+    #[error("Accept/Reject signer {signer:?} is not the followed actor of follow {follow_ap_id:?}")]
+    UnrelatedAcceptor {
+        signer: String,
+        follow_ap_id: String,
+    },
+
     /// 仕様外 / 受け入れ不能なフィールド構造。
     #[error("activity is malformed: {0}")]
     Malformed(String),
@@ -72,9 +85,9 @@ impl DispatchError {
             Self::BadJson(_) | Self::MissingType | Self::MissingActor | Self::Malformed(_) => {
                 StatusCode::BAD_REQUEST
             }
-            Self::ActorMismatch { .. } | Self::NestedObjectActorMismatch { .. } => {
-                StatusCode::UNAUTHORIZED
-            }
+            Self::ActorMismatch { .. }
+            | Self::NestedObjectActorMismatch { .. }
+            | Self::UnrelatedAcceptor { .. } => StatusCode::UNAUTHORIZED,
             Self::Internal(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -191,15 +204,11 @@ pub(crate) async fn dispatch(
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
         "Accept" => {
-            handler::handle_accept(state, signer, &activity)
-                .await
-                .map_err(DispatchError::Internal)?;
+            handler::handle_accept(state, signer, &activity).await?;
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
         "Reject" => {
-            handler::handle_reject(state, signer, &activity)
-                .await
-                .map_err(DispatchError::Internal)?;
+            handler::handle_reject(state, signer, &activity).await?;
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
         other => {
