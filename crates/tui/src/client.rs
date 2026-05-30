@@ -69,8 +69,12 @@ pub enum ApiError {
 
 impl LocalApi {
     /// 新しいクライアントを構築する。`socket` は実際の Unix socket パス
-    /// (例: `/run/sakurasato/local.sock`)。`token` は **空文字を許さない**
-    /// (`server::token` の SHA-256 lookup と合わせるため)。
+    /// (例: `/run/sakurasato/local.sock`)、`token` は Bearer トークン。
+    ///
+    /// 空トークンは構築自体は通すが、最初の認証付きリクエストで `server::token`
+    /// の SHA-256 lookup が空文字に対しても比較するため 401 を返す。CLI 側
+    /// (`main.rs`) で `resolve_token` がそもそも空文字を弾くので、
+    /// ここでは追加検査しない。
     pub fn new(socket: PathBuf, token: String) -> Self {
         Self {
             inner: Client::unix(),
@@ -243,6 +247,10 @@ pub struct TimelineNote {
     pub actor_preferred_username: String,
     #[serde(default)]
     pub actor_display_name: Option<String>,
+    /// 投稿主のアバター URL (M5 PR2 で server が timeline 応答に載せる)。
+    /// TUI は本フィールドを使って画像 fetch をキックする。
+    #[serde(default)]
+    pub actor_icon_url: Option<String>,
     pub content: String,
     #[serde(default)]
     pub summary: Option<String>,
@@ -306,6 +314,8 @@ pub struct NoteCreatedPayload {
     pub actor_preferred_username: String,
     #[serde(default)]
     pub actor_display_name: Option<String>,
+    #[serde(default)]
+    pub actor_icon_url: Option<String>,
     pub content: String,
     #[serde(default)]
     pub summary: Option<String>,
@@ -330,6 +340,7 @@ impl NoteCreatedPayload {
             actor_ap_id: self.actor_ap_id,
             actor_preferred_username: self.actor_preferred_username,
             actor_display_name: self.actor_display_name,
+            actor_icon_url: self.actor_icon_url,
             content: self.content,
             summary: self.summary,
             language: None,

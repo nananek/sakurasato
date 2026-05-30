@@ -49,6 +49,11 @@ struct Cli {
     #[arg(long, default_value_t = 40)]
     page_size: i64,
 
+    /// 画像表示を無効化する。Kitty 等の対応端末でも強制的にテキスト UI。
+    /// 視覚刺激抑制の暫定スイッチ ── 要素別トグルは M9 で実装予定。
+    #[arg(long)]
+    no_images: bool,
+
     /// 起動せずに組み込みテーマ名を列挙して終了。
     #[arg(long)]
     list_themes: bool,
@@ -81,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         token,
         theme,
         page_size: cli.page_size.clamp(1, 80),
+        images_enabled: !cli.no_images,
     };
 
     runtime::run(opts).await

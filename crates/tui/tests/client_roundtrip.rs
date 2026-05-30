@@ -85,18 +85,25 @@ async fn http_400_is_surfaced_as_status_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn spawn_server() -> anyhow::Result<(PathBuf, Arc<CapturedAuth>, tokio::task::JoinHandle<()>)>
-{
-    let dir = tempfile::tempdir()?;
+/// テストごとに掴むサーバハンドル一式。`_dir` は `TempDir` の生存を保持する
+/// ためだけのフィールドで、drop されると socket file ごと消える。
+/// 以前は `Box::leak` していたが、`--test-threads` を上げると leak が累積
+/// するため `Arc<TempDir>` で明示的に lifetime を縛る形に直した
+/// ([PR #34 claude-review 改善提案 #1])。
+#[allow(dead_code, reason = "TempDir/JoinHandle を握っておくだけで使わない")]
+struct ServerGuard {
+    dir: Arc<tempfile::TempDir>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+async fn spawn_server() -> anyhow::Result<(PathBuf, Arc<CapturedAuth>, ServerGuard)> {
+    let dir = Arc::new(tempfile::tempdir()?);
     let socket = dir.path().join("api.sock");
-    // tempdir は test 終了時に drop されるので、ソケットファイル保持のため
-    // leak する (= テストプロセス終了で OS が掃除する)。
-    let _kept_dir = Box::leak(Box::new(dir));
 
     let captured = Arc::new(CapturedAuth::default());
     let listener = UnixListener::bind(&socket).context("bind uds")?;
     let cap_for_task = captured.clone();
-    let server = tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _addr)) = listener.accept().await else {
                 break;
@@ -116,7 +123,7 @@ async fn spawn_server() -> anyhow::Result<(PathBuf, Arc<CapturedAuth>, tokio::ta
     // ソケット readiness 安定化。tokio bind 直後でも accept は OK だが、
     // CI 環境の小さなずれを吸収する。
     tokio::time::sleep(Duration::from_millis(20)).await;
-    Ok((socket, captured, server))
+    Ok((socket, captured, ServerGuard { dir, handle }))
 }
 
 async fn handle(

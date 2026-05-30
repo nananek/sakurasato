@@ -20,8 +20,10 @@ figment.workspace = true
 percent-encoding.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
+# `net_guard` モジュールが `url::Url` で SSRF allowlist 判定を提供する。
+# reqwest を引かず軽い url crate だけで完結する。
+url.workspace = true
 
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }
 serde_json.workspace = true
-url.workspace = true

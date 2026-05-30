@@ -47,6 +47,9 @@ pub struct TimelineNote {
     pub actor_ap_id: String,
     pub actor_preferred_username: String,
     pub actor_display_name: Option<String>,
+    /// 投稿主のアバター URL。M5 PR2 で TUI 側が画像表示に使う。
+    /// クライアントが直接 fetch する想定 (server は decode しない)。
+    pub actor_icon_url: Option<String>,
     pub content: String,
     pub summary: Option<String>,
     pub language: Option<String>,
@@ -68,6 +71,7 @@ impl From<TimelineEntry> for TimelineNote {
             actor_ap_id: e.actor_ap_id,
             actor_preferred_username: e.actor_preferred_username,
             actor_display_name: e.actor_display_name,
+            actor_icon_url: e.actor_icon_url,
             content: e.content,
             summary: e.summary,
             language: e.language,

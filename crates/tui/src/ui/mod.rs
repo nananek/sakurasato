@@ -22,10 +22,17 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui_image::Image;
 
 use crate::app::{App, Focus, StatusKind};
 use crate::client::TimelineNote;
 use crate::theme::{Palette, Theme};
+
+/// avatar をレンダリングするときに左側へ確保する cell 数。`width` = この値、
+/// `height` = 2 行で固定 (header + CW or 1 行 content)。3 セル × 2 行は
+/// Kitty/Sixel/iTerm2 の最小フォントサイズでも視認できる程度。
+const AVATAR_CELLS_W: u16 = 4;
+const AVATAR_CELLS_H: u16 = 2;
 
 pub mod hit;
 
@@ -120,17 +127,35 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
         return hits;
     }
 
+    let avatar_enabled = app.images.enabled();
+    let header_indent = if avatar_enabled {
+        AVATAR_CELLS_W + 1
+    } else {
+        0
+    };
+
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner.height as usize);
     let mut row_cursor: u16 = 0;
     let mut idx = app.top;
+    // 描画後に上書きするアバター矩形をここに溜める。Paragraph 描画より後で
+    // render_widget(Image, ...) で重ねる必要があるため。
+    let mut avatar_overlays: Vec<(u16, &str)> = Vec::new();
     while idx < app.notes.len() && row_cursor < inner.height {
         let note = &app.notes[idx];
         let is_selected = idx == app.selected;
-        let block_lines = note_lines(note, palette, is_selected, inner.width);
+        let block_lines = note_lines(note, palette, is_selected, inner.width, header_indent);
         let consumed = u16::try_from(block_lines.len()).unwrap_or(u16::MAX);
         let visible_top = inner.y + row_cursor;
         let visible_height = consumed.min(inner.height - row_cursor);
         hits.push(idx, visible_top, visible_height);
+
+        if avatar_enabled
+            && visible_height >= 1
+            && let Some(url) = note.actor_icon_url.as_deref()
+        {
+            avatar_overlays.push((visible_top, url));
+        }
+
         for l in block_lines {
             if row_cursor >= inner.height {
                 break;
@@ -143,7 +168,30 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
 
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(p, inner);
+
+    if avatar_enabled {
+        for (y, url) in avatar_overlays {
+            render_avatar(frame, app, inner.x, y, url);
+        }
+    }
     hits
+}
+
+fn render_avatar(frame: &mut Frame<'_>, app: &App, x: u16, y: u16, url: &str) {
+    let rect = Rect::new(x, y, AVATAR_CELLS_W, AVATAR_CELLS_H);
+    // 未取得ならフェッチを spawn (= 次フレームには Ready になる可能性がある)。
+    app.images.ensure(url, rect);
+    let Some(protocol) = app.images.get(url) else {
+        // 取得待ち / 失敗のときはプレースホルダ。視覚刺激抑制との互換性も保てる。
+        let p = Paragraph::new(Line::from(Span::styled(
+            "▒▒",
+            Style::default().fg(app.theme.palette.muted),
+        )));
+        frame.render_widget(p, rect);
+        return;
+    };
+    let widget = Image::new(protocol.as_ref());
+    frame.render_widget(widget, rect);
 }
 
 fn note_lines(
@@ -151,6 +199,7 @@ fn note_lines(
     palette: &Palette,
     selected: bool,
     width: u16,
+    avatar_indent: u16,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::with_capacity(4);
     let marker_style = if selected {
@@ -161,11 +210,13 @@ fn note_lines(
         Style::default().fg(palette.muted)
     };
     let marker = if selected { "▍ " } else { "  " };
+    let pad = " ".repeat(avatar_indent as usize);
 
     let local_published = note.published_at.with_timezone(&Local);
     let time = local_published.format("%H:%M").to_string();
     let handle = format_handle(note);
     let header = Line::from(vec![
+        Span::raw(pad.clone()),
         Span::styled(marker.to_string(), marker_style),
         Span::styled(format!("[{time}] "), Style::default().fg(palette.muted)),
         Span::styled(
@@ -193,6 +244,7 @@ fn note_lines(
         && !cw.is_empty()
     {
         out.push(Line::from(vec![
+            Span::raw(pad.clone()),
             Span::styled(
                 "  CW: ",
                 Style::default()
@@ -203,21 +255,22 @@ fn note_lines(
         ]));
     }
 
-    // content を改行で割り、各行に 2 文字のインデントを足す。
+    let total_indent = avatar_indent + 2;
+    let body_width = width.saturating_sub(total_indent);
     for body_line in note.content.lines() {
         out.push(Line::from(vec![
-            Span::raw("  "),
+            Span::raw(format!("{pad}  ")),
             Span::styled(
-                truncate_for_width(body_line, width.saturating_sub(2)),
+                truncate_for_width(body_line, body_width),
                 Style::default().fg(palette.foreground),
             ),
         ]));
     }
     if note.content.is_empty() {
-        out.push(Line::from(Span::styled(
-            "  (empty)",
-            Style::default().fg(palette.muted),
-        )));
+        out.push(Line::from(vec![
+            Span::raw(pad.clone()),
+            Span::styled("  (empty)", Style::default().fg(palette.muted)),
+        ]));
     }
     out.push(Line::from(""));
     out

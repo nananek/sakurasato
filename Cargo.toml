@@ -116,6 +116,25 @@ bytes = "1"
 # `bytes` feature だけ十分 (= reqwest 同梱版でない素のストリームパーサ)。
 eventsource-stream = "0.2"
 
+# ── M5 PR2: TUI 画像対応 ─────────────────────────────────────────────
+# ratatui-image: Kitty / Sixel / iTerm2 / unicode-half fallback の自動検出と
+# `Image` widget。Picker::from_query_stdio() で端末問い合わせを行う。
+# crossterm 0.29 とバージョンを合わせる (ratatui-image 11 系は ratatui 0.30 + crossterm 0.29 を要求)。
+# `default-features = false` + `crossterm` のみ ── 以下を意図的に外している:
+#   - `chafa-dyn` (libchafa の system 依存)
+#   - `image-defaults` (= image/default。AVIF を含む全コーデックを引き、`ravif`
+#     / `rav1e` (AV1 エンコーダ) という不要に大きい依存を持ち込む)
+# `image` crate は workspace 側で `["png", "jpeg", "webp", "gif"]` を直接指定する
+# ので、`image-defaults` が無くてもアバターのデコードは可能。
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
+# `image` crate (= ratatui-image が内部で使うものに揃える)。Avatar デコードの
+# ために server 本体ではなく TUI クライアントで使う ── 信頼できないバイト列を
+# server コンテナで decode しない設計 (CLAUDE.md §7) は維持される。
+# default-features を保ち、PNG / JPEG / WebP / GIF を対応にする (最低限のフォーマット)。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# LRU は実用十分な小さい実装。`lru` crate は put/get が O(1)。
+lru = "0.16"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
