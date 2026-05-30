@@ -58,7 +58,7 @@ pub struct TuiOptions {
     /// テーマ名 (`sakura`/`dark`/`light` の組み込み、または `--theme-file` で
     /// 直接指定したパスの拡張子抜きファイル名)。
     pub theme: theme::Theme,
-    /// 1 ページ分のタイクライン取得件数。`/api/v1/timeline/home?limit=` に渡す。
+    /// 1 ページ分のタイムライン取得件数。`/api/v1/timeline/home?limit=` に渡す。
     pub page_size: i64,
     /// 画像 (アバター) 表示を有効化する。`false` または terminal が
     /// 画像プロトコル非対応のときはテキスト専用にフォールバックする。

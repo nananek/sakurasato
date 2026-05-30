@@ -7,13 +7,18 @@
 //!
 //! # セキュリティ方針
 //!
-//! - 取得先は **任意のリモート URL**。TUI はユーザのホスト上で走るため、
-//!   server コンテナの egress 制限の外。`reqwest` を rustls で使う。
-//! - **サイズ上限**: `MAX_BYTES = 4 MiB`。リモート画像を巨大にして OOM を狙う
-//!   攻撃を限定する。HTTP `Content-Length` だけでなく、ストリーミング読み出し
-//!   中に超過したら abort する。
+//! - 取得先は **任意のリモート URL** (= 連合相手の actor.icon が指す HTTP URL)。
+//!   TUI はユーザのホスト上で走るため server コンテナの egress 制限の外なので、
+//!   ここで多層防御を入れないと SSRF で LAN/クラウドメタデータが漏れる。
+//! - **SSRF**: `sakurasato_core::net_guard::host_blocked` で IP literal /
+//!   localhost / .local / private 帯域 / 169.254.x.x (IMDS) 等を遮断する。
+//!   **リダイレクト追従の各ステップでも再検証**する (`reqwest::redirect::Policy::custom`)。
+//! - **スキーマ制限**: `http` / `https` 以外は弾く (`file://` / `data:` を禁止)。
+//! - **取得サイズ上限**: `MAX_BYTES = 4 MiB`。`Content-Length` チェックに加え、
+//!   ストリーミングで累計を数えて越えたら abort (= chunked / gzip でも有効)。
+//! - **ピクセル上限**: `image::Limits` で `max_image_width` / `max_image_height` /
+//!   `max_alloc` を設定。decompression bomb 防御。
 //! - **タイムアウト**: 10 秒。
-//! - **スキーマ制限**: `http` / `https` 以外は弾く (`file://` 等の禁止)。
 //! - 画像 decode は本クライアント (TUI) で行う ── server 本体ではしない。
 //!   `image` crate は CVE 履歴が知られているが、本クライアントが独立プロセスで
 //!   走る限り server には波及しない (CLAUDE.md §7)。
@@ -30,12 +35,14 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use image::ImageReader;
 use lru::LruCache;
 use ratatui::layout::{Rect, Size};
 use ratatui_image::Resize;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
+use sakurasato_core::net_guard::host_blocked;
 use tracing::{debug, warn};
 
 /// 1 アバターの取得サイズ上限。
@@ -46,6 +53,10 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// LRU 容量。お一人様 TUI なので 64 ホスト分くらいで十分。
 const CACHE_CAP: usize = 64;
+/// 画像の最大幅/高さ (ピクセル)。アバターはサムネ用途なので 4096x4096 で十分。
+/// decompression bomb (`100000x100000` のような巨大解像度宣言) を image crate
+/// のデコード前段で弾く。
+const MAX_IMAGE_DIMENSION: u32 = 4096;
 
 /// キャッシュ entry の状態。
 ///
@@ -94,15 +105,33 @@ impl std::fmt::Debug for ImageCache {
 
 impl ImageCache {
     /// 新しいキャッシュ。`picker` が `None` のときは画像表示無効化モード
-    /// (= ensure / get が no-op)。
+    /// (= ensure / get が no-op)。HTTP クライアント構築に失敗した場合も
+    /// 画像無効化モードに落とす (= TLS 設定の沈黙的フォールバック禁止)。
     pub fn new(picker: Option<Picker>) -> Self {
+        // リダイレクトポリシ: 最大 3 回 + 各 hop で SSRF allowlist 再検証。
+        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.error("too many redirects (>3)");
+            }
+            if let Some(reason) = host_blocked(attempt.url()) {
+                return attempt.error(format!("redirect to blocked host ({reason})"));
+            }
+            attempt.follow()
+        });
         let http = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
             .user_agent(concat!("sakurasato-tui/", env!("CARGO_PKG_VERSION")))
-            // リダイレクトは最大 3 回 (リモート → CDN → 実体 を吸収)。
-            .redirect(reqwest::redirect::Policy::limited(3))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .redirect(redirect_policy)
+            .build();
+        let (http, picker) = match http {
+            Ok(c) => (c, picker),
+            Err(err) => {
+                // rustls の初期化失敗等。silently デフォルト client に落ちると
+                // TLS 検証が緩む可能性があるので、画像取得を諦める方が安全。
+                warn!(?err, "TUI: reqwest client build failed; disabling images");
+                (reqwest::Client::new(), None)
+            }
+        };
         let cap = NonZeroUsize::new(CACHE_CAP).expect("non-zero cap");
         Self {
             inner: Arc::new(Mutex::new(LruCache::new(cap))),
@@ -137,9 +166,9 @@ impl ImageCache {
         let Some(picker) = self.picker.clone() else {
             return;
         };
-        if !is_allowed_scheme(url) {
+        let Some(_vetted) = vet_url(url) else {
             return;
-        }
+        };
         let needs_fetch = {
             let Ok(mut cache) = self.inner.lock() else {
                 return;
@@ -183,11 +212,21 @@ impl ImageCache {
     }
 }
 
-fn is_allowed_scheme(url: &str) -> bool {
-    let Ok(u) = url::Url::parse(url) else {
-        return false;
-    };
-    matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+/// URL が画像取得に許容できるか。スキーム制限 + SSRF allowlist の両方を通す。
+/// 通過すれば `Some(parsed)` を返し、callers がそのまま `reqwest` に渡す。
+fn vet_url(raw: &str) -> Option<url::Url> {
+    let parsed = url::Url::parse(raw).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return None;
+    }
+    if let Some(reason) = host_blocked(&parsed) {
+        debug!(url = %parsed, reason, "avatar URL blocked by net_guard");
+        return None;
+    }
+    Some(parsed)
 }
 
 async fn fetch_and_decode(
@@ -197,9 +236,10 @@ async fn fetch_and_decode(
     size: Rect,
 ) -> Result<Protocol, String> {
     let target = Size::new(size.width, size.height);
-    debug!(%url, "fetch avatar");
+    let parsed = vet_url(url).ok_or_else(|| "blocked URL".to_string())?;
+    debug!(url = %parsed, "fetch avatar");
     let resp = http
-        .get(url)
+        .get(parsed)
         .send()
         .await
         .map_err(|e| format!("request: {e}"))?;
@@ -211,19 +251,32 @@ async fn fetch_and_decode(
     {
         return Err(format!("Content-Length {len} exceeds {MAX_BYTES}"));
     }
-    let bytes = resp.bytes().await.map_err(|e| format!("read body: {e}"))?;
-    if bytes.len() > MAX_BYTES {
-        return Err(format!("body {} exceeds {MAX_BYTES}", bytes.len()));
+    // chunked / gzip 等ヘッダ無しの転送に備え、ストリームで累計バイト数を
+    // 数えながら受信。`MAX_BYTES` を超えた瞬間に切断 (= 全部メモリに展開
+    // してから後段で reject という最悪パターンを避ける)。
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("read body: {e}"))?;
+        if buf.len() + chunk.len() > MAX_BYTES {
+            return Err(format!(
+                "body exceeds limit during stream ({}>{MAX_BYTES})",
+                buf.len() + chunk.len()
+            ));
+        }
+        buf.extend_from_slice(&chunk);
     }
 
     // `image` crate でフォーマット推定 + デコード。`with_guessed_format` は
     // バイトの magic を見て jpg/png/webp/gif を分ける。失敗時はそのまま伝搬。
-    // `set_limits` で巨大画像のピクセル展開を抑制する (= decompression bomb 対策)。
-    let mut reader = ImageReader::new(std::io::Cursor::new(bytes.clone()))
+    // `Limits` で巨大画像のピクセル展開を抑制する (= decompression bomb 対策)。
+    let mut reader = ImageReader::new(std::io::Cursor::new(buf))
         .with_guessed_format()
         .map_err(|e| format!("guess format: {e}"))?;
     let mut limits = image::Limits::no_limits();
     limits.max_alloc = Some(64 * 1024 * 1024); // 64 MiB
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
     reader.limits(limits);
     let dyn_img = reader.decode().map_err(|e| format!("decode: {e}"))?;
 
@@ -238,13 +291,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowed_scheme_filters_file_and_data_uris() {
-        assert!(is_allowed_scheme("https://example.com/a.png"));
-        assert!(is_allowed_scheme("http://example.com/a.png"));
-        assert!(!is_allowed_scheme("file:///etc/passwd"));
-        assert!(!is_allowed_scheme("data:image/png;base64,AAA"));
-        assert!(!is_allowed_scheme("ftp://example.com/a.png"));
-        assert!(!is_allowed_scheme("not a url"));
+    fn vet_url_blocks_non_http_schemes() {
+        assert!(vet_url("https://example.com/a.png").is_some());
+        assert!(vet_url("http://example.com/a.png").is_some());
+        assert!(vet_url("file:///etc/passwd").is_none());
+        assert!(vet_url("data:image/png;base64,AAA").is_none());
+        assert!(vet_url("ftp://example.com/a.png").is_none());
+        assert!(vet_url("not a url").is_none());
+    }
+
+    #[test]
+    fn vet_url_blocks_ssrf_targets() {
+        // SSRF allowlist (sakurasato_core::net_guard 経由) が効くこと。
+        assert!(vet_url("http://127.0.0.1/x").is_none());
+        assert!(vet_url("http://10.0.0.1/x").is_none());
+        assert!(vet_url("http://192.168.1.1/x").is_none());
+        assert!(vet_url("http://169.254.169.254/latest/meta-data/").is_none());
+        assert!(vet_url("http://localhost/x").is_none());
+        assert!(vet_url("http://postgres.local/x").is_none());
+        assert!(vet_url("http://[::1]/x").is_none());
+        assert!(vet_url("http://[fe80::1]/x").is_none());
+        // 公開 IP は通る。
+        assert!(vet_url("https://1.1.1.1/x").is_some());
+        assert!(vet_url("https://example.com/x").is_some());
     }
 
     #[test]

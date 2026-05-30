@@ -53,7 +53,8 @@ image.workspace = true
 lru.workspace = true
 # Avatar fetch は HTTPS の公開エンドポイントへ行くので reqwest を使う (Unix socket
 # は hyperlocal、画像 fetch は reqwest と分離)。rustls + http2 で distroless 互換。
-reqwest.workspace = true
+# `stream` feature でストリーミング受信 (= 累計サイズ上限チェック) を有効化。
+reqwest = { workspace = true, features = ["stream"] }
 
 [dev-dependencies]
 tempfile = "3"

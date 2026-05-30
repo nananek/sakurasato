@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod model;
+pub mod net_guard;
 pub mod repo;
 
 pub use config::Config;
