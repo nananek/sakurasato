@@ -7,9 +7,10 @@
 -- 識別・取り消し可能にするため Bearer トークンを併用する。
 --
 -- 設計メモ:
--- - `token_hash` は **生トークンの SHA-256 (hex)** を格納。生トークンは
---   発行時に 1 回だけ stdout に出し、以降は再表示できない。DB 漏洩しても
---   生トークンは復元できない。
+-- - `token_hash` は **生トークンの SHA-256 を Base64URL (no-pad) でエンコード
+--   した文字列** (44 文字未満、43 文字固定) を格納。生トークンは発行時に
+--   1 回だけ stdout に出し、以降は再表示できない。DB 漏洩しても生トークンは
+--   復元できない (256-bit エントロピー)。
 -- - `name` は人間可読ラベル (例: "tui-laptop")。同名の重複は許可する
 --   ── 同じ TUI を再発行する際に古い行を残せるようにしておく。`name` の
 --   一意制約は付けない。
@@ -24,8 +25,9 @@ CREATE TABLE api_token (
     id            BIGSERIAL   PRIMARY KEY,
     -- 人間可読ラベル (例: "tui-laptop", "tui-mobile")。重複可。
     name          TEXT        NOT NULL,
-    -- 生トークンの SHA-256 hex。一意制約で「同じ生トークンを 2 度発行
-    -- してしまった」状態を DB レイヤで弾く。
+    -- 生トークンの SHA-256 を Base64URL (no-pad) エンコードしたもの。
+    -- 実装は server::token::hash 参照。一意制約で「同じ生トークンを 2 度
+    -- 発行してしまった」状態を DB レイヤで弾く。
     token_hash    TEXT        NOT NULL UNIQUE,
     -- 最終利用時刻。auth middleware が成功時に best-effort で更新。
     last_used_at  TIMESTAMPTZ,
