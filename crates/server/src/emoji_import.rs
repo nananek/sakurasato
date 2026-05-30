@@ -245,15 +245,17 @@ async fn import_archive<R: Read + Seek>(
         };
 
         let storage_key = format!("{LOCAL_EMOJI_KEY_PREFIX}{shortcode}.webp");
-        let media_type = processed.content_type.clone();
-        let put_bytes = processed.bytes.clone();
+        // `processed.bytes` は `bytes::Bytes` で ref-counted。`ByteStream::from`
+        // が `Bytes` を直接受け取れるので `.to_vec()` のコピーは省ける
+        // ([[m8-pr1-review]] PR #44 軽微指摘 #1)。
+        let media_type = processed.content_type;
         let put = state
             .s3_client()
             .put_object()
             .bucket(&bucket)
             .key(&storage_key)
             .content_type(&media_type)
-            .body(ByteStream::from(put_bytes.to_vec()))
+            .body(ByteStream::from(processed.bytes))
             .send()
             .await;
         if let Err(err) = put {
@@ -290,8 +292,12 @@ async fn import_archive<R: Read + Seek>(
 }
 
 /// `meta.json` を読む。サイズ上限 [`META_MAX_BYTES`] を超えていれば拒否。
+///
+/// `ZipFile::size()` (= zip ヘッダの宣言値) と `Read::take` の二重ガードで
+/// 切る ── `read_emoji_bytes` と対称。ヘッダが `uncompressed_size=0` と
+/// 嘘をついても実際の inflate を上限で打ち切る ([[m8-pr1-review]] PR #44)。
 fn read_meta<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> anyhow::Result<MisskeyMeta> {
-    let mut file = archive
+    let file = archive
         .by_name("meta.json")
         .map_err(|e| anyhow!("meta.json not found in zip: {e}"))?;
     if file.size() > META_MAX_BYTES {
@@ -301,8 +307,15 @@ fn read_meta<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> anyhow::Result
             META_MAX_BYTES,
         );
     }
-    let mut buf = Vec::with_capacity(usize::try_from(file.size()).unwrap_or(0));
-    file.read_to_end(&mut buf).context("read meta.json bytes")?;
+    let cap = usize::try_from(file.size()).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
+    let mut limited = file.take(META_MAX_BYTES + 1);
+    limited
+        .read_to_end(&mut buf)
+        .context("read meta.json bytes")?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > META_MAX_BYTES {
+        bail!("meta.json exceeded {META_MAX_BYTES} bytes during inflate");
+    }
     serde_json::from_slice(&buf).context("parse meta.json")
 }
 
@@ -429,6 +442,22 @@ mod tests {
         let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
         let err = read_meta(&mut archive).unwrap_err();
         assert!(format!("{err}").contains("meta.json is"));
+    }
+
+    /// `take` ガードの追加で、`META_MAX_BYTES` 直下のサイズは引き続き受ける
+    /// ことを確認 (回帰防止: take limit を `META_MAX_BYTES` ぴったりに置くと
+    /// off-by-one でちょうど境界の合法 zip を拒否してしまう)。
+    #[test]
+    fn read_meta_accepts_at_limit() {
+        // `_pad` の中身を調整して meta.json 全体が META_MAX_BYTES 未満になるよう詰める。
+        // 余裕を持って 32 byte 引いておく ── JSON 構造のオーバーヘッド分。
+        let pad_len = usize::try_from(META_MAX_BYTES).unwrap() - 32;
+        let near_limit = format!("{{\"emojis\":[], \"_pad\":\"{}\"}}", "a".repeat(pad_len));
+        assert!(u64::try_from(near_limit.len()).unwrap() < META_MAX_BYTES);
+        let zip_bytes = build_zip(&near_limit, &[]);
+        let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+        let meta = read_meta(&mut archive).expect("just below limit must be accepted");
+        assert!(meta.emojis.is_empty());
     }
 
     /// `read_emoji_bytes` が解凍前のヘッダサイズで弾くこと。
