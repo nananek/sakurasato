@@ -8,6 +8,9 @@ authors.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "sakurasato-tui"
 path = "src/main.rs"
@@ -17,4 +20,34 @@ workspace = true
 
 [dependencies]
 sakurasato-core.workspace = true
+
 anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+url.workspace = true
+clap.workspace = true
+http.workspace = true
+
+ratatui.workspace = true
+crossterm.workspace = true
+
+# Unix socket 越しの HTTP/SSE クライアント。
+hyperlocal.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+eventsource-stream.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# 統合テスト用に hyper の server 機能を引く (本体は client のみ)。
+hyper = { workspace = true, features = ["server"] }

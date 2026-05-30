@@ -1,0 +1,22 @@
+# 明背景テーマ。Kitty 等で背景を白寄りにしている場合の置き換え。
+
+[meta]
+name = "Sakurasato Light"
+description = "明背景に淡い墨。逆光の桜並木。"
+dark = false
+
+[palette]
+background     = "#f8f5f6"
+foreground     = "#2a2128"
+muted          = "#7a727a"
+border         = "#d6cfd1"
+selection      = "#ecd6e0"
+accent         = "#c4628a"
+accent_strong  = "#9a2f5a"
+status_bar_bg  = "#ecd6e0"
+status_bar_fg  = "#2a2128"
+warning        = "#a06030"
+error          = "#b03040"
+success        = "#386c38"
+link           = "#3060b0"
+cw_marker      = "#7a4828"

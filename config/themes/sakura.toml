@@ -1,0 +1,30 @@
+# Sakurasato 既定テーマ (桜)。
+#
+# - すべての色は 16 進 (`#rrggbb`) または ratatui の名前 ("white" / "lightblue"
+#   等) で指定する。色をハードコードせず、ここを書き換えるだけで TUI 全体の
+#   見た目を切り替えられる。
+# - フィールドが欠けたら組み込み既定 (= このファイルの値) で補完される。
+#   ([`tui::theme::Theme::with_overrides`])
+# - 視覚刺激抑制モードは M9 で別軸 (要素別画像トグル) として導入予定。色は
+#   抑制しない: 桜色も雪原の白も「静謐」の一部。
+
+[meta]
+name = "Sakurasato Sakura"
+description = "桜の里。淡いピンクとくすんだ墨。神里家の氷を遠目に思わせる白。"
+dark = true
+
+[palette]
+background     = "#1c1a1f"
+foreground     = "#e4dce0"
+muted          = "#7a737a"
+border         = "#3a333a"
+selection      = "#322a32"
+accent         = "#f6c1d6"
+accent_strong  = "#f088b6"
+status_bar_bg  = "#252128"
+status_bar_fg  = "#cfc7cc"
+warning        = "#ffbf80"
+error          = "#ff7a82"
+success        = "#a6d4a0"
+link           = "#9fc6f5"
+cw_marker      = "#d8b18a"

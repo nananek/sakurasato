@@ -1,0 +1,22 @@
+# 暗背景の汎用テーマ。色味を最小限に抑えた中庸セット。
+
+[meta]
+name = "Sakurasato Dark"
+description = "落ち着いた暗背景。アクセントだけ柔らかい青系。"
+dark = true
+
+[palette]
+background     = "#181818"
+foreground     = "#d8d8d8"
+muted          = "#6c6c6c"
+border         = "#2c2c2c"
+selection      = "#2a2a2a"
+accent         = "#7ec5f3"
+accent_strong  = "#5aa5e0"
+status_bar_bg  = "#202020"
+status_bar_fg  = "#c0c0c0"
+warning        = "#e0b070"
+error          = "#e07070"
+success        = "#90c890"
+link           = "#7ec5f3"
+cw_marker      = "#c7a36d"
