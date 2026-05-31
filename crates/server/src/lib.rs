@@ -6,12 +6,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod actor_admin;
 pub mod cli;
 pub mod delivery;
 pub(crate) mod dispatch;
 pub mod emoji_import;
 pub(crate) mod extract;
 pub mod follow;
+pub mod follow_request;
 pub(crate) mod http_client;
 pub mod init;
 pub mod local_api;

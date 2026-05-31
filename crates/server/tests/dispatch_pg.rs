@@ -112,6 +112,7 @@ fn local_actor(pub_pem: &str, priv_pem: &str) -> NewActor {
         moved_to_ap_id: None,
         is_local: true,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     }
 }
 
@@ -140,6 +141,7 @@ fn remote_actor(host: &str, user: &str, pub_pem: &str, inbox_url: &str) -> NewAc
         moved_to_ap_id: None,
         is_local: false,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     }
 }
 
@@ -717,6 +719,7 @@ async fn worker_drains_pending_rows(pool: PgPool) {
             moved_to_ap_id: None,
             is_local: true,
             actor_type: "Person".into(),
+            manually_approves_followers: false,
         },
     )
     .await
@@ -1909,4 +1912,382 @@ async fn undo_announce_removes_row(pool: PgPool) {
         .await
         .unwrap();
     assert!(row.is_none(), "Undo Announce must remove the row");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #66 (鍵アカ / manuallyApprovesFollowers) ── M12
+// ---------------------------------------------------------------------------
+
+fn locked_local_actor(pub_pem: &str, priv_pem: &str) -> NewActor {
+    let mut a = local_actor(pub_pem, priv_pem);
+    a.manually_approves_followers = true;
+    a
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn locked_actor_keeps_inbound_follow_pending(pool: PgPool) {
+    // 鍵アカ (`manually_approves_followers = TRUE`) の local actor 宛 Follow
+    // は auto-Accept されず `follow.state = pending` で据え置かれ、
+    // `delivery_queue` に Accept は積まれない (Issue #66)。
+    let (local_priv, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let _ = local_priv;
+
+    let local = repo::actor::insert(&pool, locked_local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote_inbox = "https://remote.test/users/bob/inbox".to_string();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor("remote.test", "bob", &remote_pub, &remote_inbox),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let follow_id = format!(
+        "https://remote.test/users/bob/activities/locked-follow-{}",
+        local.id,
+    );
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "locked actor still returns 202 for the inbound Follow (silent hold)",
+    );
+
+    let row = sqlx::query!("SELECT state FROM follow WHERE ap_id = $1", follow_id,)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.state, "pending",
+        "locked actor must keep follow row at pending until CLI approval",
+    );
+
+    let queued = sqlx::query!(
+        "SELECT count(*) AS c FROM delivery_queue WHERE sender_actor_id = $1",
+        local.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        queued.c.unwrap_or(0),
+        0,
+        "locked actor must NOT auto-enqueue an Accept activity",
+    );
+
+    let inboxes = repo::follow::list_accepted_inboxes(&pool, local.id)
+        .await
+        .unwrap();
+    assert!(
+        !inboxes.iter().any(|u| u == &remote_inbox),
+        "follower of a still-pending Follow must not appear as a delivery target",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn locked_actor_existing_accepted_follow_still_re_accepts(pool: PgPool) {
+    // unlock → followed → lock の順に状態が遷移した actor に対し、Mastodon
+    // が retry で再送してきた既存 Follow が来たケース。`row.state =
+    // accepted` のまま `Accept を再送出` するブランチに入る (state を
+    // Pending に巻き戻さない / lock 後でも再 Accept は queue する)。
+    let (local_priv, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let _ = local_priv;
+
+    let local = repo::actor::insert(&pool, locked_local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    // 既存 accepted の follow row を事前に積んでおく (= unlock 時代の名残)。
+    let follow_id = format!(
+        "https://remote.test/users/bob/activities/preexisting-{}",
+        local.id
+    );
+    sqlx::query!(
+        r"INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)
+          VALUES ($1, $2, $3, 'accepted')",
+        follow_id,
+        remote.id,
+        local.id,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // 既存 accepted → Accept 再送 ── state は accepted のまま据え置き、
+    // delivery_queue に Accept が 1 行追加される。
+    let row = sqlx::query!("SELECT state FROM follow WHERE ap_id = $1", follow_id,)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.state, "accepted");
+
+    let queued = sqlx::query!(
+        "SELECT count(*) AS c FROM delivery_queue WHERE sender_actor_id = $1",
+        local.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        queued.c.unwrap_or(0),
+        1,
+        "Accept must be re-enqueued for the retry, even on locked actor",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_request_list_returns_only_pending_local(pool: PgPool) {
+    // 鍵アカ 1 + remote actor を作り、`follow` 行を 3 つ (pending/accepted/
+    // pending-but-followed-is-remote) 仕込む。`list_pending_for_local` は
+    // 1 件目だけ返す。
+    let (_, local_pub) = fresh_rsa();
+    let (_, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, locked_local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let (_, remote2_pub) = fresh_rsa();
+    let remote2 = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "carol",
+            &remote2_pub,
+            "https://remote.test/users/carol/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    // 1) bob → local pending → 列挙される
+    let visible_ap_id = "https://remote.test/users/bob/activities/visible".to_string();
+    sqlx::query!(
+        r"INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)
+          VALUES ($1, $2, $3, 'pending')",
+        visible_ap_id,
+        remote.id,
+        local.id,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 2) carol → local accepted → 列挙されない (state フィルタ)
+    sqlx::query!(
+        r"INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)
+          VALUES ($1, $2, $3, 'accepted')",
+        "https://remote.test/users/carol/activities/already-accepted",
+        remote2.id,
+        local.id,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 3) local → carol pending (= outbound follow 待ち) → 列挙されない
+    //    (followed が remote actor なので `followed.is_local = TRUE` フィルタで落ちる)
+    sqlx::query!(
+        r"INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)
+          VALUES ($1, $2, $3, 'pending')",
+        "https://sakura.test/users/alice/activities/outbound",
+        local.id,
+        remote2.id,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let pending = repo::follow::list_pending_for_local(&pool).await.unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "only the inbound pending row must show up"
+    );
+    let (_, ap_id, follower_ap, _) = &pending[0];
+    assert_eq!(ap_id, &visible_ap_id);
+    assert_eq!(follower_ap, &remote.ap_id);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_request_approve_enqueues_accept_and_flips_state(pool: PgPool) {
+    use sakurasato_core::model::FollowState;
+    use sakurasato_server::follow_request;
+
+    let (_, local_pub) = fresh_rsa();
+    let (_, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, locked_local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote_inbox = "https://remote.test/users/bob/inbox".to_string();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor("remote.test", "bob", &remote_pub, &remote_inbox),
+    )
+    .await
+    .unwrap();
+
+    let follow_ap_id = "https://remote.test/users/bob/activities/pending-1".to_string();
+    let follow_id: i64 = sqlx::query_scalar!(
+        r"INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)
+          VALUES ($1, $2, $3, 'pending') RETURNING id",
+        follow_ap_id,
+        remote.id,
+        local.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    follow_request::approve_or_reject(&state, follow_id, FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let row = sqlx::query!("SELECT state FROM follow WHERE id = $1", follow_id,)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.state, "accepted");
+
+    let queue = sqlx::query!(
+        r#"SELECT inbox_url, activity as "activity: sqlx::types::Json<serde_json::Value>"
+           FROM delivery_queue WHERE sender_actor_id = $1"#,
+        local.id,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queue.len(), 1, "Accept queued exactly once");
+    let q = &queue[0];
+    assert_eq!(q.inbox_url, remote_inbox);
+    assert_eq!(q.activity.0["type"], "Accept");
+    assert_eq!(q.activity.0["actor"], local.ap_id);
+    // object には最小 Follow JSON (id/type/actor/object) が inline で埋まる。
+    assert_eq!(q.activity.0["object"]["id"], follow_ap_id);
+    assert_eq!(q.activity.0["object"]["actor"], remote.ap_id);
+    assert_eq!(q.activity.0["object"]["object"], local.ap_id);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_request_reject_enqueues_reject_and_flips_state(pool: PgPool) {
+    use sakurasato_core::model::FollowState;
+    use sakurasato_server::follow_request;
+
+    let (_, local_pub) = fresh_rsa();
+    let (_, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, locked_local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let follow_ap_id = "https://remote.test/users/bob/activities/pending-rej".to_string();
+    let follow_id: i64 = sqlx::query_scalar!(
+        r"INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)
+          VALUES ($1, $2, $3, 'pending') RETURNING id",
+        follow_ap_id,
+        remote.id,
+        local.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    follow_request::approve_or_reject(&state, follow_id, FollowState::Rejected)
+        .await
+        .unwrap();
+
+    let row = sqlx::query!("SELECT state FROM follow WHERE id = $1", follow_id,)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.state, "rejected");
+
+    let q = sqlx::query!(
+        r#"SELECT activity as "activity: sqlx::types::Json<serde_json::Value>"
+           FROM delivery_queue WHERE sender_actor_id = $1"#,
+        local.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(q.activity.0["type"], "Reject");
+    assert_eq!(q.activity.0["object"]["id"], follow_ap_id);
+
+    // 再度叩いても pending 以外なので拒否される (idempotent でなく明示エラー)。
+    let err = follow_request::approve_or_reject(&state, follow_id, FollowState::Accepted)
+        .await
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("only `pending` rows"),
+        "expected idempotency guard error, got {msg}",
+    );
 }

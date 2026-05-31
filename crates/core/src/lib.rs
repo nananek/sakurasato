@@ -23,6 +23,7 @@ mod tests {
         // 0009 media (M7: アップロードメディアのメタデータ)
         // 0010 note_edited_at (M11: Update Note 受信時刻)
         // 0011 announce (M11: Boost 受信)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 11);
+        // 0012 actor_manually_approves (M12 / Issue #66: 鍵アカフラグ)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 12);
     }
 }

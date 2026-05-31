@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE actor SET\n            preferred_username = $1,\n            host = $2,\n            display_name = $3,\n            summary = $4,\n            icon_url = $5,\n            image_url = $6,\n            inbox_url = $7,\n            shared_inbox_url = $8,\n            outbox_url = $9,\n            followers_url = $10,\n            following_url = $11,\n            public_key_id = $12,\n            public_key_pem = $13,\n            ed25519_public_key_id = $14,\n            ed25519_public_key_pem = $15,\n            also_known_as = $16,\n            moved_to_ap_id = $17,\n            actor_type = $18,\n            updated_at = now()\n        WHERE id = $19\n        RETURNING\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: sqlx::types::Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at\n        ",
+  "query": "\n        SELECT\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            fetched_at, created_at, updated_at\n        FROM actor WHERE preferred_username = $1 AND host = $2\n        ",
   "describe": {
     "columns": [
       {
@@ -214,7 +214,7 @@
       },
       {
         "ordinal": 19,
-        "name": "also_known_as: sqlx::types::Json<Vec<String>>",
+        "name": "also_known_as: Json<Vec<String>>",
         "type_info": "Jsonb",
         "origin": {
           "Table": {
@@ -258,6 +258,17 @@
       },
       {
         "ordinal": 23,
+        "name": "manually_approves_followers",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "manually_approves_followers"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
         "name": "fetched_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -268,7 +279,7 @@
         }
       },
       {
-        "ordinal": 24,
+        "ordinal": 25,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -279,7 +290,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -293,24 +304,7 @@
     "parameters": {
       "Left": [
         "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Jsonb",
-        "Text",
-        "Text",
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
@@ -337,10 +331,11 @@
       true,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "a8ee5014ef0f72c5856e8c386c0c0608d662e1d6ee37ed31cbd67566493ee624"
+  "hash": "34373b9610cb1e359afefd2e1b2a644f080ad385d5535fe6d3a0eaabd0e11198"
 }

@@ -42,6 +42,50 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Fol
     .await
 }
 
+/// `follow.id` で 1 行引く (`follow-request approve/reject` CLI 用)。
+pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<FollowRow>> {
+    sqlx::query_as!(
+        FollowRow,
+        r#"
+        SELECT id, ap_id, follower_actor_id, followed_actor_id, state, created_at, updated_at
+        FROM follow WHERE id = $1
+        "#,
+        id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// **Issue #66 / M12 `follow-request list`**: local actor 宛 `pending` Follow を
+/// 列挙する。鍵アカ運用で承認待ちになっている inbound Follow を表示する用途。
+///
+/// 返り値は `(follow.id, follow.ap_id, follower.ap_id, created_at)`。
+/// 順序は `follow.created_at` の昇順 (= 古い順) で固定する。
+pub async fn list_pending_for_local(
+    pool: &PgPool,
+) -> sqlx::Result<Vec<(i64, String, String, chrono::DateTime<chrono::Utc>)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            f.id           AS "id!",
+            f.ap_id        AS "ap_id!",
+            follower.ap_id AS "follower_ap_id!",
+            f.created_at   AS "created_at!"
+        FROM follow f
+        JOIN actor follower ON follower.id = f.follower_actor_id
+        JOIN actor followed ON followed.id = f.followed_actor_id
+        WHERE f.state = 'pending' AND followed.is_local = TRUE
+        ORDER BY f.created_at ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.id, r.ap_id, r.follower_ap_id, r.created_at))
+        .collect())
+}
+
 pub async fn set_state(pool: &PgPool, id: i64, state: FollowState) -> sqlx::Result<()> {
     sqlx::query!(
         "UPDATE follow SET state = $1, updated_at = now() WHERE id = $2",

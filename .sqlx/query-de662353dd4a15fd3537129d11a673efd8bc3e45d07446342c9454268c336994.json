@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            f.id           AS \"id!\",\n            f.ap_id        AS \"ap_id!\",\n            follower.ap_id AS \"follower_ap_id!\",\n            f.created_at   AS \"created_at!\"\n        FROM follow f\n        JOIN actor follower ON follower.id = f.follower_actor_id\n        JOIN actor followed ON followed.id = f.followed_actor_id\n        WHERE f.state = 'pending' AND followed.is_local = TRUE\n        ORDER BY f.created_at ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ap_id!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "follower_ap_id!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "de662353dd4a15fd3537129d11a673efd8bc3e45d07446342c9454268c336994"
+}

@@ -54,6 +54,20 @@ pub enum Command {
     /// `--from <file>` で activity 本文 (signer 含む) を読み、検証なしで
     /// `dispatch::move_handler::handle_move` を直接呼ぶ。
     MoveAccept(MoveAcceptArgs),
+    /// Manage local actor state (Issue #66 — 鍵アカ運用 lock/unlock)。
+    ///
+    /// `actor lock` / `actor unlock` で `manuallyApprovesFollowers` を切替える。
+    /// 切替後は actor `Update` activity をフォロワー全員に配信する (= プロ
+    /// フィール変更と同じ作法。受信側のキャッシュを更新させる)。
+    Actor(ActorArgs),
+    /// Manage incoming follow requests when locked (Issue #66)。
+    ///
+    /// `manually_approves_followers = TRUE` の local actor では inbound Follow
+    /// が `pending` で据え置かれる。`follow-request list/approve/reject` で
+    /// 承認・拒否を行う。approve は Accept activity を `delivery_queue` に
+    /// 積み、state を `accepted` に遷移。reject は Reject activity を積み、
+    /// state を `rejected` に遷移。
+    FollowRequest(FollowRequestArgs),
 }
 
 #[derive(Debug, Args)]
@@ -68,6 +82,13 @@ pub struct InitArgs {
     /// signing key — break federation, destructive).
     #[arg(long, default_value_t = false)]
     pub force: bool,
+    /// 鍵アカ (`manuallyApprovesFollowers = true`) として initialise する
+    /// (Issue #66 / M12)。`--force` 経路では既存 lock 状態は **保たれ** て
+    /// いる ── `--locked` を渡せば lock を維持/有効化、渡さなくても既存が
+    /// lock なら lock のまま。lock を解除したいときは init 後に
+    /// `sakurasato-server actor unlock` を叩く。
+    #[arg(long, default_value_t = false)]
+    pub locked: bool,
 }
 
 #[derive(Debug, Args)]
@@ -205,4 +226,49 @@ pub struct MoveAcceptArgs {
     /// 通常は activity 本文の `actor` を信用してよいが、改竄を疑うときに使う。
     #[arg(long)]
     pub signer: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ActorArgs {
+    #[command(subcommand)]
+    pub command: ActorCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ActorCommand {
+    /// 鍵アカ化 (`manuallyApprovesFollowers = true`)。Update activity を
+    /// フォロワーに配信して相手側のキャッシュを更新する。
+    Lock,
+    /// 鍵アカ解除 (`manuallyApprovesFollowers = false`)。同じく Update を
+    /// フォロワーに配信。lock 中に溜まった pending Follow は手動で
+    /// `follow-request approve/reject` する必要がある (= unlock しただけで
+    /// 過去の pending が自動 accept されるわけではない: 鍵 ON 中に届いた
+    /// 「待ち」を unlock の事故で全部 accept してしまうのを避ける設計)。
+    Unlock,
+}
+
+#[derive(Debug, Args)]
+pub struct FollowRequestArgs {
+    #[command(subcommand)]
+    pub command: FollowRequestCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FollowRequestCommand {
+    /// `follow.state = 'pending'` かつ followed が local actor の Follow
+    /// を列挙する。`id` / `follower` (`ap_id`) / `received_at` を表示。
+    List,
+    /// `--id <N>` で指定した pending Follow を承認し、Accept activity を
+    /// `delivery_queue` に積む + `follow.state = 'accepted'` に遷移する。
+    Approve(FollowRequestMutateArgs),
+    /// `--id <N>` で指定した pending Follow を拒否し、Reject activity を
+    /// `delivery_queue` に積む + `follow.state = 'rejected'` に遷移する。
+    Reject(FollowRequestMutateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct FollowRequestMutateArgs {
+    /// `follow.id` (= `follow-request list` で表示される number)。
+    #[arg(long)]
+    pub id: i64,
 }

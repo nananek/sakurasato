@@ -51,6 +51,7 @@ mod common {
             moved_to_ap_id: None,
             is_local: true,
             actor_type: "Person".into(),
+            manually_approves_followers: false,
         }
     }
 
@@ -616,6 +617,7 @@ async fn notes_reject_foreign_media(pool: PgPool) {
         moved_to_ap_id: None,
         is_local: false,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     };
     let remote_row = repo::actor::insert(&pool, remote).await.unwrap();
     let foreign_media = repo::media::insert(

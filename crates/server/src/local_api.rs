@@ -25,6 +25,11 @@
 //! - `POST /api/v1/reactions` ── ローカル Note へのリアクション作成 + EmojiReact/Like
 //!   配送 (M8 PR2)
 //! - `DELETE /api/v1/reactions/{id}` ── 自分のリアクション取消 + Undo 配送 (M8 PR2)
+//! - `POST /api/v1/actor/lock` / `POST /api/v1/actor/unlock` ── 鍵アカフラグ
+//!   切替 + actor Update 配信 (M12 / Issue #66)
+//! - `GET /api/v1/follow-requests` ── 承認待ち follow 一覧 (M12 / Issue #66)
+//! - `POST /api/v1/follow-requests/{id}/approve` ── Accept 配送 + state 遷移
+//! - `POST /api/v1/follow-requests/{id}/reject` ── Reject 配送 + state 遷移
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -38,7 +43,9 @@ use tracing::warn;
 
 use crate::state::AppState;
 
+pub mod actor_admin;
 pub mod auth;
+pub mod follow_request;
 pub mod media;
 pub mod media_proxy;
 pub mod notes;
@@ -81,6 +88,19 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/reactions/{id}",
             axum::routing::delete(reactions::delete),
+        )
+        // M12 / Issue #66: 鍵アカ運用の lock/unlock + 承認待ち管理。
+        // CLI と同じロジックを呼ぶだけ。pytest 連合テストと TUI 共通のフロント。
+        .route("/api/v1/actor/lock", post(actor_admin::lock))
+        .route("/api/v1/actor/unlock", post(actor_admin::unlock))
+        .route("/api/v1/follow-requests", get(follow_request::list))
+        .route(
+            "/api/v1/follow-requests/{id}/approve",
+            post(follow_request::approve),
+        )
+        .route(
+            "/api/v1/follow-requests/{id}/reject",
+            post(follow_request::reject),
         )
         // 全 `/api/v1/*` に Bearer 認証を要求する。`from_fn_with_state` で
         // middleware に `AppState` を渡し、`api_token` lookup に使う。

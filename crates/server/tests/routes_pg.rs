@@ -47,6 +47,7 @@ mod common {
             moved_to_ap_id: None,
             is_local: true,
             actor_type: "Person".into(),
+            manually_approves_followers: false,
         }
     }
 
@@ -322,6 +323,66 @@ async fn actor_json_omits_assertion_method_when_no_ed25519(pool: PgPool) {
         !ctx.iter()
             .any(|v| v == "https://w3id.org/security/multikey/v1"),
         "multikey context must be omitted alongside assertionMethod: {ctx:?}",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_json_emits_manually_approves_followers(pool: PgPool) {
+    // Issue #66 / M12: 鍵アカフラグは actor JSON に常時 emit する。
+    // false (= 通常アカ) と true (= 鍵アカ) の両方を確認。
+    let mut unlocked = common::sample_local_actor("uno", "example.test");
+    unlocked.manually_approves_followers = false;
+    let mut locked = common::sample_local_actor("locked", "example.test");
+    locked.manually_approves_followers = true;
+    repo::actor::insert(&pool, unlocked).await.unwrap();
+    repo::actor::insert(&pool, locked).await.unwrap();
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp_u = app
+        .clone()
+        .oneshot(
+            Request::get("/users/uno")
+                .header("accept", "application/activity+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body_u = read_json(resp_u).await;
+    assert_eq!(
+        body_u["manuallyApprovesFollowers"], false,
+        "unlocked actor emits manuallyApprovesFollowers=false: {body_u}",
+    );
+
+    let resp_l = app
+        .oneshot(
+            Request::get("/users/locked")
+                .header("accept", "application/activity+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body_l = read_json(resp_l).await;
+    assert_eq!(
+        body_l["manuallyApprovesFollowers"], true,
+        "locked actor emits manuallyApprovesFollowers=true: {body_l}",
+    );
+
+    // @context に `manuallyApprovesFollowers` の alias オブジェクトが
+    // 含まれていること (strict JSON-LD processor 対策)。
+    let ctx = body_l["@context"].as_array().expect("context is array");
+    let has_alias = ctx.iter().any(|v| {
+        v.as_object()
+            .and_then(|m| m.get("manuallyApprovesFollowers"))
+            .and_then(|x| x.as_str())
+            == Some("as:manuallyApprovesFollowers")
+    });
+    assert!(
+        has_alias,
+        "context must alias manuallyApprovesFollowers to as:manuallyApprovesFollowers: {ctx:?}",
     );
 }
 

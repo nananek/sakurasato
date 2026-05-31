@@ -329,6 +329,7 @@ mod tests {
             moved_to_ap_id: Some("https://new.test/users/alice".into()),
             is_local: true,
             actor_type: "Person".into(),
+            manually_approves_followers: false,
             fetched_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

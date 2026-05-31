@@ -53,6 +53,7 @@ fn sample_local_actor(suffix: &str) -> repo::actor::NewActor {
         moved_to_ap_id: None,
         is_local: true,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     }
 }
 

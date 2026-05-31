@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO actor (\n            ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as, moved_to_ap_id, is_local, actor_type\n        )\n        VALUES (\n            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,\n            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22\n        )\n        RETURNING\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at\n        ",
+  "query": "\n        SELECT\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            fetched_at, created_at, updated_at\n        FROM actor WHERE ap_id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -258,6 +258,17 @@
       },
       {
         "ordinal": 23,
+        "name": "manually_approves_followers",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "manually_approves_followers"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
         "name": "fetched_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -268,7 +279,7 @@
         }
       },
       {
-        "ordinal": 24,
+        "ordinal": 25,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -279,7 +290,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -292,27 +303,6 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Jsonb",
-        "Text",
-        "Bool",
         "Text"
       ]
     },
@@ -340,10 +330,11 @@
       true,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "22aaf00ea6260e63f62c47b6798c7be13a493e97adcf830144422d8d085e12b9"
+  "hash": "2e71d77ea758f80d07260a35bf6180877ce5085707183b42c65e86bd86a20cae"
 }

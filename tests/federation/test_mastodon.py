@@ -206,6 +206,100 @@ class TestReplyDeliveryToNonFollower:
         )
 
 
+# ── 3.6. Locked actor (鍵アカ運用 / Issue #66) ──────────────
+
+
+class TestLockedFollow:
+    """**#66**: Sakurasato が `manuallyApprovesFollowers = true` の鍵アカ状態
+    のとき、Mastodon Bob からの Follow が `requested` で据え置かれ、Sakurasato
+    の `follow-request approve` で initial に Accept が配送されて Mastodon の
+    relationship が `following = true` に遷移すること。
+
+    本テストは **TestFollow より前** に走る必要がある:
+
+    - Bob はまだ Sakurasato を follow していない (= TestFollow の前提) 状態で
+      開始することで、鍵アカ分岐 (= 新規 Follow が pending で据え置かれる)
+      を確実に通せる。
+    - 既存 accepted follow が存在すると `dispatch::handler::handle_follow` が
+      Accept 再送ブランチに入って locked 判定をスキップする (= 設計どおり)
+      ため、テストにならない。
+
+    終了時に Sakurasato を unlock + Bob は Sakurasato を follow 済み状態で
+    終わるので、後続の TestFollow / TestNoteFromSakurasato 等は **そのまま**
+    走る (idempotent follow + 既に accepted)。
+    """
+
+    def test_lock_round_trip_with_mastodon_follow(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        try:
+            # 1) Sakurasato を lock。actor JSON で manuallyApprovesFollowers=true。
+            lock_resp = sakurasato.actor_lock()
+            assert lock_resp["manually_approves_followers"] is True
+            actor = sakurasato.actor_json("me")
+            assert actor.get("manuallyApprovesFollowers") is True
+
+            # 2) Bob が search → follow。Sakurasato 側 dispatch は pending で
+            #    据え置く ので Mastodon は requested=true を観測する。
+            #    Mastodon は actor JSON の locked 判定を信用するため、UI 上は
+            #    follow Button 押下直後から `requested=true` で返る。
+            accounts = mastodon.search_accounts(
+                f"me@{SAKURASATO_DOMAIN}", resolve=True
+            )
+            assert accounts
+            sks_id = accounts[0]["id"]
+            follow_resp = mastodon.follow(sks_id)
+            # follow_resp は relationship object。`requested` または
+            # `following` のどちらかが True。Mastodon は actor JSON 再取得を
+            # 含むので、初回 follow 直後は requested=True、following=False
+            # を期待。
+            assert follow_resp["requested"] or follow_resp["following"]
+
+            # 3) Sakurasato の pending リストに 1 件出現するまで待つ
+            #    (delivery / inbox 処理が非同期)。
+            def list_has_bob() -> int | None:
+                items = sakurasato.follow_requests()
+                for it in items:
+                    if it["follower_ap_id"].endswith("/users/bob") or (
+                        "bob" in it["follower_ap_id"]
+                        and MASTODON_DOMAIN in it["follower_ap_id"]
+                    ):
+                        return it["id"]
+                return None
+
+            follow_id = poll_until(
+                list_has_bob,
+                desc="follow-request list includes Bob's pending Follow",
+            )
+
+            # 4) approve → Sakurasato が Accept を Mastodon に配送。
+            approve_resp = sakurasato.follow_request_approve(follow_id)
+            assert approve_resp["new_state"] == "accepted"
+
+            # 5) Mastodon 側 relationship が following=true に遷移するまで待つ。
+            def is_following_now() -> bool:
+                resp = mastodon.http.get(
+                    "/api/v1/accounts/relationships",
+                    params={"id[]": sks_id},
+                    headers={"Authorization": f"Bearer {mastodon.token}"},
+                )
+                if resp.status_code != 200:
+                    return False
+                rows = resp.json()
+                return bool(rows) and rows[0].get("following") is True
+
+            poll_until(
+                is_following_now,
+                desc="Mastodon relationship.following=true after CLI approve",
+            )
+        finally:
+            # 後続テストの前提 (= 鍵アカ off) に戻す。lock した状態で
+            # 例外発生 / abort しても unlock を必ず通すために finally。
+            sakurasato.actor_unlock()
+            actor_after = sakurasato.actor_json("me")
+            assert actor_after.get("manuallyApprovesFollowers") is False
+
+
 # ── 4. Follow ───────────────────────────────────────────────
 
 

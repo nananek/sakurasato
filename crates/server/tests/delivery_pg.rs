@@ -98,6 +98,7 @@ fn local_actor_with_real_key(username: &str, host: &str) -> NewActor {
         moved_to_ap_id: None,
         is_local: true,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     }
 }
 

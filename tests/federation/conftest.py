@@ -230,6 +230,32 @@ class SakurasatoClient:
         resp = self._local.delete(f"/api/v1/reactions/{reaction_id}")
         resp.raise_for_status()
 
+    # ── Issue #66 / M12: 鍵アカ ── lock/unlock + follow-request 管理 ───────
+    def actor_lock(self) -> dict:
+        resp = self._local.post("/api/v1/actor/lock")
+        resp.raise_for_status()
+        return resp.json()
+
+    def actor_unlock(self) -> dict:
+        resp = self._local.post("/api/v1/actor/unlock")
+        resp.raise_for_status()
+        return resp.json()
+
+    def follow_requests(self) -> list[dict]:
+        resp = self._local.get("/api/v1/follow-requests")
+        resp.raise_for_status()
+        return resp.json().get("items", [])
+
+    def follow_request_approve(self, follow_id: int) -> dict:
+        resp = self._local.post(f"/api/v1/follow-requests/{follow_id}/approve")
+        resp.raise_for_status()
+        return resp.json()
+
+    def follow_request_reject(self, follow_id: int) -> dict:
+        resp = self._local.post(f"/api/v1/follow-requests/{follow_id}/reject")
+        resp.raise_for_status()
+        return resp.json()
+
     # ── public AP / WebFinger ────────────────────────────────
     def webfinger(self, acct: str) -> dict:
         resp = self._public.get(

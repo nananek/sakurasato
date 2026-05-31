@@ -122,6 +122,25 @@ pub(crate) async fn handle_follow(
             "rejected Follow re-received; ignoring",
         );
         return Ok(());
+    } else if followed.manually_approves_followers {
+        // **Issue #66 (鍵アカ運用)**: followed actor が manually approves で、
+        // かつ既存 Follow 行が `pending` の場合は Accept を queue せず据え置く。
+        // 承認は管理 CLI (`sakurasato-server follow-request approve --id N`)
+        // で明示的に実行する想定。
+        //
+        // `Accepted` ブランチでこの分岐より前に return しているのは意図的:
+        // 以前 unlock 状態で受理した Follow が `accepted` のまま残っている
+        // ところに lock 後の retry 配送が来た場合、相手側は accepted のはず
+        // なので Accept を返してあげないと延々と pending 扱いされる。
+        // (lock した瞬間に従来フォロワーを切るのではなく、新規 Follow だけ
+        // 承認制に切替える設計)
+        info!(
+            follow_id = row.id,
+            follower = %signer.ap_id,
+            followed = %followed.ap_id,
+            "follow-request received (manually_approves_followers); awaiting CLI approval",
+        );
+        return Ok(());
     }
 
     let accept_activity = build_accept_activity(state, &followed, activity, row.id);
