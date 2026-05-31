@@ -102,6 +102,12 @@ pub struct TokenIssueArgs {
     /// Human-readable label (e.g. "tui-laptop"). Duplicates are allowed.
     #[arg(long)]
     pub name: String,
+    /// 生トークンを stdout に出す代わりに **指定ファイルだけ** に書き込む。
+    /// 既存ファイルは上書きせず失敗する (= 古いトークンが意図せず奪われる
+    /// のを避ける)。compose の名前付きボリューム経由でテストランナや TUI
+    /// に共有する用途を想定。
+    #[arg(long)]
+    pub out: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]

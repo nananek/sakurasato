@@ -1,0 +1,82 @@
+name: Federation Test (Mastodon)
+
+# 連合テスト (pytest + httpx) の自動駆動。
+# Issue #56: 手動 e2e (compose + setup-*.sh) を programmatic に置き換える。
+#
+# 起動契機:
+#   - nightly cron (UTC 19:00 = JST 04:00)
+#   - workflow_dispatch (= UI から手動キック)
+#
+# required check には **しない**。失敗しても PR を blocking しない。
+# 外部 image (ghcr.io/mastodon/mastodon:latest) の更新タイミング次第で
+# 不安定になることが想定されるため。
+#
+# 失敗時の通知は (a) この workflow ページの run 一覧、(b) GitHub の
+# Actions タブから個別 run のログ、で確認する。Discord 通知は将来 PR で
+# 統合予定 (notify-discord-on-federation-failure.yml 等)。
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC 19:00 = JST 04:00 (日次)。runner の混み具合が緩い時間帯。
+    - cron: "0 19 * * *"
+
+permissions:
+  contents: read
+
+# 1 run しか走らせない (= 重複 trigger でリソースを浪費しない)。
+concurrency:
+  group: federation-test-mastodon
+  cancel-in-progress: false
+
+jobs:
+  mastodon:
+    name: Mastodon (programmatic)
+    runs-on: ubuntu-latest
+    # 連合テストは Mastodon の image pull + DB migrate + healthcheck で
+    # 起動だけで数分。delivery worker / Sidekiq の伝播待ちも入るため、
+    # 全体で 30 分を上限にする (cron なので長めに取って構わない)。
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # docker compose v2 は actions runner に同梱。明示インストール不要。
+      - name: docker compose version
+        run: docker compose version
+
+      - name: Run pytest stack
+        run: ./scripts/federation-test/pytest.sh mastodon
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          set +e
+          project="sakurasato-fed-mastodon-pytest"
+          echo "==> docker compose ps"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-mastodon.yml ps
+          echo "==> sakurasato-server logs"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-mastodon.yml \
+            logs --no-color --tail=300 sakurasato-server || true
+          echo "==> mastodon-web logs"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-mastodon.yml \
+            logs --no-color --tail=300 mastodon-web || true
+          echo "==> mastodon-sidekiq logs"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-mastodon.yml \
+            logs --no-color --tail=300 mastodon-sidekiq || true
+          echo "==> pytest logs"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-mastodon.yml \
+            --profile pytest logs --no-color --tail=300 pytest || true
+
+      - name: Tear down on failure
+        if: always()
+        run: |
+          project="sakurasato-fed-mastodon-pytest"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-mastodon.yml \
+            --profile pytest down -v --remove-orphans || true

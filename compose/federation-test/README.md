@@ -34,6 +34,24 @@ Mastodon / Misskey / Fedibird の公式 actor JSON は `assertionMethod` を
 `mastodon` を `misskey / pleroma / mitra / fedibird / nekonoverse` の
 いずれかに差し替えて使う。
 
+### Programmatic (pytest) — Mastodon のみ (M12 / Issue #56)
+
+手動 `setup-*.sh` の代わりに pytest で Pass/Fail を出すモード:
+
+```bash
+./scripts/federation-test/pytest.sh mastodon
+# ↑ compose --profile pytest で全サービスを立ち上げ、
+#   `tests/federation/test_mastodon.py` を回す
+# DEBUG_KEEP=1 を付けると終了後もコンテナを残す (= ログ漁り用)
+```
+
+CI では `.github/workflows/federation-test.yml` が nightly cron +
+`workflow_dispatch` で同じ stack を回す (required check ではない、
+外部 image の更新で揺らぐため)。
+
+後続 PR で Misskey / Pleroma / Mitra / Fedibird / Nekonoverse 用の
+`test_misskey.py` 等を同じパターンで追加する予定。
+
 ## 検証はコンテナの中から
 
 各 compose は **ホストに 443 を公開しない** (impl 同士が内部ネット上の DNS

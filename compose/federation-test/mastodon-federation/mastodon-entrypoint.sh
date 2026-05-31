@@ -38,4 +38,29 @@ bundle exec rails runner "
   end
 " 2>/dev/null || true
 
+# Pytest 連合テスト用に bob の OAuth Bearer トークンを一度だけ発行する。
+# Mastodon 4.x で OAuth password grant が削除されたため、Doorkeeper 経由で
+# 直接 AccessToken を作って共有 volume にファイル出力しておく ── pytest 側
+# は `MASTODON_TOKEN_FILE` (= /mastodon-tokens/bob.token) を読むだけ。
+# (`/mastodon-tokens` が存在しない & ファイルがすでにある場合はスキップ。
+#  pytest profile 外で立ち上げた場合に余計な Rails 起動を増やさない)。
+if [ -d /mastodon-tokens ] && [ ! -f /mastodon-tokens/bob.token ]; then
+  bundle exec rails runner "
+    user = User.find_by(email: 'bob@mastodon')
+    if user
+      app = Doorkeeper::Application.create!(
+        name: 'sakurasato-pytest',
+        redirect_uri: 'urn:ietf:wg:oauth:2.0:oob',
+        scopes: 'read write follow'
+      )
+      token = Doorkeeper::AccessToken.create!(
+        application: app,
+        resource_owner_id: user.id,
+        scopes: 'read write follow'
+      )
+      File.write('/mastodon-tokens/bob.token', token.token + \"\\n\")
+    end
+  " 2>/dev/null || echo 'pytest bearer token issue skipped'
+fi
+
 exec bundle exec puma -C config/puma.rb

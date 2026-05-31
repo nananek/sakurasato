@@ -19,12 +19,21 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     SQLX_OFFLINE=true cargo build --release --target x86_64-unknown-linux-musl -p sakurasato-media-proxy && \
     cp target/x86_64-unknown-linux-musl/release/sakurasato-media-proxy /sakurasato-media-proxy
 
+# /run/sakurasato を `nonroot:nonroot 0700` で先に掘っておく。これにより
+# media_sock 名前付き volume の初回マウント時 docker がこの ownership を
+# そのまま引き継ぐ (= runtime user uid 65532 が socket を bind 可能)。
+# 掘る場所だけ用意できればよいので空ディレクトリ。`--chmod=0700` 付き
+# `COPY` で nonroot 専用にする。
+RUN mkdir -p /stub/run-sakurasato
+
 # ---- runtime ----
 FROM gcr.io/distroless/static:nonroot AS runtime
 
 WORKDIR /app
 COPY --from=builder /sakurasato-media-proxy /app/sakurasato-media-proxy
 COPY --from=builder /build/config /app/config
+COPY --from=builder --chown=nonroot:nonroot --chmod=0700 \
+     /stub/run-sakurasato /run/sakurasato
 
 USER nonroot:nonroot
 ENV SAKURASATO_CONFIG=/app/config/default.toml

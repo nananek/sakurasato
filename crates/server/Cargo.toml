@@ -67,3 +67,6 @@ http-body-util = "0.1"
 # the actor JSON multibase converter).
 ed25519-dalek = { workspace = true }
 rsa = { workspace = true }
+# `token::write_token_file` の単体テストで一時ディレクトリを作る用。
+# tui crate でも 3 系を使っており workspace 内で共有する。
+tempfile = "3"
