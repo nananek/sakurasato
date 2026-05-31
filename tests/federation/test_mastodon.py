@@ -1,16 +1,17 @@
 """Mastodon ↔ Sakurasato programmatic federation tests.
 
-カバー範囲 (Issue #56 の指定):
+カバー範囲 (Issue #56 + 後続 issues):
 
-- TestHealth           ── 両 instance の `/healthz` / NodeInfo
-- TestWebFinger        ── 相互の `acct:` 解決
-- TestActor            ── 相互の actor JSON 取得
-- TestFollow           ── Sakurasato → Mastodon (`sakurasato-prefollow-bob` 経由) と
-                          Mastodon → Sakurasato (`accounts/search?resolve=true` + follow)
-- TestNoteFromSks      ── Sakurasato 投稿 → Mastodon Bob の home timeline に届く
-- TestNoteFromMastodon ── Mastodon 投稿 → Sakurasato Me の home timeline に届く (= #55 で実装)
-- TestReactionInbound  ── Mastodon Bob の Favourite (= Like) が Sakurasato 側 reactions に反映
-- TestMoveSkip         ── alsoKnownAs + Move は 2nd Mastodon account が要るため将来 PR で
+- TestHealth                       ── 両 instance の `/healthz` / NodeInfo
+- TestWebFinger                    ── 相互の `acct:` 解決
+- TestActor                        ── 相互の actor JSON 取得
+- TestReplyDeliveryToNonFollower   ── **#64**: 未フォロー相手への返信が届く
+- TestFollow                       ── Sakurasato → Mastodon (`sakurasato-prefollow-bob` 経由) と
+                                      Mastodon → Sakurasato (`accounts/search?resolve=true` + follow)
+- TestNoteFromSks                  ── Sakurasato 投稿 → Mastodon Bob の home timeline に届く
+- TestNoteFromMastodon             ── Mastodon 投稿 → Sakurasato Me の home timeline に届く (= #55 で実装)
+- TestReactionInbound              ── Mastodon Bob の Favourite (= Like) が Sakurasato 側 reactions に反映
+- TestMoveSkip                     ── alsoKnownAs + Move は 2nd Mastodon account が要るため将来 PR で
 
 ポイント:
 
@@ -24,6 +25,9 @@
 
 ordering 依存 (重要):
 
+- `TestReplyDeliveryToNonFollower` は **`TestFollow` より前** に走らなければ
+  ならない (Bob → Sakurasato follow が成立すると followers loop で reply が
+  届いてしまい、未フォロー経路の分離検証ができなくなる)。
 - `TestNoteFromSakurasato` / `TestNoteFromMastodon` / `TestReactionInbound` は
   **`TestFollow` が走ったあと** に動くことが期待される (Mastodon Bob と
   Sakurasato Me 双方向のフォローが accepted になっている前提で進む)。
@@ -103,6 +107,74 @@ class TestActor:
         assert pem.startswith("-----BEGIN PUBLIC KEY-----")
         for k in ("inbox", "outbox", "followers", "following"):
             assert k in actor, f"actor missing {k}"
+
+
+# ── 3.5. Reply delivery to non-follower (#64) ─────────────
+
+
+class TestReplyDeliveryToNonFollower:
+    """**#64**: Sakurasato が Bob の note に返信したとき、Bob が Sakurasato を
+    follow していなくても、Bob の inbox に reply が届くこと。
+
+    バグ修正前: `enqueue_to_followers` だけが配送経路だったため、Bob が
+    Sakurasato の follower でない場合は reply の配送先が空になり、Bob は
+    気付けなかった。修正後: 親 author URI が `cc` に乗り、Bob の inbox が
+    `delivery_queue` に積まれる。
+
+    本テストは **TestFollow より前** に実行することが重要 ── TestFollow で
+    Bob → Sakurasato follow が成立すると followers loop でも届くようになり、
+    バグの分離検証ができなくなる。pytest の default 順 (= 定義順) で先に
+    走るようにこの位置に置いている (test_mastodon.py 冒頭の ordering 注記)。
+    """
+
+    def test_reply_to_non_follower_reaches_them(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        # Phase 1: Bob が seed status を投稿。
+        seed_marker = f"reply-seed-{int(time.time() * 1000)}"
+        bob_status = mastodon.create_status(f"seed: {seed_marker}")
+        bob_status_id = bob_status["id"]
+
+        # Phase 2: Sakurasato (= Bob を follow 済み via prefollow) が
+        # ingest するのを待ち、ap_id を拾う。
+        def sakurasato_has_seed() -> str | None:
+            tl = sakurasato.home_timeline(limit=40)
+            for n in tl:
+                if seed_marker in (n.get("content") or ""):
+                    return n.get("ap_id")
+            return None
+
+        seed_ap_id = poll_until(
+            sakurasato_has_seed,
+            desc=f"sakurasato ingested seed {seed_marker}",
+        )
+
+        # Phase 3: Sakurasato が seed に reply する。Bob はまだ Sakurasato を
+        # follow していない状態で投げるのがポイント。
+        reply_marker = f"reply-body-{int(time.time() * 1000)}"
+        sakurasato.create_note(
+            f"reply: {reply_marker}",
+            in_reply_to_ap_id=seed_ap_id,
+        )
+
+        # Phase 4: Mastodon 側の status context に reply が descendants として
+        # 出現するまで待つ。Mastodon は inbox 受領で status row を作る ──
+        # follow 関係に関わらず、cc / 親 author 経路で届けば context に乗る。
+        def reply_visible_on_mastodon() -> bool:
+            resp = mastodon.http.get(
+                f"/api/v1/statuses/{bob_status_id}/context",
+                headers={"Authorization": f"Bearer {mastodon.token}"},
+            )
+            if resp.status_code != 200:
+                return False
+            ctx = resp.json()
+            descendants = ctx.get("descendants") or []
+            return any(reply_marker in (s.get("content") or "") for s in descendants)
+
+        poll_until(
+            reply_visible_on_mastodon,
+            desc=f"reply {reply_marker} visible on Mastodon as descendant of {bob_status_id}",
+        )
 
 
 # ── 4. Follow ───────────────────────────────────────────────
