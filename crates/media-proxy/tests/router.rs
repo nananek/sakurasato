@@ -237,6 +237,50 @@ async fn sanitize_rejects_invalid_variant() {
 }
 
 #[tokio::test]
+async fn webfinger_rejects_invalid_acct() {
+    let app = make_router();
+    for body in [
+        r#"{"acct":"no-at-sign"}"#,
+        r#"{"acct":"@@double"}"#,
+        r#"{"acct":""}"#,
+    ] {
+        let req = Request::post("/v1/webfinger/resolve")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        let json = read_json(resp).await;
+        assert_eq!(json["reason"], "invalid_acct", "{body} → {json}");
+    }
+}
+
+#[tokio::test]
+async fn webfinger_blocks_ssrf_hosts() {
+    let app = make_router();
+    for acct in [
+        "alice@127.0.0.1",
+        "alice@10.0.0.1",
+        "alice@169.254.169.254",
+        "alice@localhost",
+        "alice@postgres.local",
+    ] {
+        let body = format!(r#"{{"acct":"{acct}"}}"#);
+        let req = Request::post("/v1/webfinger/resolve")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{acct}");
+        let json = read_json(resp).await;
+        assert!(
+            !json["reason"].as_str().unwrap_or("").is_empty(),
+            "{acct} → {json}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn sanitize_resizes_oversized_avatar() {
     let app = make_router();
     let png = png_bytes(1024, 800);

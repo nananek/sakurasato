@@ -27,7 +27,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyperlocal::{UnixClientExt, UnixConnector, Uri as UnixUri};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 
@@ -74,6 +74,24 @@ pub enum MediaProxyError {
 struct FetchBody<'a> {
     url: &'a str,
     variant: &'a str,
+}
+
+/// `POST /v1/webfinger/resolve` のリクエスト本文。
+#[derive(Debug, Serialize)]
+struct ResolveBody<'a> {
+    acct: &'a str,
+}
+
+/// `POST /v1/webfinger/resolve` の正常レスポンス。
+#[derive(Debug, Deserialize)]
+pub struct ResolvedActor {
+    /// 正規化された `acct:user@host`。
+    pub subject: String,
+    /// `ActivityPub` actor の URI (`rel=self` + AS2 type の `href`)。
+    pub actor_uri: String,
+    /// `WebFinger` レスポンスの `aliases[]` をそのまま転載。
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 /// fetch / sanitize の正常レスポンス。
@@ -129,6 +147,28 @@ impl MediaProxyClient {
         self.read_processed(resp).await
     }
 
+    /// `POST /v1/webfinger/resolve` — `acct:user@host` を解決して
+    /// `ActivityPub` actor URI を返す (M10)。
+    ///
+    /// `follow <acct>` CLI から呼ぶ。WebFinger 取得は JSON 通信 (= 画像
+    /// デコードを伴わない) だが、外向き接続を media-proxy に集約して server
+    /// コンテナの egress を絞るため経路を寄せる。
+    pub async fn resolve_webfinger(&self, acct: &str) -> Result<ResolvedActor, MediaProxyError> {
+        let body = serde_json::to_vec(&ResolveBody { acct })
+            .map_err(|e| MediaProxyError::Transport(format!("serialize body: {e}")))?;
+        let uri: http::Uri = UnixUri::new(&self.socket, "/v1/webfinger/resolve").into();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(http::header::HOST, AUTHORITY)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| MediaProxyError::Transport(e.to_string()))?;
+
+        let resp = self.send(request).await?;
+        self.read_json::<ResolvedActor>(resp).await
+    }
+
     /// `POST /v1/image/sanitize` — 受け取ったバイト列を再エンコードして返す。
     /// M7 (アップロード) で使う想定。
     pub async fn sanitize_image(
@@ -160,6 +200,40 @@ impl MediaProxyClient {
             Ok(Err(e)) => Err(MediaProxyError::Transport(e.to_string())),
             Err(_) => Err(MediaProxyError::Timeout(REQUEST_TIMEOUT)),
         }
+    }
+
+    /// JSON 本文を返す系のエンドポイント (`/v1/webfinger/resolve` 等) を読む。
+    ///
+    /// `read_processed` と違って画像バイト列は期待せず、成功時は
+    /// `T` にデシリアライズする。失敗時は `Upstream` に詰める ──
+    /// `error / reason` 構造は image 系と同じ。
+    async fn read_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        resp: hyper::Response<Incoming>,
+    ) -> Result<T, MediaProxyError> {
+        let status = resp.status();
+        let bytes = read_limited_body(resp.into_body()).await?;
+
+        if !status.is_success() {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+            return Err(MediaProxyError::Upstream {
+                status,
+                reason: parsed
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                message: parsed
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+
+        serde_json::from_slice::<T>(&bytes)
+            .map_err(|e| MediaProxyError::Transport(format!("decode json body: {e}")))
     }
 
     async fn read_processed(

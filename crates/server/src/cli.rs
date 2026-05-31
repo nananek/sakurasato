@@ -40,6 +40,20 @@ pub enum Command {
     /// `moved_to_ap_id` が target に倒れ、actor JSON が `movedTo` を返す
     /// ようになる。
     MoveOut(MoveOutArgs),
+    /// Manually send a Follow activity to `<acct>` (M10).
+    ///
+    /// `acct:user@host` を `WebFinger` (media-proxy 経由) で解決し、
+    /// `delivery_queue` に Follow を 1 行積む。常駐ワーカが拾って送る。
+    /// 同じ相手にもう一度叩いても (`follower`, `followed`) UNIQUE と
+    /// 決定論的な activity id で冪等。
+    Follow(FollowArgs),
+    /// Re-process an inbound `Move` activity from a saved JSON payload (M10).
+    ///
+    /// 初回受領時に DB / network エラーで 503 を返したケースを CLI で手動
+    /// リトライするための薄いラッパ。
+    /// `--from <file>` で activity 本文 (signer 含む) を読み、検証なしで
+    /// `dispatch::move_handler::handle_move` を直接呼ぶ。
+    MoveAccept(MoveAcceptArgs),
 }
 
 #[derive(Debug, Args)]
@@ -153,4 +167,30 @@ pub struct MoveOutArgs {
     /// 可能性が高い (Mastodon は alsoKnownAs を必須にしている)。
     #[arg(long, default_value_t = false)]
     pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct FollowArgs {
+    /// `acct:user@host` / `@user@host` / `user@host` のいずれでも可。
+    /// `--actor-uri` を併用する場合は `WebFinger` 解決をスキップする。
+    #[arg(default_value = "")]
+    pub acct: String,
+    /// `WebFinger` を経由せず直接 `ActivityPub` actor URI を指定する (オプション)。
+    /// 例: `--actor-uri https://example.com/users/foo`。
+    /// `acct` 引数があっても **こちらを優先** する。
+    #[arg(long)]
+    pub actor_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct MoveAcceptArgs {
+    /// 元 inbox に来た `Move` activity 本文を保存した JSON ファイル。
+    /// `actor` フィールドの URI が `signer` の lookup に使われる。
+    /// `--signer` を併用するとそちらが優先。
+    #[arg(long)]
+    pub from: std::path::PathBuf,
+    /// signer (= activity.actor) を上書きする `ActivityPub` actor URI。
+    /// 通常は activity 本文の `actor` を信用してよいが、改竄を疑うときに使う。
+    #[arg(long)]
+    pub signer: Option<String>,
 }
