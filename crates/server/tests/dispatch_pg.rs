@@ -866,6 +866,7 @@ async fn move_without_target_aka_consent_is_rejected(pool: PgPool) {
     let app = router(state);
 
     let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
         "id": "https://old.test/users/alice/activities/move-evil",
         "type": "Move",
         "actor": old.ap_id,
@@ -877,9 +878,11 @@ async fn move_without_target_aka_consent_is_rejected(pool: PgPool) {
     let req = build_signed_post(body.as_bytes(), "/inbox", &old_priv, &keyid, LOCAL_HOST);
 
     let resp = app.oneshot(req).await.unwrap();
+    // [[m9-pr1-review]] round-2 [1]: 永続的な同意失敗は **4xx** で返す。
+    // 503 を返すと Mastodon が無限にリトライしてくる。
     assert!(
-        resp.status().is_server_error() || resp.status().is_client_error(),
-        "Move without target.alsoKnownAs consent must be rejected, got {}",
+        resp.status().is_client_error(),
+        "Move without target.alsoKnownAs consent must be rejected with 4xx (not 5xx), got {}",
         resp.status(),
     );
 
@@ -929,6 +932,7 @@ async fn move_object_must_equal_signer(pool: PgPool) {
     let app = router(state);
 
     let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
         "id": "https://remote.test/users/bob/activities/move-spoof",
         "type": "Move",
         "actor": signer_actor.ap_id,
@@ -941,9 +945,10 @@ async fn move_object_must_equal_signer(pool: PgPool) {
     let req = build_signed_post(body.as_bytes(), "/inbox", &signer_priv, &keyid, LOCAL_HOST);
 
     let resp = app.oneshot(req).await.unwrap();
+    // [[m9-pr1-review]] round-2 [1]: 永続的なフィールド不正は **4xx** で返す。
     assert!(
-        resp.status().is_server_error() || resp.status().is_client_error(),
-        "Move with object != signer must be rejected, got {}",
+        resp.status().is_client_error(),
+        "Move with object != signer must be rejected with 4xx, got {}",
         resp.status(),
     );
 }

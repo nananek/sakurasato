@@ -210,10 +210,15 @@ where
 ///
 /// Mastodon の慣習に合わせて `to = [Public]`、`cc = [followers]`。`object` は
 /// 移動元 (= 自分) の URI、`target` は移動先の URI。
+///
+/// **id 形式** ([[m9-pr1-review]] round-2 [2]): `#fragment` を使うと
+/// JSON-LD として「同一ドキュメント内 anchor」扱いされ、Misskey 等が
+/// キャッシュ / 重複排除で混乱する可能性がある。Mastodon と同じ
+/// `<ap_id>/activities/move-<ts>` の path 形式に揃える。
 fn build_move_activity(actor: &ActorRow, target: &str) -> JsonValue {
     let now = chrono::Utc::now();
     let activity_id = format!(
-        "{ap_id}#moves/{ts}",
+        "{ap_id}/activities/move-{ts}",
         ap_id = actor.ap_id,
         ts = now.timestamp_millis(),
     );
@@ -338,11 +343,16 @@ mod tests {
             cc.iter()
                 .any(|v| v == "https://x.test/users/alice/followers")
         );
+        let id = a["id"].as_str().unwrap();
+        // path 形式 `<ap_id>/activities/move-<ts>` (Mastodon 互換)。
+        // `#` fragment は使わない ([[m9-pr1-review]] round-2 [2])。
         assert!(
-            a["id"]
-                .as_str()
-                .unwrap()
-                .starts_with("https://x.test/users/alice#moves/")
+            id.starts_with("https://x.test/users/alice/activities/move-"),
+            "id should be a dereferenceable path, got {id}",
+        );
+        assert!(
+            !id.contains('#'),
+            "id must not contain # fragment, got {id}"
         );
     }
 }

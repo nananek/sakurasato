@@ -227,9 +227,7 @@ pub(crate) async fn dispatch(
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
         "Move" => {
-            move_handler::handle_move(state, signer, &activity)
-                .await
-                .map_err(DispatchError::Internal)?;
+            move_handler::handle_move(state, signer, &activity).await?;
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
         other => {

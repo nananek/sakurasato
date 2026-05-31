@@ -40,38 +40,42 @@ use sakurasato_core::repo;
 use serde_json::{Value as JsonValue, json};
 use tracing::{info, warn};
 
+use super::DispatchError;
 use crate::delivery;
 use crate::remote_actor;
 use crate::state::AppState;
 
 /// Move activity の受領処理。
 ///
-/// 失敗時に `Err` で返したものは [`super::dispatch`] が 503 で返す
-/// (= Mastodon が retry を持つ)。`Malformed` 系は `super::DispatchError` で
-/// 個別に返したいが、現状の `handle_*` 関数の戻り型に合わせて anyhow で返す
-/// (= dispatch 内で 503 にラップ)。
+/// **エラー方針** ([[m9-pr1-review]] round-2 [1] 対応):
+/// 恒久的な拒否 (`object != signer`、`target == object`、`alsoKnownAs` 同意
+/// 不一致など) は `DispatchError::Malformed` で **400** を返す ── Mastodon
+/// は 503 を「一時的失敗」と見なして指数バックオフでリトライを送り続ける
+/// ため、永続的な拒否を 503 で返すと無限リトライ攻撃の的になる。DB /
+/// network エラーのみ `Internal` で 503 にする (= 一時的失敗のリトライ
+/// 要請として正しい挙動)。
 pub(crate) async fn handle_move(
     state: &AppState,
     signer: &ActorRow,
     activity: &JsonValue,
-) -> anyhow::Result<()> {
+) -> Result<(), DispatchError> {
     // object: 移動元 = signer 本人であること。
-    let object_uri = super::extract_object_uri(activity)
-        .map_err(|e| anyhow!("Move has no usable `object`: {e}"))?
-        .to_string();
+    let object_uri = super::extract_object_uri(activity)?.to_string();
     if object_uri != signer.ap_id {
-        bail!(
-            "Move `object` {object_uri:?} does not match signer ap_id {:?}; refusing",
+        return Err(DispatchError::Malformed(format!(
+            "Move `object` {object_uri:?} does not match signer ap_id {:?}",
             signer.ap_id,
-        );
+        )));
     }
 
     // target: 移動先 URI。string または `{id: ...}` object。
     let target_uri = extract_target_uri(activity)
-        .ok_or_else(|| anyhow!("Move has no usable `target` field"))?
+        .ok_or_else(|| DispatchError::Malformed("Move has no usable `target` field".into()))?
         .to_string();
     if target_uri == object_uri {
-        bail!("Move `target` equals `object`; nothing to migrate");
+        return Err(DispatchError::Malformed(
+            "Move `target` equals `object`; nothing to migrate".into(),
+        ));
     }
 
     // 移動先 actor を **本番では常に fresh で取り直す** ([[m9-pr1-review]] [1]
@@ -87,21 +91,30 @@ pub(crate) async fn handle_move(
     // DB に予め seed された target を使う ── `extract.rs` の未知 actor 処理
     // と同じ規約 (= "テストは必要な actor を予め `repo::actor::insert` で
     // seed しておく契約")。
-    let target = ensure_target_actor(state, &target_uri).await?;
+    //
+    // 取得失敗は **network/DB 起因 (Internal)** として扱う ── target が一時的
+    // に到達不能なだけかもしれず、再送 (Mastodon リトライ) で成立する余地が
+    // ある。「target は存在するが alsoKnownAs に source が無い」は永続的な
+    // 同意失敗で、こちらは `Malformed` 4xx を返してリトライを止める。
+    let target = ensure_target_actor(state, &target_uri)
+        .await
+        .map_err(DispatchError::Internal)?;
 
     // 双方向同意検査: target.alsoKnownAs に object (= 移動元) が含まれていない
     // とダメ。これが無いと「A の Move を勝手に偽装」が成立してしまう。
+    // **永続的な拒否なので 4xx (= Malformed)。**
     if !target.also_known_as.0.iter().any(|a| a == &object_uri) {
-        bail!(
-            "Move target {target_uri:?} does not list source {object_uri:?} in alsoKnownAs; refusing",
-        );
+        return Err(DispatchError::Malformed(format!(
+            "Move target {target_uri:?} does not list source {object_uri:?} in alsoKnownAs",
+        )));
     }
 
     // 元 actor (= signer) に movedTo を立てる。これは情報的なフラグであり、
     // 既存 follow 行を消すことはしない (Mastodon と同じ)。
     let updated_source = repo::actor::set_moved_to(state.pool(), signer.id, Some(&target.ap_id))
         .await
-        .context("set moved_to on source actor")?;
+        .context("set moved_to on source actor")
+        .map_err(DispatchError::Internal)?;
     info!(
         source = %updated_source.ap_id,
         target = %target.ap_id,
@@ -113,7 +126,8 @@ pub(crate) async fn handle_move(
     // 該当する local follower はせいぜい 1 人。
     let movers = repo::follow::list_local_following(state.pool(), signer.id)
         .await
-        .context("list local followers of moved actor")?;
+        .context("list local followers of moved actor")
+        .map_err(DispatchError::Internal)?;
     for (old_follow_id, local_id) in movers {
         if let Err(err) = enqueue_auto_refollow(state, local_id, &target, old_follow_id).await {
             // 1 件失敗しても残りは続行 (再 Move には対応しないが、CLI で手で
