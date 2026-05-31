@@ -633,6 +633,84 @@ async fn emoji_upsert_remote_is_idempotent_by_ap_id(pool: PgPool) -> sqlx::Resul
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_set_also_known_as_and_moved_to(pool: PgPool) -> sqlx::Result<()> {
+    // M9: alsoKnownAs / moved_to_ap_id を後から書き換える経路の round-trip。
+    let me = repo::actor::insert(&pool, sample_local_actor("aka")).await?;
+    // sample_local_actor は alsoKnownAs に 1 件入れている前提。
+    assert_eq!(me.also_known_as.0.len(), 1);
+    assert!(me.moved_to_ap_id.is_none());
+
+    let new_list = vec![
+        "https://old.example.test/users/alice-old".to_string(),
+        "https://another.example.test/users/alice".to_string(),
+    ];
+    let updated = repo::actor::set_also_known_as(&pool, me.id, &new_list).await?;
+    assert_eq!(updated.also_known_as.0, new_list);
+
+    // moved_to_ap_id: 立てる → 解除。
+    let with_target =
+        repo::actor::set_moved_to(&pool, me.id, Some("https://new.example/users/alice")).await?;
+    assert_eq!(
+        with_target.moved_to_ap_id.as_deref(),
+        Some("https://new.example/users/alice"),
+    );
+    let cleared = repo::actor::set_moved_to(&pool, me.id, None).await?;
+    assert!(cleared.moved_to_ap_id.is_none());
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_list_local_following_returns_only_local_followers(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // local actor が remote を follow しているとき、list_local_following で
+    // 拾えること。逆向き (remote → local) は拾わない。
+    let local = repo::actor::insert(&pool, sample_local_actor("local-f")).await?;
+    let mut remote_new = sample_local_actor("remote-f");
+    remote_new.is_local = false;
+    remote_new.ap_id = "https://remote.test/users/bob".into();
+    remote_new.preferred_username = "bob".into();
+    remote_new.host = "remote.test".into();
+    remote_new.private_key_pem = None;
+    let remote = repo::actor::insert(&pool, remote_new).await?;
+
+    // local → remote follow (accepted)。
+    let f1 = repo::follow::insert_pending(
+        &pool,
+        "https://example.test/follows/local-to-remote",
+        local.id,
+        remote.id,
+    )
+    .await?;
+    repo::follow::set_state(&pool, f1.id, FollowState::Accepted).await?;
+
+    // 逆 (remote → local) も accepted で作っておく。これは list_local_following
+    // (followed = remote, local が follower 側) で **拾われない** ことを確認する。
+    let f2 = repo::follow::insert_pending(
+        &pool,
+        "https://example.test/follows/remote-to-local",
+        remote.id,
+        local.id,
+    )
+    .await?;
+    repo::follow::set_state(&pool, f2.id, FollowState::Accepted).await?;
+
+    let listing = repo::follow::list_local_following(&pool, remote.id).await?;
+    assert_eq!(listing.len(), 1);
+    assert_eq!(listing[0].0, f1.id);
+    assert_eq!(listing[0].1, local.id);
+
+    // remote 側に対して同じ問い合わせ: local が follower なので 1 件出るが、
+    // local が followed の側に居る場合は 0 件 (= remote 自身は is_local=false)。
+    let none = repo::follow::list_local_following(&pool, local.id).await?;
+    assert!(
+        none.is_empty(),
+        "remote follower should not appear: {none:?}"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn emoji_upsert_remote_rejects_empty_host(pool: PgPool) -> sqlx::Result<()> {
     let err = repo::emoji::upsert_remote(
         &pool,

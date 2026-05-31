@@ -31,6 +31,15 @@ pub enum Command {
     Token(TokenArgs),
     /// Manage custom emojis (M8).
     Emoji(EmojiArgs),
+    /// Manage `alsoKnownAs` (= migration source candidates, M9).
+    Alias(AliasArgs),
+    /// Send a `Move` activity to followers (M9 引っ越し).
+    ///
+    /// 移動先 actor の `alsoKnownAs` に我々の `ap_id` が **先に** 載って
+    /// いないと拒否する (相互同意検査)。実行すると local actor の
+    /// `moved_to_ap_id` が target に倒れ、actor JSON が `movedTo` を返す
+    /// ようになる。
+    MoveOut(MoveOutArgs),
 }
 
 #[derive(Debug, Args)]
@@ -109,4 +118,39 @@ pub enum EmojiCommand {
 pub struct EmojiImportArgs {
     /// Path to a Misskey-format emoji zip.
     pub zip: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct AliasArgs {
+    #[command(subcommand)]
+    pub command: AliasCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AliasCommand {
+    /// List the current `alsoKnownAs` URIs.
+    List,
+    /// Add a URI to `alsoKnownAs` (idempotent) and broadcast an `Update`.
+    Add(AliasMutateArgs),
+    /// Remove a URI from `alsoKnownAs` (no-op if absent) and broadcast an `Update`.
+    Remove(AliasMutateArgs),
+    /// Clear all `alsoKnownAs` entries and broadcast an `Update`.
+    Clear,
+}
+
+#[derive(Debug, Args)]
+pub struct AliasMutateArgs {
+    /// `ActivityPub` actor URI to add or remove (e.g. `https://old.example/users/me`).
+    pub uri: String,
+}
+
+#[derive(Debug, Args)]
+pub struct MoveOutArgs {
+    /// 移動先 actor の `ActivityPub` URI。例: `https://new.example/users/me`。
+    pub target: String,
+    /// 双方向同意検査 (target の `alsoKnownAs` に自分が居るか) をスキップする。
+    /// **緊急時のみ**: 同意が無いまま Move を投げると相手側で偽装と扱われる
+    /// 可能性が高い (Mastodon は alsoKnownAs を必須にしている)。
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }

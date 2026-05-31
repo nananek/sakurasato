@@ -693,3 +693,262 @@ async fn worker_drains_pending_rows(pool: PgPool) {
     let _ = tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
+
+// ============================================================================
+// M9: Move 受領テスト
+// ============================================================================
+
+fn remote_actor_with_aka(
+    host: &str,
+    user: &str,
+    pub_pem: &str,
+    inbox_url: &str,
+    also_known_as: Vec<String>,
+) -> NewActor {
+    let mut a = remote_actor(host, user, pub_pem, inbox_url);
+    a.also_known_as = also_known_as;
+    a
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn move_marks_source_moved_and_queues_auto_follow(pool: PgPool) {
+    // 流れ:
+    // 1. local が old@remote1 を follow している (accepted) 状態を用意。
+    // 2. new@remote2 を pre-insert (alsoKnownAs に old を載せておく) →
+    //    Move handler は HTTP fetch せずに DB から target を取れる。
+    // 3. old@remote1 が Move を投げる → local の auto-follow が new@remote2 に
+    //    対して queue されること、old の moved_to_ap_id が立つことを確認。
+    let (_lp, local_pub) = fresh_rsa();
+    let (old_priv, old_pub) = fresh_rsa();
+    let (_np, new_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let old = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "old.test",
+            "alice",
+            &old_pub,
+            "https://old.test/users/alice/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let new = repo::actor::insert(
+        &pool,
+        remote_actor_with_aka(
+            "new.test",
+            "alice",
+            &new_pub,
+            "https://new.test/users/alice/inbox",
+            vec![old.ap_id.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+
+    // local が old を follow している (accepted) 既存状態。
+    let prev_follow_ap_id = format!(
+        "https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-old-{}",
+        old.id
+    );
+    let prev = repo::follow::insert_pending(&pool, &prev_follow_ap_id, local.id, old.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(
+        &pool,
+        prev.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let move_id = format!("https://old.test/users/alice/activities/move-{}", old.id);
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": move_id,
+        "type": "Move",
+        "actor": old.ap_id,
+        "object": old.ap_id,
+        "target": new.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", old.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &old_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED, "Move must be accepted");
+
+    // 移動元 actor の moved_to_ap_id が立っている。
+    let refreshed_old = repo::actor::get_by_id(&pool, old.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        refreshed_old.moved_to_ap_id.as_deref(),
+        Some(new.ap_id.as_str())
+    );
+
+    // local 側に new への pending follow が作られている。
+    let new_follows = sqlx::query!(
+        "SELECT id, state FROM follow WHERE follower_actor_id = $1 AND followed_actor_id = $2",
+        local.id,
+        new.id,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        new_follows.len(),
+        1,
+        "auto-follow row to new actor must exist"
+    );
+    assert_eq!(new_follows[0].state, "pending");
+
+    // delivery_queue に Follow が積まれている (new actor inbox 宛)。
+    let queued = sqlx::query!(
+        r#"SELECT inbox_url, activity as "activity: sqlx::types::Json<serde_json::Value>"
+           FROM delivery_queue WHERE sender_actor_id = $1 AND state = 'pending'"#,
+        local.id,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queued.len(), 1, "auto-Follow must be queued");
+    assert_eq!(queued[0].inbox_url, new.inbox_url);
+    let activity = &queued[0].activity.0;
+    assert_eq!(activity["type"], "Follow");
+    assert_eq!(activity["actor"], local.ap_id);
+    assert_eq!(activity["object"], new.ap_id);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn move_without_target_aka_consent_is_rejected(pool: PgPool) {
+    // 双方向同意検査: target.alsoKnownAs に source が居ないと拒否すること。
+    let (_lp, local_pub) = fresh_rsa();
+    let (old_priv, old_pub) = fresh_rsa();
+    let (_np, new_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let old = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "old.test",
+            "alice",
+            &old_pub,
+            "https://old.test/users/alice/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    // new actor の alsoKnownAs を空にしておく → 同意なし。
+    let new = repo::actor::insert(
+        &pool,
+        remote_actor_with_aka(
+            "new.test",
+            "alice",
+            &new_pub,
+            "https://new.test/users/alice/inbox",
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://old.test/users/alice/activities/move-evil",
+        "type": "Move",
+        "actor": old.ap_id,
+        "object": old.ap_id,
+        "target": new.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", old.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &old_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    // [[m9-pr1-review]] round-2 [1]: 永続的な同意失敗は **4xx** で返す。
+    // 503 を返すと Mastodon が無限にリトライしてくる。
+    assert!(
+        resp.status().is_client_error(),
+        "Move without target.alsoKnownAs consent must be rejected with 4xx (not 5xx), got {}",
+        resp.status(),
+    );
+
+    // source.moved_to_ap_id は変わっていない。
+    let unchanged = repo::actor::get_by_id(&pool, old.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(unchanged.moved_to_ap_id.is_none());
+    // local 側でも target への auto-Follow は積まれていない (= 拒否されたので
+    // フォロー関係に派生変更が起きないことを明示)。
+    let new_follow_rows = sqlx::query!(
+        "SELECT count(*) as c FROM follow WHERE follower_actor_id = $1 AND followed_actor_id = $2",
+        local.id,
+        new.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(new_follow_rows.c.unwrap_or(0), 0);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn move_object_must_equal_signer(pool: PgPool) {
+    // signer が他人の `Move` を装って投げてきても拒否 (object != signer.ap_id)。
+    // F3 で body.actor == signer は確認済みだが、object も signer 本人を
+    // 指す必要がある (= 「自分が動いた」と宣言できるのは本人だけ)。
+    let (_lp, local_pub) = fresh_rsa();
+    let (signer_priv, signer_pub) = fresh_rsa();
+
+    let _local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let signer_actor = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &signer_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.test/users/bob/activities/move-spoof",
+        "type": "Move",
+        "actor": signer_actor.ap_id,
+        // 他人 (carol) を動かしたことにする → 拒否されるべき。
+        "object": "https://other.test/users/carol",
+        "target": "https://new.test/users/carol",
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", signer_actor.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &signer_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    // [[m9-pr1-review]] round-2 [1]: 永続的なフィールド不正は **4xx** で返す。
+    assert!(
+        resp.status().is_client_error(),
+        "Move with object != signer must be rejected with 4xx, got {}",
+        resp.status(),
+    );
+}

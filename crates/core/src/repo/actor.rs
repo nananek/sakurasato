@@ -265,6 +265,74 @@ pub async fn update_profile(
     .await
 }
 
+/// Replace the `also_known_as` array for an actor (M9 alias CLI / Move 受領).
+///
+/// `aliases` を **そのまま** 上書きするので、追加/削除は呼び出し側で配列を
+/// 整えること。`also_known_as` は JSONB 配列で重複検査は無いが、
+/// 慣習として URI 文字列のみが入る。
+pub async fn set_also_known_as(
+    pool: &PgPool,
+    id: i64,
+    aliases: &[String],
+) -> sqlx::Result<crate::model::ActorRow> {
+    let value = serde_json::to_value(aliases).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query_as!(
+        crate::model::ActorRow,
+        r#"
+        UPDATE actor SET
+            also_known_as = $2,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING
+            id, ap_id, preferred_username, host, display_name, summary,
+            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
+            followers_url, following_url, public_key_id, public_key_pem,
+            private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
+            also_known_as as "also_known_as: Json<Vec<String>>",
+            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+        "#,
+        id,
+        value,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// Set or clear `moved_to_ap_id` for an actor (M9 Move 受領 / 送出)。
+///
+/// `target` が `Some(uri)` なら `movedTo = uri`、`None` なら NULL に倒す
+/// (= Move を取り消したい / 誤入力からの復旧)。送出側は CLI で立て、受領側は
+/// inbox の Move handler で立てる。Move を立てると actor JSON の `movedTo`
+/// が出るので、相手が actor を再 fetch すれば自然に新しい先へ案内できる。
+pub async fn set_moved_to(
+    pool: &PgPool,
+    id: i64,
+    target: Option<&str>,
+) -> sqlx::Result<crate::model::ActorRow> {
+    sqlx::query_as!(
+        crate::model::ActorRow,
+        r#"
+        UPDATE actor SET
+            moved_to_ap_id = $2,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING
+            id, ap_id, preferred_username, host, display_name, summary,
+            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
+            followers_url, following_url, public_key_id, public_key_pem,
+            private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
+            also_known_as as "also_known_as: Json<Vec<String>>",
+            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+        "#,
+        id,
+        target,
+    )
+    .fetch_one(pool)
+    .await
+}
+
 /// Delete an actor by primary key. Used by the `init --force` admin path
 /// when re-issuing the local signing key (notes/follows cascade).
 pub async fn delete_by_id<'e, E>(executor: E, id: i64) -> sqlx::Result<u64>

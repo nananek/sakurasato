@@ -111,6 +111,44 @@ OK。
   - **nekonoverse**: cavage に Ed25519 keyId を載せる流派で sakurasato が
     拒否 (M3b フォロー対象)
 
+### M9: Move (引っ越し) の手動検証
+
+Mastodon は `tootctl account move <FROM> <TO>` で Move activity を全フォロワー
+inbox に投げてくれるので、これを使って sakurasato 側の受領経路を検証できる。
+
+```bash
+# 1) Mastodon スタック起動 + sakurasato 側で bob@mastodon を follow しておく。
+./scripts/federation-test/up.sh mastodon
+
+# 2) Mastodon 側に移動先 alice を作る (Web UI の Register Account でも、
+#    tootctl でも良い)。
+docker compose -f compose/docker-compose.federation-mastodon.yml \
+  exec mastodon-web tootctl accounts create alice \
+  --email alice@mastodon --confirmed
+
+# 3) alice の Web UI 設定 → "Move from a different account" で
+#    bob@mastodon を旧 actor として登録 (alsoKnownAs に bob が載る)。
+#    あるいは sakurasato 側で `sakurasato alias add` を打って bob → alice
+#    の片方向 alsoKnownAs を入れる手もある (実際の引っ越しは前者推奨)。
+
+# 4) bob 側で account move を実行。
+docker compose -f compose/docker-compose.federation-mastodon.yml \
+  exec mastodon-web tootctl accounts move bob alice@mastodon
+
+# 5) sakurasato のログで Move handler の起動と auto-Follow の queue を確認。
+docker compose -f compose/docker-compose.federation-mastodon.yml \
+  logs sakurasato-server | grep -E '(Move accepted|auto-Follow queued)'
+```
+
+`alsoKnownAs` 側だけ試したい (= Move まで打たない) 場合は CLI を使う:
+
+```bash
+docker compose -f compose/docker-compose.federation-mastodon.yml \
+  exec sakurasato-server sakurasato alias add https://old.example/users/me
+docker compose -f compose/docker-compose.federation-mastodon.yml \
+  exec sakurasato-server sakurasato alias list
+```
+
 ### Misskey 注意点 (2026.5+)
 
 `meta.federation` のデフォルトが `'none'` (連合無効) に変わったので、
