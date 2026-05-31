@@ -302,13 +302,15 @@ async fn dispatch_undo(
         // 渡してみる ── reaction テーブルに無ければ silent no-op。
     }
 
-    // URI のみ (= type 無し)。reaction と announce 両方を試す。
+    // URI のみ (= type 無し)。announce → reaction の順に lookup する。
+    // `is_some()` で十分 ── `handle_undo_announce` が内部で再 fetch する
+    // ([[m11-pr-review]] minor 2)。
     let target = extract_object_uri(activity)?.to_string();
-    if let Some(ann) = sakurasato_core::repo::announce::get_by_ap_id(state.pool(), &target)
+    if sakurasato_core::repo::announce::get_by_ap_id(state.pool(), &target)
         .await
         .map_err(|e| DispatchError::Internal(e.into()))?
+        .is_some()
     {
-        let _ = ann;
         return announce::handle_undo_announce(state, signer, &target).await;
     }
     reaction::handle_undo(state, signer, activity).await

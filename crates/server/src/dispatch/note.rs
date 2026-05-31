@@ -200,10 +200,13 @@ async fn build_remote_note(
         .and_then(JsonValue::as_str)
         .map(str::to_string);
     let in_reply_to_note_id = if let Some(uri) = in_reply_to_ap_id.as_deref() {
+        // DB 接続障害 (= Internal) と「親 note が未知」(= Ok(None)) を区別する。
+        // `.ok()` で平滑化すると接続障害時に reply 無し扱いで insert が成立し、
+        // インフラ問題が静かにすり抜ける ([[m11-pr-review]] minor 1)。
         repo::note::get_by_ap_id(state.pool(), uri)
             .await
-            .ok()
-            .flatten()
+            .with_context(|| format!("lookup reply parent {uri}"))
+            .map_err(DispatchError::Internal)?
             .map(|n| n.id)
     } else {
         None
