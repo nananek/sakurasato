@@ -275,6 +275,20 @@ impl PreparedNote {
 /// `actor_uri` は to/cc に乗せる用 (local actor 自身でも乗せる ── 害は無く、
 /// Mastodon/Misskey の慣習に合う)。`inbox_for_delivery` は **remote actor かつ
 /// 自分以外** のときだけ Some ── local や自分自身の inbox は配送しない。
+///
+/// **#64 F-1 (Followers 可視性の意図)**: `Visibility::Followers` の返信でも
+/// 親 author の inbox には配送する。これは Mastodon / Misskey / Nekonoverse
+/// と同じ慣習で、「mentioned (cc に乗った) リモート actor は follow 関係
+/// 問わず受領する」という `ActivityPub` の標準的な解釈。受領側は AS2 visibility
+/// (= to/cc/audience) を見て「followers-only として表示」を選択するため、
+/// 公開範囲はクライアント側で正しく扱われる。
+///
+/// **#64 F-4 (TOCTOU 受容)**: `note_id` は `state.pool()` で tx 外で取得し、
+/// `persist_note` 内の INSERT に渡す。並行 Delete dispatch が tx 開始前に親
+/// note を削除すると FK 違反で 503 を返す。お一人様サーバ + Delete は稀
+/// なため、503 → ユーザ retry の経路で許容する。pre-resolve を回避したい
+/// 場合は `reply_parent = None` を渡せば `persist_note` 内の tx 内 fallback が
+/// 走り、tx 内検索 → 親が消えていれば `note_id = None` で続行できる。
 #[derive(Debug, Clone)]
 struct ReplyParentInfo {
     note_id: i64,
@@ -544,6 +558,13 @@ async fn persist_note(
 /// `extra_inboxes` は #64 で導入: 返信先 author の inbox など、followers 集合
 /// に含まれない宛先を後付けで足す。followers と重複する inbox は dedupe で
 /// 1 回だけ enqueue する (= `shared_inbox` を共有しているケースなど)。
+///
+/// **#64 F-2 (fail-closed)**: `list_accepted_inboxes` が DB 障害で失敗した
+/// 場合は `extra_inboxes` の配送も諦め、`queued_deliveries = 0` でレスポンス
+/// する。フォロワー集合が分からないまま reply-parent だけ届ける「部分配送」
+/// は、ユーザに「配送済み」と誤認させかねず、可視性スコープも崩す。失敗側に
+/// 倒して 0 を返し、ユーザ側の再送 (= 同じ note を再 POST するか worker の
+/// retry に任せる) で復旧する設計。
 async fn enqueue_deliveries(
     state: &AppState,
     local_actor: &ActorRow,
@@ -554,8 +575,12 @@ async fn enqueue_deliveries(
     {
         Ok(list) => list,
         Err(err) => {
-            warn!(?err, "POST /api/v1/notes: list_accepted_inboxes failed");
-            Vec::new()
+            warn!(
+                ?err,
+                "POST /api/v1/notes: list_accepted_inboxes failed; skipping all deliveries (fail-closed)",
+            );
+            // fail-closed: extra_inboxes も含めて配送しない。
+            return 0;
         }
     };
     for extra in extra_inboxes {
@@ -639,6 +664,14 @@ fn validate_reply_url(uri: &str) -> Result<(), &'static str> {
     }
     if url.host_str().is_none() {
         return Err("in_reply_to_ap_id must have a host");
+    }
+    // **#64 F-3**: private / loopback / link-local / reserved IP の URI を弾く。
+    // server は in_reply_to_ap_id を fetch しない (= SSRF は起きない) が、
+    // `Create` activity の `inReplyTo` としてそのまま federate されるため、
+    // 内部 topology の漏洩を防ぐ。defense-in-depth として配送系と同じガード
+    // (= [`crate::net_guard::host_blocked`]) を通す。
+    if crate::net_guard::host_blocked(&url).is_some() {
+        return Err("in_reply_to_ap_id host is in a blocked address range");
     }
     Ok(())
 }
@@ -800,6 +833,18 @@ mod tests {
         assert!(validate_reply_url("file:///etc/passwd").is_err());
         assert!(validate_reply_url("not a url").is_err());
         assert!(validate_reply_url("https:///").is_err());
+    }
+
+    /// **#64 F-3**: private / loopback / link-local の IP literal を弾く。
+    /// `inReplyTo` フィールドとして federate される文字列なので、内部
+    /// topology を漏らさないよう `net_guard` を通す。
+    #[test]
+    fn validate_reply_url_blocks_private_address_ranges() {
+        assert!(validate_reply_url("http://127.0.0.1/notes/1").is_err());
+        assert!(validate_reply_url("http://192.168.1.1/notes/1").is_err());
+        assert!(validate_reply_url("http://10.0.0.1/notes/1").is_err());
+        assert!(validate_reply_url("http://169.254.169.254/notes/1").is_err());
+        assert!(validate_reply_url("http://localhost/notes/1").is_err());
     }
 
     #[test]

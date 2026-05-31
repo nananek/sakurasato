@@ -130,13 +130,42 @@ class TestReplyDeliveryToNonFollower:
     def test_reply_to_non_follower_reaches_them(
         self, mastodon: MastodonClient, sakurasato: SakurasatoClient
     ):
+        # **#64 F-5 (テスト前提の明示化)**: 本テストは「Sakurasato が Bob を
+        # follow している (= sakurasato-prefollow-bob 経由)」が前提。前提が
+        # 崩れると Phase 2 の poll_until が "seed not found" でタイムアウトし
+        # ミスリーディングになるので、まず Bob から見た sakurasato の relationship
+        # を確認する (= sakurasato → Bob の Follow が auto-Accept された証拠は
+        # Bob 側の `followed_by=True`)。
+        bob_accounts = mastodon.search_accounts(
+            f"me@{SAKURASATO_DOMAIN}", resolve=True
+        )
+        assert bob_accounts, "Mastodon must be able to resolve me@sakurasato"
+        sks_id = bob_accounts[0]["id"]
+
+        def sakurasato_follows_bob_per_mastodon() -> bool:
+            resp = mastodon.http.get(
+                "/api/v1/accounts/relationships",
+                params={"id[]": sks_id},
+                headers={"Authorization": f"Bearer {mastodon.token}"},
+            )
+            if resp.status_code != 200:
+                return False
+            rows = resp.json()
+            return bool(rows) and rows[0].get("followed_by") is True
+
+        poll_until(
+            sakurasato_follows_bob_per_mastodon,
+            desc="sakurasato-prefollow-bob must have completed; "
+            "Mastodon should report followed_by=True",
+        )
+
         # Phase 1: Bob が seed status を投稿。
         seed_marker = f"reply-seed-{int(time.time() * 1000)}"
         bob_status = mastodon.create_status(f"seed: {seed_marker}")
         bob_status_id = bob_status["id"]
 
-        # Phase 2: Sakurasato (= Bob を follow 済み via prefollow) が
-        # ingest するのを待ち、ap_id を拾う。
+        # Phase 2: Sakurasato (= Bob を follow 済み) が ingest するのを待ち、
+        # ap_id を拾う。
         def sakurasato_has_seed() -> str | None:
             tl = sakurasato.home_timeline(limit=40)
             for n in tl:
