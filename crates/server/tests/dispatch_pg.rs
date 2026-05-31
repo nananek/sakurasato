@@ -952,3 +952,889 @@ async fn move_object_must_equal_signer(pool: PgPool) {
         resp.status(),
     );
 }
+// =============================================================================
+// M11 — Create / Delete / Update / Announce 受信テスト
+// =============================================================================
+
+/// followee からの Create を受信して `note` 行が立つこと。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_from_followee_inserts_remote_note(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    // local が remote を accepted で follow している状態を用意。
+    let follow_ap = format!("https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-bob");
+    let f = repo::follow::insert_pending(&pool, &follow_ap, local.id, remote.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, f.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let note_id = "https://remote.test/notes/note-1";
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.test/users/bob/activities/create-1",
+        "type": "Create",
+        "actor": remote.ap_id,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": {
+            "id": note_id,
+            "type": "Note",
+            "attributedTo": remote.ap_id,
+            "content": "hello sakurasato",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "published": "2026-05-31T12:00:00Z",
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let stored = repo::note::get_by_ap_id(&pool, note_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.content, "hello sakurasato");
+    assert_eq!(stored.actor_id, remote.id);
+    assert!(!stored.is_local);
+    assert_eq!(stored.visibility, "public");
+}
+
+/// followee でも mention でもない Create は **DB に入れない** (= filter)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_from_unrelated_actor_is_filtered_out(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let _ = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "carol",
+            &remote_pub,
+            "https://remote.test/users/carol/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let note_id = "https://remote.test/notes/note-99";
+    let body = serde_json::json!({
+        "id": "https://remote.test/users/carol/activities/create-99",
+        "type": "Create",
+        "actor": remote.ap_id,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": {
+            "id": note_id,
+            "type": "Note",
+            "attributedTo": remote.ap_id,
+            "content": "stranger",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "published": "2026-05-31T12:00:00Z",
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED, "filter は silent 202");
+
+    let stored = repo::note::get_by_ap_id(&pool, note_id).await.unwrap();
+    assert!(stored.is_none(), "filter された Note は DB に残らない");
+}
+
+/// 我々の actor が `to` / `cc` に居れば follow 関係が無くても取り込む (mention)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_addressed_to_us_is_stored_even_without_follow(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "dave",
+            &remote_pub,
+            "https://remote.test/users/dave/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let note_id = "https://remote.test/notes/mention-1";
+    let body = serde_json::json!({
+        "id": "https://remote.test/users/dave/activities/create-mention",
+        "type": "Create",
+        "actor": remote.ap_id,
+        "to": [local.ap_id],
+        "object": {
+            "id": note_id,
+            "type": "Note",
+            "attributedTo": remote.ap_id,
+            "content": "@alice hello",
+            "to": [local.ap_id],
+            "published": "2026-05-31T12:00:00Z",
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let stored = repo::note::get_by_ap_id(&pool, note_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.actor_id, remote.id);
+}
+
+/// 同じ Note の Create を二度受け取っても 202 を返しつつ重複行は作らない。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_duplicate_is_idempotent(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let follow_ap = format!("https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-bob-dup");
+    let f = repo::follow::insert_pending(&pool, &follow_ap, local.id, remote.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, f.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app1 = router(state.clone());
+    let app2 = router(state);
+
+    let note_id = "https://remote.test/notes/dup-1";
+    let body = serde_json::json!({
+        "id": "https://remote.test/users/bob/activities/create-dup",
+        "type": "Create",
+        "actor": remote.ap_id,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": {
+            "id": note_id,
+            "type": "Note",
+            "attributedTo": remote.ap_id,
+            "content": "dup",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "published": "2026-05-31T12:00:00Z",
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+
+    for app in [app1, app2] {
+        let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    let count = sqlx::query!("SELECT count(*) as c FROM note WHERE ap_id = $1", note_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.c.unwrap_or(0), 1, "second receipt must not duplicate");
+}
+
+/// 自分の Note の Delete を受け取ったら DB から消える。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delete_by_author_removes_note(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let _ = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let note_ap_id = "https://remote.test/notes/to-delete";
+    let _note = repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: note_ap_id.into(),
+            actor_id: remote.id,
+            content: "bye".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::Value::Array(vec![]),
+            tags: serde_json::Value::Array(vec![]),
+            is_local: false,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "id": "https://remote.test/users/bob/activities/delete-1",
+        "type": "Delete",
+        "actor": remote.ap_id,
+        "object": {"type": "Tombstone", "id": note_ap_id},
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let after = repo::note::get_by_ap_id(&pool, note_ap_id).await.unwrap();
+    assert!(after.is_none(), "Note must be deleted by author");
+}
+
+/// 別の actor が他人の Note を Delete しようとしたら 400 (Malformed)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delete_by_non_author_is_rejected(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (_op, owner_pub) = fresh_rsa();
+    let (attacker_priv, attacker_pub) = fresh_rsa();
+
+    let _ = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let owner = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "owner",
+            &owner_pub,
+            "https://remote.test/users/owner/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let attacker = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "evil.test",
+            "eve",
+            &attacker_pub,
+            "https://evil.test/users/eve/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let _ = attacker;
+
+    let note_ap_id = "https://remote.test/notes/owners-note";
+    repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: note_ap_id.into(),
+            actor_id: owner.id,
+            content: "mine".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::Value::Array(vec![]),
+            tags: serde_json::Value::Array(vec![]),
+            is_local: false,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "id": "https://evil.test/users/eve/activities/delete-spoof",
+        "type": "Delete",
+        "actor": "https://evil.test/users/eve",
+        "object": note_ap_id,
+    })
+    .to_string();
+    let keyid = "https://evil.test/users/eve#main-key";
+    let req = build_signed_post(body.as_bytes(), "/inbox", &attacker_priv, keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "Delete by non-author must be 4xx, got {}",
+        resp.status(),
+    );
+
+    let still = repo::note::get_by_ap_id(&pool, note_ap_id).await.unwrap();
+    assert!(still.is_some(), "Note must not be deleted by attacker");
+}
+
+/// 未知 Note の Delete は silent 202 (= 我々が持っていない note を消せと
+/// 言われても落ちない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delete_of_unknown_note_is_silent(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let _ = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "id": "https://remote.test/users/bob/activities/delete-unknown",
+        "type": "Delete",
+        "actor": remote.ap_id,
+        "object": "https://remote.test/notes/never-seen",
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+/// 自分の Note の Update で content と `edited_at` が動く。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn update_note_by_author_changes_content(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let _ = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let note_ap_id = "https://remote.test/notes/edit-target";
+    let original = repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: note_ap_id.into(),
+            actor_id: remote.id,
+            content: "original".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::Value::Array(vec![]),
+            tags: serde_json::Value::Array(vec![]),
+            is_local: false,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(original.edited_at.is_none());
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "id": "https://remote.test/users/bob/activities/update-1",
+        "type": "Update",
+        "actor": remote.ap_id,
+        "object": {
+            "id": note_ap_id,
+            "type": "Note",
+            "attributedTo": remote.ap_id,
+            "content": "edited!",
+            "updated": "2026-06-01T00:00:00Z",
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let after = repo::note::get_by_ap_id(&pool, note_ap_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.content, "edited!");
+    assert!(after.edited_at.is_some(), "edited_at must be set");
+}
+
+/// 別 actor が他人の Note を Update しようとしたら 4xx (Malformed)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn update_note_by_non_author_is_rejected(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (_op, owner_pub) = fresh_rsa();
+    let (attacker_priv, attacker_pub) = fresh_rsa();
+
+    let _ = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let owner = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "owner",
+            &owner_pub,
+            "https://remote.test/users/owner/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let _ = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "evil.test",
+            "eve",
+            &attacker_pub,
+            "https://evil.test/users/eve/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let note_ap_id = "https://remote.test/notes/owners";
+    repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: note_ap_id.into(),
+            actor_id: owner.id,
+            content: "untouched".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::Value::Array(vec![]),
+            tags: serde_json::Value::Array(vec![]),
+            is_local: false,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    // F3 をすり抜けるため、attacker は own attributedTo で送る必要がある。
+    // すると F3 nested check で attributedTo == signer は通るが、handler の
+    // note.actor_id 検査で落ちる。Note: attributedTo を本人にしつつ object.id
+    // は他人 note の URI ── これは "全く知らない note を eve が更新したい"
+    // ケースとみなされ、handler は note.actor_id (= owner.id) != signer.id
+    // で 400 を返す。
+    let body = serde_json::json!({
+        "id": "https://evil.test/users/eve/activities/update-spoof",
+        "type": "Update",
+        "actor": "https://evil.test/users/eve",
+        "object": {
+            "id": note_ap_id,
+            "type": "Note",
+            "attributedTo": "https://evil.test/users/eve",
+            "content": "hijacked",
+        },
+    })
+    .to_string();
+    let keyid = "https://evil.test/users/eve#main-key";
+    let req = build_signed_post(body.as_bytes(), "/inbox", &attacker_priv, keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "Update for someone else's note must be 4xx, got {}",
+        resp.status(),
+    );
+
+    let still = repo::note::get_by_ap_id(&pool, note_ap_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still.content, "untouched");
+}
+
+/// Update Actor で object.id が signer `ap_id` と一致しなければ拒否 (fetch 前に弾く)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn update_actor_with_mismatched_object_id_is_rejected(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let _ = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "id": "https://remote.test/users/bob/activities/update-actor-spoof",
+        "type": "Update",
+        "actor": remote.ap_id,
+        "object": {
+            "id": "https://other.test/users/carol",
+            "type": "Person",
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "Update Actor with mismatched object.id must be 4xx, got {}",
+        resp.status(),
+    );
+}
+
+/// followee からの Announce で `announce` 行が作られる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn announce_from_followee_inserts_row(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let (_ap, author_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let author = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "other.test",
+            "alice",
+            &author_pub,
+            "https://other.test/users/alice/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let follow_ap = format!("https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-bob-ann");
+    let f = repo::follow::insert_pending(&pool, &follow_ap, local.id, remote.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, f.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let note_ap_id = "https://other.test/notes/known-1";
+    let note = repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: note_ap_id.into(),
+            actor_id: author.id,
+            content: "boost me".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::Value::Array(vec![]),
+            tags: serde_json::Value::Array(vec![]),
+            is_local: false,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let announce_ap = "https://remote.test/users/bob/activities/announce-1";
+    let body = serde_json::json!({
+        "id": announce_ap,
+        "type": "Announce",
+        "actor": remote.ap_id,
+        "object": note_ap_id,
+        "published": "2026-05-31T13:00:00Z",
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let row = sakurasato_core::repo::announce::get_by_ap_id(&pool, announce_ap)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.note_id, note.id);
+    assert_eq!(row.actor_id, remote.id);
+}
+
+/// 未知 Note への Announce は no-op (= 行を作らない / fetch しない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn announce_of_unknown_note_is_noop(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let follow_ap = format!("https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-bob-unk");
+    let f = repo::follow::insert_pending(&pool, &follow_ap, local.id, remote.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, f.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let announce_ap = "https://remote.test/users/bob/activities/announce-unknown";
+    let body = serde_json::json!({
+        "id": announce_ap,
+        "type": "Announce",
+        "actor": remote.ap_id,
+        "object": "https://other.test/notes/never-seen",
+        "published": "2026-05-31T13:00:00Z",
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let row = sakurasato_core::repo::announce::get_by_ap_id(&pool, announce_ap)
+        .await
+        .unwrap();
+    assert!(row.is_none(), "unknown Note の boost は記録しない");
+}
+
+/// Undo Announce で `announce` 行が消える。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn undo_announce_removes_row(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let (_ap, author_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let author = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "other.test",
+            "alice",
+            &author_pub,
+            "https://other.test/users/alice/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let follow_ap =
+        format!("https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-bob-undoann");
+    let f = repo::follow::insert_pending(&pool, &follow_ap, local.id, remote.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, f.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+    let note_ap_id = "https://other.test/notes/undo-target";
+    let note = repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: note_ap_id.into(),
+            actor_id: author.id,
+            content: "x".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::Value::Array(vec![]),
+            tags: serde_json::Value::Array(vec![]),
+            is_local: false,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let announce_ap = "https://remote.test/users/bob/activities/announce-undo";
+    sakurasato_core::repo::announce::insert_or_get(
+        &pool,
+        announce_ap,
+        note.id,
+        remote.id,
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "id": "https://remote.test/users/bob/activities/undo-1",
+        "type": "Undo",
+        "actor": remote.ap_id,
+        "object": {
+            "id": announce_ap,
+            "type": "Announce",
+            "actor": remote.ap_id,
+            "object": note_ap_id,
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let row = sakurasato_core::repo::announce::get_by_ap_id(&pool, announce_ap)
+        .await
+        .unwrap();
+    assert!(row.is_none(), "Undo Announce must remove the row");
+}

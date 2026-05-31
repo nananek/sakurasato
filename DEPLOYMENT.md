@@ -328,23 +328,23 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 
 `follow-cli-{follower_id}-{followed_id}` 形式の activity id が生成され、`delivery_queue` に積まれて常駐ワーカが送出する。
 
-### 6.1 受信できる activity の範囲 (M1〜M10 時点)
-
-現状の inbox dispatcher は **相互作用系のみ** を受領する:
+### 6.1 受信できる activity の範囲 (M11 完了時点 = inbox dispatch 完全化)
 
 | activity | 受信 | 備考 |
 |---|---|---|
 | `Follow` / `Accept` / `Reject` | ✅ | M3 |
-| `Like` / `EmojiReact` / `Undo` | ✅ | M8 (`Undo` は Reaction の取り消しのみ) |
+| `Like` / `EmojiReact` | ✅ | M8 |
+| `Undo` | ✅ | M8 Reaction の取り消し + M11 Announce の取り消し |
 | `Move` | ✅ | M9 (`alsoKnownAs` 双方向同意検査あり) |
-| `Create` / `Note` | ❌ | **未実装**。他人の投稿は届かない |
-| `Delete` | ❌ | **未実装**。リモート削除は反映されない |
-| `Update` | ❌ | **未実装**。リモート Actor / Note の更新は反映されない |
-| `Announce` | ❌ | **未実装**。Boost は届かない |
+| `Create` / `Note` | ✅ | M11 ── **followee の投稿** + **我々宛 mention / reply** のみ DB へ insert (= public TL に流れる無関係 post は引き込まない / DB 肥大対策) |
+| `Delete` | ✅ | M11 ── 既知 Note のみ削除。`note.actor_id == signer.id` を検査して**第三者削除を拒否**。未知 Note は silent no-op |
+| `Update` (Actor) | ✅ | M11 ── `object.id == signer.ap_id` を検査した上で [`remote_actor::fetch_and_upsert`] を再走。公開鍵ローテーション含む |
+| `Update` (Note) | ✅ | M11 ── 既知 Note の **作者本人** が編集している場合のみ content / summary / `edited_at` を上書き |
+| `Announce` | ✅ | M11 ── **followee** の boost を **既知 Note** にのみ記録。未知 Note は debug ログのみで no-op (= fetch しない、boost で見知らぬ note を引き込まない設計) |
 
-未実装の activity は `202 ACCEPTED` を返した上で **silently ignored** される (連合相手側の再送ループ回避)。よって「Mastodon でフォローしたのに相手の Note が TUI に出ない」「相手がプロフィール変えたのに古いまま」は**バグではなく現仕様**。
+低頻度 activity (`Add` / `Remove` / `Block` / `Flag` / `Question` / `Read` / `View` 等) は `202 ACCEPTED` を返した上で debug ログのみ。Follow の Undo (= remote 側からのフォロー解除) は本リリースでは未対応。
 
-長期解 = inbox dispatch の完全化は [#55](https://github.com/nananek/sakurasato/issues/55) で対応予定。実装状況の最新は同 issue を参照。
+実装状況の追跡は [#11](https://github.com/nananek/sakurasato/issues/11) (全体トラッカ) 参照。
 
 ---
 

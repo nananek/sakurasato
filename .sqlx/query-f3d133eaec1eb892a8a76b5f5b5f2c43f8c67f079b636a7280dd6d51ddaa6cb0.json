@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, ap_id, actor_id, content, language, in_reply_to_ap_id,\n            in_reply_to_note_id, summary, visibility, sensitive,\n            to_recipients as \"to_recipients: Json<Vec<String>>\",\n            cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            attachments as \"attachments: Json<JsonValue>\",\n            tags as \"tags: Json<JsonValue>\",\n            is_local, url, published_at, created_at, updated_at\n        FROM note WHERE id = $1\n        ",
+  "query": "\n        INSERT INTO note (\n            ap_id, actor_id, content, language, in_reply_to_ap_id,\n            in_reply_to_note_id, summary, visibility, sensitive,\n            to_recipients, cc_recipients, attachments, tags, is_local,\n            url, published_at\n        )\n        VALUES (\n            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,\n            $11, $12, $13, $14, $15, $16\n        )\n        RETURNING\n            id, ap_id, actor_id, content, language, in_reply_to_ap_id,\n            in_reply_to_note_id, summary, visibility, sensitive,\n            to_recipients as \"to_recipients: Json<Vec<String>>\",\n            cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            attachments as \"attachments: Json<JsonValue>\",\n            tags as \"tags: Json<JsonValue>\",\n            is_local, url, published_at, edited_at, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -192,6 +192,17 @@
       },
       {
         "ordinal": 17,
+        "name": "edited_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "edited_at"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -202,7 +213,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 19,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -215,7 +226,22 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Bool",
+        "Jsonb",
+        "Jsonb",
+        "Jsonb",
+        "Jsonb",
+        "Bool",
+        "Text",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -236,9 +262,10 @@
       false,
       true,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "bfa7f71ff33efbf9d8fbe74a35b2011763fe751a70c4f7b5d1381b8aa9ba78bb"
+  "hash": "f3d133eaec1eb892a8a76b5f5b5f2c43f8c67f079b636a7280dd6d51ddaa6cb0"
 }

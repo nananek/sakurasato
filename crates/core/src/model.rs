@@ -117,6 +117,10 @@ pub struct NoteRow {
     pub is_local: bool,
     pub url: Option<String>,
     pub published_at: DateTime<Utc>,
+    /// M11: リモート `Update`/`Note` を受領した時刻 (= 編集時刻)。
+    /// 初回受信時は `None`。ローカル投稿の編集機能は未実装なので、現状は
+    /// inbound 専用のメタデータ。`updated_at` は他の更新でも動くので別列。
+    pub edited_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -162,6 +166,20 @@ pub struct EmojiRow {
     pub is_local: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Row of the `announce` table (M11).
+///
+/// リモート actor の Boost (`Announce`) を記録する。`(note_id, actor_id)`
+/// UNIQUE で二重 boost は idempotent。`Undo` で `ap_id` を引いて削除する。
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct AnnounceRow {
+    pub id: i64,
+    pub ap_id: String,
+    pub note_id: i64,
+    pub actor_id: i64,
+    pub published_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Row of the `reaction` table.
