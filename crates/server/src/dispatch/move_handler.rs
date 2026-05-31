@@ -74,9 +74,20 @@ pub(crate) async fn handle_move(
         bail!("Move `target` equals `object`; nothing to migrate");
     }
 
-    // 移動先 actor を DB から、無ければ取りに行く。**target の取得は HTTP GET**
-    // なので、`remote_actor::fetch_and_upsert` の SSRF / redirect ガードを通す。
-    let target = ensure_remote_actor(state, &target_uri).await?;
+    // 移動先 actor を **本番では常に fresh で取り直す** ([[m9-pr1-review]] [1]
+    // 対応)。DB キャッシュをそのまま使うと、target が一度 `alsoKnownAs = [source]`
+    // で取り込まれた後に同意を撤回 (= `alsoKnownAs` から source を消した)
+    // ケースで、古い同意フラグを元に Move を受理してしまう。Actor JSON 取得は
+    // 画像デコードを伴わない (= JSON のみ) ので、`remote_actor::fetch_and_upsert`
+    // を経由しても CLAUDE.md §3 の隔離設計 (= 信頼できないバイト列の decode は
+    // media-proxy 側) に抵触しない。SSRF / redirect / size 上限はその中で
+    // 既存ガードを通る。
+    //
+    // テスト経路 (`AppState::from_pool` で `enable_remote_fetch=false`) では
+    // DB に予め seed された target を使う ── `extract.rs` の未知 actor 処理
+    // と同じ規約 (= "テストは必要な actor を予め `repo::actor::insert` で
+    // seed しておく契約")。
+    let target = ensure_target_actor(state, &target_uri).await?;
 
     // 双方向同意検査: target.alsoKnownAs に object (= 移動元) が含まれていない
     // とダメ。これが無いと「A の Move を勝手に偽装」が成立してしまう。
@@ -128,19 +139,27 @@ fn extract_target_uri(activity: &JsonValue) -> Option<&str> {
     }
 }
 
-async fn ensure_remote_actor(state: &AppState, ap_id: &str) -> anyhow::Result<ActorRow> {
-    if let Some(row) = repo::actor::get_by_ap_id(state.pool(), ap_id)
-        .await
-        .context("lookup Move target in DB")?
-    {
-        return Ok(row);
+/// Move target の actor row を確保する。
+///
+/// 本番経路 (= `enable_remote_fetch=true`) では **常に fresh で fetch**
+/// する ── キャッシュ済みの古い `alsoKnownAs` で同意検査をやってしまうと、
+/// 同意撤回後の偽 Move を受理してしまうため ([[m9-pr1-review]] [1])。
+/// テスト経路 (`enable_remote_fetch=false`) では DB seed を使う。
+async fn ensure_target_actor(state: &AppState, ap_id: &str) -> anyhow::Result<ActorRow> {
+    if state.enable_remote_fetch() {
+        return remote_actor::fetch_and_upsert(state, ap_id)
+            .await
+            .with_context(|| format!("fetch Move target actor {ap_id}"));
     }
-    // DB に居なければ取りに行く。SSRF / redirect / size 上限は
-    // remote_actor::fetch_and_upsert に任せる ── self-host や private range は
-    // ここで弾かれる。
-    remote_actor::fetch_and_upsert(state, ap_id)
+    repo::actor::get_by_ap_id(state.pool(), ap_id)
         .await
-        .with_context(|| format!("fetch Move target actor {ap_id}"))
+        .with_context(|| format!("lookup Move target {ap_id} in DB"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "Move target {ap_id} not in DB and remote fetch is disabled (test mode); \
+                 seed the target via repo::actor::insert first",
+            )
+        })
 }
 
 /// 自分の local actor が移動元 actor を follow していたとき、target へ

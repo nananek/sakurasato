@@ -889,8 +889,17 @@ async fn move_without_target_aka_consent_is_rejected(pool: PgPool) {
         .unwrap()
         .unwrap();
     assert!(unchanged.moved_to_ap_id.is_none());
-    // local follow も変化なし。
-    let _ = local;
+    // local 側でも target への auto-Follow は積まれていない (= 拒否されたので
+    // フォロー関係に派生変更が起きないことを明示)。
+    let new_follow_rows = sqlx::query!(
+        "SELECT count(*) as c FROM follow WHERE follower_actor_id = $1 AND followed_actor_id = $2",
+        local.id,
+        new.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(new_follow_rows.c.unwrap_or(0), 0);
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

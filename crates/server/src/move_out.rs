@@ -23,6 +23,7 @@ use sakurasato_core::model::ActorRow;
 use sakurasato_core::{Config, repo};
 use serde_json::{Value as JsonValue, json};
 use tracing::{info, warn};
+use url::Url;
 
 use crate::cli::{AliasArgs, AliasCommand, AliasMutateArgs, MoveOutArgs};
 use crate::delivery;
@@ -43,6 +44,12 @@ pub async fn run_alias(config: Config, args: AliasArgs) -> anyhow::Result<()> {
             Ok(())
         }
         AliasCommand::Add(AliasMutateArgs { uri }) => {
+            // **URI バリデーション** ([[m9-pr1-review]] [2] 対応): 任意の
+            // 文字列を `alsoKnownAs` に入れると、actor JSON 経由で連合先に
+            // 投げたとき相手側のパーサが落ちる可能性がある (`javascript:` /
+            // 空文字 / 制御文字混入など)。CLAUDE.md §5.1 が想定するのは
+            // 「過去の actor の `ap_id`」のみなので、http/https のみを許可。
+            validate_alias_uri(&uri)?;
             mutate_alias(&state, &local, |list| {
                 if list.iter().any(|u| u == &uri) {
                     info!(uri = %uri, "alsoKnownAs already contains URI; no change");
@@ -123,6 +130,29 @@ pub async fn run_move_out(config: Config, args: MoveOutArgs) -> anyhow::Result<(
         "Move activity queued ({} follower inbox(es)). target = {}",
         queued, target.ap_id,
     );
+    Ok(())
+}
+
+/// `alsoKnownAs` に入れる URI が `ActivityPub` actor URI として妥当か検査。
+///
+/// 受け入れ条件:
+/// - `url::Url::parse` を通る
+/// - scheme が `https` または `http`
+/// - host が存在する (= 空ではない)
+///
+/// 拒否例: 空文字、`javascript:alert(1)`、`mailto:`、相対パス、制御文字混入。
+fn validate_alias_uri(raw: &str) -> anyhow::Result<()> {
+    let parsed = Url::parse(raw)
+        .with_context(|| format!("invalid alias URI {raw:?}: not a parseable URL"))?;
+    if !matches!(parsed.scheme(), "https" | "http") {
+        bail!(
+            "invalid alias URI {raw:?}: scheme must be https or http, got {:?}",
+            parsed.scheme(),
+        );
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        bail!("invalid alias URI {raw:?}: host is missing");
+    }
     Ok(())
 }
 
@@ -229,6 +259,44 @@ async fn enqueue_to_followers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_alias_uri_accepts_http_and_https() {
+        validate_alias_uri("https://old.example/users/alice").unwrap();
+        validate_alias_uri("http://old.example/users/alice").unwrap();
+    }
+
+    #[test]
+    fn validate_alias_uri_rejects_non_http_schemes() {
+        for bad in [
+            "",
+            "javascript:alert(1)",
+            "mailto:alice@example.com",
+            "file:///etc/passwd",
+            "data:text/plain,hi",
+            "ftp://example.com/x",
+            "not a url",
+            "/relative/path",
+        ] {
+            assert!(
+                validate_alias_uri(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_alias_uri_requires_host_in_error_messages() {
+        // 空文字 / scheme のみは Url::parse 段で落ちる。実装としては
+        // `parsed` で先に Url パースエラーになるが、エラー文言にはどこかで
+        // ヒントが入っていれば OK。
+        let err = validate_alias_uri("https://").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid alias URI") || msg.contains("host"),
+            "unexpected error message: {msg}",
+        );
+    }
 
     #[test]
     fn move_activity_has_required_fields() {
