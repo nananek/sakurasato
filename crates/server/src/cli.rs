@@ -173,7 +173,9 @@ pub struct MoveOutArgs {
 pub struct FollowArgs {
     /// `acct:user@host` / `@user@host` / `user@host` のいずれでも可。
     /// `--actor-uri` を併用する場合は `WebFinger` 解決をスキップする。
-    #[arg(default_value = "")]
+    ///
+    /// `--actor-uri` 指定時のみ省略可能 (`required_unless_present`)。
+    #[arg(required_unless_present = "actor_uri", default_value = "")]
     pub acct: String,
     /// `WebFinger` を経由せず直接 `ActivityPub` actor URI を指定する (オプション)。
     /// 例: `--actor-uri https://example.com/users/foo`。
