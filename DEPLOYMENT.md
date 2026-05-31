@@ -328,6 +328,24 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 
 `follow-cli-{follower_id}-{followed_id}` 形式の activity id が生成され、`delivery_queue` に積まれて常駐ワーカが送出する。
 
+### 6.1 受信できる activity の範囲 (M1〜M10 時点)
+
+現状の inbox dispatcher は **相互作用系のみ** を受領する:
+
+| activity | 受信 | 備考 |
+|---|---|---|
+| `Follow` / `Accept` / `Reject` | ✅ | M3 |
+| `Like` / `EmojiReact` / `Undo` | ✅ | M8 (`Undo` は Reaction の取り消しのみ) |
+| `Move` | ✅ | M9 (`alsoKnownAs` 双方向同意検査あり) |
+| `Create` / `Note` | ❌ | **未実装**。他人の投稿は届かない |
+| `Delete` | ❌ | **未実装**。リモート削除は反映されない |
+| `Update` | ❌ | **未実装**。リモート Actor / Note の更新は反映されない |
+| `Announce` | ❌ | **未実装**。Boost は届かない |
+
+未実装の activity は `202 ACCEPTED` を返した上で **silently ignored** される (連合相手側の再送ループ回避)。よって「Mastodon でフォローしたのに相手の Note が TUI に出ない」「相手がプロフィール変えたのに古いまま」は**バグではなく現仕様**。
+
+長期解 = inbox dispatch の完全化は [#55](https://github.com/nananek/sakurasato/issues/55) で対応予定。実装状況の最新は同 issue を参照。
+
 ---
 
 ## 7. 運用タスク
