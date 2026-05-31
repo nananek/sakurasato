@@ -21,6 +21,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     SQLX_OFFLINE=true cargo build --release --target x86_64-unknown-linux-musl -p sakurasato-server && \
     cp target/x86_64-unknown-linux-musl/release/sakurasato-server /sakurasato-server
 
+# 名前付き volume が初回マウントされる際の ownership を `nonroot:nonroot 0700`
+# に倒すための空ディレクトリ stub。
+# - `/run/sakurasato` … media-proxy との UDS (`media.sock`) を置く
+# - `/run/sakurasato-local` … TUI 向けローカル API UDS (`local.sock`) を置く
+# どちらも distroless/static には存在せず、何もしないと docker が
+# root:root 0755 で掘ってしまい uid 65532 が bind 不能になる。
+RUN mkdir -p /stub/run-sakurasato /stub/run-sakurasato-local
+
 # ---- runtime ----
 FROM gcr.io/distroless/static:nonroot AS runtime
 
@@ -30,6 +38,10 @@ COPY --from=builder /build/config /app/config
 # migrations are also embedded via sqlx::migrate! at build time, but ship
 # them in the image so admins can run them manually with sqlx-cli too.
 COPY --from=builder /build/migrations /app/migrations
+COPY --from=builder --chown=nonroot:nonroot --chmod=0700 \
+     /stub/run-sakurasato /run/sakurasato
+COPY --from=builder --chown=nonroot:nonroot --chmod=0700 \
+     /stub/run-sakurasato-local /run/sakurasato-local
 
 USER nonroot:nonroot
 ENV SAKURASATO_CONFIG=/app/config/default.toml

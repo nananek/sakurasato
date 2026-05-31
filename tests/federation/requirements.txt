@@ -1,0 +1,4 @@
+# Pin floor versions only; pytest と httpx は API 安定線にいるので
+# patch 更新を引き取ってよい (dependabot で追従)。
+httpx>=0.28.0
+pytest>=8.0.0

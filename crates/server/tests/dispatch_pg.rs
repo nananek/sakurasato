@@ -442,6 +442,76 @@ async fn accept_response_marks_follow_accepted(pool: PgPool) {
     assert_eq!(updated.id, follow.id);
 }
 
+/// Mastodon は `Accept.object` を **ネストされた Follow オブジェクト** で
+/// 返す (URI 文字列ではなく)。その Follow 内側の `actor` は **我々**
+/// (= sakurasato/me)、署名者は Mastodon 側の Bob、で必然的に不一致。
+/// `dispatch` の最上段で `verify_nested_object_actor` を unconditional に
+/// 走らせていた既存挙動だと、この Mastodon 由来 Accept が全部 401 で
+/// 弾かれて follow が pending のまま残る (= 連合途絶) のが
+/// `tests/federation/test_mastodon.py::TestNoteFromMastodon` で踏んだ
+/// 既知不具合。**Create/Update/Delete に限定して呼ぶ** ことで Accept は
+/// 通過するようになる。本テストはその回帰を 1 行で守るためのもの。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn accept_with_nested_follow_object_marks_follow_accepted(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let _ = local_priv;
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let follow_ap_id = format!("https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-test");
+    let follow = repo::follow::insert_pending(&pool, &follow_ap_id, local.id, remote.id)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    // Mastodon 形式: object はネストされた Follow object。`Follow.actor` は
+    // **local** (= 我々) で signer (= remote) と一致しない。
+    let body = serde_json::json!({
+        "id": "https://remote.test/users/bob/activities/accept-1",
+        "type": "Accept",
+        "actor": remote.ap_id,
+        "object": {
+            "id": follow_ap_id.clone(),
+            "type": "Follow",
+            "actor": local.ap_id.clone(),
+            "object": remote.ap_id,
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "Mastodon-style nested Accept must not be blocked by nested-actor check"
+    );
+
+    let updated = repo::follow::get_by_ap_id(&pool, &follow_ap_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.state, "accepted");
+    assert_eq!(updated.id, follow.id);
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn accept_from_unrelated_actor_is_rejected(pool: PgPool) {
     // 関係ない actor から Accept が来たら 401 (`DispatchError::UnrelatedAcceptor`)。

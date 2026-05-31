@@ -18,11 +18,17 @@ if [ -z "${CERT_DOMAINS:-}" ]; then
 fi
 
 if [ ! -f "$CERT_DIR/ca.crt" ]; then
+  # `keyUsage` / `basicConstraints` を **明示的** に立てる ──
+  # newer Python ssl (cpython 3.13+) は CA 証明書に `keyUsage` 拡張が
+  # 無いと `CA cert does not include key usage extension` で拒否する。
+  # `-x509` だけでは拡張が乗らないので addext で補う (openssl 3.x の作法)。
   openssl req -x509 -newkey rsa:2048 -nodes \
     -keyout "$CERT_DIR/ca.key" \
     -out "$CERT_DIR/ca.crt" \
     -days 1 \
     -subj "/CN=Sakurasato Federation Test CA" \
+    -addext "basicConstraints = critical, CA:TRUE" \
+    -addext "keyUsage = critical, keyCertSign, cRLSign" \
     2>/dev/null
   echo "Generated CA cert"
 fi

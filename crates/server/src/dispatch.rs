@@ -16,6 +16,13 @@
 //!
 //! `Create`/`Update`/`Delete` のネスト object (`Note.attributedTo` 等) も
 //! 同じ規則で検証する ── [`verify_nested_object_actor`] が処理する。
+//! 一方 `Accept`/`Reject`/`Announce`/`Undo` のように **他者の Activity を
+//! 内包する** 種別では、ネスト object の actor は signer と一致しないのが
+//! 正当 (= 我々の Follow を Mastodon が Accept で返す等)。それらの種別で
+//! [`verify_nested_object_actor`] を呼ぶと正当な連合が全部弾かれるので、
+//! [`dispatch`] 関数の分岐で Create/Update/Delete のときだけ呼ぶ。
+//! なりすまし対策は handler 層で個別に行う (Accept は `UnrelatedAcceptor`
+//! 等)。
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -196,13 +203,28 @@ pub(crate) async fn dispatch(
     let activity: JsonValue = serde_json::from_slice(body)?;
 
     verify_body_actor(&activity, &signer.ap_id)?;
-    verify_nested_object_actor(&activity, &signer.ap_id)?;
 
     let activity_type = activity
         .get("type")
         .and_then(JsonValue::as_str)
         .ok_or(DispatchError::MissingType)?
         .to_string();
+
+    // ネスト object の `attributedTo` / `actor` を signer と突き合わせる検査は
+    // **「ネスト object 自身が signer の発話である」** Activity に限る。
+    // ── `Create` / `Update` / `Delete` は signer が作る / 更新する / 消す
+    //    object をネストするので、attributedTo が signer と一致してほしい。
+    // ── 一方で `Accept` / `Reject` / `Announce` / `Undo` などは **他者の
+    //    Activity を内包する** ので、ネスト object の actor は本質的に
+    //    signer と一致しない (例: Mastodon が我々の Follow に対する Accept
+    //    を返すケース → Accept.object.Follow.actor = sakurasato/me、signer
+    //    = mastodon/bob で当然不一致)。
+    // 不一致を許容するためにここでスキップする。なりすまし対策は handler
+    // 層で別途行う (Accept は `UnrelatedAcceptor`、Undo は元 Reaction 検査
+    // 等)。
+    if matches!(activity_type.as_str(), "Create" | "Update" | "Delete") {
+        verify_nested_object_actor(&activity, &signer.ap_id)?;
+    }
 
     match activity_type.as_str() {
         "Follow" => {
@@ -464,5 +486,29 @@ mod tests {
             "actor": "https://x.test/users/alice",
         });
         verify_nested_object_actor(&a, "https://x.test/users/alice").unwrap();
+    }
+
+    #[test]
+    fn verify_nested_object_actor_rejects_inbound_accept_when_called_directly() {
+        // Mastodon の Accept 構造: 我々が送った Follow を `object` に内包する。
+        // `Follow.actor` は **我々** (sakurasato/me) で、signer は Mastodon の
+        // 当該ユーザ。`verify_nested_object_actor` を Accept 受信時にそのまま
+        // 走らせると **常に** ここで弾かれてしまう ── このユニットテストは
+        // 「**だからこそ dispatch 側で Create/Update/Delete に限定して
+        // 呼ばないと壊れる**」ことを明示する regression test。
+        let a = json!({
+            "type": "Accept",
+            "actor": "https://mastodon/users/bob",
+            "object": {
+                "type": "Follow",
+                "actor": "https://sakurasato/users/me",
+                "object": "https://mastodon/users/bob",
+            },
+        });
+        let err = verify_nested_object_actor(&a, "https://mastodon/users/bob").unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchError::NestedObjectActorMismatch { .. }
+        ));
     }
 }

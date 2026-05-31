@@ -26,6 +26,22 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load(&default_path, None)
         .with_context(|| format!("failed to load config from {}", default_path.display()))?;
 
+    // `--healthcheck` モード ── distroless image には shell も `test` も無いので、
+    // docker healthcheck から呼べる自前のチェッカを binary に同居させる。
+    // socket ファイルが存在すれば 0、無ければ 1 を返す ── `bind_socket` は serve
+    // ループに入る **前** に完走するので、socket の存在 = listener が accept 可能。
+    // これにより compose 側で `condition: service_healthy` を使って依存サービス
+    // (例: `follow` CLI を回す prefollow-bob) を **ソケット readiness** に対して
+    // 待たせられる。
+    if std::env::args().nth(1).as_deref() == Some("--healthcheck") {
+        let path = config.media_proxy.socket;
+        if path.exists() {
+            return Ok(());
+        }
+        eprintln!("media-proxy socket not found at {}", path.display());
+        std::process::exit(1);
+    }
+
     let socket_path = config.media_proxy.socket.clone();
     let state = ProxyState::from_config(config)?;
     let app = router(state.clone());

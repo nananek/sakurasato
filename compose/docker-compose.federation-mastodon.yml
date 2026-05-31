@@ -69,16 +69,61 @@ services:
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
-      # 既定の /run/sakurasato は rootless container では書けない
-      # (M4 PR1 で local API が入った後の compose 漏れ)。federation-test で
-      # TUI は使わないので /tmp 配下に逃がす。
-      SAKURASATO_SERVER__LOCAL_API_SOCKET: /tmp/sakurasato-local.sock
+      # distroless の `/home/nonroot` は uid 65532 が 0o700 で所有しており、
+      # 名前付き volume の初回マウントでもこの ownership/perms がコピー
+      # される (= pytest が同 uid で覗ける)。`/tmp` だと per-container で
+      # 共有できず、`/run/sakurasato` だと docker が root:root 0755 で掘る
+      # ので uid 65532 が socket を bind できない (= 0o700 chmod も失敗)。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       sakurasato-init:
         condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
     volumes:
       - certs:/certs:ro
+      # pytest が `/home/nonroot/local.sock` を共有 UDS として開く。
+      # `up.sh mastodon` モード (= default profile) でも mount しておく
+      # 必要がある (= server がここに bind するため)。
+      - sakurasato_local_api:/home/nonroot
+      # media-proxy との通信用 UDS。M10 で `follow` CLI が WebFinger を
+      # ここから引くようになったので、prefollow-bob の経路が成立するために
+      # マウントが必要。
+      - media_sock:/run/sakurasato
+    networks:
+      - mastodon-fed
+
+  # M10 PR #51 で `follow` CLI の WebFinger 解決が media-proxy 経由に
+  # 移ったため、prefollow-bob が `acct:bob@mastodon` を解く際に必要。
+  # 画像取得用の SSRF 対策と同じガード ([`net_guard::host_blocked`]) を
+  # 通すが、`mastodon` は単一ラベル domain なので URL ガードを通過する。
+  sakurasato-media-proxy:
+    build:
+      context: ..
+      dockerfile: docker/media-proxy.Dockerfile
+    image: sakurasato/media-proxy:dev
+    environment:
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    # distroless image なので shell/test は無い ── 自前 binary の `--healthcheck`
+    # モードで socket 存在を確かめる。`bind_socket` は serve ループ前に完走
+    # するので socket が見えれば listener は accept 可能。これに service_healthy
+    # で依存させると `prefollow-bob` の WebFinger 解決時の race ([review M-2])
+    # を塞げる。
+    healthcheck:
+      test: ["CMD", "/app/sakurasato-media-proxy", "--healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
     networks:
       - mastodon-fed
 
@@ -150,6 +195,10 @@ services:
       - ./federation-test/mastodon-federation/mastodon-entrypoint.sh:/custom-entrypoint.sh:ro
       - certs:/certs:ro
       - mastodon_system:/opt/mastodon/public/system
+      # pytest 用の Doorkeeper access token を書く先 (= entrypoint 末尾)。
+      # `up.sh mastodon` モードでは何もマウントされず entrypoint の分岐で
+      # スキップされる。
+      - mastodon_tokens:/mastodon-tokens
     depends_on:
       postgres-mdn:
         condition: service_healthy
@@ -217,9 +266,119 @@ services:
         aliases:
           - mastodon
 
+  # ── pytest プロファイル ────────────────────────────────────
+  # `up.sh mastodon` (= 手動 e2e) では起動しない。pytest 自動化時のみ:
+  #   docker compose -f compose/docker-compose.federation-mastodon.yml \
+  #     --profile pytest up --build --exit-code-from pytest --abort-on-container-exit
+  # で発火させる。
+
+  # ローカル API 用 Bearer トークンを発行し、共有 volume に書き出す。
+  # `sakurasato_local_api` (= /home/nonroot, 0o700 65532:65532) を使い回す
+  # ことで、別途 `tokens:` ボリュームを掘らずに pytest と権限を共有できる。
+  # 既存ファイルがあると `--out` が EEXIST で失敗するので、毎回 fresh な
+  # 状態が前提 (CI / pytest.sh は `down -v` で消すフロー)。
+  sakurasato-token-issuer:
+    image: sakurasato/server:dev
+    command: ["token", "issue", "--name", "pytest", "--out", "/home/nonroot/pytest.token"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+    networks:
+      - mastodon-fed
+    profiles: [pytest]
+    restart: "no"
+
+  # sakurasato 側から bob@mastodon を follow しておく。Mastodon が
+  # healthy になった後に走らせ、delivery worker が Follow を配送し
+  # Accept が返ってくる経路を pytest が前提にできる状態を作る。
+  # WebFinger は media-proxy 経由で `acct:` → canonical actor URI を解く
+  # (= `--actor-uri https://mastodon/users/bob` 直指定は Mastodon の
+  # canonical `id` (`https://mastodon/ap/users/<numeric>`) と URL が
+  # 一致せず remote_actor::fetch_and_upsert が拒否する)。
+  sakurasato-prefollow-bob:
+    image: sakurasato/server:dev
+    command: ["follow", "bob@mastodon"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
+      mastodon-web:
+        condition: service_healthy
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    networks:
+      - mastodon-fed
+    profiles: [pytest]
+    restart: "no"
+
+  pytest:
+    build:
+      context: ../tests/federation
+      dockerfile: Dockerfile
+    image: sakurasato/federation-pytest:dev
+    # entrypoint で UDS / token / Mastodon API の ready を確認してから
+    # 本テストに入る。`-T` 等の TTY 切替は不要 (CI で実行する想定)。
+    command: ["pytest", "-xvs", "--tb=short", "test_mastodon.py"]
+    environment:
+      SAKURASATO_BASE_URL: https://sakurasato
+      SAKURASATO_DOMAIN: sakurasato
+      SAKURASATO_LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_TOKEN_FILE: /home/nonroot/pytest.token
+      MASTODON_BASE_URL: https://mastodon
+      MASTODON_DOMAIN: mastodon
+      MASTODON_USERNAME: bob
+      MASTODON_TOKEN_FILE: /mastodon-tokens/bob.token
+      SSL_CERT_FILE: /certs/ca.crt
+      REQUESTS_CA_BUNDLE: /certs/ca.crt
+    user: "65532:65532"
+    depends_on:
+      sakurasato-server:
+        condition: service_started
+      sakurasato-token-issuer:
+        condition: service_completed_successfully
+      sakurasato-prefollow-bob:
+        condition: service_completed_successfully
+      mastodon-web:
+        condition: service_healthy
+      # sidekiq が無いと Mastodon 側の Accept / Note 配送キューが捌けない
+      # (= Follow ループや Note 連合が成立しない)。depends_on で必ず起動。
+      mastodon-sidekiq:
+        condition: service_started
+      nginx-mdn:
+        condition: service_started
+      nginx-sks:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot:ro
+      - mastodon_tokens:/mastodon-tokens:ro
+    networks:
+      - mastodon-fed
+    profiles: [pytest]
+    restart: "no"
+
 volumes:
   certs:
   mastodon_system:
+  sakurasato_local_api:
+  media_sock:
+  mastodon_tokens:
 
 networks:
   mastodon-fed:

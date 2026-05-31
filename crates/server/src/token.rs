@@ -94,10 +94,19 @@ pub async fn run(config: Config, args: TokenArgs) -> anyhow::Result<()> {
             // 生トークンはここでだけ出す。以降 DB には hash しか残らない。
             // stderr に注意書きを出し、stdout は生トークンだけにして、
             // `sakurasato token issue --name x > token.txt` でファイルに
-            // 落とせるようにする。
+            // 落とせるようにする。`--out <PATH>` を渡した場合は stdout に
+            // は出さず、指定ファイルだけに書く (compose の名前付きボリューム
+            // 経由でテストランナに共有する用途)。既存ファイルは上書きせず
+            // エラーにする ── 古いトークンの存在を黙って奪わないため。
             eprintln!("issued token id={} name={:?}", row.id, row.name);
             eprintln!("(this is the only time the raw token is displayed)");
-            println!("{raw}");
+            if let Some(path) = issue.out.as_deref() {
+                write_token_file(path, &raw)
+                    .with_context(|| format!("write raw token to {}", path.display()))?;
+                eprintln!("wrote raw token to {}", path.display());
+            } else {
+                println!("{raw}");
+            }
             Ok(())
         }
         TokenCommand::List => {
@@ -134,6 +143,28 @@ pub async fn run(config: Config, args: TokenArgs) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// 生トークンをファイルに書き出す (mode 0o600)。
+///
+/// `OpenOptions::create_new(true)` で **既存ファイルがあれば失敗** させる ──
+/// 古いトークンが置かれた状態で黙って上書きすると、テストランナ等が「黙って
+/// 入れ替わったトークン」を読み続ける危険があるため。
+/// 上位は `--out` を毎回新しいパスに向けるか、既存ファイルを事前に削除する。
+fn write_token_file(path: &std::path::Path, raw_token: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    // 末尾に LF を付ける ── `cat` や POSIX text-file 期待のツールで「No
+    // newline at end of file」になるのを避ける。Bearer ヘッダに乗せる側は
+    // 必ず `trim()` する想定。
+    writeln!(file, "{raw_token}")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -176,6 +207,42 @@ mod tests {
         // 前後の余白は両方除去される。これは意図した挙動 (Bearer トークン
         // 自体に空白は含まれない)。
         assert_eq!(parse_bearer("  Bearer  xyz  "), Some("xyz"));
+    }
+
+    #[test]
+    fn write_token_file_creates_with_mode_0600_and_trailing_lf() {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("token.txt");
+        let raw = generate_raw();
+        write_token_file(&path, &raw).expect("write_token_file ok");
+
+        let meta = std::fs::metadata(&path).expect("stat");
+        // mode は file-type + perms。下位 9 bit だけ見る。
+        assert_eq!(meta.mode() & 0o777, 0o600, "expected 0o600");
+
+        let mut buf = String::new();
+        std::fs::File::open(&path)
+            .expect("open")
+            .read_to_string(&mut buf)
+            .expect("read");
+        // trailing LF が付くこと。
+        assert_eq!(buf, format!("{raw}\n"));
+    }
+
+    #[test]
+    fn write_token_file_refuses_to_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("token.txt");
+        write_token_file(&path, "old").expect("write initial");
+        let err = write_token_file(&path, "new")
+            .expect_err("second write must fail (would clobber existing token)");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // 元の中身が保護されていること。
+        let buf = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(buf, "old\n");
     }
 
     #[test]

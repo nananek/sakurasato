@@ -4,17 +4,22 @@ on:
   push:
     branches: [main, develop]
     paths-ignore:
-      # 連合テスト compose / scripts / docs は CI 対象外
-      # (重いビルドかつ外部 image に依存)。手動 e2e 専用。
+      # 連合テスト compose / scripts / pytest 一式 / 専用 workflow は CI 対象外
+      # (重いビルドかつ外部 image に依存)。federation-test.yml が nightly
+      # cron + workflow_dispatch で別建てに回す。
       - "compose/docker-compose.federation-*.yml"
       - "compose/federation-test/**"
       - "scripts/federation-test/**"
+      - "tests/federation/**"
+      - ".github/workflows/federation-test.yml"
   pull_request:
     branches: [main, develop]
     paths-ignore:
       - "compose/docker-compose.federation-*.yml"
       - "compose/federation-test/**"
       - "scripts/federation-test/**"
+      - "tests/federation/**"
+      - ".github/workflows/federation-test.yml"
 
 permissions:
   contents: read
