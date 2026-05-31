@@ -7,9 +7,12 @@
 //!
 //! ## カバー範囲
 //!
-//! - **Follow 受領** → `follow` 行が pending で入る + `delivery_queue` に
-//!   Accept activity が積まれる + Accept の `object` が元 Follow を埋め込む
-//! - **Accept 受領** → 既存 follow 行が accepted に遷移
+//! - **Follow 受領** → `follow` 行が **accepted で入る** (お一人様 + 自動承認
+//!   設計) + `delivery_queue` に Accept activity が積まれる + Accept の
+//!   `object` が元 Follow を埋め込む + `list_accepted_inboxes` に follower の
+//!   inbox が即時現れる (= こちらの Note を配送できる状態)
+//! - **Accept 受領** → 既存 follow 行が accepted に遷移 (outbound Follow の
+//!   応答処理)
 //! - **F3 actor mismatch 拒否** → 401 (受信 inbox に到達後、handler 前で弾く)
 //! - **delivery worker 常駐ループ** → enqueue した行が拾われ、配送先 HTTP
 //!   サーバが POST を受け取り、delivered に倒れる
@@ -272,7 +275,10 @@ async fn follow_request_enqueues_accept(pool: PgPool) {
         "Follow must be accepted"
     );
 
-    // follow row が pending で入った。
+    // follow row は **即 accepted**。お一人様 + 自動承認設計なので Accept を
+    // queue した時点で state を倒す (handle_follow)。pending のままだと
+    // `repo::follow::list_accepted_inboxes` から外れ、こちらからの Note /
+    // reaction が一切配送されない (連合テストで露見した既存バグの再発防止)。
     let follow = sqlx::query!(
         "SELECT id, ap_id, follower_actor_id, followed_actor_id, state FROM follow WHERE ap_id = $1",
         follow_id,
@@ -280,9 +286,18 @@ async fn follow_request_enqueues_accept(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(follow.state, "pending");
+    assert_eq!(follow.state, "accepted");
     assert_eq!(follow.follower_actor_id, remote.id);
     assert_eq!(follow.followed_actor_id, local.id);
+
+    // 即時 accepted の効果: follower の inbox が配送先として列挙される。
+    let inboxes = repo::follow::list_accepted_inboxes(&pool, local.id)
+        .await
+        .unwrap();
+    assert!(
+        inboxes.iter().any(|u| u == &remote_inbox),
+        "follower inbox {remote_inbox} must be a delivery target, got {inboxes:?}",
+    );
 
     // delivery_queue に Accept が 1 行積まれた。
     let queued = sqlx::query!(
@@ -358,14 +373,19 @@ async fn duplicate_follow_is_idempotent(pool: PgPool) {
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
     }
 
-    let count = sqlx::query!(
-        "SELECT count(*) as c FROM follow WHERE ap_id = $1",
+    let row = sqlx::query!(
+        "SELECT count(*) as c, max(state) as state FROM follow WHERE ap_id = $1",
         follow_id,
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(count.c.unwrap_or(0), 1, "follow row must not duplicate");
+    assert_eq!(row.c.unwrap_or(0), 1, "follow row must not duplicate");
+    assert_eq!(
+        row.state.as_deref(),
+        Some("accepted"),
+        "duplicate Follow must keep state at accepted, not flip back to pending",
+    );
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

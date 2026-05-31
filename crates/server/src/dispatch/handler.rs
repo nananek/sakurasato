@@ -135,6 +135,21 @@ pub(crate) async fn handle_follow(
         .await
         .context("enqueue Accept activity")?;
 
+    // お一人様 + 自動承認設計なので、Accept を queue した時点で follow 行を
+    // accepted に倒す。これをやらないと `repo::follow::list_accepted_inboxes`
+    // から外れたまま固定化され、こちらからの Note / reaction が一切配送されない
+    // (= 連合テストで露見した既存バグ)。Accept Activity の実配送 (= delivery
+    // worker の HTTP POST 成功) を待つ設計もあるが、worker と handler の結合が
+    // 増えるだけで、お一人様用途では即時遷移で問題ない。M3b-3 PR2 当時の名残。
+    //
+    // 再受信ケース (row.state が既に Accepted) は no-op、Rejected は前段で
+    // early return しているので、ここに来るのは Pending のみ。
+    if row.state != FollowState::Accepted.as_str() {
+        repo::follow::set_state(state.pool(), row.id, FollowState::Accepted)
+            .await
+            .with_context(|| format!("set inbound follow {} state to accepted", row.id))?;
+    }
+
     info!(
         follow_id = row.id,
         queue_id = queued.id,
