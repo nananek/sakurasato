@@ -102,6 +102,16 @@ pub async fn run(config: Config, args: InitArgs) -> anyhow::Result<()> {
         moved_to_ap_id: None,
         is_local: true,
         actor_type: "Person".into(),
+        // 鍵アカフラグ (Issue #66 / M12):
+        //   - 新規 init: `args.locked` をそのまま反映 (default = false)。
+        //   - `--force` 再鍵化: 既存 lock 状態を **保つ**。`--locked` 単独で
+        //     unlock → lock の片方向のみ可。lock → unlock したいときは
+        //     再鍵化後に `actor unlock` を叩く運用 (= 鍵更新と state 変更を
+        //     別操作に分離して、誤って lock を解除する事故を防ぐ)。
+        manually_approves_followers: args.locked
+            || existing
+                .as_ref()
+                .is_some_and(|e| e.manually_approves_followers),
     };
 
     // 既存削除と新規挿入は同一トランザクションで実行する。途中でクラッシュ

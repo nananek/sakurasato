@@ -53,6 +53,17 @@ pub struct ActorRow {
     pub moved_to_ap_id: Option<String>,
     pub is_local: bool,
     pub actor_type: String,
+    /// 鍵アカ運用フラグ (Issue #66 / M12)。
+    ///
+    /// `true` のとき、本 actor 宛の inbound `Follow` は auto-Accept されず
+    /// `follow.state = pending` で据え置かれる。承認は管理 CLI
+    /// (`sakurasato-server follow-request approve/reject`) で明示的に行う。
+    ///
+    /// remote actor 行にもこの値を載せるが、本サーバの dispatcher が分岐に
+    /// 使うのは local actor (= 我々自身) の値のみ ── 相手側インスタンスが
+    /// 自分の `manuallyApprovesFollowers` をどう扱うかは我々の管轄外。
+    /// remote 側はキャッシュとして保持しておくに留める。
+    pub manually_approves_followers: bool,
     pub fetched_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -90,6 +101,10 @@ impl std::fmt::Debug for ActorRow {
             .field("moved_to_ap_id", &self.moved_to_ap_id)
             .field("is_local", &self.is_local)
             .field("actor_type", &self.actor_type)
+            .field(
+                "manually_approves_followers",
+                &self.manually_approves_followers,
+            )
             .field("fetched_at", &self.fetched_at)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)

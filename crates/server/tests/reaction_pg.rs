@@ -89,6 +89,7 @@ fn local_actor(pub_pem: &str, priv_pem: &str) -> NewActor {
         moved_to_ap_id: None,
         is_local: true,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     }
 }
 
@@ -117,6 +118,7 @@ fn remote_actor(host: &str, user: &str, pub_pem: &str) -> NewActor {
         moved_to_ap_id: None,
         is_local: false,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     }
 }
 

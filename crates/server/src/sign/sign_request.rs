@@ -224,6 +224,7 @@ mod tests {
             moved_to_ap_id: None,
             is_local: true,
             actor_type: "Person".to_string(),
+            manually_approves_followers: false,
             fetched_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

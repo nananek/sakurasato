@@ -114,9 +114,14 @@ sakurasato/
 - **Actor 構成**: 単一ユーザー actor ＋ `instance.actor`(application actor, 必要に応じて生成)。
 - **ローカル API（server ⇄ tui）**: Unix ドメインソケット上の REST + SSE（タイムライン購読）。お一人様前提でソケットのファイルパーミッションが認証境界。トークン発行は CLI から可能。**メディアアップロード**エンドポイント（アイコン/ヘッダ/添付）を持ち、受領後 media-proxy でサニタイズ・変換 → versitygw 格納 → メタデータを DB 登録。
 - **最小 Web UI**: 投稿のパーマリンク（AP Note を人間可読 HTML で）、WebFinger/NodeInfo/actor JSON、メディア配信エンドポイント `GET /media/<key>`（versitygw から取得して配信。versitygw 自体は非公開）。
-- **管理 CLI**（同バイナリのサブコマンド, `clap`）: `init`（ユーザー/鍵生成）, `emoji import <zip>`, `follow <acct>`（M10）, `move-accept --from <file>`（M10、inbound `Move` 再処理）, `move-out <target>`（送出側 Move）, `alias add|remove|list|clear`, `token issue|list|revoke`, `deliver --queue-id` など。**Web 認証 UI は作らない。**
+- **管理 CLI**（同バイナリのサブコマンド, `clap`）: `init`（ユーザー/鍵生成、`--locked` で鍵アカ初期化 M12）, `emoji import <zip>`, `follow <acct>`（M10）, `move-accept --from <file>`（M10、inbound `Move` 再処理）, `move-out <target>`（送出側 Move）, `alias add|remove|list|clear`, `actor lock|unlock`（M12 鍵アカ切替）, `follow-request list|approve|reject`（M12 鍵アカ承認待ち管理）, `token issue|list|revoke`, `deliver --queue-id` など。**Web 認証 UI は作らない。**
   - **`follow <acct>`** は media-proxy で WebFinger を解決し、Follow を `delivery_queue` に積む。`--actor-uri` で WebFinger をスキップして直接 actor URI 指定も可能。`follow-cli-{follower}-{followed}` 形式の決定論的 activity id で `(follower, followed)` UNIQUE 制約と冪等。既存 row が `accepted` なら no-op、`rejected` は明示拒否、`pending` は再 enqueue。
   - **`move-accept` は HTTP 署名検証を通らない**ため、**自分が控えておいた activity 本文** (= 通常経路で受領したものを保存しておいた JSON) でのみ使うこと。第三者から渡された JSON を流すと「Move を勝手に偽装」の入り口になる。コードレベルのガードは「`type == "Move"`」のみで、補完的には `handle_move` 内の `alsoKnownAs` 双方向同意検査・target actor の fresh fetch が「署名なしの任意 Move 適用」を防ぐ。
+- **Follow 承認制 (鍵アカ運用, M12 / Issue #66)** ── `actor.manually_approves_followers` フラグ (default `FALSE`) で切替可能な opt-in 機能。actor JSON に `manuallyApprovesFollowers: true|false` を常時 emit (Mastodon / Misskey 互換、JSON-LD context に `as:manuallyApprovesFollowers` alias 同梱)。
+  - **inbound Follow 分岐**: フラグ `false` (default) → 従来どおり auto-Accept。フラグ `true` → `dispatch::handler::handle_follow` で Accept を queue せず `follow.state = pending` のまま据え置く (= 「鍵アカ受信」)。お一人様 + 自動承認の従来仕様は default off で完全保持。
+  - **CLI**: `actor lock` / `actor unlock` でフラグ切替 + actor `Update` をフォロワーに配信 (相手側 UI のキャッシュ更新)。`follow-request list` で承認待ち一覧、`follow-request approve --id N` / `reject --id N` で Accept / Reject activity 配送 + state 遷移。`init --locked` で最初から鍵アカ初期化、`init --force` 再鍵化時は既存 lock 状態を保持 (片方向: `--locked` なしで unlock には倒さない、unlock は `actor unlock` で明示)。
+  - **unlock しても pending を auto-accept しない**: lock 中に届いた「待ち」を unlock の事故で全部 accept する事故を防ぐ。Mastodon と同じ作法。pending の承認は CLI で明示。
+  - **既存 accepted の retry は lock 後でも Accept 再送出**: 過去にフォロー済みの相手が Mastodon 側で Follow を retry してきたとき (`row.state = accepted` で着信)、Accept を返さないと相手側で延々と pending 扱いされる。lock した瞬間に従来フォロワーを切るのではなく、新規 Follow だけ承認制に切替える設計 (`handle_follow` の `Accepted` ブランチが lock 判定より前)。
 
 ### 5.2 tui（TUI クライアント・別バイナリ）
 - ホスト端末で動作し、server のローカル API（Unix ソケット）へ接続。

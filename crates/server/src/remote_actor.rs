@@ -238,6 +238,10 @@ struct ParsedRemoteActor {
     also_known_as: Vec<String>,
     moved_to_ap_id: Option<String>,
     actor_type: String,
+    /// Mastodon / Misskey が actor JSON に乗せる鍵アカフラグ (Issue #66)。
+    /// 相手側でどう Follow を扱っているかのキャッシュとして保持する。
+    /// 値が無ければ `false` (= 通常アカ扱い)。
+    manually_approves_followers: bool,
 }
 
 /// 取得した actor JSON をパースして必要フィールドを取り出す。
@@ -304,6 +308,15 @@ fn parse_actor_json(ap_id: &str, json: &JsonValue) -> Result<ParsedRemoteActor, 
 
     let actor_type = s("type").unwrap_or_else(|| "Person".to_string());
 
+    // 鍵アカフラグ (Issue #66) ── 欠落 / 非 boolean は `false` 扱い。
+    // Mastodon / Misskey はいずれも boolean で出すが、互換層 (例えば
+    // GoToSocial の一部設定) で文字列を返す実装もあるため、`as_bool()`
+    // のみを受理する保守的なパースにする。
+    let manually_approves_followers = json
+        .get("manuallyApprovesFollowers")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+
     Ok(ParsedRemoteActor {
         ap_id: ap_id.to_string(),
         preferred_username,
@@ -324,6 +337,7 @@ fn parse_actor_json(ap_id: &str, json: &JsonValue) -> Result<ParsedRemoteActor, 
         also_known_as,
         moved_to_ap_id: s("movedTo"),
         actor_type,
+        manually_approves_followers,
     })
 }
 
@@ -425,6 +439,7 @@ async fn upsert(state: &AppState, parsed: ParsedRemoteActor) -> Result<ActorRow,
         moved_to_ap_id: parsed.moved_to_ap_id,
         is_local: false,
         actor_type: parsed.actor_type,
+        manually_approves_followers: parsed.manually_approves_followers,
     };
     let row = repo::actor::insert(state.pool(), new).await?;
     repo::actor::mark_fetched(state.pool(), row.id).await?;
@@ -466,8 +481,9 @@ async fn update_existing(
             also_known_as = $16,
             moved_to_ap_id = $17,
             actor_type = $18,
+            manually_approves_followers = $19,
             updated_at = now()
-        WHERE id = $19
+        WHERE id = $20
         RETURNING
             id, ap_id, preferred_username, host, display_name, summary,
             icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
@@ -475,7 +491,8 @@ async fn update_existing(
             private_key_pem,
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: sqlx::types::Json<Vec<String>>",
-            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
         "#,
         parsed.preferred_username,
         parsed.host,
@@ -495,6 +512,7 @@ async fn update_existing(
         also_known_as_json,
         parsed.moved_to_ap_id,
         parsed.actor_type,
+        parsed.manually_approves_followers,
         id,
     )
     .fetch_one(state.pool())

@@ -49,6 +49,11 @@ pub struct ActorJson {
     pub also_known_as: Vec<String>,
     #[serde(rename = "movedTo", skip_serializing_if = "Option::is_none")]
     pub moved_to: Option<String>,
+    /// Mastodon / Misskey 互換の鍵アカフラグ (Issue #66 / M12)。
+    /// `true` のとき相手側 UI で「フォロー承認制」のバッジが出る。
+    /// 後方互換のため `false` でも明示的に出す ── Mastodon 自身も常時 emit。
+    #[serde(rename = "manuallyApprovesFollowers")]
+    pub manually_approves_followers: bool,
     #[serde(rename = "endpoints", skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<Endpoints>,
 }
@@ -142,6 +147,12 @@ pub fn build_actor_json(row: &sakurasato_core::model::ActorRow) -> ActorJson {
     // @context: AS2 + 旧 security/v1 (publicKey) は常に。Multikey を載せると
     // きは multikey context も追加する。古い実装が知らない URI を含むと拒否
     // するケースは見当たらないが、不要なら載せないでおく。
+    //
+    // `manuallyApprovesFollowers` は AS2 vocab に元から無い拡張語。Mastodon
+    // / Pleroma / Misskey は context に `as:manuallyApprovesFollowers` の
+    // alias を明示的に並べる慣習があるので、それに従う。受信側が strict な
+    // JSON-LD processor を回したときに `manuallyApprovesFollowers` 用語が
+    // 解決されなくて取りこぼされる事故を防ぐ (Issue #66 / M12)。
     let mut context = vec![
         serde_json::Value::String("https://www.w3.org/ns/activitystreams".into()),
         serde_json::Value::String("https://w3id.org/security/v1".into()),
@@ -151,6 +162,9 @@ pub fn build_actor_json(row: &sakurasato_core::model::ActorRow) -> ActorJson {
             "https://w3id.org/security/multikey/v1".into(),
         ));
     }
+    context.push(serde_json::json!({
+        "manuallyApprovesFollowers": "as:manuallyApprovesFollowers",
+    }));
 
     ActorJson {
         context,
@@ -179,6 +193,7 @@ pub fn build_actor_json(row: &sakurasato_core::model::ActorRow) -> ActorJson {
         }),
         also_known_as: row.also_known_as.0.clone(),
         moved_to: row.moved_to_ap_id.clone(),
+        manually_approves_followers: row.manually_approves_followers,
         endpoints: row
             .shared_inbox_url
             .clone()

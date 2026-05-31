@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)\n        VALUES ($1, $2, $3, 'pending')\n        ON CONFLICT (follower_actor_id, followed_actor_id) DO UPDATE\n            SET updated_at = follow.updated_at\n        RETURNING id, ap_id, follower_actor_id, followed_actor_id, state, created_at, updated_at\n        ",
+  "query": "\n        SELECT id, ap_id, follower_actor_id, followed_actor_id, state, created_at, updated_at\n        FROM follow WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -83,8 +83,6 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Int8",
         "Int8"
       ]
     },
@@ -98,5 +96,5 @@
       false
     ]
   },
-  "hash": "83326209bfb5bf670ddd9fa33fc0c81102b4f205dd213e512d4b5ef78a6c82ba"
+  "hash": "cd2fddff6f3c157095d240a3653223e977862af32e27e511438c0335fd0a9f04"
 }

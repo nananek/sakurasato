@@ -88,12 +88,15 @@ pub async fn run(config: sakurasato_core::Config, args: DeliverArgs) -> anyhow::
 /// `inbox_url` は `url::Url::parse` で事前検証する ── DB に投入される文字列が
 /// 後段の `reqwest::Url::parse` で必ず通る形であることをここで保証する。
 /// 空文字列・`http`/`https` 以外のスキーム・host 欠落はここで弾く。
-pub async fn enqueue_activity(
-    pool: &PgPool,
+pub async fn enqueue_activity<'e, E>(
+    executor: E,
     sender_actor_id: i64,
     inbox_url: &str,
     activity: &JsonValue,
-) -> anyhow::Result<DeliveryQueueRow> {
+) -> anyhow::Result<DeliveryQueueRow>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let url = reqwest::Url::parse(inbox_url)
         .with_context(|| format!("invalid inbox_url {inbox_url:?}"))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -105,7 +108,7 @@ pub async fn enqueue_activity(
     if url.host_str().is_none() {
         bail!("inbox_url must have a host component");
     }
-    repo::delivery_queue::enqueue(pool, inbox_url, activity, sender_actor_id)
+    repo::delivery_queue::enqueue(executor, inbox_url, activity, sender_actor_id)
         .await
         .map_err(Into::into)
 }

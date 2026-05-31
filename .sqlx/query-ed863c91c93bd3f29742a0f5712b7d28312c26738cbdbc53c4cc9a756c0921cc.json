@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE follow SET state = $1, updated_at = now() WHERE id = $2 AND state = 'pending'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ed863c91c93bd3f29742a0f5712b7d28312c26738cbdbc53c4cc9a756c0921cc"
+}

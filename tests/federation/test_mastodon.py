@@ -206,6 +206,132 @@ class TestReplyDeliveryToNonFollower:
         )
 
 
+# ── 3.6. Locked actor (鍵アカ運用 / Issue #66) ──────────────
+
+
+class TestLockedFollow:
+    """**#66**: Sakurasato が `manuallyApprovesFollowers = true` の鍵アカ状態
+    のとき、Mastodon Bob からの Follow が `requested` で据え置かれ、Sakurasato
+    の `follow-request approve` で initial に Accept が配送されて Mastodon の
+    relationship が `following = true` に遷移すること。
+
+    本テストは **TestFollow より前** に走る必要がある:
+
+    - Bob はまだ Sakurasato を follow していない (= TestFollow の前提) 状態で
+      開始することで、鍵アカ分岐 (= 新規 Follow が pending で据え置かれる)
+      を確実に通せる。
+    - 既存 accepted follow が存在すると `dispatch::handler::handle_follow` が
+      Accept 再送ブランチに入って locked 判定をスキップする (= 設計どおり)
+      ため、テストにならない。
+
+    終了時に Sakurasato を unlock + Bob は Sakurasato を follow 済み状態で
+    終わるので、後続の TestFollow / TestNoteFromSakurasato 等は **そのまま**
+    走る (idempotent follow + 既に accepted)。
+    """
+
+    @staticmethod
+    def _bob_follow_predicate(item: dict) -> bool:
+        """Bob → me の follow row かどうか。`follower_ap_id` 形は実装次第で
+        `https://mastodon/users/bob` か `https://mastodon/ap/users/<num>` の
+        いずれか。bob を含み、かつ MASTODON_DOMAIN の URI で判定する。"""
+        ap_id = item.get("follower_ap_id") or ""
+        return MASTODON_DOMAIN in ap_id and ("bob" in ap_id or "/users/" in ap_id)
+
+    def _reset_bob_follow_row(self, sakurasato: SakurasatoClient) -> None:
+        """**PR #80 round-2 #6 (test re-runnability)**: 以前の Test run で
+        Bob → me の accepted 行が残っていると `upsert_pending` が ON CONFLICT で
+        accepted を返し、`handle_follow` の locked 分岐に入らないため、本テスト
+        の lock パスを検証できない。setup でハード削除して clean slate にする。
+        """
+        for it in sakurasato.follow_requests(state="all"):
+            if self._bob_follow_predicate(it):
+                sakurasato.follow_request_delete(it["id"])
+
+    def test_lock_round_trip_with_mastodon_follow(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        # 0) setup ── 以前の test run の残骸 (Bob → me follow) を削除して
+        #    再実行 idempotent にする (#6)。
+        self._reset_bob_follow_row(sakurasato)
+        accounts = mastodon.search_accounts(
+            f"me@{SAKURASATO_DOMAIN}", resolve=True
+        )
+        assert accounts, "Mastodon must resolve me@sakurasato"
+        sks_id = accounts[0]["id"]
+
+        try:
+            # 1) Sakurasato を lock。actor JSON で manuallyApprovesFollowers=true。
+            lock_resp = sakurasato.actor_lock()
+            assert lock_resp["manually_approves_followers"] is True
+            # actor JSON はキャッシュではなく source of truth ── 公開 AP 経由
+            # で値が反映されたことを確認する。
+            actor = sakurasato.actor_json("me")
+            assert actor.get("manuallyApprovesFollowers") is True
+
+            # 2) Mastodon に actor JSON を再 fetch させる (= 鍵アカ判定を更新)。
+            #    search_accounts(resolve=True) が actor を取り直すので、続く
+            #    follow() で Mastodon 側は新しい locked 判定で動く。
+            mastodon.search_accounts(f"me@{SAKURASATO_DOMAIN}", resolve=True)
+            follow_resp = mastodon.follow(sks_id)
+
+            # 3) **#7 strict assert**: Mastodon は locked actor へ follow した
+            #    瞬間 requested=True / following=False を返さなければならない。
+            #    `requested OR following` の OR 形は「既に Bob が follow 済み
+            #    だった場合」を素通りさせ、locked path を検証しないので不可。
+            assert follow_resp["requested"] is True, (
+                f"Mastodon must observe requested=True on locked actor: {follow_resp}"
+            )
+            assert follow_resp["following"] is False, (
+                f"Mastodon must NOT observe following=True yet: {follow_resp}"
+            )
+
+            # 4) Sakurasato の pending リストに Bob 行が出現するまで待つ
+            #    (delivery / inbox 処理が非同期)。
+            def list_has_bob() -> int | None:
+                for it in sakurasato.follow_requests():
+                    if self._bob_follow_predicate(it):
+                        return it["id"]
+                return None
+
+            follow_id = poll_until(
+                list_has_bob,
+                desc="follow-request list includes Bob's pending Follow",
+            )
+
+            # 5) approve → Sakurasato が Accept を Mastodon に配送。
+            approve_resp = sakurasato.follow_request_approve(follow_id)
+            assert approve_resp["new_state"] == "accepted"
+
+            # 6) Mastodon 側 relationship が following=true に遷移するまで待つ。
+            def is_following_now() -> bool:
+                resp = mastodon.http.get(
+                    "/api/v1/accounts/relationships",
+                    params={"id[]": sks_id},
+                    headers={"Authorization": f"Bearer {mastodon.token}"},
+                )
+                if resp.status_code != 200:
+                    return False
+                rows = resp.json()
+                return bool(rows) and rows[0].get("following") is True
+
+            poll_until(
+                is_following_now,
+                desc="Mastodon relationship.following=true after CLI approve",
+            )
+
+            # 7) post-condition: actor JSON は依然 locked のまま (cleanup 前)。
+            actor_locked = sakurasato.actor_json("me")
+            assert actor_locked.get("manuallyApprovesFollowers") is True
+        finally:
+            # **#8 fix**: `finally` では assert を使わず、純粋に cleanup だけ
+            # 行う。本体例外が `__context__` に隠れて CI ログが読みにくくなる
+            # のを避ける。状態確認は try ブロック内で済ませる。
+            try:
+                sakurasato.actor_unlock()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 # ── 4. Follow ───────────────────────────────────────────────
 
 

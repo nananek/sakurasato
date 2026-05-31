@@ -117,6 +117,7 @@ fn build_remote_actor(rsa_pub_pem: &str, ed25519_pub_pem: Option<&str>) -> NewAc
         moved_to_ap_id: None,
         is_local: false,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     }
 }
 
@@ -526,6 +527,7 @@ async fn user_inbox_path_also_verifies_signature(pool: PgPool) {
         moved_to_ap_id: None,
         is_local: true,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     };
     repo::actor::insert(&pool, local).await.unwrap();
     let state = AppState::from_pool(pool, make_config());

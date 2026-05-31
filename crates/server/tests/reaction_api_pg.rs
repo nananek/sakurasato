@@ -50,6 +50,7 @@ mod common {
             moved_to_ap_id: None,
             is_local: true,
             actor_type: "Person".into(),
+            manually_approves_followers: false,
         }
     }
 
@@ -454,6 +455,7 @@ fn sample_remote_actor(username: &str, host: &str) -> repo::actor::NewActor {
         moved_to_ap_id: None,
         is_local: false,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     }
 }
 

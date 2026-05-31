@@ -37,6 +37,11 @@ pub struct NewActor {
     pub moved_to_ap_id: Option<String>,
     pub is_local: bool,
     pub actor_type: String,
+    /// 鍵アカフラグ (Issue #66 / M12)。`true` のとき inbound `Follow` は
+    /// auto-Accept されず `follow.state = pending` で据え置かれる。
+    /// remote actor を upsert する際は相手側 actor JSON の
+    /// `manuallyApprovesFollowers` をキャッシュとして書く。
+    pub manually_approves_followers: bool,
 }
 
 impl std::fmt::Debug for NewActor {
@@ -70,6 +75,10 @@ impl std::fmt::Debug for NewActor {
             .field("moved_to_ap_id", &self.moved_to_ap_id)
             .field("is_local", &self.is_local)
             .field("actor_type", &self.actor_type)
+            .field(
+                "manually_approves_followers",
+                &self.manually_approves_followers,
+            )
             .finish()
     }
 }
@@ -94,11 +103,12 @@ where
             followers_url, following_url, public_key_id, public_key_pem,
             private_key_pem,
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
-            also_known_as, moved_to_ap_id, is_local, actor_type
+            also_known_as, moved_to_ap_id, is_local, actor_type,
+            manually_approves_followers
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
         )
         RETURNING
             id, ap_id, preferred_username, host, display_name, summary,
@@ -107,7 +117,8 @@ where
             private_key_pem,
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
-            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
         "#,
         new.ap_id,
         new.preferred_username,
@@ -131,6 +142,7 @@ where
         new.moved_to_ap_id,
         new.is_local,
         new.actor_type,
+        new.manually_approves_followers,
     )
     .fetch_one(executor)
     .await
@@ -148,7 +160,8 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<ActorRow>>
             private_key_pem,
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
-            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
         FROM actor WHERE id = $1
         "#,
         id,
@@ -169,7 +182,8 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Act
             private_key_pem,
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
-            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
         FROM actor WHERE ap_id = $1
         "#,
         ap_id,
@@ -195,7 +209,8 @@ pub async fn get_by_username_host(
             private_key_pem,
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
-            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
         FROM actor WHERE preferred_username = $1 AND host = $2
         "#,
         preferred_username,
@@ -249,7 +264,8 @@ pub async fn update_profile(
             private_key_pem,
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
-            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
         "#,
         id,
         display_name.is_some(),
@@ -290,7 +306,8 @@ pub async fn set_also_known_as(
             private_key_pem,
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
-            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
         "#,
         id,
         value,
@@ -324,10 +341,45 @@ pub async fn set_moved_to(
             private_key_pem,
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
-            moved_to_ap_id, is_local, actor_type, fetched_at, created_at, updated_at
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
         "#,
         id,
         target,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// Flip `manually_approves_followers` for an actor (Issue #66 / M12).
+///
+/// `lock` / `unlock` CLI と `init --locked` から呼ばれる。フラグが変わると
+/// actor JSON の `manuallyApprovesFollowers` が変わるので、呼び出し側で
+/// `Update` activity をフォロワーに配信する責務がある。
+pub async fn set_manually_approves_followers(
+    pool: &PgPool,
+    id: i64,
+    locked: bool,
+) -> sqlx::Result<crate::model::ActorRow> {
+    sqlx::query_as!(
+        crate::model::ActorRow,
+        r#"
+        UPDATE actor SET
+            manually_approves_followers = $2,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING
+            id, ap_id, preferred_username, host, display_name, summary,
+            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
+            followers_url, following_url, public_key_id, public_key_pem,
+            private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
+            also_known_as as "also_known_as: Json<Vec<String>>",
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
+        "#,
+        id,
+        locked,
     )
     .fetch_one(pool)
     .await

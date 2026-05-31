@@ -1,0 +1,102 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)\n        VALUES ($1, $2, $3, 'pending')\n        ON CONFLICT (follower_actor_id, followed_actor_id) DO UPDATE\n            SET ap_id = CASE WHEN follow.state = 'rejected' THEN EXCLUDED.ap_id ELSE follow.ap_id END,\n                state = CASE WHEN follow.state = 'rejected' THEN 'pending'      ELSE follow.state END,\n                updated_at = CASE WHEN follow.state = 'rejected' THEN now()     ELSE follow.updated_at END\n        RETURNING id, ap_id, follower_actor_id, followed_actor_id, state, created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ap_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "follower_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "follower_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "followed_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "followed_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8e20c8cf3b6c336c455618c300be257277b25fdfdcf5ff983c6961ef51392ca0"
+}

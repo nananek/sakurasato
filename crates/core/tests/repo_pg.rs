@@ -53,6 +53,7 @@ fn sample_local_actor(suffix: &str) -> repo::actor::NewActor {
         moved_to_ap_id: None,
         is_local: true,
         actor_type: "Person".into(),
+        manually_approves_followers: false,
     }
 }
 
@@ -176,6 +177,55 @@ async fn follow_state_transitions(pool: PgPool) -> sqlx::Result<()> {
         .unwrap();
     assert_eq!(updated.state, "accepted");
     assert!(updated.updated_at >= follow.updated_at);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn upsert_pending_recovers_from_rejected_with_new_ap_id(pool: PgPool) -> sqlx::Result<()> {
+    // PR #80 round-2 fix (#2): rejected 行が `(follower, followed)` UNIQUE
+    // で残っている状態で「同じ follower → 別の ap_id の Follow」が来たとき、
+    // ap_id を新しい値に書き換え、state を `pending` にリセットする。
+    // これをやらないと 1 度 reject した相手は永久に再 follow できなくなる。
+    let me = repo::actor::insert(&pool, sample_local_actor("me")).await?;
+    let them = repo::actor::insert(&pool, sample_local_actor("them")).await?;
+
+    // 旧 Follow → reject
+    let old =
+        repo::follow::insert_pending(&pool, "https://example.test/follows/old", them.id, me.id)
+            .await?;
+    repo::follow::set_state(&pool, old.id, FollowState::Rejected).await?;
+
+    // 新しい ap_id で再 Follow が届く (= リモートが Unfollow → 再 Follow)
+    let new =
+        repo::follow::upsert_pending(&pool, "https://example.test/follows/new", them.id, me.id)
+            .await?;
+
+    // 同じ id (ON CONFLICT) かつ pending に戻り、ap_id が新しい値で上書きされる。
+    assert_eq!(new.id, old.id, "ON CONFLICT must reuse the same row");
+    assert_eq!(new.state, FollowState::Pending.as_str());
+    assert_eq!(new.ap_id, "https://example.test/follows/new");
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn upsert_pending_keeps_accepted_state_on_retry(pool: PgPool) -> sqlx::Result<()> {
+    // 既存 accepted の retry は accepted のまま据え置く (= Mastodon の retry
+    // で勝手に pending に巻き戻さない)。ap_id も既存値を保つ。
+    let me = repo::actor::insert(&pool, sample_local_actor("me2")).await?;
+    let them = repo::actor::insert(&pool, sample_local_actor("them2")).await?;
+
+    let accepted =
+        repo::follow::insert_pending(&pool, "https://example.test/follows/keep", them.id, me.id)
+            .await?;
+    repo::follow::set_state(&pool, accepted.id, FollowState::Accepted).await?;
+
+    // 別 ap_id で再到達 — accepted を保持し ap_id は触らない。
+    let again =
+        repo::follow::upsert_pending(&pool, "https://example.test/follows/other", them.id, me.id)
+            .await?;
+    assert_eq!(again.id, accepted.id);
+    assert_eq!(again.state, FollowState::Accepted.as_str());
+    assert_eq!(again.ap_id, "https://example.test/follows/keep");
     Ok(())
 }
 
