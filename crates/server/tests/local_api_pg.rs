@@ -505,8 +505,10 @@ async fn create_note_rejects_empty_content(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// **#65**: direct visibility は content に `@user@host` mention が無いと
+/// 配送先が無いので 400。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn create_note_rejects_direct_visibility(pool: PgPool) {
+async fn create_note_rejects_direct_without_mention(pool: PgPool) {
     repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
         .await
         .unwrap();
@@ -514,7 +516,241 @@ async fn create_note_rejects_direct_visibility(pool: PgPool) {
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
 
-    let body = serde_json::json!({"content": "x", "visibility": "direct"});
+    let body = serde_json::json!({"content": "no mention here", "visibility": "direct"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// **#65**: direct DM が mention された remote actor の inbox にだけ
+/// `delivery_queue` 行を積み、followers (= 全く別の remote actor) には
+/// 積まないこと。activity の `to` に mention 先 URI が乗り、`cc` は空。
+/// `tag` 配列に `Mention` エントリが入る。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_direct_delivers_only_to_mentioned_inbox(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    // Bob: mention 先 (= seed しておく)。
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    bob.shared_inbox_url = Some("https://remote.test/inbox".into());
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+
+    // Carol: follower (mention されない別 remote actor)。direct DM は
+    // ここには配送されてはならない。
+    let mut carol = common::sample_local_actor("carol", "other.test");
+    carol.is_local = false;
+    carol.private_key_pem = None;
+    carol.ed25519_private_key_pem = None;
+    carol.shared_inbox_url = Some("https://other.test/inbox".into());
+    let carol = repo::actor::insert(&pool, carol).await.unwrap();
+    let f_ap_id = "https://other.test/follows/alice-by-carol".to_string();
+    let row = repo::follow::upsert_pending(&pool, &f_ap_id, carol.id, me.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({
+        "content": "@bob@remote.test psst",
+        "visibility": "direct",
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = read_json(resp).await;
+    assert_eq!(json["visibility"], "direct");
+    // mention 先 1 件のみ。Carol (= follower) には行かない。
+    assert_eq!(json["queued_deliveries"], 1);
+
+    // delivery_queue: bob の inbox にだけ 1 行ある。carol の inbox 行は無い。
+    let bob_count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) AS \"c!\" FROM delivery_queue WHERE inbox_url = $1",
+        "https://remote.test/inbox",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(bob_count, 1);
+    let carol_count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) AS \"c!\" FROM delivery_queue WHERE inbox_url = $1",
+        "https://other.test/inbox",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(carol_count, 0);
+
+    // activity body: object.to が bob の URI、cc が空、tag に Mention が入る。
+    let row = sqlx::query!(r#"SELECT activity FROM delivery_queue LIMIT 1"#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let to: Vec<&str> = row.activity["object"]["to"]
+        .as_array()
+        .expect("object.to array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(to, vec![bob.ap_id.as_str()], "direct.to should be [bob]");
+    let cc = row.activity["object"]["cc"]
+        .as_array()
+        .expect("object.cc array");
+    assert!(cc.is_empty(), "direct.cc should be empty, got {cc:?}");
+    let tags = row.activity["object"]["tag"]
+        .as_array()
+        .expect("object.tag array");
+    assert_eq!(tags.len(), 1, "expected 1 Mention tag, got {tags:?}");
+    assert_eq!(tags[0]["type"], "Mention");
+    assert_eq!(tags[0]["href"], bob.ap_id);
+    assert_eq!(tags[0]["name"], "@bob@remote.test");
+
+    // DB の note 行にも tag が永続化されていること (= timeline 等で再利用可能)。
+    let note_id = json["id"].as_i64().unwrap();
+    let note_tags: serde_json::Value =
+        sqlx::query_scalar!(r#"SELECT tags FROM note WHERE id = $1"#, note_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let arr = note_tags.as_array().expect("tags is array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["type"], "Mention");
+}
+
+/// **#65**: 公開投稿でも `@user@host` mention は `cc` に乗り、mention 先
+/// inbox にも `delivery_queue` 行が積まれる (= followers 配送と並列)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_public_with_mention_delivers_to_both(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    // Mention 先 (非フォロワー)。
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    bob.shared_inbox_url = Some("https://remote.test/inbox".into());
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+
+    // 別の follower (mention されていない)。
+    let mut carol = common::sample_local_actor("carol", "other.test");
+    carol.is_local = false;
+    carol.private_key_pem = None;
+    carol.ed25519_private_key_pem = None;
+    carol.shared_inbox_url = Some("https://other.test/inbox".into());
+    let carol = repo::actor::insert(&pool, carol).await.unwrap();
+    let f_ap_id = "https://other.test/follows/alice-by-carol".to_string();
+    let row = repo::follow::upsert_pending(&pool, &f_ap_id, carol.id, me.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({
+        "content": "ping @bob@remote.test",
+        "visibility": "public",
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = read_json(resp).await;
+    // bob (mention) + carol (follower) → 2 件。
+    assert_eq!(json["queued_deliveries"], 2);
+
+    // 両方の inbox にちょうど 1 行ずつ。
+    let bob_count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) AS \"c!\" FROM delivery_queue WHERE inbox_url = $1",
+        "https://remote.test/inbox",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(bob_count, 1);
+    let carol_count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) AS \"c!\" FROM delivery_queue WHERE inbox_url = $1",
+        "https://other.test/inbox",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(carol_count, 1);
+
+    // activity body: object.cc に bob URI + followers URL が入る。
+    let row = sqlx::query!(
+        r#"SELECT activity FROM delivery_queue WHERE inbox_url = $1"#,
+        "https://remote.test/inbox",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let cc: Vec<&str> = row.activity["object"]["cc"]
+        .as_array()
+        .expect("object.cc array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(cc.iter().any(|s| *s == bob.ap_id));
+    let tags = row.activity["object"]["tag"]
+        .as_array()
+        .expect("object.tag");
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0]["href"], bob.ap_id);
+}
+
+/// **#65**: 解決不能な mention は 400 (= seed されていない remote actor、
+/// remote fetch 無効 = テスト経路では弾かれる)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_rejects_unresolvable_mention(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({
+        "content": "hello @nobody@unknown.example",
+        "visibility": "public",
+    });
     let resp = app
         .oneshot(
             Request::post("/api/v1/notes")
