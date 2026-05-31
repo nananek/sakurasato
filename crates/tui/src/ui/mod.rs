@@ -89,6 +89,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         Rect::default()
     };
 
+    // M8 PR3: リアクション入力プロンプト。timeline 直下、compose の手前に
+    // 1 行の overlay として出す ── focus = ReactionPrompt のときだけ。
+    if app.focus == Focus::ReactionPrompt
+        && let Some(p) = app.reaction_prompt.as_ref()
+    {
+        render_reaction_prompt(frame, status_area, &app.theme, p);
+    }
+
     PanelRects {
         timeline: timeline_area,
         timeline_rows: rows,
@@ -96,6 +104,36 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         help: help_area,
         picker_list,
     }
+}
+
+/// 入力プロンプトを status バー位置に上書き表示する。1 行。
+fn render_reaction_prompt(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+    prompt: &crate::reaction_prompt::ReactionPrompt,
+) {
+    let palette = &theme.palette;
+    frame.render_widget(Clear, area);
+    let line = Line::from(vec![
+        Span::styled(
+            "  react › ",
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            prompt.buffer.clone(),
+            Style::default().fg(palette.foreground),
+        ),
+        Span::styled("▏", Style::default().fg(palette.accent)),
+        Span::styled(
+            "  Enter=send  Esc=cancel",
+            Style::default().fg(palette.muted),
+        ),
+    ]);
+    let p = Paragraph::new(line).style(Style::default().bg(palette.background));
+    frame.render_widget(p, area);
 }
 
 fn compose_height(app: &App) -> u16 {
@@ -285,8 +323,50 @@ fn note_lines(
             Span::styled("  (empty)", Style::default().fg(palette.muted)),
         ]));
     }
+    if !note.reactions.is_empty() {
+        out.push(reaction_line(note, palette, &pad));
+    }
     out.push(Line::from(""));
     out
+}
+
+/// 1 件の Note のリアクション集計を 1 行にまとめる。
+///
+/// 表示例: ` :blob_party: 3   👍 1   :tada@misskey.io: 2 `。content 文字列は
+/// AP からそのまま (= shortcode 形式は `:foo:`、Unicode はそのまま)。
+/// アイコンのインライン画像描画は M? で別途 (現状は shortcode テキストのみ)。
+fn reaction_line(note: &TimelineNote, palette: &Palette, pad: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> =
+        Vec::with_capacity(note.reactions.len().saturating_mul(2).saturating_add(1));
+    spans.push(Span::raw(format!("{pad}  ")));
+    for (i, r) in note.reactions.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", Style::default().fg(palette.muted)));
+        }
+        let label = reaction_label(&r.content);
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" ×{}", r.count),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// 表示用ラベル: `:foo@host:` → `:foo:` に短縮、Unicode はそのまま。
+fn reaction_label(content: &str) -> String {
+    if let Some(stripped) = content.strip_prefix(':').and_then(|s| s.strip_suffix(':'))
+        && let Some(name) = stripped.split('@').next()
+        && !name.is_empty()
+    {
+        return format!(":{name}:");
+    }
+    content.to_string()
 }
 
 fn format_handle(note: &TimelineNote) -> String {
@@ -438,6 +518,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::Compose => "compose",
         Focus::Help => "help",
         Focus::Picker => "picker",
+        Focus::ReactionPrompt => "react",
     };
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -541,6 +622,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "A", "upload avatar"),
         help_entry(palette, "H", "upload header"),
         help_entry(palette, ";", "attach image (picker)"),
+        help_entry(palette, "e", "react to selected note"),
         Line::from(""),
         Line::from(Span::styled("compose", help_section(palette))),
         help_entry(palette, "Enter", "insert newline"),
@@ -558,6 +640,13 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "Backspace", "go to parent"),
         help_entry(palette, ".", "toggle hidden files"),
         help_entry(palette, "Esc / q", "cancel picker"),
+        Line::from(""),
+        Line::from(Span::styled("reactions", help_section(palette))),
+        help_entry(palette, "e", "open reaction prompt"),
+        help_entry(palette, ":foo:", "local custom emoji"),
+        help_entry(palette, "👍 / 🎉", "Unicode emoji"),
+        help_entry(palette, "Enter", "send"),
+        help_entry(palette, "Esc", "cancel"),
         Line::from(""),
         Line::from(Span::styled(
             "press ? again to close",
@@ -803,5 +892,17 @@ mod tests {
             Some("example.test".into()),
         );
         assert_eq!(extract_host("not a url"), None);
+    }
+
+    #[test]
+    fn reaction_label_strips_colons_and_host() {
+        assert_eq!(reaction_label(":blob:"), ":blob:");
+        assert_eq!(reaction_label(":blob_party:"), ":blob_party:");
+        assert_eq!(reaction_label(":blob@misskey.io:"), ":blob:");
+        // Unicode は素通り。
+        assert_eq!(reaction_label("👍"), "👍");
+        // 空 / 不正は素通り (= サーバ側で検証済み)。
+        assert_eq!(reaction_label(""), "");
+        assert_eq!(reaction_label("::"), "::");
     }
 }

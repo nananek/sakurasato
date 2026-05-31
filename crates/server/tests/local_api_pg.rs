@@ -328,6 +328,94 @@ async fn timeline_home_returns_local_and_followed_notes(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_home_includes_reaction_counts(pool: PgPool) {
+    // M8 PR3: timeline 応答に `reactions: [{content, count, emoji_image_url?, ...}]`
+    // が含まれることを検証する。
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+
+    // Note は alice の local 投稿。
+    let note_id = insert_local_note(&pool, me.id, "example.test", "reactnote", "hello").await;
+
+    // bob が 👍 を 1 回、alice 自身が :blob: を 1 回 (= ローカル emoji 学習済み)。
+    repo::reaction::insert(
+        &pool,
+        "https://remote.test/users/bob/r/1",
+        note_id,
+        bob.id,
+        "👍",
+        None,
+    )
+    .await
+    .unwrap();
+    let emoji = repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "blob".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/blob.webp".into(),
+            media_type: "image/webp".into(),
+        },
+    )
+    .await
+    .unwrap();
+    repo::reaction::insert(
+        &pool,
+        "https://example.test/users/alice/r/1",
+        note_id,
+        me.id,
+        ":blob:",
+        Some(emoji.id),
+    )
+    .await
+    .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/timeline/home")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let notes = json["notes"].as_array().unwrap();
+    let n = notes
+        .iter()
+        .find(|n| n["id"].as_i64() == Some(note_id))
+        .expect("note must be present");
+    let reactions = n["reactions"].as_array().expect("reactions field present");
+    assert_eq!(reactions.len(), 2, "two distinct contents: {reactions:?}");
+    // 並びは MIN(created_at)。bob の Like → alice の :blob: の順。
+    assert_eq!(reactions[0]["content"], "👍");
+    assert_eq!(reactions[0]["count"], 1);
+    assert!(reactions[0]["emoji_image_url"].is_null());
+    assert_eq!(reactions[1]["content"], ":blob:");
+    assert_eq!(reactions[1]["count"], 1);
+    // local emoji → image_url が `/media/emoji/local/blob.webp` に展開される。
+    assert_eq!(
+        reactions[1]["emoji_image_url"]
+            .as_str()
+            .expect("emoji_image_url for local"),
+        "https://example.test/media/emoji/local/blob.webp",
+    );
+    assert_eq!(reactions[1]["emoji_is_local"], serde_json::json!(true));
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn create_note_persists_and_enqueues(pool: PgPool) {
     let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
         .await

@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            r.note_id as \"note_id!\",\n            r.content as \"content!\",\n            COUNT(*) as \"count!\",\n            MAX(e.id) as \"emoji_id: i64\",\n            MAX(e.image_key) as \"image_key: String\",\n            MAX(e.media_type) as \"media_type: String\",\n            BOOL_OR(e.is_local) as \"is_local: bool\",\n            MIN(r.created_at) as \"first_at!\"\n        FROM reaction r\n        LEFT JOIN emoji e ON e.id = r.emoji_id\n        WHERE r.note_id = ANY($1)\n        GROUP BY r.note_id, r.content\n        ORDER BY r.note_id, MIN(r.created_at)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "note_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "reaction",
+            "name": "note_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "content!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "reaction",
+            "name": "content"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "emoji_id: i64",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "image_key: String",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "media_type: String",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "is_local: bool",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "first_at!",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "4c0ebce49098e76eb46eab56bc3cd67a4bda690946218a9cbfbf7a44c42be853"
+}

@@ -151,3 +151,56 @@ pub struct ReactionContentCount {
     /// 既知の絵文字 → 既知側を採用したいので MAX を使う。
     pub any_emoji_id: Option<i64>,
 }
+
+/// 複数 Note に対するリアクション集計を 1 クエリで取る (M8 PR3 home timeline)。
+///
+/// 戻り値の各行は 1 つの (`note_id`, `content`) ペアに対応する。
+/// `image_url` / `media_type` / `is_local` は emoji への LEFT JOIN 結果で、
+/// `emoji_id` が NULL (= Unicode reaction) の場合は全て NULL。
+pub async fn counts_for_notes(
+    pool: &PgPool,
+    note_ids: &[i64],
+) -> sqlx::Result<Vec<ReactionSummaryRow>> {
+    if note_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        ReactionSummaryRow,
+        r#"
+        SELECT
+            r.note_id as "note_id!",
+            r.content as "content!",
+            COUNT(*) as "count!",
+            MAX(e.id) as "emoji_id: i64",
+            MAX(e.image_key) as "image_key: String",
+            MAX(e.media_type) as "media_type: String",
+            BOOL_OR(e.is_local) as "is_local: bool",
+            MIN(r.created_at) as "first_at!"
+        FROM reaction r
+        LEFT JOIN emoji e ON e.id = r.emoji_id
+        WHERE r.note_id = ANY($1)
+        GROUP BY r.note_id, r.content
+        ORDER BY r.note_id, MIN(r.created_at)
+        "#,
+        note_ids,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// `counts_for_notes` の戻り行。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReactionSummaryRow {
+    pub note_id: i64,
+    pub content: String,
+    pub count: i64,
+    /// 代表 `emoji_id`。同じ shortcode に複数の emoji 行が紐付くことは事実上
+    /// 無いが、念のため `MAX` で 1 つ選ぶ。
+    pub emoji_id: Option<i64>,
+    /// 対応 emoji の `image_key` (= local: `emoji/local/...webp` / remote URL)。
+    pub image_key: Option<String>,
+    pub media_type: Option<String>,
+    pub is_local: Option<bool>,
+    /// `MIN(created_at)`。並び替えにだけ使い、API には出さない。
+    pub first_at: chrono::DateTime<chrono::Utc>,
+}

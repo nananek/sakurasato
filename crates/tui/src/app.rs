@@ -50,6 +50,9 @@ pub enum Focus {
     Help,
     /// M7: ファイルピッカ。`App::picker` が `Some` のときだけ取りうる。
     Picker,
+    /// M8 PR3: リアクション送信プロンプト。`App::reaction_prompt` が `Some` の
+    /// ときだけ取りうる。
+    ReactionPrompt,
 }
 
 #[derive(Debug)]
@@ -81,6 +84,9 @@ pub struct App {
     /// M7: 進行中のアップロードジョブ数。0 でも picker を閉じてよい。
     /// UI のステータスバーに `↑ N` として出す。
     pub pending_uploads: u32,
+    /// M8 PR3: リアクション送信プロンプト。`Focus::ReactionPrompt` 中のみ
+    /// 表示される。
+    pub reaction_prompt: Option<crate::reaction_prompt::ReactionPrompt>,
 }
 
 impl App {
@@ -108,6 +114,7 @@ impl App {
             picker: None,
             previews,
             pending_uploads: 0,
+            reaction_prompt: None,
         }
     }
 
@@ -248,6 +255,7 @@ mod tests {
             in_reply_to_note_id: None,
             published_at: Utc::now(),
             is_local: actor == "https://x.test/users/me",
+            reactions: Vec::new(),
         }
     }
 

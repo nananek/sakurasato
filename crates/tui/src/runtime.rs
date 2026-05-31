@@ -421,6 +421,85 @@ async fn apply_action(
                 );
             }
         }
+        Action::OpenReactionPrompt => open_reaction_prompt(app),
+        Action::ReactionPromptInsertChar(c) => {
+            if let Some(p) = app.reaction_prompt.as_mut() {
+                p.insert_char(c);
+            }
+        }
+        Action::ReactionPromptBackspace => {
+            if let Some(p) = app.reaction_prompt.as_mut() {
+                p.backspace();
+            }
+        }
+        Action::ReactionPromptSubmit => {
+            submit_reaction(app, api, page_size).await;
+        }
+        Action::ReactionPromptCancel => {
+            close_reaction_prompt(app);
+        }
+    }
+}
+
+fn open_reaction_prompt(app: &mut App) {
+    let Some(note) = app.notes.get(app.selected) else {
+        app.set_status(
+            "no note selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    };
+    app.reaction_prompt = Some(crate::reaction_prompt::ReactionPrompt::new(note.id));
+    app.focus = Focus::ReactionPrompt;
+}
+
+fn close_reaction_prompt(app: &mut App) {
+    app.reaction_prompt = None;
+    app.focus = Focus::Timeline;
+}
+
+async fn submit_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(prompt) = app.reaction_prompt.as_ref() else {
+        return;
+    };
+    if prompt.is_empty() {
+        app.set_status(
+            "reaction is empty",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    }
+    let note_id = prompt.note_id;
+    let content = prompt.buffer.trim().to_string();
+
+    match api.create_reaction(note_id, &content).await {
+        Ok(resp) => {
+            app.set_status(
+                format!(
+                    "reacted with {} ({} queued)",
+                    resp.content, resp.queued_deliveries
+                ),
+                StatusKind::Success,
+                Some(Duration::from_secs(3)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("reaction failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+            // 失敗時はプロンプトを残したままにしてユーザが修正できるようにする。
+            return;
+        }
+    }
+    close_reaction_prompt(app);
+
+    // 成功 → タイムラインを取り直して reaction count を反映。
+    if let Ok(resp) = api.timeline_home(None, page_size).await {
+        app.replace_timeline(resp.notes, resp.next_before_id);
     }
 }
 

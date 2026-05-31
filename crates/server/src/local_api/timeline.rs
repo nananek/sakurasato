@@ -15,16 +15,20 @@
 //!   フォロー先 actor が居ない初期状態でも 200 + 空配列を返す (自分の投稿が
 //!   無くてもエラーにしない)。
 
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use sakurasato_core::repo;
 use sakurasato_core::repo::note::TimelineEntry;
+use sakurasato_core::repo::reaction::ReactionSummaryRow;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::error;
+use tracing::{error, warn};
 
+use crate::local_api::media::build_media_url;
 use crate::state::AppState;
 
 const LIMIT_DEFAULT: i64 = 40;
@@ -59,10 +63,34 @@ pub struct TimelineNote {
     pub in_reply_to_note_id: Option<i64>,
     pub published_at: chrono::DateTime<chrono::Utc>,
     pub is_local: bool,
+    /// M8 PR3: 受領したリアクション集計 (`content` 単位)。空 Vec は省略しない
+    /// (= 必ず `reactions: []` を返す) ── 既存 TUI の serde は配列 default が
+    /// `Vec::new()` で安全。
+    #[serde(default)]
+    pub reactions: Vec<ReactionSummaryDto>,
 }
 
-impl From<TimelineEntry> for TimelineNote {
-    fn from(e: TimelineEntry) -> Self {
+/// `TimelineNote.reactions` の 1 要素。`content` は AP のまま (`:foo:` /
+/// Unicode / `:foo@host:`)。`emoji_image_url` は local emoji の場合
+/// `/media/emoji/local/...` の絶対 URL、remote emoji の場合は連合先サーバ
+/// の URL がそのまま入る (TUI は `media/proxy?url=...&variant=emoji` 経由で
+/// fetch する想定)。
+#[derive(Debug, Serialize)]
+pub struct ReactionSummaryDto {
+    pub content: String,
+    pub count: i64,
+    #[serde(default)]
+    pub emoji_image_url: Option<String>,
+    #[serde(default)]
+    pub emoji_media_type: Option<String>,
+    /// `Some(true)` = local emoji (= 直接 `image_url` を fetch してよい)、
+    /// `Some(false)` = remote emoji (= TUI 側で proxy 経由)、`None` = Unicode。
+    #[serde(default)]
+    pub emoji_is_local: Option<bool>,
+}
+
+impl TimelineNote {
+    fn from_entry_with_reactions(e: TimelineEntry, reactions: Vec<ReactionSummaryDto>) -> Self {
         Self {
             id: e.id,
             ap_id: e.ap_id,
@@ -81,7 +109,29 @@ impl From<TimelineEntry> for TimelineNote {
             in_reply_to_note_id: e.in_reply_to_note_id,
             published_at: e.published_at,
             is_local: e.is_local,
+            reactions,
         }
+    }
+}
+
+/// `ReactionSummaryRow` (DB) → `ReactionSummaryDto` (API)。
+///
+/// `image_key` のうち local emoji (`emoji/local/<shortcode>.webp`) は
+/// `build_media_url` で `https://<host>/media/<key>` に展開し、TUI が
+/// `/media/proxy?url=...` 越しに fetch できるようにする。remote emoji
+/// (= 元 URL の絶対 URL) はそのまま渡す。
+fn row_to_dto(host: &str, row: ReactionSummaryRow) -> ReactionSummaryDto {
+    let emoji_image_url = match (row.is_local, row.image_key.as_ref()) {
+        (Some(true), Some(key)) => Some(build_media_url(host, key)),
+        (Some(false), Some(key)) => Some(key.clone()),
+        _ => None,
+    };
+    ReactionSummaryDto {
+        content: row.content,
+        count: row.count,
+        emoji_image_url,
+        emoji_media_type: row.media_type,
+        emoji_is_local: row.is_local,
     }
 }
 
@@ -122,7 +172,33 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
         };
 
     let next_before_id = entries.last().map(|e| e.id);
-    let notes: Vec<TimelineNote> = entries.into_iter().map(TimelineNote::from).collect();
+
+    // M8 PR3: 当ページの note 全件のリアクションを 1 クエリで集計する。
+    // failure は warn でログに残し、空の集計で続行 ── タイムライン本体を
+    // 失敗させたくない。
+    let note_ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
+    let mut by_note: HashMap<i64, Vec<ReactionSummaryDto>> = HashMap::new();
+    match repo::reaction::counts_for_notes(state.pool(), &note_ids).await {
+        Ok(rows) => {
+            for row in rows {
+                by_note
+                    .entry(row.note_id)
+                    .or_default()
+                    .push(row_to_dto(host, row));
+            }
+        }
+        Err(err) => {
+            warn!(?err, "timeline/home: reaction counts_for_notes failed");
+        }
+    }
+
+    let notes: Vec<TimelineNote> = entries
+        .into_iter()
+        .map(|e| {
+            let reactions = by_note.remove(&e.id).unwrap_or_default();
+            TimelineNote::from_entry_with_reactions(e, reactions)
+        })
+        .collect();
 
     Json(TimelineResponse {
         notes,
