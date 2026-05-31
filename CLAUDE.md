@@ -233,12 +233,19 @@ cargo test --workspace
 # DB マイグレーション
 sqlx migrate run
 
-# 起動（開発）
+# 起動（開発, ローカル build）
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 # server 管理 CLI
 cargo run -p sakurasato-server -- init
 # TUI（ホスト端末）
 cargo run -p sakurasato-tui
+
+# 起動（本番風, ghcr 発行済みイメージを pull）
+# ─ §11 publish.yml で発行された ghcr.io/nananek/sakurasato-* を使う
+# ─ :latest = 最新 CalVer リリースに追従。固定したい場合は overlay の
+#   `image:` を `:YYYY.MM.patch` に書き換える
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 ```
 
 ---
@@ -270,6 +277,7 @@ cargo run -p sakurasato-tui
 ### リリース（バージョニング）
 - **CalVer `YYYY.MM.patch`**（Misskey 準拠、例 `2026.05.0`）。
 - `develop` → `main` を手動マージした後、`main` にタグ `YYYY.MM.patch` を打ってリリース。**タグ push は許可**。
+- **タグ push で `.github/workflows/publish.yml` が発火**し、`ghcr.io/nananek/sakurasato-{server,media-proxy,versitygw}` に `:YYYY.MM.patch` + `:latest` を public で push する (linux/amd64)。`develop` への push は `:develop` のみ。手動再発行は GitHub UI の `workflow_dispatch` から。
 
 ### コミット規約
 - **Conventional Commits**。type 例: `feat` / `fix` / `docs` / `refactor` / `test` / `perf` / `chore` / `ci` / `docker` / `deps`。
@@ -282,6 +290,7 @@ cargo run -p sakurasato-tui
 
 ### CI / 自動化（`.github/`）
 - **CI** (`ci.yml`): `cargo fmt --check` / `clippy -D warnings` / `test`。`main`・`develop` の push と PR。required status check = `ci`。`Cargo.toml` が無い間はスキップして緑（M1 で本稼働）。
+- **Publish** (`publish.yml`): タグ push (`YYYY.MM.patch`) と `develop` push で発火。ghcr に `sakurasato-{server,media-proxy,versitygw}` を public で push する。BuildKit + GitHub Actions cache (`type=gha,scope=<name>`) を使うことで 3 イメージ並列ビルドが現実時間内に収まる。**新しい deploy host は `docker compose -f docker-compose.yml -f docker-compose.ghcr.yml pull` で取得**（§9 参照）。
 - **CodeQL** (`codeql.yml`): Rust SAST（`build-mode: none`）。`.rs`/`Cargo.*` 変更時と週次。
 - **Dependency Review** (`dependency-review.yml`): high 以上で fail、GPL/AGPL/SSPL を deny（MIT 維持）。
 - **Claude PR レビュー** (`claude-review.yml`): `anthropics/claude-code-action@v1`、認証 **`secrets.CLAUDE_CODE_OAUTH_TOKEN`**。PR 自動 + `@claude` メンション、verdict 付き top-level コメントを必ず投稿。
