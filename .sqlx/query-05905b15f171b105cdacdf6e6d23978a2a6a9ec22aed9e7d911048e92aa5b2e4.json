@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT in_reply_to_note_id FROM note WHERE actor_id = $1 ORDER BY id DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "in_reply_to_note_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "in_reply_to_note_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "05905b15f171b105cdacdf6e6d23978a2a6a9ec22aed9e7d911048e92aa5b2e4"
+}

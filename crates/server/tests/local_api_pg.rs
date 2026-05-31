@@ -526,6 +526,248 @@ async fn create_note_rejects_direct_visibility(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// **#64**: 未フォローの remote actor の note に reply すると、その author の
+/// inbox に対しても `delivery_queue` 行が積まれること (= 親 author 配送)。
+/// activity body の `object.cc` にも親 author URI が乗ること。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_reply_enqueues_to_non_follower_parent_author(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    // Charlie: remote actor、follower ではない (= follow 関係なし)。
+    let mut charlie = common::sample_local_actor("charlie", "remote.test");
+    charlie.is_local = false;
+    charlie.private_key_pem = None;
+    charlie.ed25519_private_key_pem = None;
+    charlie.shared_inbox_url = Some("https://remote.test/inbox".into());
+    let charlie = repo::actor::insert(&pool, charlie).await.unwrap();
+
+    // Charlie の remote note を仕込む (= 過去に受領済みという想定)。
+    let charlie_note_ap_id = "https://remote.test/notes/seed-123";
+    repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: charlie_note_ap_id.into(),
+            actor_id: charlie.id,
+            content: "seed".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: false,
+            url: Some(charlie_note_ap_id.into()),
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({
+        "content": "replying to non-follower",
+        "visibility": "public",
+        "in_reply_to_ap_id": charlie_note_ap_id,
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = read_json(resp).await;
+    // 未フォロー相手だが、親 author の inbox に 1 件積まれている。
+    assert_eq!(json["queued_deliveries"], 1);
+
+    // delivery_queue の宛先が Charlie の shared_inbox + activity body の
+    // `object.cc` に Charlie の URI が乗っていること。
+    let row = sqlx::query!(
+        r#"SELECT inbox_url, activity FROM delivery_queue WHERE inbox_url = $1"#,
+        "https://remote.test/inbox",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.inbox_url, "https://remote.test/inbox");
+    let cc = row.activity["object"]["cc"]
+        .as_array()
+        .expect("object.cc array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        cc.iter().any(|s| *s == charlie.ap_id),
+        "expected {} in object.cc; got {cc:?}",
+        charlie.ap_id,
+    );
+    // note 行も in_reply_to_note_id が立っていること (pre-resolve 経路の確認)。
+    let linked = sqlx::query!(
+        r#"SELECT in_reply_to_note_id FROM note WHERE actor_id = $1 ORDER BY id DESC LIMIT 1"#,
+        me.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        linked.in_reply_to_note_id.is_some(),
+        "in_reply_to_note_id should be linked",
+    );
+}
+
+/// **#64**: 親 author が既に follower 集合に居る場合、`delivery_queue` 行を
+/// 二重に作らない (`shared_inbox` の重複排除)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_reply_dedupes_when_parent_author_is_follower(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    bob.shared_inbox_url = Some("https://remote.test/inbox".into());
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+    // Bob は alice の follower (= accepted)。
+    let f_ap_id = "https://remote.test/follows/alice-by-bob".to_string();
+    let row = repo::follow::upsert_pending(&pool, &f_ap_id, bob.id, me.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    // Bob の remote note を仕込む。
+    let bob_note_ap_id = "https://remote.test/notes/from-bob-1";
+    repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: bob_note_ap_id.into(),
+            actor_id: bob.id,
+            content: "hi".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: false,
+            url: Some(bob_note_ap_id.into()),
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({
+        "content": "reply",
+        "visibility": "public",
+        "in_reply_to_ap_id": bob_note_ap_id,
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = read_json(resp).await;
+    // followers loop で 1 件、親 author 経路で重複しないため計 1 件。
+    assert_eq!(json["queued_deliveries"], 1);
+    let count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) AS \"c!\" FROM delivery_queue WHERE inbox_url = $1",
+        "https://remote.test/inbox",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    // cc に Bob の URI が乗っていること (follower でも parent 経路で重複は無い)。
+    let row = sqlx::query!(r#"SELECT activity FROM delivery_queue LIMIT 1"#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let cc: Vec<&str> = row.activity["object"]["cc"]
+        .as_array()
+        .expect("object.cc")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    let parent_count = cc.iter().filter(|s| **s == bob.ap_id).count();
+    assert_eq!(
+        parent_count, 1,
+        "parent author URI must appear exactly once in cc: {cc:?}",
+    );
+}
+
+/// **#64**: 自己 reply (= 自分の note への返信) は、自分の inbox を
+/// `delivery_queue` に積まない。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_self_reply_does_not_enqueue_self(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    // 自分の note を 1 つ仕込む。
+    let _ = insert_local_note(&pool, me.id, "example.test", "self-1", "first").await;
+    let my_note_ap_id = "https://example.test/notes/self-1";
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({
+        "content": "self reply",
+        "visibility": "public",
+        "in_reply_to_ap_id": my_note_ap_id,
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = read_json(resp).await;
+    // followers ゼロ、parent は self なので enqueue 件数は 0。
+    assert_eq!(json["queued_deliveries"], 0);
+    let count: i64 = sqlx::query_scalar!("SELECT COUNT(*) AS \"c!\" FROM delivery_queue",)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn stream_emits_note_created_event_after_post(pool: PgPool) {
     use http_body_util::BodyStream;
