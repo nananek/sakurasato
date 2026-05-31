@@ -4,9 +4,27 @@
 
 [server]
 host = "localhost"
+# 既定 listener (= `public_listen` / `local_api_listen` 未設定時の fallback)。
+# 公開 AP = TCP 8080、ローカル API = UDS の伝統的構成。
 bind = "0.0.0.0:8080"
 local_api_socket = "/run/sakurasato/local.sock"
 user = "me"
+
+# ── #69: Listener transport の URI 表現 (任意設定) ───────────────────────
+#
+# 公開 AP / ローカル API それぞれ `tcp://host:port` または `unix:/path` を
+# 個別に指定できる。未設定なら上の `bind` / `local_api_socket` に倒れる。
+#
+# 推奨運用:
+# - Cloudflared Tunnel → 公開 AP は UDS。host にポートを出さない。
+#     public_listen = "unix:/run/sakurasato/public.sock"
+# - Tailscale tailnet 越しの TUI → ローカル API は TCP。
+#     local_api_listen = "tcp://0.0.0.0:18080"
+#
+# どちらか片方だけ切り替えるのも OK (= 既定値と混在可能)。
+#
+# public_listen = "unix:/run/sakurasato/public.sock"
+# local_api_listen = "tcp://0.0.0.0:18080"
 
 [database]
 # `{password}` プレースホルダは起動時に `password_file` の中身で置換される。

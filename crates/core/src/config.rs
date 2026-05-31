@@ -49,12 +49,136 @@ pub struct Config {
 pub struct ServerConfig {
     /// Public-facing hostname (used for actor IDs, `WebFinger`, etc.).
     pub host: String,
-    /// HTTP bind address inside the container.
+    /// HTTP bind address inside the container (TCP).
+    ///
+    /// **Deprecated**: prefer [`Self::public_listen`] which accepts a
+    /// `tcp://host:port` or `unix:/path` URI. This field is kept as a
+    /// fallback when `public_listen` is unset so existing deployments
+    /// continue to work unchanged.
     pub bind: String,
     /// Path of the Unix domain socket exposed to the TUI client on the host.
+    ///
+    /// **Deprecated**: prefer [`Self::local_api_listen`] which accepts a
+    /// `unix:/path` or `tcp://host:port` URI. Kept as a fallback for
+    /// existing deployments.
     pub local_api_socket: PathBuf,
+    /// Optional URI for the **public AP listener**. When set, overrides
+    /// [`Self::bind`]. Accepts:
+    /// - `tcp://host:port` (= `0.0.0.0:443` 形式と等価)
+    /// - `unix:/path` または `unix:///path` (= Cloudflared 等の UDS origin 用)
+    ///
+    /// 推奨運用: Cloudflared Tunnel を使う場合は `unix:/run/...` に倒し、
+    /// host にポートを露出しない。
+    #[serde(default)]
+    pub public_listen: Option<String>,
+    /// Optional URI for the **local API (`/api/v1/*`) listener**. When set,
+    /// overrides [`Self::local_api_socket`]. Accepts the same scheme as
+    /// [`Self::public_listen`].
+    ///
+    /// 推奨運用: Tailscale tailnet 経由で TUI を別端末から触る場合は
+    /// `tcp://0.0.0.0:18080` 等に倒す ── tailscale は TCP/UDP しか流せ
+    /// ないため、UDS のままだと `tailscale serve` の薄いブリッジが要る。
+    /// 直接ホスト上で TUI を動かすなら従来どおり `unix:/run/...` でよい。
+    #[serde(default)]
+    pub local_api_listen: Option<String>,
     /// Single user actor handle (the only local user).
     pub user: String,
+}
+
+/// 抽象 listener (TCP / Unix domain socket)。`server` 側で `axum::serve` の
+/// バインド先として、`tui` 側で接続先として使う。
+///
+/// URI 表現:
+/// - `tcp://host:port` (`host` は `0.0.0.0` / `127.0.0.1` / `[::]` 等)
+/// - `unix:/abs/path` または `unix:///abs/path`
+///   (`unix://localhost/abs/path` も同義扱い)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listen {
+    /// TCP listener。`host:port` 文字列をそのまま保持する (= `TcpListener::bind` 形式)。
+    Tcp(String),
+    /// Unix domain socket。絶対パス推奨。
+    Unix(PathBuf),
+}
+
+impl Listen {
+    /// 文字列 URI から `Listen` を組む。許容: `tcp://host:port` / `unix:/path` /
+    /// `unix:///path`。スキーム無しは原則拒否 (= 設定の事故を防ぐ)。
+    ///
+    /// `unix://host/path` 形式は **host が `localhost` または空の場合のみ**
+    /// 受理する。それ以外の host は「abstract namespace を意図したのか
+    /// remote unix socket か」が曖昧なので 400 で弾く。
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("listen URI is empty");
+        }
+        if let Some(rest) = trimmed.strip_prefix("tcp://") {
+            if rest.is_empty() {
+                anyhow::bail!("tcp:// URI must have host:port body");
+            }
+            // `host:port` の最低限の sanity だけ確認 (port:digits の存在)。
+            // 実際の bind は OS に任せる ── 詳細は OS のエラーで判定する。
+            if !rest.contains(':') {
+                anyhow::bail!("tcp:// URI must include :port (got {rest:?})");
+            }
+            return Ok(Self::Tcp(rest.to_string()));
+        }
+        if let Some(rest) = trimmed.strip_prefix("unix://") {
+            // unix:///path or unix://localhost/path or unix:///path
+            let path_str = if let Some(p) = rest.strip_prefix('/') {
+                // `unix:///path` (= host 部空) → `/path`
+                format!("/{p}")
+            } else if let Some(p) = rest.strip_prefix("localhost/") {
+                format!("/{p}")
+            } else {
+                anyhow::bail!(
+                    "unix:// URI must be `unix:/path`, `unix:///path`, or `unix://localhost/path` (got {trimmed:?})"
+                );
+            };
+            if path_str == "/" || path_str.is_empty() {
+                anyhow::bail!("unix:// URI must have a non-empty path");
+            }
+            return Ok(Self::Unix(PathBuf::from(path_str)));
+        }
+        if let Some(rest) = trimmed.strip_prefix("unix:") {
+            // unix:/path
+            if rest.is_empty() || !rest.starts_with('/') {
+                anyhow::bail!("unix: URI must have an absolute path (got {trimmed:?})");
+            }
+            return Ok(Self::Unix(PathBuf::from(rest)));
+        }
+        anyhow::bail!("listen URI must start with `tcp://` or `unix:` (got {trimmed:?})")
+    }
+
+    /// 診断ログ・エラーメッセージ向けの表示文字列 (= 入力 URI を可逆に復元)。
+    pub fn display(&self) -> String {
+        match self {
+            Self::Tcp(s) => format!("tcp://{s}"),
+            Self::Unix(p) => format!("unix:{}", p.display()),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// 公開 AP listener の有効値。`public_listen` 優先、無ければ `bind` を
+    /// TCP として fall back する。
+    pub fn public_listener(&self) -> anyhow::Result<Listen> {
+        if let Some(uri) = self.public_listen.as_deref() {
+            Listen::parse(uri).map_err(|e| anyhow::anyhow!("server.public_listen invalid: {e}"))
+        } else {
+            Ok(Listen::Tcp(self.bind.clone()))
+        }
+    }
+
+    /// ローカル API listener の有効値。`local_api_listen` 優先、無ければ
+    /// `local_api_socket` を UDS として fall back する。
+    pub fn local_api_listener(&self) -> anyhow::Result<Listen> {
+        if let Some(uri) = self.local_api_listen.as_deref() {
+            Listen::parse(uri).map_err(|e| anyhow::anyhow!("server.local_api_listen invalid: {e}"))
+        } else {
+            Ok(Listen::Unix(self.local_api_socket.clone()))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -343,6 +467,117 @@ max_pixels = 33554432
             let path = write_default(jail);
             let cfg = Config::load(&path, None).unwrap();
             assert!(cfg.database.resolved_url().is_err());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn listen_parse_tcp_forms() {
+        assert_eq!(
+            Listen::parse("tcp://0.0.0.0:8080").unwrap(),
+            Listen::Tcp("0.0.0.0:8080".into())
+        );
+        assert_eq!(
+            Listen::parse("tcp://127.0.0.1:18080").unwrap(),
+            Listen::Tcp("127.0.0.1:18080".into())
+        );
+        assert_eq!(
+            Listen::parse("tcp://[::]:443").unwrap(),
+            Listen::Tcp("[::]:443".into())
+        );
+    }
+
+    #[test]
+    fn listen_parse_unix_forms() {
+        // unix:/path
+        assert_eq!(
+            Listen::parse("unix:/run/sakurasato/local.sock").unwrap(),
+            Listen::Unix(PathBuf::from("/run/sakurasato/local.sock"))
+        );
+        // unix:///path
+        assert_eq!(
+            Listen::parse("unix:///run/sakurasato/local.sock").unwrap(),
+            Listen::Unix(PathBuf::from("/run/sakurasato/local.sock"))
+        );
+        // unix://localhost/path
+        assert_eq!(
+            Listen::parse("unix://localhost/run/local.sock").unwrap(),
+            Listen::Unix(PathBuf::from("/run/local.sock"))
+        );
+    }
+
+    #[test]
+    fn listen_parse_rejects_malformed() {
+        // 空
+        assert!(Listen::parse("").is_err());
+        assert!(Listen::parse("   ").is_err());
+        // スキーム無し
+        assert!(Listen::parse("0.0.0.0:8080").is_err());
+        assert!(Listen::parse("/run/local.sock").is_err());
+        // tcp 不完全
+        assert!(Listen::parse("tcp://").is_err());
+        assert!(Listen::parse("tcp://localhost").is_err()); // :port 欠落
+        // unix 不完全
+        assert!(Listen::parse("unix:").is_err());
+        assert!(Listen::parse("unix:relative").is_err()); // 相対パス
+        assert!(Listen::parse("unix:///").is_err()); // 空パス
+        // unix://host/path で host が localhost でない (= remote unix の曖昧さ)
+        assert!(Listen::parse("unix://otherhost/path").is_err());
+        // 未対応スキーム
+        assert!(Listen::parse("http://localhost/").is_err());
+    }
+
+    #[test]
+    fn server_config_listener_resolution() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            // 既定: public_listen / local_api_listen 未設定 → bind / local_api_socket fallback。
+            let cfg = Config::load(&path, None).unwrap();
+            assert_eq!(
+                cfg.server.public_listener().unwrap(),
+                Listen::Tcp("0.0.0.0:8080".into())
+            );
+            assert_eq!(
+                cfg.server.local_api_listener().unwrap(),
+                Listen::Unix(PathBuf::from("/run/sakurasato/local.sock"))
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn server_config_listener_override_via_env() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env(
+                "SAKURASATO_SERVER__PUBLIC_LISTEN",
+                "unix:/run/sakurasato/public.sock",
+            );
+            jail.set_env("SAKURASATO_SERVER__LOCAL_API_LISTEN", "tcp://0.0.0.0:18080");
+            let cfg = Config::load(&path, None).unwrap();
+            assert_eq!(
+                cfg.server.public_listener().unwrap(),
+                Listen::Unix(PathBuf::from("/run/sakurasato/public.sock"))
+            );
+            assert_eq!(
+                cfg.server.local_api_listener().unwrap(),
+                Listen::Tcp("0.0.0.0:18080".into())
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn server_config_invalid_listen_uri_surfaces() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env("SAKURASATO_SERVER__PUBLIC_LISTEN", "garbage://nope");
+            let cfg = Config::load(&path, None).unwrap();
+            let err = cfg.server.public_listener().unwrap_err().to_string();
+            assert!(
+                err.contains("public_listen invalid"),
+                "expected wrapped error, got {err}",
+            );
             Ok(())
         });
     }

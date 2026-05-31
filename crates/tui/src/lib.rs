@@ -55,8 +55,10 @@ pub mod ui;
 /// バイナリの runtime 設定。CLI から組み立てて [`runtime::run`] に渡す。
 #[derive(Debug, Clone)]
 pub struct TuiOptions {
-    /// 接続先の Unix socket。`config/default.toml` の `server.local_api_socket` と合わせるのが既定。
-    pub socket: std::path::PathBuf,
+    /// 接続先 endpoint。UDS (`Endpoint::Unix`) なら従来どおりホスト同居運用、
+    /// TCP (`Endpoint::Tcp`) なら Tailscale tailnet 経由 (#69)。CLI が
+    /// `--socket` / `--api-url` を解決して組み立てる。
+    pub endpoint: client::Endpoint,
     /// Bearer トークン。`sakurasato-server token issue` で発行されたもの。
     pub token: String,
     /// テーマ名 (`sakura`/`dark`/`light` の組み込み、または `--theme-file` で

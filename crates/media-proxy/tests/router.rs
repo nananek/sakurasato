@@ -25,6 +25,8 @@ fn make_config() -> Config {
             host: "example.test".into(),
             bind: "127.0.0.1:0".into(),
             local_api_socket: "/tmp/x".into(),
+            public_listen: None,
+            local_api_listen: None,
             user: "me".into(),
         },
         database: DatabaseConfig {

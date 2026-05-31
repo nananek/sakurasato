@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use sakurasato_tui::TuiOptions;
+use sakurasato_tui::client::Endpoint;
 use sakurasato_tui::runtime;
 use sakurasato_tui::suppression::ImageSuppression;
 use sakurasato_tui::theme::Theme;
@@ -34,8 +35,15 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "sakurasato-tui", version)]
 struct Cli {
     /// 接続先 Unix socket。既定は `config.server.local_api_socket` (= /run/sakurasato/local.sock)。
+    /// `--api-url` と排他 ── 同時指定したら `--api-url` 優先。
     #[arg(long, env = "SAKURASATO_SOCKET")]
     socket: Option<PathBuf>,
+
+    /// 接続先 TCP URL (例: `http://127.0.0.1:18080`)。Tailscale 経由で別端末
+    /// から TUI を動かすときに使う (#69)。指定された場合は `--socket` を
+    /// 無視して TCP モードで接続する。
+    #[arg(long, env = "SAKURASATO_API_URL")]
+    api_url: Option<String>,
 
     /// Bearer トークン。プロセス一覧から見えるので `--token-file` 推奨。
     #[arg(long, env = "SAKURASATO_TOKEN", hide_env_values = true)]
@@ -126,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let token = resolve_token(&cli)?;
-    let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
+    let endpoint = resolve_endpoint(&cli)?;
 
     let suppression = resolve_suppression(&cli);
     let theme = match cli.theme_file {
@@ -136,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("load builtin theme `{}`", cli.theme))?,
     };
     let opts = TuiOptions {
-        socket,
+        endpoint,
         token,
         theme,
         page_size: cli.page_size.clamp(1, 80),
@@ -144,6 +152,20 @@ async fn main() -> anyhow::Result<()> {
     };
 
     runtime::run(opts).await
+}
+
+/// `--api-url` 優先、無ければ `--socket` → 既定パスへフォールバック。
+/// `--api-url` は `http://host:port` を期待する (末尾 `/` は削る)。
+fn resolve_endpoint(cli: &Cli) -> anyhow::Result<Endpoint> {
+    if let Some(raw) = &cli.api_url {
+        let base = raw.trim_end_matches('/').to_string();
+        if !(base.starts_with("http://") || base.starts_with("https://")) {
+            anyhow::bail!("--api-url must start with http:// or https:// (got {raw:?})");
+        }
+        return Ok(Endpoint::Tcp { base });
+    }
+    let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
+    Ok(Endpoint::Unix(socket))
 }
 
 fn resolve_token(cli: &Cli) -> anyhow::Result<String> {

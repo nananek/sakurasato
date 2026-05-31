@@ -7,7 +7,7 @@ pub mod model;
 pub mod net_guard;
 pub mod repo;
 
-pub use config::Config;
+pub use config::{Config, Listen};
 
 /// Embed the workspace's `migrations/` directory so it ships with the binary.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
