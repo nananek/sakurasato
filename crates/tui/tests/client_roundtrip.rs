@@ -4,11 +4,6 @@
 //! 1 本立て、固定 JSON を返す薄いハンドラだけ書く。`server` クレートに依存
 //! せず、wire-format の整合性 (Bearer / Accept / JSON body) を確認する。
 
-use std::convert::Infallible;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::Context;
 use bytes::Bytes;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -19,6 +14,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use sakurasato_tui::client::{CreateNoteRequest, Endpoint, LocalApi};
 use serde_json::json;
+use std::convert::Infallible;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex;
 
@@ -124,7 +122,14 @@ async fn spawn_server() -> anyhow::Result<(PathBuf, Arc<CapturedAuth>, ServerGua
     let captured = Arc::new(CapturedAuth::default());
     let listener = UnixListener::bind(&socket).context("bind uds")?;
     let cap_for_task = captured.clone();
+    // **[PR #70 review medium]**: 旧 `sleep(20ms)` を oneshot に置換。
+    // listener は `bind` 後すでに OS backlog 受領可能だが、Tokio task が
+    // accept ループに入ったことを明示同期して race を完全に排除する。
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
+        // accept 直前で ready を送る ── ここまで来れば listener は確実に
+        // tokio リアクタに登録済み。
+        let _ = ready_tx.send(());
         loop {
             let Ok((stream, _addr)) = listener.accept().await else {
                 break;
@@ -140,10 +145,7 @@ async fn spawn_server() -> anyhow::Result<(PathBuf, Arc<CapturedAuth>, ServerGua
             });
         }
     });
-
-    // ソケット readiness 安定化。tokio bind 直後でも accept は OK だが、
-    // CI 環境の小さなずれを吸収する。
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = ready_rx.await;
     Ok((socket, captured, ServerGuard { dir, handle }))
 }
 
@@ -154,7 +156,10 @@ async fn spawn_tcp_server()
     let listener = TcpListener::bind("127.0.0.1:0").await.context("bind tcp")?;
     let addr = listener.local_addr()?;
     let cap_for_task = captured.clone();
+    // UDS 版と同様 oneshot で accept ループ突入を同期する (= sleep 廃止)。
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
+        let _ = ready_tx.send(());
         loop {
             let Ok((stream, _peer)) = listener.accept().await else {
                 break;
@@ -170,7 +175,7 @@ async fn spawn_tcp_server()
             });
         }
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = ready_rx.await;
     Ok((addr, captured, TcpServerGuard { handle }))
 }
 

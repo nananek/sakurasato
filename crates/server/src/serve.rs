@@ -203,8 +203,13 @@ async fn bind_public_unix(path: &std::path::Path) -> anyhow::Result<tokio::net::
     // 0o666: world-rw。Cloudflared 等が別 uid で繋ぐ前提。socket 越しの
     // クライアント認証は不要 (= 公開 AP listener の本質的性質)。volume を
     // compose 内で隔離する設計に任せる。
+    //
+    // **[PR #70 review medium]**: `tokio::fs::set_permissions` (async) を使う。
+    // `std::fs::*` を async 関数内で直接叩くと Tokio スレッドをブロックする。
+    // 1 syscall とはいえ慣習どおり async 経路に揃える。
     let perms = std::fs::Permissions::from_mode(0o666);
-    std::fs::set_permissions(path, perms)
+    tokio::fs::set_permissions(path, perms)
+        .await
         .with_context(|| format!("chmod 0o666 on public socket {}", path.display()))?;
     Ok(listener)
 }

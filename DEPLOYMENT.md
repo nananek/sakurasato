@@ -263,15 +263,30 @@ services:
   server:
     environment:
       # 既定の UDS 経路を捨て、Tailscale 越しに別端末の TUI が直接叩ける TCP に倒す。
-      # ホスト loopback には出さず、コンテナ → tailnet の素直な経路に乗せる。
+      # **container 内 0.0.0.0**: docker bridge 越しに `ports:` で host に
+      # 出すための bind (= container 内 LAN しか開かない、外には出ない)。
       SAKURASATO_SERVER__LOCAL_API_LISTEN: "tcp://0.0.0.0:18080"
     ports:
-      # tailnet ノードからアクセスする host インタフェースに限定 (= ホストの
-      # tailscale0 もしくは 0.0.0.0 + Tailscale ACL)。一般 LAN 公開は避けること。
+      # **重要**: 必ず `127.0.0.1:` を前置する。`"18080:18080"` だと docker が
+      # `0.0.0.0:18080:18080` 扱いで一般 LAN にも漏れる。
+      # 127.0.0.1 に限定すれば host loopback だけに上がり、Tailscale が tailnet
+      # に流す相手はこの loopback ポート (host) になる。
       - "127.0.0.1:18080:18080"
 ```
 
-`tailscale serve` を経由しない場合は、host で `tailscale serve --tcp 18080 tcp://127.0.0.1:18080` を立てるか、もしくは Tailscale ACL でこのポートへの tailnet 内アクセスだけを許可する。TUI 側 (= ノートパソコン等):
+公開経路の選択肢は 2 通り。**いずれも一般 LAN へは出ない構成**にすること:
+
+1. **`tailscale serve` で tailnet HTTPS** ── host で
+   `sudo tailscale serve --tcp 18080 tcp://127.0.0.1:18080` を立て、tailnet
+   ノードから `https://<host>.<tailnet>.ts.net/` で受ける。TLS 終端は Tailscale。
+2. **Tailscale ACL + 直接 TCP** ── host の Tailscale ACL で port 18080 への
+   tailnet 内アクセスだけを許可し、`http://<host>.<tailnet>.ts.net:18080` で
+   接続する。WireGuard が暗号化するため平文 HTTP でも盗聴されない (TUI 側で
+   `--api-url https://` は **未対応**: `crates/tui/src/main.rs::resolve_endpoint`
+   が明示拒否する。理由は TUI に TLS スタックを抱えない設計 ── [PR #70 review])。
+   ACL 設定方針の参考: <https://tailscale.com/kb/1018/acls>
+
+TUI 側 (= ノートパソコン等):
 
 ```bash
 # Tailscale tailnet 内のホスト名 (MagicDNS) で接続
