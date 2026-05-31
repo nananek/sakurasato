@@ -38,6 +38,11 @@ jobs:
           # 利用者は `docker compose pull` で全 3 イメージを取得できる。
           - name: versitygw
             dockerfile: docker/versitygw.Dockerfile
+          # TUI client は server / media-proxy と同じ Rust + distroless 構成。
+          # `docker run --rm -it ghcr.io/.../sakurasato-tui:latest --api-url ...` で
+          # 利用者が手元 (or 別端末) から接続する想定。compose で常駐させるものではない。
+          - name: tui
+            dockerfile: docker/tui.Dockerfile
 
     steps:
       - uses: actions/checkout@v6
