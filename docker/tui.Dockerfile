@@ -12,10 +12,11 @@
 #     --api-url http://sakurasato.tailnet.example.ts.net:8443 \
 #     --token-file /run/secrets/token
 #
-#   # host bind の UDS (default `/run/sakurasato-local/local.sock`):
+#   # host bind の UDS (server 側 socket = `/run/sakurasato-local/local.sock` を
+#   # TUI 既定の `/run/sakurasato/local.sock` にマウントし直す):
 #   docker run --rm -it \
 #     -e TERM \
-#     -v /run/sakurasato-local:/run/sakurasato-local:ro \
+#     -v /run/sakurasato-local:/run/sakurasato:ro \
 #     -v $HOME/.config/sakurasato/token.txt:/run/secrets/token:ro \
 #     ghcr.io/nananek/sakurasato-tui:latest \
 #     --token-file /run/secrets/token
@@ -23,7 +24,15 @@
 # 注意:
 #   - TTY 必須 (`-it`)。`TERM` を環境変数で渡す (Kitty graphics には xterm-kitty 等)。
 #   - TCP 接続時は `--network host` で tailnet IP / 公開ドメインに直接到達するのが楽。
-#   - UDS 接続時はソケットを bind mount で import。
+#     ただし `--network host` は **Linux Docker 専用** ── macOS / Windows
+#     (Docker Desktop) では host network namespace に入れないため、別途
+#     `-p` でポート公開 + `--api-url http://host.docker.internal:...` の構成にする。
+#   - TCP 例の `http://` は tailnet ACL が暗号化を担う前提。**直 IP / 公開
+#     ドメイン経由では必ず HTTPS** を使うこと (TUI の Bearer トークンが
+#     平文で流れないように)。
+#   - UDS 接続時は server 側ソケットを TUI 既定パス (`/run/sakurasato/`) に
+#     bind mount し直す。`--socket /run/sakurasato-local/local.sock` を渡す
+#     代替経路もあるが、デフォルトで動く方を例示する。
 
 # ---- builder ----
 FROM rust:1.96-alpine AS builder
@@ -35,6 +44,11 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY config ./config
+# sakurasato-core が `sqlx::migrate!("../../migrations")` で workspace ルートの
+# migrations/ を build 時に canonicalize するため、TUI 自身は DB を叩かなくても
+# builder stage には migrations/ が必要 (= server.Dockerfile と同じ理由)。
+# runtime stage には migrations/ を COPY しないので image サイズは増えない。
+COPY migrations ./migrations
 COPY .sqlx ./.sqlx
 
 # BuildKit のキャッシュマウントで registry とビルド成果物を温存。
