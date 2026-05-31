@@ -55,6 +55,8 @@ fn make_config() -> sakurasato_core::Config {
             host: LOCAL_HOST.into(),
             bind: "127.0.0.1:0".into(),
             local_api_socket: "/tmp/sakurasato.sock".into(),
+            public_listen: None,
+            local_api_listen: None,
             user: LOCAL_USER.into(),
         },
         database: sakurasato_core::config::DatabaseConfig {

@@ -184,7 +184,14 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml logs -f server
 
 ## 4. Cloudflare Tunnel の設定
 
-ホスト機の `server` コンテナ (`:8080`) を Cloudflare Tunnel に渡す。cloudflared を **同じ compose の追加サービス** として動かすのが楽。
+ホスト機の `server` コンテナを Cloudflare Tunnel に渡す。cloudflared を **同じ compose の追加サービス** として動かすのが楽。
+
+cloudflared の **Service** には 2 経路ある:
+
+- **TCP** (= 既定): `http://server:8080`。compose 内部ネットの DNS で解決される。
+- **UDS** (#69, 推奨): `unix:/run/sakurasato/public.sock`。共有 volume 越しに繋ぐ。host にポートが出ない (= scan / 直接アクセスの表面が消える)。
+
+UDS 経路にする場合は `server` 側で `SAKURASATO_SERVER__PUBLIC_LISTEN=unix:/run/sakurasato/public.sock` を入れ、cloudflared サービスにも同じ volume をマウントする。cloudflared ダッシュボードで Service を `unix:/run/sakurasato/public.sock` に登録すれば動く。
 
 ### 4.1 token を compose secret として注入
 
@@ -245,11 +252,57 @@ actor JSON が返れば連合準備完了。
 
 ## 5. TUI 経路 (Tailscale)
 
-`docker-compose.yml` の `server` サービスは `/run/sakurasato-local/local.sock` を `local_sock` named volume にマウントしている。本体は HTTP (REST + SSE) を喋るが Unix socket 上なので、別端末から叩くには **UDS↔TCP ブリッジコンテナを挟む + tailscale serve で tailnet に HTTPS で出す** 構成が必要。
+別端末から TUI を叩くには **server のローカル API listener を TCP に切替えて Tailscale tailnet に直出し** するのが推奨 (#69 で実装、2026-05 以降)。
+従来の **socat ブリッジ + tailscale serve** 構成 (= 後述 5.2 / 5.3) も互換性のため残すが、新規構築では `local_api_listen` で TCP に倒す方が一手 (= bridge コンテナ + tailscale serve 不要)。
+
+### 5.1 推奨: `local_api_listen` を TCP に倒す (#69)
+
+```yaml
+# docker-compose.override.yml (例)
+services:
+  server:
+    environment:
+      # 既定の UDS 経路を捨て、Tailscale 越しに別端末の TUI が直接叩ける TCP に倒す。
+      # **container 内 0.0.0.0**: docker bridge 越しに `ports:` で host に
+      # 出すための bind (= container 内 LAN しか開かない、外には出ない)。
+      SAKURASATO_SERVER__LOCAL_API_LISTEN: "tcp://0.0.0.0:18080"
+    ports:
+      # **重要**: 必ず `127.0.0.1:` を前置する。`"18080:18080"` だと docker が
+      # `0.0.0.0:18080:18080` 扱いで一般 LAN にも漏れる。
+      # 127.0.0.1 に限定すれば host loopback だけに上がり、Tailscale が tailnet
+      # に流す相手はこの loopback ポート (host) になる。
+      - "127.0.0.1:18080:18080"
+```
+
+公開経路の選択肢は 2 通り。**いずれも一般 LAN へは出ない構成**にすること:
+
+1. **`tailscale serve` で tailnet HTTPS** ── host で
+   `sudo tailscale serve --tcp 18080 tcp://127.0.0.1:18080` を立て、tailnet
+   ノードから `https://<host>.<tailnet>.ts.net/` で受ける。TLS 終端は Tailscale。
+2. **Tailscale ACL + 直接 TCP** ── host の Tailscale ACL で port 18080 への
+   tailnet 内アクセスだけを許可し、`http://<host>.<tailnet>.ts.net:18080` で
+   接続する。WireGuard が暗号化するため平文 HTTP でも盗聴されない (TUI 側で
+   `--api-url https://` は **未対応**: `crates/tui/src/main.rs::resolve_endpoint`
+   が明示拒否する。理由は TUI に TLS スタックを抱えない設計 ── [PR #70 review])。
+   ACL 設定方針の参考: <https://tailscale.com/kb/1018/acls>
+
+TUI 側 (= ノートパソコン等):
+
+```bash
+# Tailscale tailnet 内のホスト名 (MagicDNS) で接続
+sakurasato-tui --api-url http://<host>.<tailnet>.ts.net:18080 \
+  --token-file ~/.config/sakurasato/tui.token
+```
+
+`Authorization: Bearer <token>` ヘッダはそのまま流れ、認証は **Bearer + tailnet ACL** の二重壁。UDS の `chmod 0o600` は使えなくなるが、tailnet 自体が closed network なので安全に差し替えられる。
+
+### 5.2 旧法 (socat ブリッジ + tailscale serve)
+
+UDS 運用を維持したい場合は従来どおりブリッジを噛ます。`docker-compose.yml` の `server` サービスは `/run/sakurasato-local/local.sock` を `local_sock` named volume にマウントしている。本体は HTTP (REST + SSE) を喋るが Unix socket 上なので、別端末から叩くには **UDS↔TCP ブリッジコンテナを挟む + tailscale serve で tailnet に HTTPS で出す** 構成になる。
 
 > Tailscale 自身は UDS をそのまま serve できない (`tailscale serve --tcp <PORT>` は TCP backend 必須)。`tailscale serve --bg /path/to/socket` 系の用法も無いので、必ずブリッジを 1 個挟む。
 
-### 5.1 socat による UDS→TCP ブリッジ
+#### 5.2.1 socat による UDS→TCP ブリッジ
 
 ```yaml
 # docker-compose.tui.yml (例)
@@ -270,7 +323,7 @@ services:
     restart: unless-stopped
 ```
 
-### 5.2 tailscale serve で tailnet に出す
+#### 5.2.2 tailscale serve で tailnet に出す
 
 ```bash
 # ホスト機
@@ -281,7 +334,7 @@ tailscale serve status
 
 これで `https://<host-machine>.<tailnet>.ts.net/` (= MagicDNS が振った名前) で **tailnet 内のノードからだけ** 本体ローカル API に到達できる。`tailscale serve` は外部からは到達不可。`tailscale funnel` (= 公衆公開) は **絶対に使わない** ── ローカル API が外に出る。
 
-### 5.3 トークン発行
+#### 5.2.3 トークン発行
 
 ブリッジ越しでも Bearer 認証は維持される (HTTP ヘッダ素通し)。
 
@@ -292,7 +345,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 
 TUI 側 (= 別端末、ノートパソコン等) は `https://<host>.<tailnet>.ts.net/` + Bearer token を設定して接続する。
 
-### 5.4 代替: SSH で host に入って TUI を local 実行
+#### 5.2.4 代替: SSH で host に入って TUI を local 実行
 
 ブリッジが面倒なら、tailnet 越しに SSH してホストで TUI を直接動かす手もある (= UDS をコンテナ外に晒さないでよい):
 

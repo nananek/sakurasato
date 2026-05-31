@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use sakurasato_tui::TuiOptions;
+use sakurasato_tui::client::Endpoint;
 use sakurasato_tui::runtime;
 use sakurasato_tui::suppression::ImageSuppression;
 use sakurasato_tui::theme::Theme;
@@ -34,8 +35,15 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "sakurasato-tui", version)]
 struct Cli {
     /// 接続先 Unix socket。既定は `config.server.local_api_socket` (= /run/sakurasato/local.sock)。
+    /// `--api-url` と排他 ── 同時指定したら `--api-url` 優先。
     #[arg(long, env = "SAKURASATO_SOCKET")]
     socket: Option<PathBuf>,
+
+    /// 接続先 TCP URL (例: `http://127.0.0.1:18080`)。Tailscale 経由で別端末
+    /// から TUI を動かすときに使う (#69)。指定された場合は `--socket` を
+    /// 無視して TCP モードで接続する。
+    #[arg(long, env = "SAKURASATO_API_URL")]
+    api_url: Option<String>,
 
     /// Bearer トークン。プロセス一覧から見えるので `--token-file` 推奨。
     #[arg(long, env = "SAKURASATO_TOKEN", hide_env_values = true)]
@@ -126,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let token = resolve_token(&cli)?;
-    let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
+    let endpoint = resolve_endpoint(&cli)?;
 
     let suppression = resolve_suppression(&cli);
     let theme = match cli.theme_file {
@@ -136,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("load builtin theme `{}`", cli.theme))?,
     };
     let opts = TuiOptions {
-        socket,
+        endpoint,
         token,
         theme,
         page_size: cli.page_size.clamp(1, 80),
@@ -144,6 +152,31 @@ async fn main() -> anyhow::Result<()> {
     };
 
     runtime::run(opts).await
+}
+
+/// `--api-url` 優先、無ければ `--socket` → 既定パスへフォールバック。
+/// `--api-url` は `http://host:port` を期待する (末尾 `/` は削る)。
+fn resolve_endpoint(cli: &Cli) -> anyhow::Result<Endpoint> {
+    if let Some(raw) = &cli.api_url {
+        let base = raw.trim_end_matches('/').to_string();
+        // **[PR #70 review medium]**: `https://` は明示エラー。hyper-util の
+        // `build_http()` は TLS 非対応で、無音で「平文 https 試行 → connection
+        // error」になる footgun を防ぐ。Tailscale tailnet (= WireGuard) で
+        // 暗号化される前提なので、TUI 側で TLS スタックを抱えない設計。
+        if base.starts_with("https://") {
+            anyhow::bail!(
+                "--api-url https:// is not supported (TUI に TLS スタック無し)。\
+                 Tailscale tailnet 内の http://<host>.<tailnet>.ts.net:<port> を指定し、\
+                 暗号化は WireGuard 層に任せてください"
+            );
+        }
+        if !base.starts_with("http://") {
+            anyhow::bail!("--api-url must start with http:// (got {raw:?})");
+        }
+        return Ok(Endpoint::Tcp { base });
+    }
+    let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
+    Ok(Endpoint::Unix(socket))
 }
 
 fn resolve_token(cli: &Cli) -> anyhow::Result<String> {
@@ -183,4 +216,60 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli_with(api_url: Option<&str>) -> Cli {
+        Cli {
+            socket: None,
+            api_url: api_url.map(str::to_string),
+            token: None,
+            token_file: None,
+            theme: "sakura".into(),
+            theme_file: None,
+            page_size: 40,
+            no_images: false,
+            no_avatars: false,
+            no_attachments: false,
+            no_emojis: false,
+            no_previews: false,
+            no_animations: false,
+            list_themes: false,
+        }
+    }
+
+    #[test]
+    fn resolve_endpoint_accepts_http() {
+        let ep = resolve_endpoint(&cli_with(Some("http://127.0.0.1:18080/"))).unwrap();
+        match ep {
+            Endpoint::Tcp { base } => assert_eq!(base, "http://127.0.0.1:18080"),
+            Endpoint::Unix(_) => panic!("expected Tcp"),
+        }
+    }
+
+    #[test]
+    fn resolve_endpoint_rejects_https_with_explanation() {
+        let err = resolve_endpoint(&cli_with(Some("https://example.test"))).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("https://"), "msg: {msg}");
+        assert!(msg.contains("TLS"), "msg: {msg}");
+    }
+
+    #[test]
+    fn resolve_endpoint_rejects_other_schemes() {
+        let err = resolve_endpoint(&cli_with(Some("ws://example.test"))).unwrap_err();
+        assert!(format!("{err}").contains("http://"));
+    }
+
+    #[test]
+    fn resolve_endpoint_falls_back_to_socket() {
+        let ep = resolve_endpoint(&cli_with(None)).unwrap();
+        match ep {
+            Endpoint::Unix(p) => assert_eq!(p, default_socket_path()),
+            Endpoint::Tcp { .. } => panic!("expected Unix"),
+        }
+    }
 }

@@ -4,11 +4,6 @@
 //! 1 本立て、固定 JSON を返す薄いハンドラだけ書く。`server` クレートに依存
 //! せず、wire-format の整合性 (Bearer / Accept / JSON body) を確認する。
 
-use std::convert::Infallible;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::Context;
 use bytes::Bytes;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -17,9 +12,12 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use sakurasato_tui::client::{CreateNoteRequest, LocalApi};
+use sakurasato_tui::client::{CreateNoteRequest, Endpoint, LocalApi};
 use serde_json::json;
-use tokio::net::UnixListener;
+use std::convert::Infallible;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex;
 
 #[derive(Default)]
@@ -30,7 +28,7 @@ struct CapturedAuth {
 #[tokio::test]
 async fn whoami_passes_bearer_and_parses_response() -> anyhow::Result<()> {
     let (socket, captured, _server) = spawn_server().await?;
-    let api = LocalApi::new(socket.clone(), "secret-token".into());
+    let api = LocalApi::from_socket(socket.clone(), "secret-token".into());
     let whoami = api.whoami().await.context("whoami")?;
     assert_eq!(whoami.preferred_username, "me");
     assert_eq!(whoami.host, "x.test");
@@ -42,7 +40,7 @@ async fn whoami_passes_bearer_and_parses_response() -> anyhow::Result<()> {
 #[tokio::test]
 async fn timeline_home_returns_parsed_notes() -> anyhow::Result<()> {
     let (socket, _captured, _server) = spawn_server().await?;
-    let api = LocalApi::new(socket, "t".into());
+    let api = LocalApi::from_socket(socket, "t".into());
     let resp = api.timeline_home(None, 5).await?;
     assert_eq!(resp.notes.len(), 1);
     assert_eq!(resp.notes[0].content, "hello");
@@ -52,7 +50,7 @@ async fn timeline_home_returns_parsed_notes() -> anyhow::Result<()> {
 #[tokio::test]
 async fn create_note_round_trips() -> anyhow::Result<()> {
     let (socket, _captured, _server) = spawn_server().await?;
-    let api = LocalApi::new(socket, "t".into());
+    let api = LocalApi::from_socket(socket, "t".into());
     let req = CreateNoteRequest {
         content: "ping".into(),
         summary: None,
@@ -68,10 +66,29 @@ async fn create_note_round_trips() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// **#69**: TCP モードでも UDS と同じく Bearer + JSON 往復が成立すること。
+/// Tailscale tailnet 経由で別端末から TUI を動かすケースの回帰テスト。
+#[tokio::test]
+async fn whoami_via_tcp_backend_round_trips() -> anyhow::Result<()> {
+    let (addr, captured, _server) = spawn_tcp_server().await?;
+    let api = LocalApi::new(
+        Endpoint::Tcp {
+            base: format!("http://{addr}"),
+        },
+        "tcp-token".into(),
+    );
+    let whoami = api.whoami().await.context("whoami over tcp")?;
+    assert_eq!(whoami.preferred_username, "me");
+    assert_eq!(whoami.host, "x.test");
+    let auth = captured.inner.lock().await.clone();
+    assert_eq!(auth, Some("Bearer tcp-token".into()));
+    Ok(())
+}
+
 #[tokio::test]
 async fn http_400_is_surfaced_as_status_error() -> anyhow::Result<()> {
     let (socket, _captured, _server) = spawn_server().await?;
-    let api = LocalApi::new(socket, "t".into());
+    let api = LocalApi::from_socket(socket, "t".into());
     // 既知の bad path → 400 を返す。
     let req = CreateNoteRequest {
         content: "BAD".into(),
@@ -105,7 +122,14 @@ async fn spawn_server() -> anyhow::Result<(PathBuf, Arc<CapturedAuth>, ServerGua
     let captured = Arc::new(CapturedAuth::default());
     let listener = UnixListener::bind(&socket).context("bind uds")?;
     let cap_for_task = captured.clone();
+    // **[PR #70 review medium]**: 旧 `sleep(20ms)` を oneshot に置換。
+    // listener は `bind` 後すでに OS backlog 受領可能だが、Tokio task が
+    // accept ループに入ったことを明示同期して race を完全に排除する。
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
+        // accept 直前で ready を送る ── ここまで来れば listener は確実に
+        // tokio リアクタに登録済み。
+        let _ = ready_tx.send(());
         loop {
             let Ok((stream, _addr)) = listener.accept().await else {
                 break;
@@ -121,11 +145,43 @@ async fn spawn_server() -> anyhow::Result<(PathBuf, Arc<CapturedAuth>, ServerGua
             });
         }
     });
-
-    // ソケット readiness 安定化。tokio bind 直後でも accept は OK だが、
-    // CI 環境の小さなずれを吸収する。
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = ready_rx.await;
     Ok((socket, captured, ServerGuard { dir, handle }))
+}
+
+/// `spawn_server` の TCP 版。`127.0.0.1:0` で bind して OS 割当ポートを返す。
+async fn spawn_tcp_server()
+-> anyhow::Result<(std::net::SocketAddr, Arc<CapturedAuth>, TcpServerGuard)> {
+    let captured = Arc::new(CapturedAuth::default());
+    let listener = TcpListener::bind("127.0.0.1:0").await.context("bind tcp")?;
+    let addr = listener.local_addr()?;
+    let cap_for_task = captured.clone();
+    // UDS 版と同様 oneshot で accept ループ突入を同期する (= sleep 廃止)。
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _ = ready_tx.send(());
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                break;
+            };
+            let captured = cap_for_task.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let service =
+                    service_fn(move |req: Request<Incoming>| handle(req, captured.clone()));
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
+            });
+        }
+    });
+    let _ = ready_rx.await;
+    Ok((addr, captured, TcpServerGuard { handle }))
+}
+
+#[allow(dead_code, reason = "JoinHandle を握っておくだけで使わない")]
+struct TcpServerGuard {
+    handle: tokio::task::JoinHandle<()>,
 }
 
 async fn handle(

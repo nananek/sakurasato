@@ -1,20 +1,23 @@
-//! ローカル API クライアント (Unix socket + Bearer + JSON)。
+//! ローカル API クライアント (UDS or TCP + Bearer + JSON)。
 //!
-//! `server::local_api` が `/run/sakurasato/local.sock` に提供する
-//! `/api/v1/{whoami,timeline/home,notes,stream}` を叩く。本クレートは
-//! HTTPS 経由の公開 API は扱わない。
+//! `server::local_api` が提供する `/api/v1/{whoami,timeline/home,notes,stream,...}`
+//! を叩く。本クレートは HTTPS 経由の公開 API は扱わない。
 //!
 //! # 接続
 //!
-//! [`hyperlocal::UnixConnector`] + [`hyper_util::client::legacy::Client`] で
-//! Unix socket 越しに HTTP/1.1。`hyperlocal::Uri::new(socket, path)` で
-//! URI を組み、`Host` ヘッダ相当の authority は "localhost" 固定。
+//! 接続方式は構築時に [`Endpoint`] で選ぶ:
+//!
+//! - **UDS** (`Endpoint::Unix(path)`): [`hyperlocal::UnixConnector`] +
+//!   `hyper_util::client::legacy::Client`。`Host` ヘッダ相当の authority は
+//!   `sakurasato.local` 固定。ホスト同居運用 (= TUI が server と同じマシン)。
+//! - **TCP** (`Endpoint::Tcp(base_url)`): `HttpConnector`。Tailscale tailnet
+//!   越しに別端末から TUI を動かすケース用 (#69)。
 //!
 //! # 認証
 //!
-//! すべてのリクエストに `Authorization: Bearer <token>` を付与する。
-//! ソケット側で 0o600 (`server::local_api::bind_socket`) が掛かるので、
-//! 同 UID プロセスでないとそもそも繋がらない。
+//! すべてのリクエストに `Authorization: Bearer <token>` を付与する。UDS なら
+//! socket 0o600 + Bearer の二重壁、TCP なら Bearer + tailnet ACL (= Tailscale
+//! 側のアクセス制御) の二重壁。
 //!
 //! # エラー
 //!
@@ -30,12 +33,14 @@ use http::{Method, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use hyperlocal::{UnixClientExt, UnixConnector, Uri as UnixUri};
 use serde::{Deserialize, Serialize};
 
-/// Auth / Host のための固定 authority。Unix socket の場合 hyper は authority
-/// を要求するが実際には DNS 解決されないので何でもよい。
-const AUTHORITY: &str = "sakurasato.local";
+/// Auth / Host のための固定 authority (UDS 時)。Unix socket の場合 hyper は
+/// authority を要求するが実際には DNS 解決されないので何でもよい。
+const UNIX_AUTHORITY: &str = "sakurasato.local";
 
 /// 1 リクエスト全体のタイムアウト。TUI 内でハングしないように低めに切る。
 /// SSE はこの上限を適用しない (= 別経路で長時間維持)。
@@ -45,12 +50,41 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// を想定し、攻撃的な誤動作対策で 4 MiB に上限を切る。
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
+/// クライアントの接続先指定。`LocalApi::new` に渡す。
+///
+/// TOML の `server.local_api_listen` URI と 1 対 1 で対応するが、CLI 側で
+/// 別途構築する (TUI は `--socket` または `--api-url` で受ける)。
+#[derive(Debug, Clone)]
+pub enum Endpoint {
+    /// Unix domain socket への接続。`PathBuf` は server 側 listener と同じパス。
+    Unix(PathBuf),
+    /// TCP HTTP origin への接続。`base` は `http://host:port` 形式 (末尾 `/` 無し)。
+    Tcp { base: String },
+}
+
+impl Endpoint {
+    /// 診断ログ / エラーメッセージ向けの表示文字列。
+    pub fn display(&self) -> String {
+        match self {
+            Self::Unix(p) => format!("unix:{}", p.display()),
+            Self::Tcp { base } => base.clone(),
+        }
+    }
+}
+
 /// 共有可能なローカル API クライアント。`Clone` 可で各 task が安全に使える。
 #[derive(Debug, Clone)]
 pub struct LocalApi {
-    inner: Client<UnixConnector, Full<Bytes>>,
-    socket: PathBuf,
+    backend: Backend,
+    endpoint: Endpoint,
     token: String,
+}
+
+/// 内部で hyper クライアントを transport 別に保持する。
+#[derive(Debug, Clone)]
+enum Backend {
+    Unix(Client<UnixConnector, Full<Bytes>>),
+    Tcp(Client<HttpConnector, Full<Bytes>>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -68,24 +102,44 @@ pub enum ApiError {
 }
 
 impl LocalApi {
-    /// 新しいクライアントを構築する。`socket` は実際の Unix socket パス
-    /// (例: `/run/sakurasato/local.sock`)、`token` は Bearer トークン。
+    /// 新しいクライアントを構築する。`endpoint` で UDS / TCP を選び、`token`
+    /// は Bearer トークン。
     ///
     /// 空トークンは構築自体は通すが、最初の認証付きリクエストで `server::token`
     /// の SHA-256 lookup が空文字に対しても比較するため 401 を返す。CLI 側
     /// (`main.rs`) で `resolve_token` がそもそも空文字を弾くので、
     /// ここでは追加検査しない。
-    pub fn new(socket: PathBuf, token: String) -> Self {
+    pub fn new(endpoint: Endpoint, token: String) -> Self {
+        let backend = match &endpoint {
+            Endpoint::Unix(_) => Backend::Unix(Client::unix()),
+            Endpoint::Tcp { .. } => {
+                Backend::Tcp(Client::builder(TokioExecutor::new()).build_http())
+            }
+        };
         Self {
-            inner: Client::unix(),
-            socket,
+            backend,
+            endpoint,
             token,
         }
     }
 
-    /// 接続先 socket。診断ログ用。
-    pub fn socket(&self) -> &Path {
-        &self.socket
+    /// 後方互換用ショートカット: UDS パスから構築。既存呼び出し元を一気に
+    /// 書き換えずに済むよう残してある。
+    pub fn from_socket(socket: PathBuf, token: String) -> Self {
+        Self::new(Endpoint::Unix(socket), token)
+    }
+
+    /// 接続先 socket (UDS 時のみ)。診断ログ用。TCP のときは `None`。
+    pub fn socket(&self) -> Option<&Path> {
+        match &self.endpoint {
+            Endpoint::Unix(p) => Some(p.as_path()),
+            Endpoint::Tcp { .. } => None,
+        }
+    }
+
+    /// 診断ログ向け表示文字列 (UDS / TCP どちらにも対応)。
+    pub fn endpoint_display(&self) -> String {
+        self.endpoint.display()
     }
 
     /// `GET /api/v1/whoami`
@@ -254,8 +308,7 @@ impl LocalApi {
             .map_err(|e| ApiError::Transport(e.to_string()))?;
         // SSE は長時間維持なので REQUEST_TIMEOUT を適用しない。
         let resp = self
-            .inner
-            .request(request)
+            .raw_request(request)
             .await
             .map_err(|e| ApiError::Transport(e.to_string()))?;
         if !resp.status().is_success() {
@@ -280,12 +333,27 @@ impl LocalApi {
         method: Method,
         path: &str,
     ) -> Result<http::request::Builder, ApiError> {
-        let uri: http::Uri = UnixUri::new(&self.socket, path).into();
+        let (uri, host_header) = match &self.endpoint {
+            Endpoint::Unix(socket) => {
+                let uri: http::Uri = UnixUri::new(socket, path).into();
+                (uri, UNIX_AUTHORITY.to_string())
+            }
+            Endpoint::Tcp { base } => {
+                let raw = format!("{base}{path}");
+                let uri: http::Uri = raw.parse().map_err(|e: http::uri::InvalidUri| {
+                    ApiError::Transport(format!("invalid TCP URI {raw:?}: {e}"))
+                })?;
+                let host = uri
+                    .authority()
+                    .map_or_else(|| UNIX_AUTHORITY.to_string(), |a| a.as_str().to_string());
+                (uri, host)
+            }
+        };
         let bearer = format!("Bearer {}", self.token);
         Ok(Request::builder()
             .method(method)
             .uri(uri)
-            .header(http::header::HOST, AUTHORITY)
+            .header(http::header::HOST, host_header)
             .header(AUTHORIZATION, http::HeaderValue::from_str(&bearer)?))
     }
 
@@ -293,11 +361,23 @@ impl LocalApi {
         &self,
         request: Request<Full<Bytes>>,
     ) -> Result<hyper::Response<Incoming>, ApiError> {
-        let fut = self.inner.request(request);
+        let fut = self.raw_request(request);
         match tokio::time::timeout(REQUEST_TIMEOUT, fut).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => Err(ApiError::Transport(e.to_string())),
             Err(_) => Err(ApiError::Timeout(REQUEST_TIMEOUT)),
+        }
+    }
+
+    /// `Backend` 越しに raw `request` を撃つ薄いヘルパ。`send` (タイムアウト
+    /// 付き) と `open_stream` (タイムアウト無し) の両方から呼ぶ。
+    async fn raw_request(
+        &self,
+        request: Request<Full<Bytes>>,
+    ) -> Result<hyper::Response<Incoming>, hyper_util::client::legacy::Error> {
+        match &self.backend {
+            Backend::Unix(client) => client.request(request).await,
+            Backend::Tcp(client) => client.request(request).await,
         }
     }
 }

@@ -69,22 +69,23 @@ enum UploadOutcome {
 
 /// メイン関数。`main.rs` から呼ぶ唯一のエントリ。
 pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
-    let api = LocalApi::new(options.socket.clone(), options.token.clone());
+    let api = LocalApi::new(options.endpoint.clone(), options.token.clone());
 
     // whoami は接続テストも兼ねる。失敗したらここで abort して main にエラーを
     // 返す ── 端末はまだ raw mode に入っていないので追加の cleanup 不要。
+    let endpoint_label = api.endpoint_display();
     let whoami = api
         .whoami()
         .await
-        .with_context(|| format!("whoami via {}", api.socket().display()))?;
+        .with_context(|| format!("whoami via {endpoint_label}"))?;
     info!(
         ap_id = %whoami.ap_id,
         user = %whoami.preferred_username,
-        socket = %api.socket().display(),
+        endpoint = %endpoint_label,
         "TUI: connected to local API"
     );
 
-    let socket_label = api.socket().display().to_string();
+    let socket_label = endpoint_label;
 
     // Picker は端末を実際に問い合わせる (escape sequence 送出 → 応答待ち)。
     // alt screen / raw mode に切り替える **前** に呼ぶのが穏当 ── 失敗しても
