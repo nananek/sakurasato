@@ -21,6 +21,8 @@ mod tests {
         // 0007 actor_ed25519 (M3b: デュアル鍵)
         // 0008 api_token (M4: ローカル API Bearer 認証)
         // 0009 media (M7: アップロードメディアのメタデータ)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 9);
+        // 0010 note_edited_at (M11: Update Note 受信時刻)
+        // 0011 announce (M11: Boost 受信)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 11);
     }
 }

@@ -1,10 +1,11 @@
 //! 受信した Activity の dispatch。
 //!
 //! `extract::SignedInboxBody` で署名検証を通過した body を JSON としてパースし、
-//! `type` ごとに `handler::*` / `reaction::*` / `move_handler::*` に振る。
-//! M3b-3 PR2 で Follow / Accept / Reject を、M8 PR2 で `Like` / `EmojiReact` /
-//! `Undo` を、M9 で `Move` を実装した。`Create`/`Note` / `Announce` / `Update` /
-//! `Delete` は後続 PR で順次対応する。
+//! `type` ごとに `handler::*` / `reaction::*` / `move_handler::*` / `note::*` /
+//! `delete::*` / `update::*` / `announce::*` に振る。M3b-3 PR2 で Follow /
+//! Accept / Reject を、M8 PR2 で `Like` / `EmojiReact` / `Undo` を、M9 で
+//! `Move` を、M11 で `Create`/`Note` / `Delete` / `Update` / `Announce` の
+//! 受信を実装した (= inbox dispatch 完全化)。
 //!
 //! ## F3: Activity body actor と署名者の一致 (PR #19 で挙がった必須項目)
 //!
@@ -21,13 +22,17 @@ use axum::response::{IntoResponse, Response};
 use sakurasato_core::model::ActorRow;
 use serde_json::Value as JsonValue;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::state::AppState;
 
+pub(crate) mod announce;
+pub(crate) mod delete;
 pub(crate) mod handler;
 pub(crate) mod move_handler;
+pub(crate) mod note;
 pub(crate) mod reaction;
+pub(crate) mod update;
 
 /// dispatch エラー → HTTP レスポンス変換。署名検証 [`crate::sign::SigError`]
 /// と同様に、検証失敗の詳細は body に書き戻さず汎用文言を返す。
@@ -223,22 +228,92 @@ pub(crate) async fn dispatch(
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
         "Undo" => {
-            reaction::handle_undo(state, signer, &activity).await?;
+            dispatch_undo(state, signer, &activity).await?;
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
         "Move" => {
             move_handler::handle_move(state, signer, &activity).await?;
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
+        "Create" => {
+            note::handle_create(state, signer, &activity).await?;
+            Ok((StatusCode::ACCEPTED, "accepted").into_response())
+        }
+        "Delete" => {
+            delete::handle_delete(state, signer, &activity).await?;
+            Ok((StatusCode::ACCEPTED, "accepted").into_response())
+        }
+        "Update" => {
+            update::handle_update(state, signer, &activity).await?;
+            Ok((StatusCode::ACCEPTED, "accepted").into_response())
+        }
+        "Announce" => {
+            announce::handle_announce(state, signer, &activity).await?;
+            Ok((StatusCode::ACCEPTED, "accepted").into_response())
+        }
         other => {
-            info!(
+            // M11 完了時点で AS2 の中で我々がまだ実装していないのは Add /
+            // Remove / Block / Flag / Question / Read / View など低頻度な
+            // もののみ。連合相手の retry ループに乗らないよう 202 で受け流す。
+            // info ではなく debug に下げて、通常運用ログでは雑音にしない
+            // (= 統計を見たい場合は RUST_LOG=debug で拾う)。
+            debug!(
                 activity_type = other,
                 signer = %signer.ap_id,
-                "inbox dispatch: unsupported activity type accepted (no-op)",
+                "inbox dispatch: activity type not handled (silently accepted)",
             );
-            Ok((StatusCode::ACCEPTED, "accepted; type not yet handled").into_response())
+            Ok((StatusCode::ACCEPTED, "accepted; type not handled").into_response())
         }
     }
+}
+
+/// `Undo` activity の sub-dispatcher。`object.type` (inline) を見て
+/// Like/EmojiReact → [`reaction::handle_undo`]、Announce →
+/// [`announce::handle_undo_announce`] に振る。`object` が URI 文字列のみ
+/// (= inline 無し) の場合は `reaction` と `announce` の両テーブルを順に
+/// 探して、見つかった側を消す。
+///
+/// Follow の Undo (= remote 側からのフォロー解除) は本 PR ではまだ未対応。
+/// 必要になった時点で `handler::handle_undo_follow` を生やす。
+async fn dispatch_undo(
+    state: &AppState,
+    signer: &ActorRow,
+    activity: &JsonValue,
+) -> Result<(), DispatchError> {
+    let Some(obj) = activity.get("object") else {
+        return Err(DispatchError::Malformed("Undo has no `object`".into()));
+    };
+
+    // inline object — type を見て分岐できる。
+    if let JsonValue::Object(map) = obj
+        && let Some(t) = map.get("type").and_then(JsonValue::as_str)
+    {
+        if t.eq_ignore_ascii_case("Announce") {
+            let target = map
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| DispatchError::Malformed("Undo.object has no string `id`".into()))?;
+            return announce::handle_undo_announce(state, signer, target).await;
+        }
+        if t.eq_ignore_ascii_case("Like") || t.eq_ignore_ascii_case("EmojiReact") {
+            return reaction::handle_undo(state, signer, activity).await;
+        }
+        // 未対応 inline type は `reaction` 経路 (ap_id を URI として扱う) に
+        // 渡してみる ── reaction テーブルに無ければ silent no-op。
+    }
+
+    // URI のみ (= type 無し)。announce → reaction の順に lookup する。
+    // `is_some()` で十分 ── `handle_undo_announce` が内部で再 fetch する
+    // ([[m11-pr-review]] minor 2)。
+    let target = extract_object_uri(activity)?.to_string();
+    if sakurasato_core::repo::announce::get_by_ap_id(state.pool(), &target)
+        .await
+        .map_err(|e| DispatchError::Internal(e.into()))?
+        .is_some()
+    {
+        return announce::handle_undo_announce(state, signer, &target).await;
+    }
+    reaction::handle_undo(state, signer, activity).await
 }
 
 /// `ActivityPub` Activity body から `id` (= `ap_id`) を取り出す。

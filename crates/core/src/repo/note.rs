@@ -56,7 +56,7 @@ where
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, created_at, updated_at
+            is_local, url, published_at, edited_at, created_at, updated_at
         "#,
         new.ap_id,
         new.actor_id,
@@ -77,6 +77,63 @@ where
     )
     .fetch_one(executor)
     .await
+}
+
+/// Update content / summary / `edited_at` on an existing note. Returns the
+/// updated row, or `Ok(None)` if `ap_id` matched no row. Used by the
+/// inbound `Update`/`Note` dispatcher (M11) — only the editable fields are
+/// touched, the rest (visibility, attachments, etc.) stays as the original.
+///
+/// The caller is responsible for verifying that the editor is the original
+/// author (`note.actor_id == signer.id`) before invoking this.
+pub async fn update_content<'e, E>(
+    executor: E,
+    ap_id: &str,
+    content: &str,
+    summary: Option<&str>,
+    edited_at: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<Option<NoteRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as!(
+        NoteRow,
+        r#"
+        UPDATE note
+        SET content = $1,
+            summary = $2,
+            edited_at = $3,
+            updated_at = now()
+        WHERE ap_id = $4
+        RETURNING
+            id, ap_id, actor_id, content, language, in_reply_to_ap_id,
+            in_reply_to_note_id, summary, visibility, sensitive,
+            to_recipients as "to_recipients: Json<Vec<String>>",
+            cc_recipients as "cc_recipients: Json<Vec<String>>",
+            attachments as "attachments: Json<JsonValue>",
+            tags as "tags: Json<JsonValue>",
+            is_local, url, published_at, edited_at, created_at, updated_at
+        "#,
+        content,
+        summary,
+        edited_at,
+        ap_id,
+    )
+    .fetch_optional(executor)
+    .await
+}
+
+/// Delete a note row by AP id. Returns the number of rows deleted (0 if
+/// no row matched — used by the inbound `Delete` dispatcher for the
+/// "we never had it" no-op case).
+pub async fn delete_by_ap_id<'e, E>(executor: E, ap_id: &str) -> sqlx::Result<u64>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query!("DELETE FROM note WHERE ap_id = $1", ap_id)
+        .execute(executor)
+        .await
+        .map(|r| r.rows_affected())
 }
 
 /// Insert 後に `ap_id` と `url` を「実 id を埋めた canonical URL」に書き
@@ -119,7 +176,7 @@ where
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, created_at, updated_at
+            is_local, url, published_at, edited_at, created_at, updated_at
         FROM note WHERE ap_id = $1
         "#,
         ap_id,
@@ -156,7 +213,7 @@ pub async fn list_home_timeline(
             n.cc_recipients as "cc_recipients: Json<Vec<String>>",
             n.attachments as "attachments: Json<JsonValue>",
             n.tags as "tags: Json<JsonValue>",
-            n.is_local, n.url, n.published_at, n.created_at, n.updated_at,
+            n.is_local, n.url, n.published_at, n.edited_at, n.created_at, n.updated_at,
             a.ap_id AS actor_ap_id,
             a.preferred_username AS actor_preferred_username,
             a.display_name AS actor_display_name,
@@ -206,6 +263,8 @@ pub struct TimelineEntry {
     pub is_local: bool,
     pub url: Option<String>,
     pub published_at: DateTime<Utc>,
+    /// M11: `Update`/`Note` 受領で動く編集時刻。初回は `None`。
+    pub edited_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub actor_ap_id: String,
@@ -228,7 +287,7 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> 
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, created_at, updated_at
+            is_local, url, published_at, edited_at, created_at, updated_at
         FROM note WHERE id = $1
         "#,
         id,

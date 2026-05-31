@@ -282,12 +282,18 @@ fn now_http_date() -> String {
 /// 検証成功 → dispatch でも 202 で受理されるよう、F3 ([`crate::dispatch::verify_body_actor`])
 /// を満たす最小 body を組み立てる。
 ///
-/// `type` は M3b-3 PR2 で未実装の `Announce` を使う ── dispatch の default
-/// アームに落ちて handler を経由せず 202 で返るので、local actor の seed が
-/// 不要 (= ここでのテストはあくまで「署名検証が通って handler に届く」だけ
+/// `type` は本リポジトリで **handler 未実装** の AS2 verb (`View`) を使う ──
+/// dispatch の default アームに落ちて handler を経由せず 202 で返るので、
+/// local actor / follow / note の seed や `id` / `object` フィールドが不要
+/// (= ここでのテストはあくまで「署名検証が通って dispatch 入口に届く」だけ
 /// を確認する)。
+///
+/// 当初は `Announce` を使っていたが、M11 で Announce にも実 handler が
+/// 付いたため、`extract_activity_id` の missing-id reject (400) で落ちる
+/// ようになった。fallback アームに残るのは `Add` / `Remove` / `Block` /
+/// `Flag` / `Read` / `Question` / `View` 等の低頻度 verb。
 fn minimal_body_for(signer_ap_id: &str) -> Vec<u8> {
-    format!(r#"{{"type":"Announce","actor":"{signer_ap_id}"}}"#).into_bytes()
+    format!(r#"{{"type":"View","actor":"{signer_ap_id}"}}"#).into_bytes()
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

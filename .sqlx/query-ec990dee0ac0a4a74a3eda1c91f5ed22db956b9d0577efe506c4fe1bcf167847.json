@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM announce WHERE ap_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ec990dee0ac0a4a74a3eda1c91f5ed22db956b9d0577efe506c4fe1bcf167847"
+}

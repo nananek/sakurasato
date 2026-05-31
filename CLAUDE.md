@@ -106,10 +106,11 @@ sakurasato/
   - `/users/<name>`（actor JSON）, `/inbox`（共有 inbox）, `/users/<name>/inbox`, `/users/<name>/outbox`
   - HTTP 署名検証は `activitypub_federation` に委譲。
 - **アウトバウンド**: 配送キューを Postgres に永続化し、tokio ワーカーで**指数バックオフ・リトライ**送出。
-- **対応アクティビティ** (M1〜M10 完了時点):
-  - **受信実装済み**: `Follow` / `Accept` / `Reject` (M3), `Like` / `EmojiReact` (M8), `Undo` (M8、Reaction の取り消しのみ), **`Move`(`movedTo`/`alsoKnownAs`)** (M9)。
+- **対応アクティビティ** (M11 完了時点 = inbox dispatch 完全化):
+  - **受信実装済み**: `Follow` / `Accept` / `Reject` (M3), `Like` / `EmojiReact` (M8), `Undo` (M8 Reaction + M11 Announce), **`Move`(`movedTo`/`alsoKnownAs`)** (M9), **`Create`/`Note`** (M11 ── followee 投稿 + 我々宛 mention/reply のみ取り込み)、**`Delete`** (M11 ── 既知 Note の author 削除を反映)、**`Update`** (M11 ── Actor は [`crate::remote_actor::fetch_and_upsert`] 再走、Note は content/summary/`edited_at` 上書き)、**`Announce`** (M11 ── followee の boost を既知 Note にのみ記録)。
   - **送出実装済み**: `Create`/`Note` (M3), `Follow` / `Accept` (M3), `Like` / `EmojiReact` / `Undo` (M8), 自身の `Move` 送出 (M9)。
-  - **受信未実装 ([#55](https://github.com/nananek/sakurasato/issues/55) で対応予定)**: `Create`/`Note` (他人の投稿), `Update` (Actor / Note 更新), `Delete` (リモート削除), `Announce` (Boost)。これらは [`crates/server/src/dispatch.rs`](crates/server/src/dispatch.rs) の match arm の `_ =>` fallback で `202 ACCEPTED` を返した上で **silently ignored** される。連合相手側の再送ループを起こさないための暫定挙動であり、TUI には**他人の Note は流れてこない / 相手の削除も反映されない**。長期解は [#55](https://github.com/nananek/sakurasato/issues/55)。短期の現状記述は [#57](https://github.com/nananek/sakurasato/issues/57)。
+  - **未対応 (低頻度・将来作業)**: `Add` / `Remove` / `Block` / `Flag` / `Question` / `Read` / `View` 等。`crates/server/src/dispatch.rs` の `_ =>` fallback で `202 ACCEPTED` を返した上で debug ログのみ残す (連合相手の再送ループ抑止)。
+  - **M11 受信側の意図的スコープ外**: (a) Announce 受信時の未知 Note の自動 fetch ── 他人の boost で見知らぬ note を引き込まないため debug ログのみ。(b) Follow の Undo (= remote 側からのフォロー解除) ── 必要になった時点で `handler::handle_undo_follow` を生やす。
 - **Actor 構成**: 単一ユーザー actor ＋ `instance.actor`(application actor, 必要に応じて生成)。
 - **ローカル API（server ⇄ tui）**: Unix ドメインソケット上の REST + SSE（タイムライン購読）。お一人様前提でソケットのファイルパーミッションが認証境界。トークン発行は CLI から可能。**メディアアップロード**エンドポイント（アイコン/ヘッダ/添付）を持ち、受領後 media-proxy でサニタイズ・変換 → versitygw 格納 → メタデータを DB 登録。
 - **最小 Web UI**: 投稿のパーマリンク（AP Note を人間可読 HTML で）、WebFinger/NodeInfo/actor JSON、メディア配信エンドポイント `GET /media/<key>`（versitygw から取得して配信。versitygw 自体は非公開）。
