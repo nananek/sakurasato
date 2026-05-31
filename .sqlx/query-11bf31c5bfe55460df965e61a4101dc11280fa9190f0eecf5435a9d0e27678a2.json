@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tags FROM note WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tags",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "tags"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "11bf31c5bfe55460df965e61a4101dc11280fa9190f0eecf5435a9d0e27678a2"
+}
