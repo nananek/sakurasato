@@ -29,11 +29,14 @@
 //!
 //! `--no-images` は **全要素を一括 off** にするキルスイッチとして残す。
 //! `--no-avatars` / `--no-attachments` / `--no-emojis` / `--no-previews`
-//! / `--no-animations` で個別にも切れる。`--no-images` と細粒度フラグの
-//! 両方が指定されたら細粒度フラグの方が優先 (= `--no-images --avatars`
-//! は実装上 `--no-images` 経由で off にしてから `--avatars` で戻す感覚)。
-//! ── 単純化のため、現在は「`--no-images` の後に個別 `--*-on` フラグは
-//! 提供しない」運用にする。必要になったら追加する。
+//! / `--no-animations` で個別にも切れる。`--no-images` と細粒度フラグが
+//! 同時指定された場合は **`--no-images` が最優先で全要素 off** に倒し、
+//! 個別 `--no-*` は (どのみち off になるので) 評価しない。「一括 off の後に
+//! 個別 on で戻す」用途は `--*-on` フラグを提供せず、ランタイムの `i`
+//! overlay (キーバインド `*`) で復帰させる設計にしている ── ただし起動時
+//! に全要素 off で来た場合は Picker が None で固定されるため、ランタイム
+//! 復帰でも実際の画像描画は出ない (M9 PR2 review Finding 3 で明示の警告
+//! メッセージを出すよう改修済)。
 
 use serde::Deserialize;
 
@@ -88,9 +91,15 @@ impl ImageSuppression {
 
     /// どれか 1 つでも有効なら `true`。Picker 取得自体は (= 端末問い合わせ
     /// による初期化コスト) どれか 1 要素でも使う場合だけ走らせたい。
+    ///
+    /// `animation` も含めて 5 要素すべてを OR で見る ── `disable_all()` /
+    /// `all_off()` が animation も触る以上、`any_enabled()` も対称的に判定
+    /// しないと「`--no-avatars --no-attachments --no-emojis --no-previews`
+    /// だけで起動 → animation=true なのに `any_enabled()=false` で Picker 未
+    /// 初期化」のサイレント不整合を起こす ([[m9-pr2-review]] Finding 2)。
     #[must_use]
     pub const fn any_enabled(&self) -> bool {
-        self.avatar || self.attachment || self.emoji || self.preview
+        self.avatar || self.attachment || self.emoji || self.preview || self.animation
     }
 
     /// `--no-images` のような単一フラグ → 全要素 off に倒す。
@@ -191,6 +200,21 @@ mod tests {
         assert!(s.is_on(Element::Attachment));
         s.toggle(Element::Avatar);
         assert!(s.is_on(Element::Avatar));
+    }
+
+    #[test]
+    fn any_enabled_includes_animation_field() {
+        // [[m9-pr2-review]] Finding 2 回帰: avatar/attachment/emoji/preview を
+        // 全部 off にしても animation だけ on なら any_enabled は true で
+        // ないと Picker 初期化スキップでサイレント壊れる。
+        let s = ImageSuppression {
+            avatar: false,
+            attachment: false,
+            emoji: false,
+            preview: false,
+            animation: true,
+        };
+        assert!(s.any_enabled());
     }
 
     #[test]

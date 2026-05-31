@@ -751,7 +751,7 @@ fn render_suppression_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  j/k=move  space=toggle  !=all off  Esc=close",
+        "  j/k=move  space=toggle  !=all off  *=all on  Esc=close",
         Style::default().fg(palette.muted),
     )));
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });

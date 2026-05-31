@@ -109,7 +109,7 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
             }
         }
     } else {
-        info!("TUI: all image elements suppressed (--no-images); skipping picker query");
+        info!("TUI: all image elements suppressed; skipping picker query");
         None
     };
     // M6: 画像取得は LocalApi 経由で server → media-proxy に委譲する。
@@ -481,11 +481,17 @@ async fn apply_action(
         }
         Action::SuppressionEnableAll => {
             app.suppression = crate::suppression::ImageSuppression::all_on();
-            app.set_status(
-                "all image elements enabled",
-                StatusKind::Info,
-                Some(Duration::from_secs(2)),
-            );
+            // [[m9-pr2-review]] Finding 3: 起動時に `any_enabled()=false` だと
+            // Picker は `None` のままで再初期化できない (ratatui-image の
+            // Picker は端末問い合わせを mid-runtime に再実行できない設計)。
+            // ユーザに偽の "enabled" メッセージを返さないよう、現在の
+            // ImageCache 状態を見て status の文面を切り替える。
+            let msg = if app.images.enabled() {
+                "all image elements enabled"
+            } else {
+                "suppression flags cleared (restart to enable images)"
+            };
+            app.set_status(msg, StatusKind::Info, Some(Duration::from_secs(3)));
         }
     }
 }
@@ -786,6 +792,17 @@ fn handle_upload_outcome(app: &mut App, outcome: UploadOutcome) {
 }
 
 fn handle_click(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
+    // [[m9-pr2-review]] Finding 1: overlay 系 focus (Suppression / Picker /
+    // ReactionPrompt) の最中は背後パネルへの hit test を抜けさせない ──
+    // クリックでサイレントに overlay が閉じてしまい、背後のノートが選択
+    // されたり compose にフォーカスが奪われるのを防ぐ。Help は overlay 中の
+    // クリックで明示的に閉じる従来挙動を維持 (既存テストの依存)。
+    if matches!(
+        app.focus,
+        Focus::Suppression | Focus::Picker | Focus::ReactionPrompt,
+    ) {
+        return;
+    }
     if let Some(help_rect) = rects.help
         && rect_contains(help_rect, col, row)
     {
@@ -931,6 +948,51 @@ mod tests {
         assert_eq!(next_theme(&dark), "light");
         let light = Theme::builtin("light").unwrap();
         assert_eq!(next_theme(&light), "sakura");
+    }
+
+    fn make_test_app() -> App {
+        use crate::client::Whoami;
+        use crate::image_cache::ImageCache;
+        use crate::suppression::ImageSuppression;
+        App::new(
+            Theme::default(),
+            Whoami {
+                ap_id: "https://x.test/users/me".into(),
+                preferred_username: "me".into(),
+                host: "x.test".into(),
+                display_name: None,
+                summary: None,
+                icon_url: None,
+                image_url: None,
+                inbox: "https://x.test/users/me/inbox".into(),
+                outbox: None,
+            },
+            "test".into(),
+            ImageCache::new(None, None),
+            crate::preview::PreviewCache::new(None),
+            ImageSuppression::default(),
+        )
+    }
+
+    #[test]
+    fn click_in_overlay_focus_is_ignored() {
+        // [[m9-pr2-review]] Finding 1: Suppression / Picker / ReactionPrompt
+        // が開いている間のクリックは背後パネルへ抜けない (= overlay が
+        // サイレントに閉じてノートが選択される事故を防ぐ)。
+        let mut app = make_test_app();
+        let rects = ui::PanelRects {
+            timeline: ratatui::layout::Rect::new(0, 0, 80, 24),
+            compose: ratatui::layout::Rect::new(0, 24, 80, 5),
+            ..ui::PanelRects::default()
+        };
+        for focus in [Focus::Suppression, Focus::Picker, Focus::ReactionPrompt] {
+            app.focus = focus;
+            handle_click(&mut app, &rects, 10, 5);
+            assert_eq!(
+                app.focus, focus,
+                "click in {focus:?} focus must not change focus"
+            );
+        }
     }
 
     #[test]
