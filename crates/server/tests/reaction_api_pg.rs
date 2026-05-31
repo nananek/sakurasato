@@ -419,3 +419,306 @@ async fn create_reaction_unknown_note_returns_404(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// M9 着手前 reaction outbound 改善 (#1 note 作者 inbox / #2 Undo inline /
+// #3 _misskey_reaction 併載) のリグレッション。
+// ────────────────────────────────────────────────────────────────────────
+
+/// 単体テスト用の remote actor を 1 体作る。`shared_inbox_url` を持つ
+/// (= 配送圧縮対象)。
+fn sample_remote_actor(username: &str, host: &str) -> repo::actor::NewActor {
+    let ap_id = format!("https://{host}/users/{username}");
+    repo::actor::NewActor {
+        ap_id: ap_id.clone(),
+        preferred_username: username.into(),
+        host: host.into(),
+        display_name: Some(username.into()),
+        summary: None,
+        icon_url: None,
+        image_url: None,
+        inbox_url: format!("{ap_id}/inbox"),
+        shared_inbox_url: Some(format!("https://{host}/inbox")),
+        outbox_url: Some(format!("{ap_id}/outbox")),
+        followers_url: Some(format!("{ap_id}/followers")),
+        following_url: Some(format!("{ap_id}/following")),
+        public_key_id: format!("{ap_id}#main-key"),
+        public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----".into(),
+        private_key_pem: None,
+        ed25519_public_key_id: None,
+        ed25519_public_key_pem: None,
+        ed25519_private_key_pem: None,
+        also_known_as: vec![],
+        moved_to_ap_id: None,
+        is_local: false,
+        actor_type: "Person".into(),
+    }
+}
+
+async fn seed_remote_note(pool: &PgPool, actor_id: i64, ap_id: &str) -> i64 {
+    let inserted = repo::note::insert(
+        pool,
+        repo::note::NewNote {
+            ap_id: ap_id.into(),
+            actor_id,
+            content: "hi".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: false,
+            url: Some(ap_id.into()),
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    inserted.id
+}
+
+#[allow(clippy::similar_names)] // follower_id / followed_id は AP 用語
+async fn accepted_follow(pool: &PgPool, follower_id: i64, followed_id: i64) {
+    let row = repo::follow::insert_pending(
+        pool,
+        &format!("https://example.test/follows/{follower_id}-{followed_id}"),
+        follower_id,
+        followed_id,
+    )
+    .await
+    .unwrap();
+    repo::follow::set_state(pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+}
+
+async fn list_delivery_queue(pool: &PgPool) -> Vec<(String, serde_json::Value)> {
+    sqlx::query!(r#"SELECT inbox_url, activity FROM delivery_queue ORDER BY id"#)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.inbox_url, r.activity))
+        .collect()
+}
+
+/// `_misskey_reaction` 併載 + `tag` の Misskey 互換 shape を検証する。
+/// 旧 Misskey は `EmojiReact` ではなく `_misskey_reaction` だけ読むので、
+/// 同じ値を併載しないと旧系列で見えなくなる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_emoji_reaction_includes_misskey_reaction_and_tag(pool: PgPool) {
+    let alice = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let follower = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    accepted_follow(&pool, follower.id, alice.id).await;
+    let note_id = seed_note(&pool, alice.id, "example.test").await;
+    repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "blob_party".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/blob_party.webp".into(),
+            media_type: "image/webp".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({"note_id": note_id, "content": ":blob_party:"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/reactions")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let queued = list_delivery_queue(&pool).await;
+    assert_eq!(queued.len(), 1, "1 delivery (remote follower)");
+    let (inbox, activity) = &queued[0];
+    assert_eq!(inbox, "https://remote.test/inbox");
+    assert_eq!(activity["type"], "EmojiReact");
+    assert_eq!(activity["content"], ":blob_party:");
+    assert_eq!(activity["_misskey_reaction"], ":blob_party:");
+    let tag = activity["tag"].as_array().expect("tag is array");
+    assert_eq!(tag.len(), 1);
+    assert_eq!(tag[0]["type"], "Emoji");
+    assert_eq!(tag[0]["name"], ":blob_party:");
+    assert_eq!(tag[0]["icon"]["mediaType"], "image/webp");
+}
+
+/// Unicode (Like) 経路では `_misskey_reaction` も `tag` も付かないことを検証。
+/// Mastodon に届くので余計な拡張フィールドを混ぜない。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_unicode_reaction_omits_misskey_extensions(pool: PgPool) {
+    let alice = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let follower = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    accepted_follow(&pool, follower.id, alice.id).await;
+    let note_id = seed_note(&pool, alice.id, "example.test").await;
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({"note_id": note_id, "content": "👍"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/reactions")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let queued = list_delivery_queue(&pool).await;
+    assert_eq!(queued.len(), 1);
+    let activity = &queued[0].1;
+    assert_eq!(activity["type"], "Like");
+    assert_eq!(activity["content"], "👍");
+    assert!(activity.get("_misskey_reaction").is_none());
+    assert!(activity.get("tag").is_none());
+}
+
+/// remote note 上の reaction を DELETE すると、Undo.object は **元 Activity を
+/// inline 埋め込み**で乗り、配送先には **note 作者の (shared) inbox** が含まれる
+/// (= フォロワー集合に居なくても相手に届く)。M8 PR2 の URI 参照のみ実装からの
+/// 改善。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delete_remote_note_reaction_inlines_undo_object_and_targets_author(pool: PgPool) {
+    let alice = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let charlie = repo::actor::insert(&pool, sample_remote_actor("charlie", "remote.test"))
+        .await
+        .unwrap();
+    let remote_note_ap = "https://remote.test/users/charlie/notes/42";
+    let note_id = seed_remote_note(&pool, charlie.id, remote_note_ap).await;
+
+    // ローカル user が「他人の remote note」にリアクションを残した状態を直接
+    // 生成する (POST 経路は remote note を 404 で拒否するので DB に直挿入)。
+    let reaction_ap = "https://example.test/users/alice/activities/reaction-100";
+    let row = repo::reaction::insert_or_get(&pool, reaction_ap, note_id, alice.id, "👍", None)
+        .await
+        .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::delete(format!("/api/v1/reactions/{}", row.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let queued = list_delivery_queue(&pool).await;
+    assert_eq!(
+        queued.len(),
+        1,
+        "note 作者 (remote) の inbox に 1 件 (followers 0)"
+    );
+    let (inbox, activity) = &queued[0];
+    assert_eq!(
+        inbox, "https://remote.test/inbox",
+        "shared_inbox_url が優先される"
+    );
+    assert_eq!(activity["type"], "Undo");
+    let object = &activity["object"];
+    assert!(
+        object.is_object(),
+        "Undo.object は inline JSON でなければならない"
+    );
+    assert_eq!(object["id"], reaction_ap);
+    assert_eq!(object["type"], "Like");
+    assert_eq!(object["object"], remote_note_ap);
+    assert_eq!(object["content"], "👍");
+}
+
+/// `delete_reaction_to_remote_note_via_emoji_includes_misskey_reaction_in_undo`
+/// — Undo の inline object でも `_misskey_reaction` / `tag` が保たれる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delete_emoji_reaction_undo_preserves_misskey_reaction(pool: PgPool) {
+    let alice = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let charlie = repo::actor::insert(&pool, sample_remote_actor("charlie", "remote.test"))
+        .await
+        .unwrap();
+    let remote_note_ap = "https://remote.test/users/charlie/notes/77";
+    let note_id = seed_remote_note(&pool, charlie.id, remote_note_ap).await;
+    let emoji = repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "blob_party".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/blob_party.webp".into(),
+            media_type: "image/webp".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let row = repo::reaction::insert_or_get(
+        &pool,
+        "https://example.test/users/alice/activities/reaction-200",
+        note_id,
+        alice.id,
+        ":blob_party:",
+        Some(emoji.id),
+    )
+    .await
+    .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::delete(format!("/api/v1/reactions/{}", row.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let queued = list_delivery_queue(&pool).await;
+    assert_eq!(queued.len(), 1);
+    let object = &queued[0].1["object"];
+    assert_eq!(object["type"], "EmojiReact");
+    assert_eq!(object["content"], ":blob_party:");
+    assert_eq!(object["_misskey_reaction"], ":blob_party:");
+    assert_eq!(object["tag"][0]["name"], ":blob_party:");
+}

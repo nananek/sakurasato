@@ -12,26 +12,28 @@
 //!      AP `tag: [Emoji]` を組み立てる。
 //!    - Unicode は `emoji_id` = NULL、`tag` 無し。
 //! 3. reaction 行を idempotent に insert ([`repo::reaction::insert_or_get`])。
-//! 4. `EmojiReact` (custom emoji) / `Like` (Unicode) Activity を組み立て、
-//!    `repo::follow::list_accepted_inboxes` で配送先を取り `delivery_queue`
-//!    に inbox ごと 1 行ずつ push。
+//! 4. `EmojiReact` (custom emoji, `_misskey_reaction` 併載で旧 Misskey 互換)
+//!    / `Like` (Unicode) Activity を組み立て、followers + note 作者の inbox
+//!    (note が remote のときのみ) に `delivery_queue` 経由で push。
 //!
 //! ## 流れ (`DELETE`)
 //!
 //! 1. `reaction_id` で行を引く ── ローカル actor 所有でなければ 403。
-//! 2. `Undo` Activity を組み立て、followers の inbox に配送。
-//! 3. ローカル DB からも `reaction` 行を `delete_by_ap_id` で即時削除。
-//!    削除前の `ap_id` を Undo の `object` に乗せる。
+//! 2. 元の `Like` / `EmojiReact` Activity を再構築して `Undo.object` に
+//!    inline 埋め込み (URI 参照は Misskey 系で取りこぼし報告があるため)。
+//! 3. followers + note 作者 (remote のみ) の inbox に配送。
+//! 4. ローカル DB からも `reaction` 行を `delete_by_ap_id` で即時削除。
 
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sakurasato_core::model::{ActorRow, EmojiRow};
 use sakurasato_core::repo;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
+use std::collections::BTreeSet;
 use tracing::{error, warn};
 
 use crate::delivery;
@@ -131,8 +133,9 @@ pub async fn create(
             &req.content,
             emoji.as_ref(),
             &inserted.ap_id,
+            inserted.created_at,
         );
-        enqueue_to_followers(&state, &local_actor, &activity).await
+        enqueue_reaction_delivery(&state, &local_actor, note.actor_id, &activity).await
     } else {
         0
     };
@@ -199,9 +202,42 @@ async fn build_and_dispatch_delete(
     local_actor: &ActorRow,
     row: sakurasato_core::model::ReactionRow,
 ) -> Response {
-    // 元の Like / EmojiReact Activity を構築して Undo の object に埋める。
-    // 簡単のため URI 参照 ({object: "<URI>"}) で済ます ── Misskey / Mastodon
-    // とも `object` を URI で受けるのが標準。
+    // Undo の object には元 Activity を inline 埋め込みする。Misskey 系で
+    // URI 参照だと受信側 DB lookup に失敗して Undo を捨てる報告があるため
+    // (Nekonoverse もこのパス)。再構築には元の note ap_id と emoji 行が要る。
+    let note = match repo::note::get_by_id(state.pool(), row.note_id).await {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            // reaction → note の FK は note 削除時に外れるので通常起き得ない。
+            // 起きたら Undo の object を URI 参照にフォールバック。
+            warn!(reaction_id = row.id, note_id = row.note_id, "note vanished");
+            return finalize_undo_with_uri_object(state, local_actor, &row).await;
+        }
+        Err(err) => {
+            error!(?err, reaction_id = row.id, "DELETE: note lookup failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let emoji = match row.emoji_id {
+        Some(eid) => match repo::emoji::get_by_id(state.pool(), eid).await {
+            Ok(opt) => opt,
+            Err(err) => {
+                error!(?err, reaction_id = row.id, "DELETE: emoji lookup failed");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        },
+        None => None,
+    };
+
+    let original = build_reaction_activity(
+        state,
+        local_actor,
+        &note.ap_id,
+        &row.content,
+        emoji.as_ref(),
+        &row.ap_id,
+        row.created_at,
+    );
     let undo_id = format!(
         "https://{host}/users/{user}/activities/undo-reaction-{id}",
         host = state.config().server.host,
@@ -213,9 +249,9 @@ async fn build_and_dispatch_delete(
         "id": undo_id,
         "type": "Undo",
         "actor": local_actor.ap_id,
-        "object": row.ap_id,
+        "object": original,
     });
-    let queued = enqueue_to_followers(state, local_actor, &activity).await;
+    let queued = enqueue_reaction_delivery(state, local_actor, note.actor_id, &activity).await;
 
     // 配送 enqueue が成功してから DB から行を消す。失敗しても自分側だけ消す
     // と「相手はまだ反応中、自分は消した」のズレが残るので、ベストエフォート。
@@ -236,18 +272,85 @@ async fn build_and_dispatch_delete(
         .into_response()
 }
 
-async fn enqueue_to_followers(
+/// note 行が消失していて元 Activity を再構築できないときの退避経路。
+/// Undo.object に URI だけ載せて出す ── 受信側で取りこぼし可能性はあるが、
+/// ローカル DB の整合性 (= reaction 行を削除する) は確保したい。
+async fn finalize_undo_with_uri_object(
     state: &AppState,
     local_actor: &ActorRow,
+    row: &sakurasato_core::model::ReactionRow,
+) -> Response {
+    let undo_id = format!(
+        "https://{host}/users/{user}/activities/undo-reaction-{id}",
+        host = state.config().server.host,
+        user = local_actor.preferred_username,
+        id = row.id,
+    );
+    let activity = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": undo_id,
+        "type": "Undo",
+        "actor": local_actor.ap_id,
+        "object": row.ap_id,
+    });
+    // note が消えていれば note 作者 inbox の解決もできない。followers だけに送る。
+    let queued = enqueue_reaction_delivery(state, local_actor, local_actor.id, &activity).await;
+    if let Err(err) = repo::reaction::delete_by_ap_id(state.pool(), &row.ap_id).await {
+        warn!(?err, reaction_id = row.id, "DELETE: row delete failed");
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "deleted": row.id,
+            "queued_deliveries": queued,
+        })),
+    )
+        .into_response()
+}
+
+/// reaction Activity の配送先を組み立てて enqueue する。
+///
+/// 宛先 = (a) 自分のフォロワー全員 + (b) **note 作者の inbox** (note 作者が
+/// remote の場合のみ)。(b) を入れないと「自分のフォロワーに含まれない他人の
+/// remote note にリアクション」が相手に届かない (Misskey で言う「他人の投稿に
+/// 絵文字リアクション → 相手に通知」が成立しない)。Nekonoverse の振り分けに
+/// 揃えた挙動。
+///
+/// `shared_inbox_url` 優先 (大量フォロワーで配送圧縮) + `BTreeSet` で重複除去
+/// (= 自分のフォロワーに note 作者が含まれていれば同 inbox は 1 行になる)。
+///
+/// `note_actor_id` が local actor の id と等しいなら (b) は no-op (ローカル
+/// note → 作者は自分 → inbox 解決しない)。
+async fn enqueue_reaction_delivery(
+    state: &AppState,
+    local_actor: &ActorRow,
+    note_actor_id: i64,
     activity: &JsonValue,
 ) -> usize {
-    let inboxes = match repo::follow::list_accepted_inboxes(state.pool(), local_actor.id).await {
-        Ok(list) => list,
-        Err(err) => {
-            warn!(?err, "enqueue_to_followers: list_accepted_inboxes failed");
-            return 0;
+    let mut inboxes: BTreeSet<String> = BTreeSet::new();
+
+    match repo::follow::list_accepted_inboxes(state.pool(), local_actor.id).await {
+        Ok(list) => inboxes.extend(list),
+        Err(err) => warn!(
+            ?err,
+            "enqueue_reaction_delivery: list_accepted_inboxes failed"
+        ),
+    }
+
+    if note_actor_id != local_actor.id {
+        match repo::actor::get_by_id(state.pool(), note_actor_id).await {
+            Ok(Some(note_actor)) if !note_actor.is_local => {
+                let inbox = note_actor.shared_inbox_url.unwrap_or(note_actor.inbox_url);
+                inboxes.insert(inbox);
+            }
+            Ok(_) => {} // ローカル actor、もしくは行が消えている → 追加しない。
+            Err(err) => warn!(
+                ?err,
+                note_actor_id, "enqueue_reaction_delivery: note actor lookup failed"
+            ),
         }
-    };
+    }
+
     let mut queued = 0_usize;
     for inbox in &inboxes {
         match delivery::enqueue_activity(state.pool(), local_actor.id, inbox, activity).await {
@@ -309,8 +412,9 @@ fn build_reaction_activity(
     content: &str,
     emoji: Option<&EmojiRow>,
     ap_id: &str,
+    published: DateTime<Utc>,
 ) -> JsonValue {
-    let published = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let published = published.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let (activity_type, tag) = if let Some(emoji) = emoji {
         // Misskey 互換: EmojiReact + tag に Emoji オブジェクト。
@@ -350,6 +454,10 @@ fn build_reaction_activity(
     }
     if let Some(tag) = tag {
         activity["tag"] = tag;
+        // 旧 Misskey (= EmojiReact 解釈系ではなく Like + `_misskey_reaction` だけ
+        // 読む系統) と互換するため content と同じ値を併載する。新 Misskey は
+        // EmojiReact を優先するので二重に表示されることはない。
+        activity["_misskey_reaction"] = JsonValue::String(content.into());
     }
     activity
 }

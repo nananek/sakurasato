@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT inbox_url, activity FROM delivery_queue ORDER BY id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "inbox_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "inbox_url"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "activity",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "activity"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "2e92ef3642c925989fee191db80d1eca3a82ed39b9902afb36f66d3712a29f44"
+}

@@ -144,6 +144,24 @@ pub async fn upsert_remote(pool: &PgPool, new: NewRemoteEmoji) -> sqlx::Result<E
     .await
 }
 
+/// `id` で 1 行引く。`reaction.emoji_id` を Activity 再構築する経路で使う
+/// (例: Undo の `object` を inline 化するときに元の `Emoji` tag を組み立てる)。
+pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<EmojiRow>> {
+    sqlx::query_as!(
+        EmojiRow,
+        r#"
+        SELECT
+            id, shortcode, host, category,
+            aliases as "aliases: Json<Vec<String>>",
+            image_key, media_type, ap_id, is_local, created_at, updated_at
+        FROM emoji WHERE id = $1
+        "#,
+        id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// `ap_id` で 1 行引く。Remote emoji の存在チェック用。
 pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<EmojiRow>> {
     sqlx::query_as!(
