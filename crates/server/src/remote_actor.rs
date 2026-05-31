@@ -54,7 +54,7 @@ const MAX_ACTOR_BYTES: usize = 256 * 1024;
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
-pub(crate) enum FetchError {
+pub enum FetchError {
     #[error("URL is invalid: {0}")]
     InvalidUrl(#[from] url::ParseError),
 
@@ -96,6 +96,14 @@ pub(crate) async fn fetch_and_upsert_for_signature(
     state: &AppState,
     ap_id: &str,
 ) -> Result<ActorRow, FetchError> {
+    fetch_and_upsert(state, ap_id).await
+}
+
+/// `ap_id` から actor JSON を `GET` し、SSRF / `id` 一致 / 鍵 `owner` を検査
+/// した上で DB に upsert する。署名検証経路 (extractor) 以外からも呼べる
+/// ように `pub` で公開する ── M9 で Move 受領 / outbound の前段として、
+/// target/aka actor が DB に居ないときに引いてくる用途で必要になった。
+pub async fn fetch_and_upsert(state: &AppState, ap_id: &str) -> Result<ActorRow, FetchError> {
     let json = fetch_actor_json(state, ap_id).await?;
     let parsed = parse_actor_json(ap_id, &json)?;
     upsert(state, parsed).await

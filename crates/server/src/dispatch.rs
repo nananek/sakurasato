@@ -1,10 +1,10 @@
 //! 受信した Activity の dispatch。
 //!
 //! `extract::SignedInboxBody` で署名検証を通過した body を JSON としてパースし、
-//! `type` ごとに `handler::*` / `reaction::*` に振る。M3b-3 PR2 で Follow /
-//! Accept / Reject を、M8 PR2 で `Like` / `EmojiReact` / `Undo` を実装した。
-//! `Create`/`Note` / `Announce` / `Update` / `Delete` / `Move` は後続 PR で
-//! 順次対応する。
+//! `type` ごとに `handler::*` / `reaction::*` / `move_handler::*` に振る。
+//! M3b-3 PR2 で Follow / Accept / Reject を、M8 PR2 で `Like` / `EmojiReact` /
+//! `Undo` を、M9 で `Move` を実装した。`Create`/`Note` / `Announce` / `Update` /
+//! `Delete` は後続 PR で順次対応する。
 //!
 //! ## F3: Activity body actor と署名者の一致 (PR #19 で挙がった必須項目)
 //!
@@ -26,6 +26,7 @@ use tracing::{info, warn};
 use crate::state::AppState;
 
 pub(crate) mod handler;
+pub(crate) mod move_handler;
 pub(crate) mod reaction;
 
 /// dispatch エラー → HTTP レスポンス変換。署名検証 [`crate::sign::SigError`]
@@ -223,6 +224,12 @@ pub(crate) async fn dispatch(
         }
         "Undo" => {
             reaction::handle_undo(state, signer, &activity).await?;
+            Ok((StatusCode::ACCEPTED, "accepted").into_response())
+        }
+        "Move" => {
+            move_handler::handle_move(state, signer, &activity)
+                .await
+                .map_err(DispatchError::Internal)?;
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
         other => {

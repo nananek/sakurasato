@@ -81,6 +81,35 @@ pub async fn list_accepted_inboxes(
     .await
 }
 
+/// `follower_actor_id` の **local actor** が `followed_actor_id` を `state = 'accepted'`
+/// で follow しているとき、その follow 行を返す (M9 Move 自動再フォロー判定用)。
+///
+/// 戻り値は `(follow.id, follower_actor_id)` の組み。お一人様サーバなので
+/// 該当する local follower はせいぜい 1 件だが、複数 local actor 設計に
+/// 備えてリストで返す。
+pub async fn list_local_following(
+    pool: &PgPool,
+    followed_actor_id: i64,
+) -> sqlx::Result<Vec<(i64, i64)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT f.id AS "follow_id!", f.follower_actor_id AS "follower_actor_id!"
+        FROM follow f
+        JOIN actor a ON a.id = f.follower_actor_id
+        WHERE f.followed_actor_id = $1
+          AND f.state = 'accepted'
+          AND a.is_local = true
+        "#,
+        followed_actor_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.follow_id, r.follower_actor_id))
+        .collect())
+}
+
 /// Upsert a Follow row to `pending`. If a row with the same `ap_id` already
 /// exists return it unchanged; otherwise insert a new pending row.
 ///

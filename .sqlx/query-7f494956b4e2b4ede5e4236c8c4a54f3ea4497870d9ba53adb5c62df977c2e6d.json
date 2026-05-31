@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT f.id AS \"follow_id!\", f.follower_actor_id AS \"follower_actor_id!\"\n        FROM follow f\n        JOIN actor a ON a.id = f.follower_actor_id\n        WHERE f.followed_actor_id = $1\n          AND f.state = 'accepted'\n          AND a.is_local = true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "follow_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "follower_actor_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "follower_actor_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "7f494956b4e2b4ede5e4236c8c4a54f3ea4497870d9ba53adb5c62df977c2e6d"
+}

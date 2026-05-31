@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use sakurasato_core::Config;
-use sakurasato_server::{cli, delivery, emoji_import, init, serve, token};
+use sakurasato_server::{cli, delivery, emoji_import, init, move_out, serve, token};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -31,5 +31,7 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::Deliver(args) => delivery::run(config, args).await,
         cli::Command::Token(args) => token::run(config, args).await,
         cli::Command::Emoji(args) => emoji_import::run(config, args).await,
+        cli::Command::Alias(args) => move_out::run_alias(config, args).await,
+        cli::Command::MoveOut(args) => move_out::run_move_out(config, args).await,
     }
 }
