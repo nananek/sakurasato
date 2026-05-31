@@ -1,0 +1,27 @@
+# GHCR (= `ghcr.io/nananek/sakurasato-*`) で発行済みのイメージを使う overlay。
+# 本番 / 別ホストへの再現可能なデプロイ向け。
+#
+# 使い方:
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up
+#
+# タグ運用 (`.github/workflows/publish.yml`):
+#   - `:latest`           最新 CalVer リリース (`main` の最新タグに追従)
+#   - `:YYYY.MM.patch`    特定のリリース (= 推奨。差し戻し可能)
+#   - `:develop`          develop HEAD (= 動作確認用、本番非推奨)
+#
+# 既定は `:latest`。特定バージョンに固定したい場合は、各 service に
+# `image: ghcr.io/nananek/sakurasato-server:2026.05.0` のように上書きする。
+
+services:
+  server:
+    build: !reset null
+    image: ghcr.io/nananek/sakurasato-server:latest
+
+  media-proxy:
+    build: !reset null
+    image: ghcr.io/nananek/sakurasato-media-proxy:latest
+
+  versitygw:
+    build: !reset null
+    image: ghcr.io/nananek/sakurasato-versitygw:latest
