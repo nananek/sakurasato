@@ -170,7 +170,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 2. 設定の `server.user` + `server.host` で local actor を作成
 3. RSA 2048 + Ed25519 鍵ペアを生成し `actor.private_key_pem` / `actor.ed25519_private_key_pem` に DB 保存（`#[serde(skip)]` + Debug redacted で漏洩防止）
 
-再 keying は `init --force`。**フォロワーへの配送が全部署名検証失敗で弾かれる**ので緊急時のみ。
+再 keying は `init --force`。**フェデレーション関係が事実上ゼロからやり直しになる不可逆操作** ── 既存フォロワーへの配送は全部署名検証失敗で弾かれ、ロールバック手段は postgres dump 復元のみ。緊急時 (鍵漏洩等) のみ。詳細と挙動は §7.3 鍵ローテーションを参照。
 
 ### 3.6 起動
 
@@ -184,7 +184,19 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml logs -f server
 
 ## 4. Cloudflare Tunnel の設定
 
-ホスト機の `127.0.0.1:8080` を Cloudflare Tunnel に渡す。`docker-compose.yml` の `server` サービスは内部ネットだけだが、`docker-compose.dev.yml` 同様の overlay でホスト bind しても、cloudflared を **同じ compose の追加サービス** として動かしてもよい。後者の例:
+ホスト機の `server` コンテナ (`:8080`) を Cloudflare Tunnel に渡す。cloudflared を **同じ compose の追加サービス** として動かすのが楽。
+
+### 4.1 token を compose secret として注入
+
+CLI 引数 (`--token "${TOKEN}"`) に渡すと `ps` / `docker inspect` で平文露出するので、**compose secret** で `/run/secrets/cloudflared_token` に置く:
+
+```bash
+# ホスト側
+echo "<YOUR_CLOUDFLARED_TOKEN>" > secrets/cloudflared_token.txt
+chmod 644 secrets/cloudflared_token.txt   # secrets/ ディレクトリは 0700 (§7.1)
+```
+
+### 4.2 cloudflared overlay
 
 ```yaml
 # docker-compose.cloudflared.yml (例)
@@ -192,13 +204,27 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
-    command: tunnel --no-autoupdate run --token "${CLOUDFLARED_TOKEN}"
+    # token は file から読む経路にする (CLI 引数は ps で見える)。
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'exec cloudflared tunnel --no-autoupdate --token "$$(cat /run/secrets/cloudflared_token)" run'
+    secrets:
+      - cloudflared_token
     networks:
+      # server は internal + egress 両方に居る (CLAUDE.md §6)。
+      # cloudflared は外部 (= Cloudflare edge) と server だけ届けばよいので
+      # `egress` 一本でよい (server も egress を持つので名前解決で疎通する)。
       - egress
-      - internal
     depends_on:
       - server
+
+secrets:
+  cloudflared_token:
+    file: ./secrets/cloudflared_token.txt
 ```
+
+`compose -f docker-compose.yml -f docker-compose.ghcr.yml -f docker-compose.cloudflared.yml up -d` で 4 サービス + tunnel が立つ。
 
 cloudflared ダッシュボードで:
 - **Public Hostname** → `sakurasato.example.com`
@@ -206,7 +232,7 @@ cloudflared ダッシュボードで:
 
 を登録する。タイムアウト・HTTP/2 設定は標準で問題なし。
 
-### 4.1 動作確認
+### 4.3 動作確認
 
 ```bash
 curl -sv "https://sakurasato.example.com/.well-known/webfinger?resource=acct:me@sakurasato.example.com" | head
@@ -219,52 +245,68 @@ actor JSON が返れば連合準備完了。
 
 ## 5. TUI 経路 (Tailscale)
 
-`docker-compose.yml` の `server` サービスは `/run/sakurasato-local/local.sock` を `local_sock` named volume にマウントしている。デフォルトではコンテナ内 nonroot (= uid 65532) しか書けないので、TUI ホストから直接マウントするには 1 工夫要る。
+`docker-compose.yml` の `server` サービスは `/run/sakurasato-local/local.sock` を `local_sock` named volume にマウントしている。本体は HTTP (REST + SSE) を喋るが Unix socket 上なので、別端末から叩くには **UDS↔TCP ブリッジコンテナを挟む + tailscale serve で tailnet に HTTPS で出す** 構成が必要。
 
-### オプション A: ホスト bind mount
+> Tailscale 自身は UDS をそのまま serve できない (`tailscale serve --tcp <PORT>` は TCP backend 必須)。`tailscale serve --bg /path/to/socket` 系の用法も無いので、必ずブリッジを 1 個挟む。
 
-`docker-compose.yml` の `server.volumes` を bind mount に切り替え、ホスト側で chown する。Tailscale ノードが同じホストならこれで十分。
+### 5.1 socat による UDS→TCP ブリッジ
 
 ```yaml
 # docker-compose.tui.yml (例)
 services:
-  server:
-    volumes: !override
-      - media_sock:/run/sakurasato
-      - /var/run/sakurasato-local:/run/sakurasato-local
+  # UDS (local_sock 内 /run/sakurasato-local/local.sock) を loopback TCP 8443 に
+  # 中継する。本体 server の Bearer 認証はそのまま通る (= HTTP ヘッダのまま転送)。
+  uds-tcp-bridge:
+    image: alpine/socat:latest
+    command: TCP-LISTEN:8443,fork,reuseaddr UNIX-CONNECT:/run/sakurasato-local/local.sock
+    volumes:
+      - local_sock:/run/sakurasato-local
+    networks:
+      - internal
+    # host loopback にだけ晒す。tailscale serve がここを upstream に取る。
+    # 0.0.0.0 公開は厳禁 (= tailnet 経由のはずが外向き露出する)。
+    ports:
+      - "127.0.0.1:8443:8443"
+    restart: unless-stopped
 ```
 
-```bash
-sudo mkdir -p /var/run/sakurasato-local
-sudo chown 65532:65532 /var/run/sakurasato-local
-docker compose -f docker-compose.yml -f docker-compose.ghcr.yml -f docker-compose.tui.yml up -d
-```
-
-TUI 端末から:
-
-```bash
-ssh sakurasato-host.tailnet -- cargo run -p sakurasato-tui    # 開発時
-# または ghcr 経由で TUI バイナリを取得して
-ssh sakurasato-host.tailnet -- sakurasato-tui --socket /var/run/sakurasato-local/local.sock
-```
-
-### オプション B: tailscale serve でブリッジ
-
-`tailscale serve` でホスト機の Unix socket を tailnet 内向け HTTPS に晒す。TUI 側は HTTPS を叩く。実装上は **`/api/v1/*` が public listener に登録されていない**（CLAUDE.md §5.1 / `serve.rs` の二段 listener）ので、socket → tailnet bridge を作る方が筋がよい。
+### 5.2 tailscale serve で tailnet に出す
 
 ```bash
 # ホスト機
-tailscale serve --bg --tcp 8443 /var/run/sakurasato-local/local.sock
+tailscale serve --bg --https 443 http://127.0.0.1:8443
+# 公開状態を確認
+tailscale serve status
 ```
 
-TUI 側は `https://sakurasato-host.tailnet:8443` を叩く設定にする（要 Bearer トークン）。
+これで `https://<host-machine>.<tailnet>.ts.net/` (= MagicDNS が振った名前) で **tailnet 内のノードからだけ** 本体ローカル API に到達できる。`tailscale serve` は外部からは到達不可。`tailscale funnel` (= 公衆公開) は **絶対に使わない** ── ローカル API が外に出る。
 
-### 5.1 トークン発行
+### 5.3 トークン発行
+
+ブリッジ越しでも Bearer 認証は維持される (HTTP ヘッダ素通し)。
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server token issue --name tui-laptop
 # 出力された raw token を TUI 側に控える (この一度しか表示されない)
 ```
+
+TUI 側 (= 別端末、ノートパソコン等) は `https://<host>.<tailnet>.ts.net/` + Bearer token を設定して接続する。
+
+### 5.4 代替: SSH で host に入って TUI を local 実行
+
+ブリッジが面倒なら、tailnet 越しに SSH してホストで TUI を直接動かす手もある (= UDS をコンテナ外に晒さないでよい):
+
+```bash
+ssh <host>.<tailnet>.ts.net   # tailscale ssh でも可
+# host 機上で
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm \
+  -v /tmp/sks-tui:/tmp/sks-tui \
+  server sh -c 'cp /run/sakurasato-local/local.sock /tmp/sks-tui/'
+# or もっと素直に: TUI バイナリを host にインストールして直接 UDS を叩く
+sakurasato-tui --socket /var/run/sakurasato-local/local.sock
+```
+
+ただし host 側で TUI を動かすには **`local_sock` named volume を host bind に切り替える** か、TUI コンテナを compose 内に追加する必要があり、結局構成が増える。socat ブリッジの方が単純。
 
 ---
 
@@ -313,8 +355,17 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 例 (postgres):
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.ghcr.yml exec postgres \
+# `-T` (--no-TTY) を必ず付けること ── 付けないと exec が PTY を割り当て、
+# gzip 出力に \r\n 変換 / ESC[ シーケンスが混入して **復元不能** な dump になる。
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml exec -T postgres \
   pg_dump -U sakurasato sakurasato | gzip > backup-$(date +%F).sql.gz
+```
+
+復元時は対称に `psql` で読む:
+
+```bash
+gunzip -c backup-YYYY-MM-DD.sql.gz | docker compose -f docker-compose.yml -f docker-compose.ghcr.yml exec -T postgres \
+  psql -U sakurasato sakurasato
 ```
 
 ### 7.3 鍵ローテーション
@@ -326,6 +377,8 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 ```
 
 実行すると新しい RSA / Ed25519 鍵ペアが生成され、`public_key_id` も変わる。**既存フォロワーは旧鍵 ID をキャッシュしているので、相手側で actor JSON が refresh されるまで配送が全部 401 で弾かれる**。再フォローを依頼する覚悟が必要。
+
+**不可逆性**: 旧鍵は失われ、postgres バックアップから復元する以外に戻せない。`init --force` は §3.5 (初期化) でも触れたが、**ロールバック手段が postgres dump 復元のみ** であることを承知の上で実行すること。フェデレーション関係は事実上ゼロからやり直し。
 
 ### 7.4 引っ越し (Move)
 
@@ -349,7 +402,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm -v $PWD:/work server move-accept --from /work/move.json
 ```
 
-**`move-accept` は HTTP 署名検証を通らない**ので、自分が控えておいた本文でのみ実行すること。
+**`move-accept` は HTTP 署名検証を通らない**ので、自分が控えておいた本文でのみ実行すること。コードレベルのガードは `type == "Move"` チェックだけで (CLAUDE.md §5.1)、第三者から「この JSON を `move-accept` に渡せばフォロワーを引き継げます」と誘導されて流すと **意図しない Move を適用してしまう**。最後の防波堤は `handle_move` 内の `alsoKnownAs` 双方向検査だが、相手側 actor が攻撃者の意図通りに `alsoKnownAs` を書き換えていれば素通る。ソーシャルエンジニアリングへの耐性は低いので、入力経路を自分の inbox 控えに限ること。
 
 ### 7.5 ログ確認
 
@@ -381,11 +434,15 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml logs media-proxy
 ### 8.2 配送が全部失敗する (HTTP 401 from peers)
 
 → 鍵が peer 側でキャッシュされた古い値と不一致。`init --force` 直後はよくある。
-1. peer 側で actor JSON の cache を refresh してもらう (Mastodon なら admin)
-2. または `delivery_queue` の `state = 'failed'` 行を `pending` に戻して再送
+
+1. **先に peer 側で actor JSON の cache を refresh してもらう** ── 順番が逆だと再送しても 401 が続いて状態が改善しない。Mastodon なら admin、Misskey なら remote actor の再取得 UI から。
+2. peer のキャッシュが更新されたのを確認してから `delivery_queue` の failed 行を `pending` に戻す。**全 failed を無差別にリセットするな** ── DNS 失敗・TLS エラー等の他の永続失敗まで巻き込んで無限リトライ砲台になる。特定 inbox URL に絞る:
 
 ```sql
-UPDATE delivery_queue SET state='pending', retries=0, next_attempt_at=now() WHERE state='failed';
+-- 例: 特定 peer の inbox のみ再送 (置き換え)
+UPDATE delivery_queue
+SET state='pending', retries=0, next_attempt_at=now()
+WHERE state='failed' AND inbox_url LIKE 'https://mastodon.example/%';
 ```
 
 ### 8.3 cloudflared 経由で WebFinger が 404
@@ -407,9 +464,22 @@ ls -ln /var/run/sakurasato-local/local.sock
 
 ## 9. アンインストール
 
+> ⚠️ **先にバックアップを取り、`secrets/` を別の安全な場所に控えてから実行する。**
+> `secrets/postgres_password.txt` を失うと、`down -v` を omit して volume を残しても **postgres に接続不能** になり、データ復号は事実上不可能。順序を間違えると不可逆。
+
 ```bash
+# 1. バックアップ (§7.2 の手順で postgres + versitygw + secrets + config)
+mkdir -p ~/sakurasato-final-backup-$(date +%F)
+cp -r secrets/ config/ ~/sakurasato-final-backup-$(date +%F)/
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml exec -T postgres \
+  pg_dump -U sakurasato sakurasato | gzip > ~/sakurasato-final-backup-$(date +%F)/postgres.sql.gz
+
+# 2. バックアップが揃ったことを目視確認 → コンテナと volume 削除
+ls -la ~/sakurasato-final-backup-$(date +%F)/
 docker compose -f docker-compose.yml -f docker-compose.ghcr.yml down -v
-rm -rf secrets/postgres_password.txt secrets/s3_secret_key.txt
+
+# 3. ホスト側 secrets を消す (バックアップ済みのときだけ)
+rm -f secrets/postgres_password.txt secrets/s3_secret_key.txt secrets/cloudflared_token.txt
 ```
 
 `down -v` は **DB と versitygw volume も削除する** ので、データを残したいなら `-v` を外す。
