@@ -8,8 +8,12 @@ Sakurasato 側は **UDS (Unix domain socket) 経由** の Bearer トークン認
 
 - compose 側で `sakurasato_local_api` 名前付き volume を /home/nonroot に
   マウントしておくこと (= UDS が pytest コンテナから見える)
-- `sakurasato-token-issuer` が `/tokens/pytest.token` に raw token を書いた状態
-- `mastodon-web` が healthy で `bob`/`Password1234!` が作成済み
+- `sakurasato-token-issuer` が `SAKURASATO_TOKEN_FILE` (デフォルトは
+  `/home/nonroot/pytest.token`、compose の env で上書き) に raw token を
+  書いた状態
+- `mastodon-entrypoint` が `MASTODON_TOKEN_FILE` (デフォルトは
+  `/mastodon-tokens/bob.token`) に Doorkeeper access token を書いた状態
+  (Mastodon 4.x で OAuth password grant が削除されたため、起動時に発行する)
 - 共有 test CA が `/certs/ca.crt` にあり、`SSL_CERT_FILE` で reqwest/httpx に
   反映されている (= mastodon -> sakurasato の TLS 検証が通る)
 """
@@ -167,7 +171,11 @@ class SakurasatoClient:
             "/api/v1/timeline/home", params={"limit": str(limit)}
         )
         resp.raise_for_status()
-        return resp.json().get("notes", resp.json())  # 戻り値 shape は柔軟に
+        # 現行 server は `{ notes: [...], next_before_id: ... }` で返す。
+        # 将来 list 直返しに変わっても拾えるよう .get でフォールバック。
+        # [review L-2] 対応: 1 回だけ deserialize する。
+        data = resp.json()
+        return data.get("notes", data) if isinstance(data, dict) else data
 
     def create_note(
         self,
@@ -304,13 +312,32 @@ class MastodonClient:
         return resp.json()
 
     def search_accounts(self, q: str, *, resolve: bool = True) -> list[dict]:
-        resp = self.http.get(
-            "/api/v1/accounts/search",
-            params={"q": q, "resolve": "true" if resolve else "false"},
-            headers=self._auth_headers(),
+        # Mastodon の `resolve=true` は内部で WebFinger + actor fetch を同期
+        # 実行する。相手側 (= sakurasato) がまだ Mastodon のキャッシュに
+        # 入っていないタイミング (= 起動直後など) で resolve が時々 **422
+        # `unprocessable_content`** を返してくる ── Mastodon 内部例外を
+        # rescue した結果なので、リトライすれば通る。1 回失敗で test が
+        # 落ちないよう、最大数回の HTTP リトライをここで吸収する。
+        # (poll_until のような業務ロジック側ループより、HTTP layer の retry の
+        #  方が他の使い手に対しても効くため)
+        last_status: int | None = None
+        last_body: str | None = None
+        for _ in range(10):
+            resp = self.http.get(
+                "/api/v1/accounts/search",
+                params={"q": q, "resolve": "true" if resolve else "false"},
+                headers=self._auth_headers(),
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            last_status, last_body = resp.status_code, resp.text[:200]
+            if resp.status_code not in (422, 503, 504):
+                break
+            time.sleep(2)
+        raise RuntimeError(
+            f"Mastodon /accounts/search refused query q={q!r} "
+            f"resolve={resolve} after retries: status={last_status} body={last_body!r}"
         )
-        resp.raise_for_status()
-        return resp.json()
 
     def follow(self, account_id: str) -> dict:
         resp = self.http.post(

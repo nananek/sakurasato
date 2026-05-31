@@ -45,6 +45,11 @@ bundle exec rails runner "
 # (`/mastodon-tokens` が存在しない & ファイルがすでにある場合はスキップ。
 #  pytest profile 外で立ち上げた場合に余計な Rails 起動を増やさない)。
 if [ -d /mastodon-tokens ] && [ ! -f /mastodon-tokens/bob.token ]; then
+  # stderr は **絶対に捨てない** ── User lookup nil や File.write の権限
+  # エラーが無音で落ちて `bob.token` が生まれず、依存している pytest
+  # コンテナが `_read_token_file` で FileNotFoundError だけ吐いて原因不明、
+  # という詰み方を避ける ([review M-1] 対応)。stderr を stdout に merge して
+  # `docker compose logs mastodon-web` に Rails の例外をそのまま残す。
   bundle exec rails runner "
     user = User.find_by(email: 'bob@mastodon')
     if user
@@ -59,8 +64,10 @@ if [ -d /mastodon-tokens ] && [ ! -f /mastodon-tokens/bob.token ]; then
         scopes: 'read write follow'
       )
       File.write('/mastodon-tokens/bob.token', token.token + \"\\n\")
+    else
+      warn 'pytest token: User.find_by returned nil for bob@mastodon'
     end
-  " 2>/dev/null || echo 'pytest bearer token issue skipped'
+  " 2>&1 || echo 'pytest bearer token issue skipped (see Rails error above)'
 fi
 
 exec bundle exec puma -C config/puma.rb

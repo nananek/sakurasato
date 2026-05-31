@@ -81,7 +81,7 @@ services:
       sakurasato-init:
         condition: service_completed_successfully
       sakurasato-media-proxy:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - certs:/certs:ro
       # pytest が `/home/nonroot/local.sock` を共有 UDS として開く。
@@ -113,6 +113,17 @@ services:
     volumes:
       - certs:/certs:ro
       - media_sock:/run/sakurasato
+    # distroless image なので shell/test は無い ── 自前 binary の `--healthcheck`
+    # モードで socket 存在を確かめる。`bind_socket` は serve ループ前に完走
+    # するので socket が見えれば listener は accept 可能。これに service_healthy
+    # で依存させると `prefollow-bob` の WebFinger 解決時の race ([review M-2])
+    # を塞げる。
+    healthcheck:
+      test: ["CMD", "/app/sakurasato-media-proxy", "--healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
     networks:
       - mastodon-fed
 
@@ -305,7 +316,7 @@ services:
       sakurasato-init:
         condition: service_completed_successfully
       sakurasato-media-proxy:
-        condition: service_started
+        condition: service_healthy
       mastodon-web:
         condition: service_healthy
     volumes:
