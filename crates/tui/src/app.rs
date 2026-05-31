@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::client::{NoteCreatedPayload, TimelineNote, Whoami};
 use crate::compose::Compose;
 use crate::image_cache::ImageCache;
+use crate::suppression::ImageSuppression;
 use crate::theme::Theme;
 
 /// status line に表示するメッセージの種別。テーマの色 (success / warning /
@@ -53,6 +54,9 @@ pub enum Focus {
     /// M8 PR3: リアクション送信プロンプト。`App::reaction_prompt` が `Some` の
     /// ときだけ取りうる。
     ReactionPrompt,
+    /// M9 PR2: 視覚刺激抑制トグル overlay。各要素 (avatar / attachment /
+    /// emoji / preview / animation) を on/off できる。
+    Suppression,
 }
 
 #[derive(Debug)]
@@ -87,6 +91,13 @@ pub struct App {
     /// M8 PR3: リアクション送信プロンプト。`Focus::ReactionPrompt` 中のみ
     /// 表示される。
     pub reaction_prompt: Option<crate::reaction_prompt::ReactionPrompt>,
+    /// M9 PR2: 視覚刺激抑制 (要素別 on/off)。`avatar`/`attachment`/`emoji`/
+    /// `preview`/`animation` のフラグセット。`ImageCache` / `PreviewCache`
+    /// の `enabled()` と組で見られる ── どちらかが off なら描画パスを抜く。
+    pub suppression: ImageSuppression,
+    /// M9 PR2: suppression overlay 上のカーソル位置。`Focus::Suppression` で
+    /// 開く。`Element::all()` の index。
+    pub suppression_cursor: usize,
 }
 
 impl App {
@@ -96,6 +107,7 @@ impl App {
         socket_label: String,
         images: ImageCache,
         previews: crate::preview::PreviewCache,
+        suppression: ImageSuppression,
     ) -> Self {
         Self {
             theme,
@@ -115,6 +127,8 @@ impl App {
             previews,
             pending_uploads: 0,
             reaction_prompt: None,
+            suppression,
+            suppression_cursor: 0,
         }
     }
 
@@ -266,6 +280,7 @@ mod tests {
             "test".into(),
             ImageCache::new(None, None),
             crate::preview::PreviewCache::new(None),
+            ImageSuppression::default(),
         )
     }
 

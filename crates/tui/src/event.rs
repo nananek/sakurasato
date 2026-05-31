@@ -74,6 +74,19 @@ pub enum Action {
     ReactionPromptSubmit,
     /// プロンプト中の Esc ── キャンセル。
     ReactionPromptCancel,
+    /// M9 PR2: 視覚刺激抑制 overlay を開く / 閉じる。
+    ToggleSuppression,
+    /// suppression overlay 上のカーソル移動。
+    SuppressionNext,
+    SuppressionPrev,
+    /// 現在カーソルが指す要素を toggle (= space / Enter)。
+    SuppressionToggle,
+    /// 全要素を一括 off (= `!`)。
+    SuppressionDisableAll,
+    /// 全要素を一括 on (= 復帰用、= `*`)。
+    SuppressionEnableAll,
+    /// Esc ── overlay を閉じる。
+    SuppressionClose,
 }
 
 /// crossterm イベント → Action。
@@ -104,6 +117,7 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::Help => translate_help_key(k),
         Focus::Picker => translate_picker_key(k),
         Focus::ReactionPrompt => translate_reaction_prompt_key(k),
+        Focus::Suppression => translate_suppression_key(k),
     }
 }
 
@@ -130,6 +144,21 @@ fn translate_timeline_key(k: KeyEvent) -> Action {
         // M8 PR3: e = react ─ 選択中の Note にリアクションを付けるための
         // プロンプトを開く。
         (KeyCode::Char('e'), m) if m.is_empty() => Action::OpenReactionPrompt,
+        // M9 PR2: i = 視覚刺激抑制 overlay を開く ("images" の頭文字)。
+        // Compose 中は `i` が本文に挿入されるので timeline focus 限定。
+        (KeyCode::Char('i'), m) if m.is_empty() => Action::ToggleSuppression,
+        _ => Action::Noop,
+    }
+}
+
+fn translate_suppression_key(k: KeyEvent) -> Action {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc | KeyCode::Char('q' | 'i'), m) if m.is_empty() => Action::SuppressionClose,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::SuppressionNext,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::SuppressionPrev,
+        (KeyCode::Char(' ') | KeyCode::Enter, _) => Action::SuppressionToggle,
+        (KeyCode::Char('!'), m) if m.is_empty() => Action::SuppressionDisableAll,
+        (KeyCode::Char('*'), m) if m.is_empty() => Action::SuppressionEnableAll,
         _ => Action::Noop,
     }
 }
@@ -358,6 +387,51 @@ mod tests {
                 Focus::ReactionPrompt,
             ),
             Action::Quit,
+        ));
+    }
+
+    #[test]
+    fn timeline_i_opens_suppression_overlay() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('i'), KeyModifiers::NONE)),
+                Focus::Timeline,
+            ),
+            Action::ToggleSuppression,
+        ));
+    }
+
+    #[test]
+    fn suppression_focus_keys_route_correctly() {
+        for code in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('i')] {
+            assert!(matches!(
+                translate(
+                    Event::Key(key(code, KeyModifiers::NONE)),
+                    Focus::Suppression,
+                ),
+                Action::SuppressionClose,
+            ));
+        }
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char(' '), KeyModifiers::NONE)),
+                Focus::Suppression,
+            ),
+            Action::SuppressionToggle,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('!'), KeyModifiers::NONE)),
+                Focus::Suppression,
+            ),
+            Action::SuppressionDisableAll,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('*'), KeyModifiers::NONE)),
+                Focus::Suppression,
+            ),
+            Action::SuppressionEnableAll,
         ));
     }
 

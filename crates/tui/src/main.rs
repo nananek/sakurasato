@@ -17,11 +17,19 @@ use anyhow::Context;
 use clap::Parser;
 use sakurasato_tui::TuiOptions;
 use sakurasato_tui::runtime;
+use sakurasato_tui::suppression::ImageSuppression;
 use sakurasato_tui::theme::Theme;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 /// Sakurasato TUI クライアント。
+///
+/// 視覚刺激抑制の 5 個別フラグ (`no_avatars` 等) で bool が 4 つ超えるが、
+/// clap CLI ではフラグごとに 1 bool になるのが慣習なので明示的に許可する。
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "CLI flag struct; bool は clap の慣習"
+)]
 #[derive(Debug, Parser)]
 #[command(name = "sakurasato-tui", version)]
 struct Cli {
@@ -49,14 +57,60 @@ struct Cli {
     #[arg(long, default_value_t = 40)]
     page_size: i64,
 
-    /// 画像表示を無効化する。Kitty 等の対応端末でも強制的にテキスト UI。
-    /// 視覚刺激抑制の暫定スイッチ ── 要素別トグルは M9 で実装予定。
+    /// 画像表示を全要素一括で無効化する (= 視覚刺激抑制の killswitch)。
+    /// Kitty 等の対応端末でも強制的にテキスト UI に倒す。
+    /// 要素別に細かく切りたい場合は `--no-avatars` 等の個別フラグを使う
+    /// (M9 PR2 で追加)。
     #[arg(long)]
     no_images: bool,
+
+    /// アバター画像 (timeline 各 note の発信者アイコン) を抑制する。
+    #[arg(long)]
+    no_avatars: bool,
+
+    /// 添付画像のサムネ表示を抑制する (将来 attachment 表示で参照)。
+    #[arg(long)]
+    no_attachments: bool,
+
+    /// カスタム絵文字のインライン表示を抑制する (将来 emoji 表示で参照)。
+    #[arg(long)]
+    no_emojis: bool,
+
+    /// ファイルピッカのローカル画像プレビューを抑制する。
+    #[arg(long)]
+    no_previews: bool,
+
+    /// アニメ表示を抑制する (静的フレームのみ)。現状 ratatui-image は
+    /// 1 フレーム目しか描かないため挙動上は同じだが、トグルとして残す。
+    #[arg(long)]
+    no_animations: bool,
 
     /// 起動せずに組み込みテーマ名を列挙して終了。
     #[arg(long)]
     list_themes: bool,
+}
+
+fn resolve_suppression(cli: &Cli) -> ImageSuppression {
+    if cli.no_images {
+        return ImageSuppression::all_off();
+    }
+    let mut s = ImageSuppression::all_on();
+    if cli.no_avatars {
+        s.avatar = false;
+    }
+    if cli.no_attachments {
+        s.attachment = false;
+    }
+    if cli.no_emojis {
+        s.emoji = false;
+    }
+    if cli.no_previews {
+        s.preview = false;
+    }
+    if cli.no_animations {
+        s.animation = false;
+    }
+    s
 }
 
 #[tokio::main]
@@ -74,19 +128,19 @@ async fn main() -> anyhow::Result<()> {
     let token = resolve_token(&cli)?;
     let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
 
+    let suppression = resolve_suppression(&cli);
     let theme = match cli.theme_file {
         Some(path) => Theme::from_path(&path)
             .with_context(|| format!("load theme file {}", path.display()))?,
         None => Theme::builtin(&cli.theme)
             .with_context(|| format!("load builtin theme `{}`", cli.theme))?,
     };
-
     let opts = TuiOptions {
         socket,
         token,
         theme,
         page_size: cli.page_size.clamp(1, 80),
-        images_enabled: !cli.no_images,
+        suppression,
     };
 
     runtime::run(opts).await

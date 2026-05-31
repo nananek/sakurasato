@@ -48,6 +48,7 @@ pub mod preview;
 pub mod reaction_prompt;
 pub mod runtime;
 pub mod sse;
+pub mod suppression;
 pub mod theme;
 pub mod ui;
 
@@ -63,9 +64,12 @@ pub struct TuiOptions {
     pub theme: theme::Theme,
     /// 1 ページ分のタイムライン取得件数。`/api/v1/timeline/home?limit=` に渡す。
     pub page_size: i64,
-    /// 画像 (アバター) 表示を有効化する。`false` または terminal が
-    /// 画像プロトコル非対応のときはテキスト専用にフォールバックする。
-    /// M9 で要素別 (添付 / 絵文字 / プレビュー / アバター) の細粒度トグルに
-    /// 拡張する予定だが、PR2 では単一ブール。
-    pub images_enabled: bool,
+    /// 画像表示の要素別トグル (M9 PR2)。`avatar` / `attachment` / `emoji` /
+    /// `preview` / `animation` を個別に on/off できる。`--no-images` が
+    /// 指定されたら CLI 側で `ImageSuppression::all_off()` をセットして
+    /// 渡す ── ここに到達する時点では既に解決済み。
+    ///
+    /// `any_enabled()` が `false` なら端末への画像プロトコル問い合わせ
+    /// 自体をスキップしてテキスト専用 UI で起動する。
+    pub suppression: suppression::ImageSuppression,
 }
