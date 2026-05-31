@@ -213,8 +213,10 @@ git config core.hooksPath .githooks
 chmod 700 secrets
 # 既存 secrets/postgres_password.txt / s3_secret_key.txt が既に存在する場合は
 # 上書きしないこと (= 既存 DB / バケットが復号できなくなる)。初回のみ:
-[ -f secrets/postgres_password.txt ] || openssl rand -base64 32 > secrets/postgres_password.txt
-[ -f secrets/s3_secret_key.txt ] || openssl rand -base64 32 > secrets/s3_secret_key.txt
+# `-hex 32` (= 256 bit) で `=` パディングと改行混入を避ける ── postgres /
+# S3 接続文字列に貼ったときに URL エンコードでハマらないよう。
+[ -f secrets/postgres_password.txt ] || openssl rand -hex 32 > secrets/postgres_password.txt
+[ -f secrets/s3_secret_key.txt ]    || openssl rand -hex 32 > secrets/s3_secret_key.txt
 chmod 644 secrets/postgres_password.txt secrets/s3_secret_key.txt
 ```
 
