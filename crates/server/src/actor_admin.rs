@@ -25,6 +25,21 @@ use crate::delivery;
 use crate::local_api::profile::build_update_activity;
 use crate::state::AppState;
 
+/// `set_lock_state` の結果。`changed = false` のとき `queued = 0`。
+/// インフラ失敗 (DB / enqueue) は `anyhow::Result` 側で表現する。
+#[derive(Debug)]
+pub struct LockOutcome {
+    pub updated: ActorRow,
+    pub queued: usize,
+    pub changed: bool,
+    /// **PR #80 round-2 #4**: `list_accepted_inboxes` に失敗した場合、エラー
+    /// を握り潰して "queued=0 / 成功" と報告すると管理者は鍵アカ状態の連合
+    /// 通知が届いた前提で動いてしまう。代わりに「enqueue 経路で何件 warn
+    /// だけ残してスキップしたか」を別フィールドで返し、呼び出し側
+    /// (CLI / local API) で警告表示する。
+    pub enqueue_failures: usize,
+}
+
 pub async fn run(config: Config, args: ActorArgs) -> anyhow::Result<()> {
     let state = AppState::from_config(config).await?;
 
@@ -33,11 +48,11 @@ pub async fn run(config: Config, args: ActorArgs) -> anyhow::Result<()> {
         ActorCommand::Unlock => false,
     };
 
-    let (updated, queued, changed) = set_lock_state(&state, next).await?;
-    if !changed {
+    let outcome = set_lock_state(&state, next).await?;
+    if !outcome.changed {
         println!(
             "actor {ap_id} is already {label} (manually_approves_followers = {next})",
-            ap_id = updated.ap_id,
+            ap_id = outcome.updated.ap_id,
             label = if next { "locked" } else { "unlocked" },
         );
         return Ok(());
@@ -45,24 +60,41 @@ pub async fn run(config: Config, args: ActorArgs) -> anyhow::Result<()> {
     println!(
         "{verb} actor {ap_id} (manually_approves_followers = {next}); Update queued for {queued} follower inbox(es)",
         verb = if next { "locked" } else { "unlocked" },
-        ap_id = updated.ap_id,
+        ap_id = outcome.updated.ap_id,
+        queued = outcome.queued,
     );
+    if outcome.enqueue_failures > 0 {
+        // **#4 round-2 fix**: 黙って 0 件配送と報告すると管理者が誤解する。
+        // 失敗件数を stderr で明示しておく (= CLI 出力でも目に入る)。
+        eprintln!(
+            "WARNING: failed to enqueue Update for {n} follower inbox(es); see server logs",
+            n = outcome.enqueue_failures,
+        );
+    }
     Ok(())
 }
 
 /// `set_lock_state` ── CLI と local API の共通実装。
 ///
-/// 戻り値:
-/// - `updated` ── DB から読み直した actor row。
-/// - `queued`  ── follower inbox に積んだ Update の本数 (no-op なら 0)。
-/// - `changed` ── 値が実際に切り替わったか (= idempotent re-invoke なら false)。
-pub async fn set_lock_state(
-    state: &AppState,
-    next: bool,
-) -> anyhow::Result<(ActorRow, usize, bool)> {
+/// **PR #80 round-2 #4 修正**:
+/// 旧実装は `list_accepted_inboxes` 失敗を `warn!` + `queued=0` で吸収して
+/// しまい、管理者が「Update が全 follower に届いた」と誤解する経路があった。
+/// 修正後は:
+/// - `list_accepted_inboxes` の失敗は **`anyhow::Error` でエスカレート**
+///   する (= CLI / HTTP 層から失敗が見える)。
+/// - 個別 `enqueue_activity` の失敗は warn し続け、件数を `enqueue_failures`
+///   に詰めて呼び出し側に通知する (1 件失敗で全体を bail すると、たまたま
+///   inbox URL が壊れている follower が居るだけで lock 切替自体ができなく
+///   なるため)。
+pub async fn set_lock_state(state: &AppState, next: bool) -> anyhow::Result<LockOutcome> {
     let local = local_actor(state).await?;
     if local.manually_approves_followers == next {
-        return Ok((local, 0, false));
+        return Ok(LockOutcome {
+            updated: local,
+            queued: 0,
+            changed: false,
+            enqueue_failures: 0,
+        });
     }
 
     let updated = repo::actor::set_manually_approves_followers(state.pool(), local.id, next)
@@ -75,8 +107,13 @@ pub async fn set_lock_state(
         })?;
 
     let activity = build_update_activity(&updated);
-    let queued = enqueue_to_followers(state, &updated, &activity).await;
-    Ok((updated, queued, true))
+    let (queued, enqueue_failures) = enqueue_to_followers(state, &updated, &activity).await?;
+    Ok(LockOutcome {
+        updated,
+        queued,
+        changed: true,
+        enqueue_failures,
+    })
 }
 
 async fn local_actor(state: &AppState) -> anyhow::Result<ActorRow> {
@@ -98,25 +135,26 @@ async fn enqueue_to_followers(
     state: &AppState,
     local_actor: &ActorRow,
     activity: &JsonValue,
-) -> usize {
-    let inboxes = match repo::follow::list_accepted_inboxes(state.pool(), local_actor.id).await {
-        Ok(list) => list,
-        Err(err) => {
-            warn!(?err, "actor lock/unlock: list_accepted_inboxes failed");
-            return 0;
-        }
-    };
+) -> anyhow::Result<(usize, usize)> {
+    let inboxes = repo::follow::list_accepted_inboxes(state.pool(), local_actor.id)
+        .await
+        .context("list accepted follower inboxes")?;
     let mut queued = 0_usize;
+    let mut failures = 0_usize;
     for inbox in &inboxes {
         match delivery::enqueue_activity(state.pool(), local_actor.id, inbox, activity).await {
             Ok(_) => queued += 1,
-            Err(err) => warn!(?err, %inbox, "actor lock/unlock: enqueue failed"),
+            Err(err) => {
+                failures += 1;
+                warn!(?err, %inbox, "actor lock/unlock: enqueue failed");
+            }
         }
     }
     info!(
         actor = %local_actor.ap_id,
         queued,
+        failures,
         "Update queued for followers (lock/unlock)",
     );
-    queued
+    Ok((queued, failures))
 }

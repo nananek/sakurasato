@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)\n        VALUES ($1, $2, $3, 'pending')\n        ON CONFLICT (follower_actor_id, followed_actor_id) DO UPDATE\n            SET updated_at = follow.updated_at\n        RETURNING id, ap_id, follower_actor_id, followed_actor_id, state, created_at, updated_at\n        ",
+  "query": "\n        INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)\n        VALUES ($1, $2, $3, 'pending')\n        ON CONFLICT (follower_actor_id, followed_actor_id) DO UPDATE\n            SET ap_id = CASE WHEN follow.state = 'rejected' THEN EXCLUDED.ap_id ELSE follow.ap_id END,\n                state = CASE WHEN follow.state = 'rejected' THEN 'pending'      ELSE follow.state END,\n                updated_at = CASE WHEN follow.state = 'rejected' THEN now()     ELSE follow.updated_at END\n        RETURNING id, ap_id, follower_actor_id, followed_actor_id, state, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -98,5 +98,5 @@
       false
     ]
   },
-  "hash": "83326209bfb5bf670ddd9fa33fc0c81102b4f205dd213e512d4b5ef78a6c82ba"
+  "hash": "8e20c8cf3b6c336c455618c300be257277b25fdfdcf5ff983c6961ef51392ca0"
 }

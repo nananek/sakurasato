@@ -102,6 +102,11 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/follow-requests/{id}/reject",
             post(follow_request::reject),
         )
+        // PR #80 round-2 #6: 古いフォロー行をハード削除 (test cleanup 用)。
+        .route(
+            "/api/v1/follow-requests/{id}",
+            axum::routing::delete(follow_request::delete),
+        )
         // 全 `/api/v1/*` に Bearer 認証を要求する。`from_fn_with_state` で
         // middleware に `AppState` を渡し、`api_token` lookup に使う。
         .layer(axum::middleware::from_fn_with_state(

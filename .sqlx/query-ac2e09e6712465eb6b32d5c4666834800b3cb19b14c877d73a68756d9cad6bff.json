@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            f.id           AS \"id!\",\n            f.ap_id        AS \"ap_id!\",\n            follower.ap_id AS \"follower_ap_id!\",\n            f.created_at   AS \"created_at!\"\n        FROM follow f\n        JOIN actor follower ON follower.id = f.follower_actor_id\n        JOIN actor followed ON followed.id = f.followed_actor_id\n        WHERE f.state = 'pending' AND followed.is_local = TRUE\n        ORDER BY f.created_at ASC\n        ",
+  "query": "\n        SELECT\n            f.id           AS \"id!\",\n            f.ap_id        AS \"ap_id!\",\n            follower.ap_id AS \"follower_ap_id!\",\n            f.state        AS \"state!\",\n            f.created_at   AS \"created_at!\"\n        FROM follow f\n        JOIN actor follower ON follower.id = f.follower_actor_id\n        JOIN actor followed ON followed.id = f.followed_actor_id\n        WHERE followed.is_local = TRUE\n          AND ($1::BOOLEAN = TRUE OR f.state = 'pending')\n        ORDER BY f.created_at ASC\n        ",
   "describe": {
     "columns": [
       {
@@ -38,6 +38,17 @@
       },
       {
         "ordinal": 3,
+        "name": "state!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
         "name": "created_at!",
         "type_info": "Timestamptz",
         "origin": {
@@ -49,14 +60,17 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Bool"
+      ]
     },
     "nullable": [
+      false,
       false,
       false,
       false,
       false
     ]
   },
-  "hash": "de662353dd4a15fd3537129d11a673efd8bc3e45d07446342c9454268c336994"
+  "hash": "ac2e09e6712465eb6b32d5c4666834800b3cb19b14c877d73a68756d9cad6bff"
 }

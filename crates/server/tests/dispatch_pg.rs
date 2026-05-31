@@ -2225,6 +2225,82 @@ async fn follow_request_approve_enqueues_accept_and_flips_state(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn unlock_does_not_auto_accept_pending_follows(pool: PgPool) {
+    // **PR #80 round-2 review #10 (invariant test)**: lock 中に届いた Follow が
+    // pending で据え置かれている状態で actor を unlock したとき、pending 行が
+    // **勝手に accepted に倒れない** ことを保証する。設計意図 (= 鍵 ON 中の
+    // 「待ち」を unlock の事故で全部 accept してしまわない) を将来のリファクタで
+    // 意図せず壊さないための guard。
+    use sakurasato_server::actor_admin;
+
+    let (_, local_pub) = fresh_rsa();
+    let (_, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, locked_local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let pending_ap_id = "https://remote.test/users/bob/activities/locked-pending".to_string();
+    sqlx::query!(
+        r"INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)
+          VALUES ($1, $2, $3, 'pending')",
+        pending_ap_id,
+        remote.id,
+        local.id,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // unlock 経路を直叩き (= CLI / local API どちらでも同じヘルパに集約)。
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let outcome = actor_admin::set_lock_state(&state, false).await.unwrap();
+    assert!(outcome.changed, "lock state must have flipped");
+    assert!(
+        !outcome.updated.manually_approves_followers,
+        "actor must be unlocked",
+    );
+
+    // **不変式**: pending 行は依然 pending のまま、accepted には倒れない。
+    let after = sqlx::query!("SELECT state FROM follow WHERE ap_id = $1", pending_ap_id,)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.state, "pending",
+        "unlock must NOT auto-accept the previously-pending follow row",
+    );
+
+    // Accept activity が queue されていないことも確認 ── 自動承認の副作用が
+    // delivery_queue 経由で起きないこと。
+    let queued = sqlx::query!(
+        "SELECT count(*) AS c FROM delivery_queue \
+         WHERE sender_actor_id = $1 \
+           AND activity->>'type' = 'Accept'",
+        local.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        queued.c.unwrap_or(0),
+        0,
+        "no Accept must be queued by an unlock operation",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn follow_request_reject_enqueues_reject_and_flips_state(pool: PgPool) {
     use sakurasato_core::model::FollowState;
     use sakurasato_server::follow_request;

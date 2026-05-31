@@ -27,6 +27,10 @@ pub struct LockResponse {
     pub queued_deliveries: usize,
     /// 値が実際に切り替わったか。idempotent re-invoke では false。
     pub changed: bool,
+    /// **PR #80 round-2 #4**: 個別 follower への `enqueue_activity` 失敗件数。
+    /// 0 が正常、>0 のとき呼び出し側 (TUI / pytest) で警告表示することを
+    /// 想定する。
+    pub enqueue_failures: usize,
 }
 
 pub async fn lock(State(state): State<AppState>) -> Response {
@@ -39,12 +43,13 @@ pub async fn unlock(State(state): State<AppState>) -> Response {
 
 async fn apply(state: &AppState, next: bool) -> Response {
     match set_lock_state(state, next).await {
-        Ok((updated, queued, changed)) => {
+        Ok(outcome) => {
             let body = LockResponse {
-                ap_id: updated.ap_id,
-                manually_approves_followers: updated.manually_approves_followers,
-                queued_deliveries: queued,
-                changed,
+                ap_id: outcome.updated.ap_id,
+                manually_approves_followers: outcome.updated.manually_approves_followers,
+                queued_deliveries: outcome.queued,
+                changed: outcome.changed,
+                enqueue_failures: outcome.enqueue_failures,
             };
             (StatusCode::OK, Json(body)).into_response()
         }

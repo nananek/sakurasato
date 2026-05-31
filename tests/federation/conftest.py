@@ -241,8 +241,11 @@ class SakurasatoClient:
         resp.raise_for_status()
         return resp.json()
 
-    def follow_requests(self) -> list[dict]:
-        resp = self._local.get("/api/v1/follow-requests")
+    def follow_requests(self, state: str = "pending") -> list[dict]:
+        """`state`: `pending` (default) / `all`。`all` は accepted/rejected も含む。"""
+        resp = self._local.get(
+            "/api/v1/follow-requests", params={"state": state}
+        )
         resp.raise_for_status()
         return resp.json().get("items", [])
 
@@ -255,6 +258,13 @@ class SakurasatoClient:
         resp = self._local.post(f"/api/v1/follow-requests/{follow_id}/reject")
         resp.raise_for_status()
         return resp.json()
+
+    def follow_request_delete(self, follow_id: int) -> None:
+        """**PR #80 round-2 #6 (test re-runnability)**: 古い follow 行をハード削除する。"""
+        resp = self._local.delete(f"/api/v1/follow-requests/{follow_id}")
+        if resp.status_code == 404:
+            return  # 既に無い → no-op
+        resp.raise_for_status()
 
     # ── public AP / WebFinger ────────────────────────────────
     def webfinger(self, acct: str) -> dict:

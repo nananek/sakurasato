@@ -14,12 +14,21 @@ use crate::model::DeliveryQueueRow;
 /// retired into the `dead` state. The worker can override this per call.
 pub const DEFAULT_MAX_ATTEMPTS: i32 = 10;
 
-pub async fn enqueue(
-    pool: &PgPool,
+/// `delivery_queue` に 1 行 push する。
+///
+/// `executor` を generic にしてあるので `&PgPool` (= 単発) と
+/// `&mut Transaction` (= 周囲の DB 変更とまとめてコミット) のどちらでも
+/// 呼べる。PR #80 round-2 で `follow-request approve/reject` が
+/// `set_state` と enqueue を同一トランザクションで囲むために generic 化。
+pub async fn enqueue<'e, E>(
+    executor: E,
     inbox_url: &str,
     activity: &JsonValue,
     sender_actor_id: i64,
-) -> sqlx::Result<DeliveryQueueRow> {
+) -> sqlx::Result<DeliveryQueueRow>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as!(
         DeliveryQueueRow,
         r#"
@@ -35,7 +44,7 @@ pub async fn enqueue(
         activity,
         sender_actor_id,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
