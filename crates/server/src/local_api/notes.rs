@@ -66,6 +66,12 @@ const PUBLIC_URI: &str = "https://www.w3.org/ns/activitystreams#Public";
 /// 添付の最大件数。Mastodon API の 4 件と揃える ── 連合相手にも違和感が
 /// 出ない値で、お一人様サーバとしても十分。
 const ATTACHMENT_MAX: usize = 4;
+/// **#65**: 1 投稿で resolve する mention の最大件数。お一人様 server で
+/// ローカル API のアクセス権 = 所有者本人のため自己 `DoS` が中心だが、
+/// 5000 文字 content + `@a@b.cd` (8 文字) で最大 ~625 件まで通る計算になり、
+/// それぞれ `WebFinger` + actor fetch を直列実行すると応答が分単位になる。
+/// Mastodon の慣習に近い 50 件を上限とする (PR #78 review #2)。
+const MENTION_MAX: usize = 50;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateNoteRequest {
@@ -147,6 +153,12 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
     // direct visibility の宛先決定にも、public/unlisted/followers の cc
     // に乗せる mention 通知にも、両方で使う共通経路。
     let parsed_mentions = parse_mentions(&req.content);
+    if parsed_mentions.len() > MENTION_MAX {
+        return bad_request_owned(&format!(
+            "content has {} mentions; the maximum per post is {MENTION_MAX}",
+            parsed_mentions.len(),
+        ));
+    }
     let mentions = match resolve_mentions(&state, &local_actor, &parsed_mentions).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -155,15 +167,9 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
     // **#65**: direct visibility は宛先解決が完了して初めて成立する。
     // 解決後 mention 0 件 + reply_parent も無い場合は配送先がゼロになるので
     // 400 で拒否する (= followers にも配らない = どこにも届かない post)。
-    if matches!(visibility, Visibility::Direct)
-        && mentions.iter().all(|m| m.inbox_for_delivery.is_none())
-        && reply_parent
-            .as_ref()
-            .and_then(|p| p.inbox_for_delivery.as_ref())
-            .is_none()
-        && mentions.is_empty()
-        && reply_parent.is_none()
-    {
+    // `mentions.is_empty()` が真なら `inbox_for_delivery.is_none()` 系の
+    // all() 条件は真空的に true なので、空判定だけで十分 (PR #78 review #1)。
+    if matches!(visibility, Visibility::Direct) && mentions.is_empty() && reply_parent.is_none() {
         return bad_request(
             "direct visibility requires at least one resolvable @user@host mention or a reply target",
         );
@@ -1337,5 +1343,15 @@ mod tests {
         let m = parse_mentions("see (@alice@x.test) for details");
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "@alice@x.test");
+    }
+
+    /// **#65 (review #2)**: 同一投稿で `MENTION_MAX` を超える mention は
+    /// 配送経路の `DoS` 防止に巻き込まれ得るため、`MENTION_MAX` の値が
+    /// 妥当 (= Mastodon 慣習に近い 50) で固定されていることを assert する。
+    /// 上限超過時の 400 は統合テスト経路でカバー (= 50 件ちょうどは通り、
+    /// 51 件は弾かれる) ── unit test 段ではコンスタント値の固定のみ確認。
+    #[test]
+    fn mention_max_is_pinned_to_fifty() {
+        assert_eq!(MENTION_MAX, 50);
     }
 }
