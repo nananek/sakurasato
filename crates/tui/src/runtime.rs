@@ -90,7 +90,11 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
     // alt screen / raw mode に切り替える **前** に呼ぶのが穏当 ── 失敗しても
     // 画像表示は単に無効化するだけで TUI は続行する。Kitty 等で `?` を出すと
     // Foot や非対応端末では即座に Err になり、grace-degrade する。
-    let picker = if options.images_enabled {
+    //
+    // M9 PR2: 視覚刺激抑制で「画像系がすべて off」のときは端末問い合わせも
+    // 省く ── 1 要素でも on なら問い合わせて Picker を確保する (= ランタイム
+    // 中に toggle で on に戻したくなったときに使える)。
+    let picker = if options.suppression.any_enabled() {
         match ratatui_image::picker::Picker::from_query_stdio() {
             Ok(p) => {
                 info!(?p, "TUI: ratatui-image picker initialized");
@@ -105,7 +109,7 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
             }
         }
     } else {
-        info!("TUI: images disabled by --no-images");
+        info!("TUI: all image elements suppressed (--no-images); skipping picker query");
         None
     };
     // M6: 画像取得は LocalApi 経由で server → media-proxy に委譲する。
@@ -120,6 +124,7 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
         socket_label,
         images,
         previews,
+        options.suppression,
     );
 
     // 初回タイムライン取得。
@@ -276,7 +281,7 @@ async fn apply_action(
         Action::EnterCompose => {
             app.focus = Focus::Compose;
         }
-        Action::FocusTimeline => {
+        Action::FocusTimeline | Action::SuppressionClose => {
             app.focus = Focus::Timeline;
         }
         Action::ToggleHelp => {
@@ -438,6 +443,59 @@ async fn apply_action(
         Action::ReactionPromptCancel => {
             close_reaction_prompt(app);
         }
+        Action::ToggleSuppression => toggle_suppression_overlay(app),
+        Action::SuppressionNext => {
+            let len = crate::suppression::Element::all().len();
+            app.suppression_cursor = (app.suppression_cursor + 1) % len;
+        }
+        Action::SuppressionPrev => {
+            let len = crate::suppression::Element::all().len();
+            app.suppression_cursor = (app.suppression_cursor + len - 1) % len;
+        }
+        Action::SuppressionToggle => {
+            let elements = crate::suppression::Element::all();
+            if let Some(e) = elements.get(app.suppression_cursor) {
+                app.suppression.toggle(*e);
+                app.set_status(
+                    format!(
+                        "{} = {}",
+                        e.label(),
+                        if app.suppression.is_on(*e) {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                    ),
+                    StatusKind::Info,
+                    Some(Duration::from_secs(2)),
+                );
+            }
+        }
+        Action::SuppressionDisableAll => {
+            app.suppression.disable_all();
+            app.set_status(
+                "all image elements suppressed",
+                StatusKind::Info,
+                Some(Duration::from_secs(2)),
+            );
+        }
+        Action::SuppressionEnableAll => {
+            app.suppression = crate::suppression::ImageSuppression::all_on();
+            app.set_status(
+                "all image elements enabled",
+                StatusKind::Info,
+                Some(Duration::from_secs(2)),
+            );
+        }
+    }
+}
+
+fn toggle_suppression_overlay(app: &mut App) {
+    if app.focus == Focus::Suppression {
+        app.focus = Focus::Timeline;
+    } else {
+        app.focus = Focus::Suppression;
+        app.suppression_cursor = 0;
     }
 }
 

@@ -97,6 +97,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         render_reaction_prompt(frame, status_area, &app.theme, p);
     }
 
+    // M9 PR2: 視覚刺激抑制トグル overlay。
+    if app.focus == Focus::Suppression {
+        render_suppression_overlay(frame, area, app);
+    }
+
     PanelRects {
         timeline: timeline_area,
         timeline_rows: rows,
@@ -178,7 +183,9 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
         return hits;
     }
 
-    let avatar_enabled = app.images.enabled();
+    // M9 PR2: 画像取得経路 (= Picker + LocalApi) が揃っていて、かつ
+    // 視覚刺激抑制で avatar が on のときだけ実描画。
+    let avatar_enabled = app.images.enabled() && app.suppression.avatar;
     let header_indent = if avatar_enabled {
         AVATAR_CELLS_W + 1
     } else {
@@ -519,6 +526,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::Help => "help",
         Focus::Picker => "picker",
         Focus::ReactionPrompt => "react",
+        Focus::Suppression => "suppress",
     };
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -623,6 +631,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "H", "upload header"),
         help_entry(palette, ";", "attach image (picker)"),
         help_entry(palette, "e", "react to selected note"),
+        help_entry(palette, "i", "image suppression toggle"),
         Line::from(""),
         Line::from(Span::styled("compose", help_section(palette))),
         help_entry(palette, "Enter", "insert newline"),
@@ -675,6 +684,78 @@ fn help_entry(palette: &Palette, key: &str, desc: &str) -> Line<'static> {
         ),
         Span::styled(desc.to_string(), Style::default().fg(palette.foreground)),
     ])
+}
+
+/// M9 PR2: 視覚刺激抑制 overlay。中央に小さなパネルを浮かべ、各要素の
+/// on/off を一覧する。`j/k` でカーソル移動、`space/Enter` でトグル、`!` で
+/// 一括 off、`Esc/i` で閉じる (実際のキーバインドは [`crate::event`])。
+#[allow(
+    clippy::many_single_char_names,
+    reason = "矩形 w/h/x/y は ratatui 慣習"
+)]
+fn render_suppression_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    use crate::suppression::Element;
+    let palette = &app.theme.palette;
+    let w = area.width.clamp(36, 48);
+    let h = 12.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let block = Block::default()
+        .title(Span::styled(
+            "  visual suppression  ",
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.accent))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    frame.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let elements = Element::all();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(elements.len() + 3);
+    lines.push(Line::from(Span::styled(
+        "  toggle image elements".to_string(),
+        Style::default().fg(palette.muted),
+    )));
+    lines.push(Line::from(""));
+    for (i, e) in elements.iter().enumerate() {
+        let on = app.suppression.is_on(*e);
+        let cursor = if i == app.suppression_cursor {
+            "▍ "
+        } else {
+            "  "
+        };
+        let box_char = if on { "[x]" } else { "[ ]" };
+        let style = if i == app.suppression_cursor {
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else if on {
+            Style::default().fg(palette.foreground)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{cursor}{box_char} {}", e.label()),
+            style,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  j/k=move  space=toggle  !=all off  Esc=close",
+        Style::default().fg(palette.muted),
+    )));
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(p, inner);
 }
 
 /// M7: ファイルピッカの描画。中央に大きめの overlay を出して、左にエントリ
@@ -836,7 +917,9 @@ fn render_picker_preview(
         return;
     }
 
-    if !app.previews.enabled() {
+    // M9 PR2: 画像取得経路と視覚刺激抑制 (preview トグル) の両方が on
+    // のときだけプレビューを描く。
+    if !app.previews.enabled() || !app.suppression.preview {
         let placeholder = Paragraph::new(Line::from(Span::styled(
             "  (preview disabled)",
             Style::default().fg(palette.muted),
