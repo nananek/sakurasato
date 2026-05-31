@@ -116,19 +116,63 @@ impl Listen {
             if rest.is_empty() {
                 anyhow::bail!("tcp:// URI must have host:port body");
             }
-            // `host:port` の最低限の sanity だけ確認 (port:digits の存在)。
-            // 実際の bind は OS に任せる ── 詳細は OS のエラーで判定する。
-            if !rest.contains(':') {
-                anyhow::bail!("tcp:// URI must include :port (got {rest:?})");
+            // **[PR #70 round-2 #1]**: `rest.contains(':')` だけでは IPv6 bare
+            // address (= `[::1]`) が `:` を含むため port 欠落をすり抜ける。
+            // `std::net::SocketAddr::from_str` で構造検証する ── これで
+            // `0.0.0.0:8080` / `127.0.0.1:18080` / `[::1]:443` / `[::]:8080`
+            // は通り、`[::1]` (port 欠落) / `localhost:abc` (port 非数値) /
+            // `localhost:8080` (DNS 必要、bind 時の errno 任せ) は事前に弾く。
+            //
+            // ただし `localhost:8080` のような DNS ホスト名形式は `SocketAddr`
+            // が受け付けない ── 実装の互換性のため「`SocketAddr` で通れば OK、
+            // 通らなければ `host:port` パターン (= 末尾が `:digits`) で fall
+            // back 検証」の 2 段で受ける。
+            if rest.parse::<std::net::SocketAddr>().is_err() {
+                // IPv6 ブラケットの外で最後の `:` を探し、その後が数値なら OK。
+                let bracket_close = rest.rfind(']');
+                let last_colon = rest.rfind(':');
+                let port_str = match (bracket_close, last_colon) {
+                    // `[::1]:8080` パターンは SocketAddr 経路で通っているはず
+                    // なので、ここに来るのは異常 (= `[::1]` ポート無し等)。
+                    (Some(close), Some(colon)) if colon > close => &rest[colon + 1..],
+                    // ブラケット無しなら最後の `:` 以降が port (= `host:port`)。
+                    (None, Some(colon)) => &rest[colon + 1..],
+                    _ => {
+                        anyhow::bail!("tcp:// URI must include :port (got {rest:?})");
+                    }
+                };
+                if port_str.is_empty() || !port_str.chars().all(|c| c.is_ascii_digit()) {
+                    anyhow::bail!("tcp:// URI port must be numeric (got {rest:?})");
+                }
+                // port は 0..=65535 (u16 範囲)。port 0 は OS 任せの自動割当
+                // 慣習があるので受理する。
+                let port: u32 = port_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("tcp:// port {port_str:?} is not numeric"))?;
+                if port > 65535 {
+                    anyhow::bail!("tcp:// port must be 0..=65535 (got {port})");
+                }
             }
             return Ok(Self::Tcp(rest.to_string()));
         }
         if let Some(rest) = trimmed.strip_prefix("unix://") {
-            // unix:///path or unix://localhost/path or unix:///path
+            // unix:///path or unix://localhost/path
+            // **[PR #70 round-2 #4]**: `unix:////path` (= `///path`) は
+            // `strip_prefix('/')` 後に `//path` が残るので二重スラッシュ検出で弾く。
             let path_str = if let Some(p) = rest.strip_prefix('/') {
                 // `unix:///path` (= host 部空) → `/path`
+                if p.starts_with('/') {
+                    anyhow::bail!(
+                        "unix:// URI must not have extra leading slashes (got {trimmed:?})"
+                    );
+                }
                 format!("/{p}")
             } else if let Some(p) = rest.strip_prefix("localhost/") {
+                if p.starts_with('/') {
+                    anyhow::bail!(
+                        "unix://localhost/ URI must not have extra leading slashes (got {trimmed:?})"
+                    );
+                }
                 format!("/{p}")
             } else {
                 anyhow::bail!(
@@ -145,6 +189,9 @@ impl Listen {
             if rest.is_empty() || !rest.starts_with('/') {
                 anyhow::bail!("unix: URI must have an absolute path (got {trimmed:?})");
             }
+            // `unix://...` は上で先に処理済みなので、ここは `unix:/...` のみ。
+            // `unix://` は通常 `strip_prefix("unix://")` で先に取られるが、
+            // 念のため再確認 (= `unix:///` のような形が万一来ても上で弾かれる)。
             return Ok(Self::Unix(PathBuf::from(rest)));
         }
         anyhow::bail!("listen URI must start with `tcp://` or `unix:` (got {trimmed:?})")
@@ -525,6 +572,55 @@ max_pixels = 33554432
         assert!(Listen::parse("unix://otherhost/path").is_err());
         // 未対応スキーム
         assert!(Listen::parse("http://localhost/").is_err());
+    }
+
+    /// **[PR #70 round-2 #1]**: IPv6 bare アドレス (`tcp://[::1]`) は `::`
+    /// で `:` 含有チェックを通過する旧バグの回帰テスト。
+    #[test]
+    fn listen_parse_rejects_ipv6_without_port() {
+        assert!(Listen::parse("tcp://[::1]").is_err());
+        assert!(Listen::parse("tcp://[::]").is_err());
+        assert!(Listen::parse("tcp://[2001:db8::1]").is_err());
+        // port 部が数値でない
+        assert!(Listen::parse("tcp://[::1]:abc").is_err());
+        assert!(Listen::parse("tcp://127.0.0.1:abc").is_err());
+        // port が範囲外。port 0 は **listener bind では OS が空きを割当てる
+        // 慣習** なので受理する (= テストでも `127.0.0.1:0` が頻出)。
+        assert!(Listen::parse("tcp://localhost:65536").is_err());
+    }
+
+    /// **[PR #70 round-2 #1]**: IPv6 with port は通す。
+    #[test]
+    fn listen_parse_accepts_ipv6_with_port() {
+        assert_eq!(
+            Listen::parse("tcp://[::1]:443").unwrap(),
+            Listen::Tcp("[::1]:443".into())
+        );
+        assert_eq!(
+            Listen::parse("tcp://[::]:8080").unwrap(),
+            Listen::Tcp("[::]:8080".into())
+        );
+    }
+
+    /// **[PR #70 round-2 #1]**: hostname 形式 (= `localhost:port`) も実用上は
+    /// 受け入れる ── `SocketAddr` parse は通らないが、末尾 `:数値` で fall back。
+    #[test]
+    fn listen_parse_accepts_hostname_with_port() {
+        assert_eq!(
+            Listen::parse("tcp://localhost:8080").unwrap(),
+            Listen::Tcp("localhost:8080".into())
+        );
+        assert_eq!(
+            Listen::parse("tcp://example.test:443").unwrap(),
+            Listen::Tcp("example.test:443".into())
+        );
+    }
+
+    /// **[PR #70 round-2 #4]**: `unix:////path` (= スラッシュ 4 つ以上) は弾く。
+    #[test]
+    fn listen_parse_rejects_extra_leading_slashes_in_unix() {
+        assert!(Listen::parse("unix:////run/local.sock").is_err());
+        assert!(Listen::parse("unix://localhost//run/local.sock").is_err());
     }
 
     #[test]
