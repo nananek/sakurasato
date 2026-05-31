@@ -630,6 +630,21 @@ async fn create_note_direct_delivers_only_to_mentioned_inbox(pool: PgPool) {
     assert_eq!(tags[0]["href"], bob.ap_id);
     assert_eq!(tags[0]["name"], "@bob@remote.test");
 
+    // **PR #78 review F-5**: outer Create envelope の to/cc も同値で乗ること
+    // (= 将来のリファクタで object 側と乖離しても捕まえる)。
+    let outer_to: Vec<&str> = row.activity["to"]
+        .as_array()
+        .expect("Create.to array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(outer_to, vec![bob.ap_id.as_str()], "Create.to == object.to");
+    let outer_cc = row.activity["cc"].as_array().expect("Create.cc array");
+    assert!(
+        outer_cc.is_empty(),
+        "Create.cc should be empty, got {outer_cc:?}",
+    );
+
     // DB の note 行にも tag が永続化されていること (= timeline 等で再利用可能)。
     let note_id = json["id"].as_i64().unwrap();
     let note_tags: serde_json::Value =

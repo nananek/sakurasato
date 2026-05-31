@@ -481,18 +481,27 @@ fn parse_mentions(content: &str) -> Vec<MentionAcct> {
     let mut out: Vec<MentionAcct> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut i = 0;
+    // **PR #78 review F-2**: 直前の反復で mention を抽出しきった場合、その
+    // mention の末尾は host TLD 文字 (= 英数) なので単純な前一文字判定では
+    // 次の `@user@host` が word boundary 違反として黙って捨てられる。
+    // `@alice@a.test@bob@b.test` を空白なしで書かれてもどちらも拾うため、
+    // 「直前位置が前回 mention の終端 (= k)」も boundary と認める。
+    let mut prev_mention_end: Option<usize> = None;
     while i < bytes.len() {
         if bytes[i] != b'@' {
+            prev_mention_end = None;
             i += 1;
             continue;
         }
         // 単語境界: `@` の直前が英数 / `_` / `@` ならスキップ (メアド誤認回避)。
         // 非 ASCII バイト (= マルチバイト UTF-8 の途中) は ascii_alphanumeric() が
         // false を返すので「日本語の後の @user@host」は正しく拾える。
-        let prev_ok = i == 0 || {
+        // ただし「直前位置が前回 mention 末尾」のときは boundary と認める (F-2)。
+        let prev_ok = i == 0 || prev_mention_end == Some(i) || {
             let b = bytes[i - 1];
             !b.is_ascii_alphanumeric() && b != b'_' && b != b'@'
         };
+        prev_mention_end = None;
         if !prev_ok {
             i += 1;
             continue;
@@ -551,6 +560,7 @@ fn parse_mentions(content: &str) -> Vec<MentionAcct> {
             });
         }
         i = k;
+        prev_mention_end = Some(k);
     }
     out
 }
@@ -619,8 +629,23 @@ async fn resolve_mentions(
 /// `enable_remote_fetch=false` (テスト経路) のときは `WebFinger` / fetch を
 /// 試さず DB ヒットだけで判定する ── 統合テストは事前に
 /// `repo::actor::insert` で actor を seed する契約。
+///
+/// **PR #78 review F-1 (cross-domain hijack 防御)**: `WebFinger` が返した
+/// `actor_uri` のホストが、クエリしたホスト (`m.host`) と一致するか検証する。
+/// 一致しない場合、悪意ある `WebFinger` サーバが「`@legit@evil.example` を
+/// `https://victim.example/users/legit` に向ける」差し替えをやって DM 宛先を
+/// 乗っ取れる。`fetch_and_upsert` 内の `id == ap_id` 自己整合性チェックでは
+/// この攻撃を防げない (= victim 側 actor 自身は自分の id を正しく返すため)。
+///
+/// **PR #78 review F-3 (case-insensitive lookup)**: `preferred_username` /
+/// `host` の DB 列は `TEXT` で case-sensitive 比較になる。`@BOB@REMOTE.TEST`
+/// のように mention を大文字で書かれても DB ヒットさせるため、lookup 時は
+/// 両方を ASCII lowercase に倒す。`MentionAcct.name` (= 表示用) は元のケースを
+/// 保持しているのでそちらに影響しない。
 async fn resolve_mention_actor(state: &AppState, m: &MentionAcct) -> Result<ActorRow, String> {
-    match repo::actor::get_by_username_host(state.pool(), &m.user, &m.host).await {
+    let user_lc = m.user.to_ascii_lowercase();
+    let host_lc = m.host.to_ascii_lowercase();
+    match repo::actor::get_by_username_host(state.pool(), &user_lc, &host_lc).await {
         Ok(Some(a)) => return Ok(a),
         Ok(None) => {}
         Err(err) => return Err(format!("mention {} DB lookup failed: {err}", m.name)),
@@ -631,15 +656,46 @@ async fn resolve_mention_actor(state: &AppState, m: &MentionAcct) -> Result<Acto
             m.name,
         ));
     }
-    let acct = format!("{}@{}", m.user, m.host);
+    let acct = format!("{user_lc}@{host_lc}");
     let resolved = state
         .media_proxy()
         .resolve_webfinger(&acct)
         .await
         .map_err(|err| format_webfinger_err(&m.name, &err))?;
+    // F-1: WebFinger が返した actor_uri のホストが、クエリしたホストと一致するか。
+    // 不一致は cross-domain 差し替え攻撃の徴候なので reject。
+    ensure_webfinger_host_match(&m.name, &host_lc, &resolved.actor_uri)?;
     remote_actor::fetch_and_upsert(state, &resolved.actor_uri)
         .await
         .map_err(|err| format_fetch_err(&m.name, &err))
+}
+
+/// **PR #78 review F-1**: `WebFinger` レスポンスの `actor_uri` ホストが、
+/// クエリした acct のホストと一致するか確認する。一致しない場合は
+/// `Err(String)` で reject する (= 上位は 400 に倒す)。
+///
+/// `url::Host` は DNS 名を lowercase で返す。IP リテラル等は既存の
+/// `net_guard` (`fetch_and_upsert` 内) で別途遮断されるので、ここは
+/// **ドメイン文字列の一致** だけを担保する。
+fn ensure_webfinger_host_match(
+    name: &str,
+    expected_host_lc: &str,
+    actor_uri: &str,
+) -> Result<(), String> {
+    let parsed = url::Url::parse(actor_uri)
+        .map_err(|e| format!("mention {name} webfinger returned invalid actor_uri: {e}"))?;
+    let actor_host = parsed
+        .host_str()
+        .ok_or_else(|| format!("mention {name} webfinger actor_uri has no host"))?
+        .to_ascii_lowercase();
+    if actor_host == expected_host_lc {
+        return Ok(());
+    }
+    Err(format!(
+        "mention {name} webfinger returned actor_uri on different host \
+         (expected {expected_host_lc:?}, got {actor_host:?}); \
+         possible cross-domain redirect, refusing to use",
+    ))
 }
 
 fn format_webfinger_err(name: &str, err: &MediaProxyError) -> String {
@@ -1343,6 +1399,62 @@ mod tests {
         let m = parse_mentions("see (@alice@x.test) for details");
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "@alice@x.test");
+    }
+
+    /// **PR #78 review F-2**: 空白なしで連続する `@user@host@user@host` でも
+    /// 2 件目を黙って捨てない (= 前回 mention 末尾を boundary と認める)。
+    #[test]
+    fn parse_mentions_handles_adjacent_pair_without_whitespace() {
+        let m = parse_mentions("@alice@a.test@bob@b.test");
+        assert_eq!(m.len(), 2, "expected 2 mentions, got {m:?}");
+        assert_eq!(m[0].name, "@alice@a.test");
+        assert_eq!(m[1].name, "@bob@b.test");
+    }
+
+    /// **PR #78 review F-2**: 直後に通常文字が来た場合は flag が解除されて
+    /// 次の `@` は通常の boundary 判定に戻る (= メアド誤認の回避は維持)。
+    #[test]
+    fn parse_mentions_boundary_flag_resets_after_nonat_char() {
+        // mention 直後にスペース、その後にメアド風 (= `text@host`) があっても
+        // 拾わないこと。
+        let m = parse_mentions("@alice@a.test bob@b.test");
+        assert_eq!(m.len(), 1, "expected only alice, got {m:?}");
+        assert_eq!(m[0].name, "@alice@a.test");
+    }
+
+    /// **PR #78 review F-1**: `ensure_webfinger_host_match` は host が完全一致
+    /// すれば Ok、異なる host (cross-domain redirect) なら Err。case fold あり。
+    #[test]
+    fn webfinger_host_match_accepts_exact_and_case_fold() {
+        assert!(
+            ensure_webfinger_host_match("@bob@a.test", "a.test", "https://a.test/users/bob")
+                .is_ok()
+        );
+        // expected が lower-cased で渡されることを前提に、actor_uri の host は
+        // 大文字でも `to_ascii_lowercase()` で揃う。
+        assert!(
+            ensure_webfinger_host_match("@bob@a.test", "a.test", "https://A.TEST/users/bob")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn webfinger_host_match_rejects_cross_domain() {
+        let err = ensure_webfinger_host_match(
+            "@legit@evil.example",
+            "evil.example",
+            "https://victim.example/users/legit",
+        )
+        .unwrap_err();
+        assert!(err.contains("different host"), "msg={err}");
+        assert!(err.contains("victim.example"), "msg={err}");
+    }
+
+    #[test]
+    fn webfinger_host_match_rejects_invalid_uri() {
+        let err =
+            ensure_webfinger_host_match("@x@a.test", "a.test", "not a url at all").unwrap_err();
+        assert!(err.contains("invalid actor_uri"), "msg={err}");
     }
 
     /// **#65 (review #2)**: 同一投稿で `MENTION_MAX` を超える mention は
