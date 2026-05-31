@@ -1,0 +1,90 @@
+name: Publish images to GHCR
+
+# `develop` push と CalVer タグ (`YYYY.MM.patch`) push の双方をトリガする。
+#   - develop push  → `:develop` (最新 develop HEAD を追跡)
+#   - tag push      → `:YYYY.MM.patch` + `:latest`
+# tag は `main` に対して打つ運用 (CLAUDE.md §11) なので、tag push 単独で
+# 「リリース」を表す。main そのものの push では発行しない。
+on:
+  push:
+    branches: [develop]
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
+    paths-ignore:
+      # 連合テスト compose / scripts / docs はイメージに影響しない。
+      - "compose/docker-compose.federation-*.yml"
+      - "compose/federation-test/**"
+      - "scripts/federation-test/**"
+      - "**/*.md"
+  # 手動再発行用 (例: ghcr cache 喪失からの復旧)。
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # server / media-proxy は自前 Dockerfile (Rust 静的バイナリ + distroless)。
+          - name: server
+            dockerfile: docker/server.Dockerfile
+          - name: media-proxy
+            dockerfile: docker/media-proxy.Dockerfile
+          # versitygw は upstream イメージ + USER 65534 のラッパで十分軽量。
+          # 利用者は `docker compose pull` で全 3 イメージを取得できる。
+          - name: versitygw
+            dockerfile: docker/versitygw.Dockerfile
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/sakurasato-${{ matrix.name }}
+          # CalVer は `YYYY.MM.patch` (Misskey 準拠) で SemVer 互換の形なので
+          # `match` pattern で `\d+\.\d+\.\d+` を拾う。`latest` はタグ push のとき
+          # だけ更新する (develop push では `latest` に触らない)。
+          tags: |
+            type=match,pattern=\d+\.\d+\.\d+,group=0,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=develop,enable=${{ github.ref == 'refs/heads/develop' }}
+          # OCI labels: source / created / revision / version を自動付与。
+          # ghcr の image overview に repo リンクが表示される。
+          labels: |
+            org.opencontainers.image.title=sakurasato-${{ matrix.name }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Sakurasato ${{ matrix.name }} (M10 hardened, distroless + rootless)
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache を BuildKit に橋渡し ── server / media-proxy
+          # の Rust 段は cargo registry + target ディレクトリ重め。
+          # `scope=<name>` で 3 イメージ間のキャッシュ干渉を分ける。
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          # provenance / sbom は M10+ で別 issue 化する (本 workflow は最小スコープ)。
+          provenance: false
+          sbom: false
