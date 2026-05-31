@@ -34,9 +34,12 @@ services:
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     secrets:
       # docker compose (非 swarm) は bind-mount された secret の uid/gid/mode を
-      # 変更できない (compose の警告で明示される) ため、ホスト側ファイルの
-      # パーミッションがそのまま反映される。dev では 0644 で運用し、
-      # 本格的な secret 管理は M10 (セキュリティ硬化) で対応する。
+      # 変更できない (compose が WARN を出す既知の制約) ため、ホスト側ファイルの
+      # パーミッションがそのまま反映される。dev (rootless Docker) では:
+      #   - secrets/ ディレクトリは chmod 700 でホスト他ユーザから遮断
+      #   - ファイル自体は chmod 644 (= postgres コンテナ uid 70 が読めるため。
+      #     0600 ホスト$USER 所有だと subuid マッピング上で uid 70 が read 不可)
+      # 本番 (rootful / swarm) は CLAUDE.md §7.1 参照。
       - postgres_password
     volumes:
       # postgres 18+ の推奨は /var/lib/postgresql 単一マウント
@@ -129,8 +132,9 @@ services:
       # server から直接外部 (HTTPS POST / GET) に出る設計。Mastodon / Misskey /
       # Pleroma も server 直配送が業界標準で、配送経路を media-proxy に通す利点が
       # 限定的なため。受け取るレスポンスは JSON のみで画像デコードを伴わない。
-      # M6 完了 (画像取得は media-proxy 経由に切替済み) でも本方針は維持。
-      # 配送経路自体の隔離は M10 セキュリティ硬化で再評価する。
+      # M6 / M10 完了時点でも本方針は維持 (画像取得は M6 で media-proxy 経由に、
+      # WebFinger は M10 PR #51 で media-proxy 経由に切替済み)。配送 POST と
+      # actor JSON GET の媒介化は将来の独立 issue で再評価する。
       - internal
       - egress
 

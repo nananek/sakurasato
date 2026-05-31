@@ -67,8 +67,9 @@
 
 - **server だけが外部公開**（リバースプロキシ経由で 443）。
 - **外部 GET（リモートメディア取得・OGP）は media-proxy のみに許可**。本体 server は信頼できないバイト列をデコードしない。
-- **外部 POST（ActivityPub 配送 / remote actor fetch）は当面 server から直接行う**（暫定）。Mastodon / Misskey / Pleroma も server 直配送が業界標準で、配送経路を media-proxy に通す利点は限定的なため。これは M6 で media-proxy を実装した時点で再評価する選択（[Issue #23](https://github.com/nananek/sakurasato/issues/23)）。**M6 完了時点で本方針を維持**（配送 POST と remote actor fetch のレスポンスは JSON のみで画像デコードを伴わず、media-proxy 経由化の利得が薄い）。配送経路自体の隔離は M10 セキュリティ硬化で再評価。
-- **外部 GET（リモートメディア / OGP）は media-proxy のみ**。M6 で TUI のアバター取得経路も `/api/v1/media/proxy` 経由 → media-proxy に切り替え済み（[Issue #36](https://github.com/nananek/sakurasato/issues/36) 解消）── TUI ホストプロセスから直接外向き接続が出なくなり、ホスト LAN / クラウド IMDS への SSRF 表面が縮小。
+- **WebFinger 解決も media-proxy 経由**（M10、PR #51 で追加）。`follow <acct>` CLI は media-proxy の `/v1/webfinger/resolve` を通る ── SSRF / redirect / `max_bytes` を画像取得と同じ防御で共有し、`acct:` → actor URI 解決の外向き HTTP が server から消える。
+- **外部 POST（ActivityPub 配送 / remote actor fetch）は当面 server から直接行う**（暫定）。Mastodon / Misskey / Pleroma も server 直配送が業界標準で、配送経路を media-proxy に通す利点は限定的なため。これは M6 で media-proxy を実装した時点で再評価する選択（[Issue #23](https://github.com/nananek/sakurasato/issues/23)）。**M6 / M10 完了時点でも本方針を維持**（配送 POST と remote actor fetch のレスポンスは JSON のみで画像デコードを伴わず、媒介化の利得が薄い。一方 WebFinger は鍵を要さない単純 GET なので媒介化済み）。配送経路自体の隔離は将来の独立 issue で再評価。
+- **外部 GET（リモートメディア / OGP / WebFinger）は media-proxy のみ**。M6 で TUI のアバター取得経路も `/api/v1/media/proxy` 経由 → media-proxy に切り替え済み（[Issue #36](https://github.com/nananek/sakurasato/issues/36) 解消）── TUI ホストプロセスから直接外向き接続が出なくなり、ホスト LAN / クラウド IMDS への SSRF 表面が縮小。M10 では WebFinger も同 egress 経路に寄せた。
 - postgres / versitygw は内部ネットのみ。TUI はコンテナ外でホスト端末から Unix ソケット接続。
 
 ---
@@ -109,7 +110,9 @@ sakurasato/
 - **Actor 構成**: 単一ユーザー actor ＋ `instance.actor`(application actor, 必要に応じて生成)。
 - **ローカル API（server ⇄ tui）**: Unix ドメインソケット上の REST + SSE（タイムライン購読）。お一人様前提でソケットのファイルパーミッションが認証境界。トークン発行は CLI から可能。**メディアアップロード**エンドポイント（アイコン/ヘッダ/添付）を持ち、受領後 media-proxy でサニタイズ・変換 → versitygw 格納 → メタデータを DB 登録。
 - **最小 Web UI**: 投稿のパーマリンク（AP Note を人間可読 HTML で）、WebFinger/NodeInfo/actor JSON、メディア配信エンドポイント `GET /media/<key>`（versitygw から取得して配信。versitygw 自体は非公開）。
-- **管理 CLI**（同バイナリのサブコマンド, `clap`）: `init`（ユーザー/鍵生成）, `emoji import <zip>`, `follow <acct>`, `move accept`, `token issue` など。**Web 認証 UI は作らない。**
+- **管理 CLI**（同バイナリのサブコマンド, `clap`）: `init`（ユーザー/鍵生成）, `emoji import <zip>`, `follow <acct>`（M10）, `move-accept --from <file>`（M10、inbound `Move` 再処理）, `move-out <target>`（送出側 Move）, `alias add|remove|list|clear`, `token issue|list|revoke`, `deliver --queue-id` など。**Web 認証 UI は作らない。**
+  - **`follow <acct>`** は media-proxy で WebFinger を解決し、Follow を `delivery_queue` に積む。`--actor-uri` で WebFinger をスキップして直接 actor URI 指定も可能。`follow-cli-{follower}-{followed}` 形式の決定論的 activity id で `(follower, followed)` UNIQUE 制約と冪等。既存 row が `accepted` なら no-op、`rejected` は明示拒否、`pending` は再 enqueue。
+  - **`move-accept` は HTTP 署名検証を通らない**ため、**自分が控えておいた activity 本文** (= 通常経路で受領したものを保存しておいた JSON) でのみ使うこと。第三者から渡された JSON を流すと「Move を勝手に偽装」の入り口になる。コードレベルのガードは「`type == "Move"`」のみで、補完的には `handle_move` 内の `alsoKnownAs` 双方向同意検査・target actor の fresh fetch が「署名なしの任意 Move 適用」を防ぐ。
 
 ### 5.2 tui（TUI クライアント・別バイナリ）
 - ホスト端末で動作し、server のローカル API（Unix ソケット）へ接続。
@@ -164,9 +167,24 @@ TUI クライアントはコンテナ外（ホスト端末）で実行し、マ�
 - **rootless**: 非 root UID で実行（`USER nonroot` / 数値 UID）。
 - `read_only: true`（root fs）＋ 必要箇所のみ `tmpfs`(/tmp)。
 - `cap_drop: [ALL]`、`security_opt: ["no-new-privileges:true"]`。
-- **ネットワーク分離**: versitygw・postgres は内部ネットのみ。**media-proxy は外部 GET（画像 / OGP）の egress を持つ**。**server は AP 配送 POST と remote actor fetch のみ外部に egress を持つ**（暫定、§3 / [Issue #23](https://github.com/nananek/sakurasato/issues/23)）── M6 で再評価。
-- **シークレット**: compose secrets / 環境変数（postgres・S3 認証）。HTTP 署名鍵は CLI 生成で安全に保管（DB 内 or マウントした鍵ファイル、パーミッション 600）。
+- **ネットワーク分離**: versitygw・postgres は内部ネットのみ。**media-proxy は外部 GET（画像 / OGP / WebFinger）の egress を持つ**。**server は AP 配送 POST と remote actor fetch のみ外部に egress を持つ**（暫定、§3 / [Issue #23](https://github.com/nananek/sakurasato/issues/23)）── M10 で再評価し配送経路は当面 server 直のまま維持、WebFinger は M10 PR #51 で media-proxy 経由に移行。
 - **危険な入力の隔離**: 画像デコード・外部 GET は必ず media-proxy 側。server は信頼できないバイト列を直接デコードしない（AP 配送と actor fetch のレスポンスは JSON のみで扱う）。
+
+### 7.1 シークレット管理
+
+- **HTTP 署名鍵 (RSA + Ed25519)** は `init` CLI で生成し、`actor.private_key_pem` / `actor.ed25519_private_key_pem` に **DB 保管**。
+  - `ActorRow` で `#[serde(skip)]` + `Debug` redacted（[`crates/core/src/model.rs`](crates/core/src/model.rs)）── ローカル API / `tracing::debug!(?actor)` 経由で漏れない。
+  - マスアサインメント脆弱性（外部 JSON → `serde_json::from_value::<ActorRow>` で書き戻し）も `#[serde(skip)]` で塞ぐ。
+  - バックアップは postgres の物理バックアップに乗る（鍵単独のファイル管理は不要）。
+  - 鍵ローテーション = `init --force`。**フェデレーション破壊** (= 既存フォロワーの inbox 配送が署名検証失敗で全部弾かれる) なので緊急時のみ。
+- **compose secrets** (`secrets/postgres_password.txt`, `secrets/s3_secret_key.txt`)
+  - **`secrets/` ディレクトリは `chmod 700`** ── ホスト上の他ユーザから secrets を見せない一次防御。ディレクトリ traversal は docker daemon (= ホスト `$USER`) が行うので、コンテナ側の通信には影響しない。
+  - **ファイル自体は `chmod 644`** で OK (rootless Docker 環境では `chmod 600` だと **postgres コンテナ (uid 70) が読めず起動失敗** する。検証済み: ホスト `$USER` 所有 0600 ファイルは container uid 0 (= subuid マップで host `$USER`) のみ読み取り可、container uid 70 (= host subuid 100070) は権限なし)。
+  - **compose v5 (bind-mount secret) は `uid` / `gid` / `mode` を上書きできない** (compose が `WARN[0000] secrets.postgres_password: 'mode' is not supported by compose` を出す既知の制約) ため、ホストファイルの mode がそのままコンテナ内に出る。
+  - **本番 (rootful Docker / Docker Swarm)** では `chmod 600 secrets/*.txt` + ファイル所有者を実際の postgres / versitygw コンテナ uid に合わせる、もしくは `swarm secret` (compose v3 swarm mode で `external: true`) を使うのが王道。本リポジトリは dev / single-host を主想定とするため bind-mount + 0700 ディレクトリで運用する。
+  - **`secrets/.gitignore`** が `*` で全 ignore、`!example.txt` と `!.gitignore` のみ追跡 ── 実シークレットは絶対にコミットされない。
+  - ローテーション: `docker compose down` → `secrets/*.txt` を新値で書き換え → `docker compose up`。サービス断は postgres / versitygw が起動するまでの数秒。
+- **ローカル API トークン** (M4): `api_token` テーブルに **ハッシュのみ** 保管 (`token issue` 時に raw 値を一度だけ stdout に出す)。再表示不可なので失敗時は `revoke` → 再 `issue`。
 
 ---
 
@@ -186,6 +204,20 @@ cargo install sqlx-cli --no-default-features --features postgres
 
 # git hooks を有効化（main 保護: 直接 commit/push を禁止）
 git config core.hooksPath .githooks
+
+# シークレットを準備 (§7.1)
+# - ディレクトリは 0700 でホスト上の他ユーザから遮断
+# - ファイルは rootless Docker でも postgres uid 70 が読めるよう 0644
+# (※ 0600 は rootless 環境で postgres コンテナが起動失敗するので避ける。
+#    本番 rootful Docker では 0600 + 適切な chown を §7.1 参照)
+chmod 700 secrets
+# 既存 secrets/postgres_password.txt / s3_secret_key.txt が既に存在する場合は
+# 上書きしないこと (= 既存 DB / バケットが復号できなくなる)。初回のみ:
+# `-hex 32` (= 256 bit) で `=` パディングと改行混入を避ける ── postgres /
+# S3 接続文字列に貼ったときに URL エンコードでハマらないよう。
+[ -f secrets/postgres_password.txt ] || openssl rand -hex 32 > secrets/postgres_password.txt
+[ -f secrets/s3_secret_key.txt ]    || openssl rand -hex 32 > secrets/s3_secret_key.txt
+chmod 644 secrets/postgres_password.txt secrets/s3_secret_key.txt
 ```
 
 ---
@@ -285,4 +317,6 @@ cargo run -p sakurasato-tui
 - `sakurasato emoji import <misskey.zip>` → TUI でカスタム絵文字表示を確認。
 - TUI のファイルセレクタで画像を選択 → プレビュー → アイコン/ヘッダ/添付としてアップロードし、media-proxy でサニタイズ（EXIF 除去）された画像が versitygw に格納され、連合・パーマリンクに反映されることを確認。
 - テストアカウントから `Move` を送り、フォロワー引き継ぎ受け入れを確認。
-- egress 制限の確認: server コンテナから外部 URL 取得が直接できず、media-proxy 経由のみで成立すること。
+- **`sakurasato-server follow <acct>`** (M10) で実 Misskey 等への WebFinger 解決 → Follow 送出 → 相手側 Accept が返って `follow.state = accepted` になることを確認。`--actor-uri` 直指定経路と WebFinger 経路の双方をカバーする。
+- **`sakurasato-server move-accept --from <file>`** (M10) で保存しておいた inbound `Move` 本文を再処理し、`alsoKnownAs` 検査と自動 re-follow が通常経路と同じく走ることを確認。
+- egress 制限の確認: server コンテナから外部 URL 取得 (画像 / WebFinger) が直接できず、media-proxy 経由のみで成立すること。`docker exec sakurasato-server-1 wget -O- https://example.com` 等で接続が失敗することを確認。

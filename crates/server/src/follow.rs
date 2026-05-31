@@ -125,13 +125,19 @@ async fn resolve_target(state: &AppState, args: &FollowArgs) -> anyhow::Result<A
         );
         uri.to_string()
     } else {
+        // `--actor-uri` 無しのときは `acct` が `required_unless_present` で
+        // 必須になっているため、ここに来た時点で `acct` は Some。
+        // 念のため `unwrap_or_default()` で空文字に倒し、media-proxy 側の
+        // `parse_acct` で `invalid_acct` を返させる (= clap 側を素通りした
+        // 異常系でも `unwrap()` panic を避ける)。
+        let acct = args.acct.as_deref().unwrap_or_default();
         let resolved = state
             .media_proxy()
-            .resolve_webfinger(&args.acct)
+            .resolve_webfinger(acct)
             .await
             .map_err(map_media_proxy_err)?;
         info!(
-            acct = %args.acct,
+            acct = %acct,
             subject = %resolved.subject,
             actor_uri = %resolved.actor_uri,
             "follow: WebFinger resolved",

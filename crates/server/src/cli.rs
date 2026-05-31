@@ -173,8 +173,14 @@ pub struct MoveOutArgs {
 pub struct FollowArgs {
     /// `acct:user@host` / `@user@host` / `user@host` のいずれでも可。
     /// `--actor-uri` を併用する場合は `WebFinger` 解決をスキップする。
-    #[arg(default_value = "")]
-    pub acct: String,
+    ///
+    /// `--actor-uri` 指定時のみ省略可能 (`required_unless_present`)。
+    /// **`default_value` は付けない**: clap v4 で `default_value` が設定された
+    /// 引数は常に「present」扱いになり、`required_unless_present` の発火が
+    /// 環境依存で不安定になる ([[m10-pr2-review]] 指摘 #1 対応)。
+    /// `Option<String>` で受けて follow.rs 側で `unwrap_or_default()` する。
+    #[arg(required_unless_present = "actor_uri")]
+    pub acct: Option<String>,
     /// `WebFinger` を経由せず直接 `ActivityPub` actor URI を指定する (オプション)。
     /// 例: `--actor-uri https://example.com/users/foo`。
     /// `acct` 引数があっても **こちらを優先** する。
