@@ -56,6 +56,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     info!(role = "public", listen = %public_listen.display(), "sakurasato-server starting listener");
     info!(role = "local-api", listen = %local_listen.display(), "sakurasato-server starting listener");
+    warn_if_non_loopback_local_api(&local_listen);
 
     let public_fut = serve_role(
         ListenerRole::Public,
@@ -204,14 +205,41 @@ async fn bind_public_unix(path: &std::path::Path) -> anyhow::Result<tokio::net::
     // クライアント認証は不要 (= 公開 AP listener の本質的性質)。volume を
     // compose 内で隔離する設計に任せる。
     //
-    // **[PR #70 review medium]**: `tokio::fs::set_permissions` (async) を使う。
-    // `std::fs::*` を async 関数内で直接叩くと Tokio スレッドをブロックする。
-    // 1 syscall とはいえ慣習どおり async 経路に揃える。
+    // **[PR #70 round-2 #2]**: chmod は **bind 直後の同期 syscall** で打つ
+    // ── async fs::set_permissions に変えると bind → await 境界 → chmod の
+    // 間に TOCTOU 窓が生まれ、hardened umask 環境 (umask=0o177 等) では
+    // socket が一瞬 0o600 で見え、別 UID の Cloudflared が EACCES を踏む。
+    // `std::fs::set_permissions` は 1 syscall (`chmod`) なので Tokio thread
+    // ブロック量は無視できる。`bind_socket` (= 0o600) と同じパターンに揃える。
     let perms = std::fs::Permissions::from_mode(0o666);
-    tokio::fs::set_permissions(path, perms)
-        .await
+    std::fs::set_permissions(path, perms)
         .with_context(|| format!("chmod 0o666 on public socket {}", path.display()))?;
     Ok(listener)
+}
+
+/// `Listen::Tcp` の bind 先が非 loopback (= 0.0.0.0 / 公衆 IP) のとき、
+/// オペレータに「ポート転送と Tailscale ACL を確認しろ」と警告する。
+///
+/// **[PR #70 round-2 #3]**: `local_api_listen = "tcp://0.0.0.0:18080"` を
+/// 受理するが、Docker の `ports: "18080:18080"` (= 127.0.0.1 prefix 忘れ)
+/// と組み合わさると local API がインターネット公開される。UDS 経路では
+/// 0o600 がファイルシステム壁だったが、TCP には Bearer トークンしか壁が
+/// ないので、起動時に明示警告で防御深度を一段上げる。
+fn warn_if_non_loopback_local_api(listen: &Listen) {
+    let Listen::Tcp(addr) = listen else {
+        return;
+    };
+    let is_loopback = addr
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|sa| sa.ip().is_loopback());
+    if !is_loopback {
+        warn!(
+            addr = %addr,
+            "local API is bound to a non-loopback TCP address. \
+             Ensure docker `ports:` uses 127.0.0.1: prefix and Tailscale ACL is configured. \
+             (see DEPLOYMENT.md §5.1)"
+        );
+    }
 }
 
 /// `Listen::Unix` であればその path を返す (shutdown 時の cleanup 用)。
@@ -228,5 +256,50 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => info!("SIGTERM received"),
         _ = int.recv() => info!("SIGINT received"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// **[PR #70 round-2 #3]**: loopback bind は警告しない、非 loopback は
+    /// 警告する。実際の `warn!` 発火は tracing-test を引かないと検証できない
+    /// ので、`is_loopback` 判定が想定どおり動くかを `SocketAddr` 経路で確認。
+    #[test]
+    fn warn_if_non_loopback_local_api_only_fires_on_non_loopback() {
+        // どれも panic せずに通ること (= 関数自体の sanity)。
+        warn_if_non_loopback_local_api(&Listen::Tcp("127.0.0.1:18080".into()));
+        warn_if_non_loopback_local_api(&Listen::Tcp("[::1]:18080".into()));
+        warn_if_non_loopback_local_api(&Listen::Tcp("0.0.0.0:18080".into()));
+        warn_if_non_loopback_local_api(&Listen::Tcp("[::]:18080".into()));
+        // hostname は SocketAddr parse できないので「loopback でない」扱い
+        // → 警告される。ここでも panic しないことだけ確認。
+        warn_if_non_loopback_local_api(&Listen::Tcp("localhost:18080".into()));
+        // UDS は対象外で no-op。
+        warn_if_non_loopback_local_api(&Listen::Unix(PathBuf::from("/run/local.sock")));
+    }
+
+    /// IP literal の loopback 判定が `is_loopback` で正しく拾えること
+    /// (= 警告の必要性判定ロジックの単体検証)。
+    #[test]
+    fn is_loopback_detection_matches_std() {
+        let cases = [
+            ("127.0.0.1:18080", true),
+            ("127.5.5.5:18080", true), // 127.0.0.0/8 全部
+            ("[::1]:18080", true),
+            ("0.0.0.0:18080", false),
+            ("[::]:18080", false),
+            ("10.0.0.1:18080", false),
+        ];
+        for (addr, expected) in cases {
+            let parsed = addr.parse::<std::net::SocketAddr>().unwrap();
+            assert_eq!(
+                parsed.ip().is_loopback(),
+                expected,
+                "addr {addr} loopback judgment",
+            );
+        }
     }
 }
