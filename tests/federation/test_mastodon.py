@@ -21,6 +21,17 @@
   60 秒待つ。
 - 連合経路は **side-effect で観測** する (= Bob が home_timeline に load し直して
   確認する等)。直接 DB を覗かない。
+
+ordering 依存 (重要):
+
+- `TestNoteFromSakurasato` / `TestNoteFromMastodon` / `TestReactionInbound` は
+  **`TestFollow` が走ったあと** に動くことが期待される (Mastodon Bob と
+  Sakurasato Me 双方向のフォローが accepted になっている前提で進む)。
+- pytest のデフォルト collection 順 (= 定義順) で正しく並ぶように書いてあるが、
+  `pytest-randomly` 等で順序がかき混ぜられると依存が崩れ、180s poll の
+  保険でも吸収しきれない可能性がある。order を変える場合は各テストの
+  冒頭で `mastodon.follow(...)` を再度叩いて、暗黙の前提を idempotent な
+  明示前提に置き直すこと ([round-2 review L-2] 対応)。
 """
 from __future__ import annotations
 

@@ -33,8 +33,12 @@ SAKURASATO_DOMAIN = os.environ.get("SAKURASATO_DOMAIN", "sakurasato")
 SAKURASATO_LOCAL_API_SOCKET = os.environ.get(
     "SAKURASATO_LOCAL_API_SOCKET", "/home/nonroot/local.sock"
 )
+# [round-2 M-2] docstring と一致させる ── compose env で常に上書きされる
+# 想定だが、direct 実行・debug 等で env 無しで走った時に
+# `FileNotFoundError: /tokens/pytest.token` で詰まないよう、docstring 記載の
+# 実体パスをデフォルトにする。
 SAKURASATO_TOKEN_FILE = os.environ.get(
-    "SAKURASATO_TOKEN_FILE", "/tokens/pytest.token"
+    "SAKURASATO_TOKEN_FILE", "/home/nonroot/pytest.token"
 )
 
 MASTODON_BASE_URL = os.environ.get("MASTODON_BASE_URL", "https://mastodon")
@@ -53,10 +57,23 @@ MASTODON_TOKEN_FILE = os.environ.get(
 DEFAULT_POLL_TIMEOUT = int(os.environ.get("FEDERATION_POLL_TIMEOUT", "180"))
 DEFAULT_POLL_INTERVAL = float(os.environ.get("FEDERATION_POLL_INTERVAL", "3"))
 
-# self-signed test CA を信頼するため verify=False を全リクエストで使う。
-# SSL_CERT_FILE 経由で trust を入れている実装もあるが、httpx は環境変数を
-# 拾わないので明示的に切る ── 本番経路は test CA を信頼しないので影響なし。
-_SSL_VERIFY = False
+# [round-2 M-1] httpx は `SSL_CERT_FILE` 環境変数を **自動では** 拾わない。
+# `verify=` に `ssl.SSLContext` を渡すと **自己署名 CA を信頼しつつホスト名・
+# チェーン検証を維持** できる ── `verify=False` だと Bearer 込みの通信でも
+# 証明書エラーを無音でスルーするのでテスト経路でも望ましくない。
+# httpx 0.28+ で `verify=<str>` が DeprecationWarning なので、`SSLContext`
+# 直渡しが現行の正解。
+# compose 側で `SSL_CERT_FILE: /certs/ca.crt` が常時セットされる前提だが、
+# 未設定環境 (= compose 外の手動 debug 等) では `verify=False` にフォールバック
+# して「とにかく繋ぐ」を優先する。
+def _build_ssl_verify() -> "ssl.SSLContext | bool":
+    ca_file = os.environ.get("SSL_CERT_FILE")
+    if not ca_file:
+        return False
+    return ssl.create_default_context(cafile=ca_file)
+
+
+_SSL_VERIFY = _build_ssl_verify()
 
 
 def poll_until(
