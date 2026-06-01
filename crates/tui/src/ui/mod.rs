@@ -26,6 +26,7 @@ use ratatui_image::Image;
 
 use crate::app::{App, Focus, StatusKind};
 use crate::client::TimelineNote;
+use crate::profile::ProfileScreen;
 use crate::theme::{Palette, Theme};
 
 /// avatar をレンダリングするときに左側へ確保する cell 数。`width` = この値、
@@ -47,6 +48,9 @@ pub struct PanelRects {
     /// M7: ピッカ表示中はリスト部分の矩形 (= PageDown/Up の高さ算出用)。
     /// 非表示時は zero rect。
     pub picker_list: Rect,
+    /// M13 PR4: Profile 画面の notes 一覧領域 (= PageDown/Up 高さ算出用)。
+    /// 非表示時は zero rect。
+    pub profile_notes: Rect,
 }
 
 /// タイムラインのスクロール可能領域内に並んだ note の行位置をビット圧縮せず
@@ -70,7 +74,18 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     let compose_area = chunks[1];
     let status_area = chunks[2];
 
-    let rows = render_timeline(frame, timeline_area, app);
+    // M13 PR4: Profile が積まれているときは Timeline 領域を Profile で
+    // 上書きする (compose / status バーは下に残す ── 終了したら Timeline に
+    // 戻る視覚的連続性のため)。
+    let mut profile_notes_rect = Rect::default();
+    let rows = if app.focus == Focus::Profile
+        && let Some(profile) = app.current_profile()
+    {
+        profile_notes_rect = render_profile_screen(frame, timeline_area, app, profile);
+        ScrollHits::default()
+    } else {
+        render_timeline(frame, timeline_area, app)
+    };
     render_compose(frame, compose_area, app);
     render_status(frame, status_area, app);
 
@@ -115,6 +130,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         compose: compose_area,
         help: help_area,
         picker_list,
+        profile_notes: profile_notes_rect,
     }
 }
 
@@ -270,6 +286,294 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
         }
     }
     hits
+}
+
+/// M13 PR4: Profile 画面 (Timeline の代わりに `timeline_area` に描く)。
+///
+/// 上段: ヘッダ画像帯 (2 行、画像があれば 1 行使う) + プロフィール (アバター +
+/// 名前 + acct + 状態 + bio + counts)。下段: notes 一覧。
+///
+/// 返り値は notes 一覧領域の矩形 (= `PanelRects::profile_notes` に保存)。
+#[allow(clippy::too_many_lines, reason = "Profile 1 画面分の宣言的描画")]
+fn render_profile_screen(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    profile: &ProfileScreen,
+) -> Rect {
+    let palette = &app.theme.palette;
+    let title_acct = profile.acct();
+    let block = Block::default()
+        .title(Span::styled(
+            format!("  profile — {title_acct}  "),
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style(palette, app.focus == Focus::Profile))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // ヘッダ部の高さは bio の行数で可変。最低 4 行 (名前 / acct / 状態 / counts)、
+    // bio で +N。残りを notes 一覧に渡す。
+    let summary_lines: Vec<String> = profile
+        .actor
+        .summary
+        .as_deref()
+        .map(|s| s.lines().map(ToOwned::to_owned).collect())
+        .unwrap_or_default();
+    let summary_height = u16::try_from(summary_lines.len()).unwrap_or(0).min(6);
+    let banner_height: u16 = u16::from(profile.actor.moved_to_ap_id.is_some());
+    // 名前行 / acct + state 行 / counts 行 / 区切り行 + summary + moved banner
+    let header_height = 4u16
+        .saturating_add(summary_height)
+        .saturating_add(banner_height);
+
+    let header_rect = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        header_height.min(inner.height),
+    );
+    let notes_top = inner.y + header_rect.height;
+    let notes_rect = Rect::new(
+        inner.x,
+        notes_top,
+        inner.width,
+        inner.height.saturating_sub(header_rect.height),
+    );
+
+    let avatar_enabled = app.images.enabled() && app.suppression.avatar;
+    let avatar_indent = if avatar_enabled {
+        AVATAR_CELLS_W + 1
+    } else {
+        0
+    };
+    let pad = " ".repeat(avatar_indent as usize);
+
+    let mut header_lines: Vec<Line<'static>> = Vec::with_capacity(usize::from(header_height));
+    let display_name = profile.display_name();
+    header_lines.push(Line::from(vec![
+        Span::raw(pad.clone()),
+        Span::styled(
+            display_name.clone(),
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let mut second = vec![
+        Span::raw(pad.clone()),
+        Span::styled(title_acct.clone(), Style::default().fg(palette.muted)),
+    ];
+    if profile.actor.manually_approves_followers {
+        second.push(Span::raw("  "));
+        second.push(Span::styled(
+            "🔒 locked",
+            Style::default().fg(palette.warning),
+        ));
+    }
+    if !profile.actor.is_local {
+        second.push(Span::raw("  "));
+        second.push(Span::styled(
+            format!("({})", profile.actor.actor_type),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    header_lines.push(Line::from(second));
+
+    let rel = &profile.relationship;
+    let state_label = profile.relationship_label();
+    let state_color = if rel.following {
+        palette.success
+    } else if matches!(rel.follow_state.as_deref(), Some("pending")) {
+        palette.warning
+    } else if matches!(rel.follow_state.as_deref(), Some("rejected")) {
+        palette.error
+    } else {
+        palette.muted
+    };
+    let mut state_spans = vec![
+        Span::raw(pad.clone()),
+        Span::styled(
+            format!("[{state_label}]"),
+            Style::default()
+                .fg(state_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if rel.followed_by {
+        state_spans.push(Span::raw("  "));
+        state_spans.push(Span::styled(
+            "← follows you",
+            Style::default().fg(palette.accent),
+        ));
+    }
+    header_lines.push(Line::from(state_spans));
+
+    if let Some(moved) = profile.actor.moved_to_ap_id.as_deref() {
+        header_lines.push(Line::from(vec![
+            Span::raw(pad.clone()),
+            Span::styled(
+                "moved to ",
+                Style::default()
+                    .fg(palette.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(moved.to_string(), Style::default().fg(palette.foreground)),
+        ]));
+    }
+
+    if !summary_lines.is_empty() {
+        let body_indent_str = format!("{pad}  ");
+        let body_width = inner.width.saturating_sub(avatar_indent + 2);
+        for raw in summary_lines.iter().take(usize::from(summary_height)) {
+            header_lines.push(Line::from(vec![
+                Span::raw(body_indent_str.clone()),
+                Span::styled(
+                    truncate_for_width(raw, body_width),
+                    Style::default().fg(palette.foreground),
+                ),
+            ]));
+        }
+    }
+
+    // count 行 (notes 件数のみ取り回せるが、follow counts は AP collection
+    // 解決が必要なので PR4 では省略)。
+    header_lines.push(Line::from(vec![
+        Span::raw(pad.clone()),
+        Span::styled(
+            format!("recent notes: {}", profile.notes.len()),
+            Style::default().fg(palette.muted),
+        ),
+    ]));
+
+    let p = Paragraph::new(header_lines).wrap(Wrap { trim: false });
+    frame.render_widget(p, header_rect);
+
+    // アバター描画。ヘッダの最初の 2 行に被せる。
+    if avatar_enabled && let Some(url) = profile.actor.icon_url.as_deref() {
+        render_avatar(frame, app, inner.x, inner.y, url);
+    }
+
+    // notes 一覧。
+    render_profile_notes(frame, notes_rect, profile, palette);
+    notes_rect
+}
+
+/// Profile 画面の下半分: notes 一覧。Timeline の `note_lines` と同様だが
+/// avatar 描画は省く (= author は profile ヘッダで既に明示されている)。
+fn render_profile_notes(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    profile: &ProfileScreen,
+    palette: &Palette,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if profile.notes.is_empty() {
+        let msg = if profile.notes_exhausted {
+            "  (no visible notes)"
+        } else {
+            "  (loading notes…)"
+        };
+        let p = Paragraph::new(Line::from(Span::styled(
+            msg,
+            Style::default().fg(palette.muted),
+        )));
+        frame.render_widget(p, area);
+        return;
+    }
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+    let mut row_cursor: u16 = 0;
+    let mut idx = profile.note_top;
+    while idx < profile.notes.len() && row_cursor < area.height {
+        let note = &profile.notes[idx];
+        let is_selected = idx == profile.selected_note;
+        let block_lines = profile_note_lines(note, palette, is_selected, area.width);
+        for l in block_lines {
+            if row_cursor >= area.height {
+                break;
+            }
+            lines.push(l);
+            row_cursor += 1;
+        }
+        idx += 1;
+    }
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(p, area);
+}
+
+/// Profile 内 notes 一覧の 1 件分。Timeline と異なり avatar indent は不要、
+/// `[time] (visibility)` ヘッダ + 本文 1〜2 行 + リアクション行。
+fn profile_note_lines(
+    note: &TimelineNote,
+    palette: &Palette,
+    selected: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::with_capacity(4);
+    let marker_style = if selected {
+        Style::default()
+            .fg(palette.accent_strong)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    let marker = if selected { "▍ " } else { "  " };
+    let local_published = note.published_at.with_timezone(&Local);
+    let time = local_published.format("%m-%d %H:%M").to_string();
+    out.push(Line::from(vec![
+        Span::styled(marker.to_string(), marker_style),
+        Span::styled(format!("[{time}]"), Style::default().fg(palette.muted)),
+        Span::raw("  "),
+        Span::styled(
+            format!("({})", note.visibility),
+            Style::default().fg(palette.muted),
+        ),
+    ]));
+    if let Some(cw) = &note.summary
+        && !cw.is_empty()
+    {
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "CW: ",
+                Style::default()
+                    .fg(palette.cw_marker)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(cw.clone(), Style::default().fg(palette.cw_marker)),
+        ]));
+    }
+    let body_width = width.saturating_sub(2);
+    for body_line in note.content.lines() {
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                truncate_for_width(body_line, body_width),
+                Style::default().fg(palette.foreground),
+            ),
+        ]));
+    }
+    if note.content.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("(empty)", Style::default().fg(palette.muted)),
+        ]));
+    }
+    if !note.reactions.is_empty() {
+        out.push(reaction_line(note, palette, ""));
+    }
+    out.push(Line::from(""));
+    out
 }
 
 fn render_avatar(frame: &mut Frame<'_>, app: &App, x: u16, y: u16, url: &str) {
@@ -580,6 +884,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::ReactionPrompt => "react",
         Focus::Suppression => "suppress",
         Focus::AltPrompt => "alt",
+        Focus::Profile => "profile",
     };
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -685,6 +990,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, ";", "attach image (picker)"),
         help_entry(palette, "e", "react to selected note"),
         help_entry(palette, "i", "image suppression toggle"),
+        help_entry(palette, "p", "open profile of author"),
         Line::from(""),
         Line::from(Span::styled("compose", help_section(palette))),
         help_entry(palette, "Enter", "insert newline"),
@@ -709,6 +1015,13 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "👍 / 🎉", "Unicode emoji"),
         help_entry(palette, "Enter", "send"),
         help_entry(palette, "Esc", "cancel"),
+        Line::from(""),
+        Line::from(Span::styled("profile", help_section(palette))),
+        help_entry(palette, "j / k", "next / prev note"),
+        help_entry(palette, "f", "follow / unfollow toggle"),
+        help_entry(palette, "o", "load older notes"),
+        help_entry(palette, "r", "refresh relationship + notes"),
+        help_entry(palette, "Esc / q", "back to previous screen"),
         Line::from(""),
         Line::from(Span::styled(
             "press ? again to close",

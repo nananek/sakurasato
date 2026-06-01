@@ -1218,6 +1218,10 @@ async fn actor_lookup_by_ap_id_returns_db_hit_without_remote_fetch(pool: PgPool)
     assert_eq!(json["relationship"]["following"], false);
     assert!(json["relationship"]["follow_state"].is_null());
     assert_eq!(json["relationship"]["followed_by"], false);
+    // M13 PR4: follow 行が無いケースは follow_id 自体が JSON に乗らない
+    // (`skip_serializing_if = "Option::is_none"`) ── TUI は欠落と null を
+    // 同等扱いするので欠落でよい。
+    assert!(json["relationship"]["follow_id"].is_null());
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
@@ -1344,6 +1348,9 @@ async fn relationship_reflects_follow_states(pool: PgPool) {
     assert_eq!(json["following"], true, "{json}");
     assert_eq!(json["follow_state"], "accepted", "{json}");
     assert_eq!(json["followed_by"], true, "{json}");
+    // M13 PR4: accepted のとき follow_id を露出する (= TUI Profile `f` toggle
+    // が DELETE /api/v1/follow/{id} に渡す引数源)。
+    assert!(json["follow_id"].is_i64(), "{json}");
 
     // pending case: following=false, follow_state=pending, followed_by=false。
     let resp = app
@@ -1360,6 +1367,9 @@ async fn relationship_reflects_follow_states(pool: PgPool) {
     assert_eq!(json["following"], false, "{json}");
     assert_eq!(json["follow_state"], "pending", "{json}");
     assert_eq!(json["followed_by"], false, "{json}");
+    // M13 PR4: pending のときも follow_id は露出 (= unfollow CTA を出して
+    // 取り消しできるようにするため)。
+    assert!(json["follow_id"].is_i64(), "{json}");
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

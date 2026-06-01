@@ -61,6 +61,10 @@ pub enum Focus {
     /// M13 PR6: 添付アップロード時の alt text 入力プロンプト。
     /// `App::alt_prompt` が `Some` のときのみ取りうる。
     AltPrompt,
+    /// M13 PR4 (Issue #79): リモート / ローカル actor の Profile 画面。
+    /// `App::profile_stack` の末尾が描画対象。空 stack で Profile に
+    /// 入ったままになることは無い (= push と focus 切替を 1 セットで行う)。
+    Profile,
 }
 
 #[derive(Debug)]
@@ -110,6 +114,10 @@ pub struct App {
     /// TUI 再起動で消える ── 永続性は不要 (= サーバが真実、TUI はキャッシュ
     /// に過ぎない)。
     pub last_reaction_ids: HashMap<i64, i64>,
+    /// M13 PR4 (Issue #79): Profile 画面 stack。末尾が現在描画中の Profile。
+    /// `p` で push、`Esc`/`q` で pop。空 stack + `Focus::Profile` は許されない
+    /// (= `apply_action` 側で焦点を Timeline に戻す責務)。
+    pub profile_stack: Vec<crate::profile::ProfileScreen>,
 }
 
 impl App {
@@ -143,7 +151,19 @@ impl App {
             suppression_cursor: 0,
             alt_prompt: None,
             last_reaction_ids: HashMap::new(),
+            profile_stack: Vec::new(),
         }
+    }
+
+    /// 現在開いている Profile 画面 (= stack 末尾) への可変参照。
+    pub fn current_profile_mut(&mut self) -> Option<&mut crate::profile::ProfileScreen> {
+        self.profile_stack.last_mut()
+    }
+
+    /// 現在開いている Profile 画面 (= stack 末尾) への不変参照。
+    #[must_use]
+    pub fn current_profile(&self) -> Option<&crate::profile::ProfileScreen> {
+        self.profile_stack.last()
     }
 
     /// 初回 / 手動更新で取ったタイムラインで上書きする。
@@ -389,6 +409,42 @@ mod tests {
         app.selected = 5;
         app.ensure_visible(10);
         assert_eq!(app.top, 5);
+    }
+
+    #[test]
+    fn profile_stack_round_trips() {
+        use crate::client::{ActorProfile, Relationship};
+        use crate::profile::ProfileScreen;
+        let mut app = new_app();
+        assert!(app.current_profile().is_none());
+        let actor = ActorProfile {
+            id: 42,
+            ap_id: "https://x.test/users/alice".into(),
+            preferred_username: "alice".into(),
+            host: "x.test".into(),
+            display_name: None,
+            summary: None,
+            icon_url: None,
+            image_url: None,
+            moved_to_ap_id: None,
+            is_local: false,
+            actor_type: "Person".into(),
+            manually_approves_followers: false,
+        };
+        let rel = Relationship::neutral();
+        app.profile_stack
+            .push(ProfileScreen::new(actor.clone(), rel, vec![], None));
+        assert_eq!(app.current_profile().map(|p| p.actor.id), Some(42));
+        // 2 段目を push して deep-stack 形態を確認。
+        app.profile_stack.push(ProfileScreen::new(
+            actor,
+            Relationship::neutral(),
+            vec![],
+            None,
+        ));
+        assert_eq!(app.profile_stack.len(), 2);
+        app.profile_stack.pop();
+        assert_eq!(app.profile_stack.len(), 1);
     }
 
     #[test]

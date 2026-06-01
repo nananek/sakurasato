@@ -73,6 +73,12 @@ pub struct Relationship {
     pub following: bool,
     pub follow_state: Option<FollowState>,
     pub followed_by: bool,
+    /// local → target の follow 行が `pending` / `accepted` のときの
+    /// `follow.id`。`DELETE /api/v1/follow/{follow_id}` の引数に使う
+    /// (= TUI Profile `f` キーが unfollow を撃つときの引数解決)。
+    /// `rejected` / 行無しのときは `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_id: Option<i64>,
 }
 
 impl Relationship {
@@ -81,6 +87,7 @@ impl Relationship {
             following: false,
             follow_state: None,
             followed_by: false,
+            follow_id: None,
         }
     }
 }
@@ -329,11 +336,20 @@ async fn compute_relationship(
         target_to_local.as_ref().map(|r| r.state.as_str()),
         Some("accepted")
     );
+    // `pending` / `accepted` のときだけ follow_id を露出する。`rejected` は
+    // unfollow 不要 (= 行は残っているがフォロー関係としては成立していない)、
+    // かつ `DELETE /follow/{id}` で削除すると次に follow しようとした時に
+    // `upsert_pending` 経由で `pending` に復活する設計と整合しなくなる。
+    let follow_id = match local_to_target.as_ref() {
+        Some(row) if matches!(row.state.as_str(), "pending" | "accepted") => Some(row.id),
+        _ => None,
+    };
 
     Ok(Relationship {
         following,
         follow_state,
         followed_by,
+        follow_id,
     })
 }
 

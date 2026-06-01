@@ -282,6 +282,74 @@ impl LocalApi {
         decode_json(resp).await
     }
 
+    /// `GET /api/v1/actor?acct=...` ── M13 PR4 (Issue #79)。
+    ///
+    /// acct (`user@host` 形式) を server 側 `webfinger_guard` + media-proxy で
+    /// 解決し、actor を DB upsert した上で local actor との relationship と
+    /// あわせて返す。`:follow @user@host` や Profile 画面の起動経路で使う。
+    pub async fn lookup_actor_by_acct(
+        &self,
+        acct: &str,
+    ) -> Result<ActorWithRelationship, ApiError> {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("acct", acct)
+            .finish();
+        let path = format!("/api/v1/actor?{query}");
+        self.get_json(&path).await
+    }
+
+    /// `GET /api/v1/actor?ap_id=...` ── M13 PR4 (Issue #79)。
+    ///
+    /// AP URI 直指定で actor を DB upsert した上で relationship を返す。
+    /// `WebFinger` を経由しないため、actor URI が既知の場面 (= 別経路で取得した
+    /// JSON / Move target / debug) 向け。
+    #[allow(dead_code, reason = "PR5 / TUI command mode で利用予定")]
+    pub async fn lookup_actor_by_ap_id(
+        &self,
+        ap_id: &str,
+    ) -> Result<ActorWithRelationship, ApiError> {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("ap_id", ap_id)
+            .finish();
+        let path = format!("/api/v1/actor?{query}");
+        self.get_json(&path).await
+    }
+
+    /// `GET /api/v1/actor/{id}` ── M13 PR4 (Issue #79)。
+    ///
+    /// 既知 actor を DB id で取得する高速経路。remote fetch を伴わない (= 同じ
+    /// Profile を再描画する用)。
+    pub async fn get_actor(&self, actor_id: i64) -> Result<ActorOnly, ApiError> {
+        let path = format!("/api/v1/actor/{actor_id}");
+        self.get_json(&path).await
+    }
+
+    /// `GET /api/v1/actor/{id}/relationship` ── M13 PR4 (Issue #79)。
+    ///
+    /// follow toggle 後に relationship だけを再取得して画面に反映する。
+    pub async fn get_relationship(&self, actor_id: i64) -> Result<Relationship, ApiError> {
+        let path = format!("/api/v1/actor/{actor_id}/relationship");
+        self.get_json(&path).await
+    }
+
+    /// `GET /api/v1/actor/{id}/notes?limit=&before_id=` ── M13 PR4 (Issue #79)。
+    ///
+    /// Profile 画面下部の「最近の投稿」用。visibility filter は viewer (=
+    /// local actor) 視点で server 側 SQL が評価するため、TUI は素直に表示する。
+    pub async fn list_actor_notes(
+        &self,
+        actor_id: i64,
+        before_id: Option<i64>,
+        limit: i64,
+    ) -> Result<TimelineResponse, ApiError> {
+        use std::fmt::Write as _;
+        let mut path = format!("/api/v1/actor/{actor_id}/notes?limit={limit}");
+        if let Some(b) = before_id {
+            write!(&mut path, "&before_id={b}").expect("write to String");
+        }
+        self.get_json(&path).await
+    }
+
     /// `POST /api/v1/follow` ── M13 PR2 (Issue #79)。
     ///
     /// `target` で `acct` / `actor_uri` / `actor_id` のいずれか 1 つを指定する
@@ -679,6 +747,75 @@ pub struct ReactionResponse {
     #[serde(default)]
     pub emoji_id: Option<i64>,
     pub queued_deliveries: usize,
+}
+
+/// `GET /api/v1/actor` のレスポンス body。
+/// `server::local_api::actor::ActorWithRelationship` と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActorWithRelationship {
+    pub actor: ActorProfile,
+    pub relationship: Relationship,
+}
+
+/// `GET /api/v1/actor/{id}` のレスポンス body。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActorOnly {
+    pub actor: ActorProfile,
+}
+
+/// Profile 画面が表示する actor のサブセット。`ActorRow` のうち TUI が触る
+/// フィールドだけを受け取る (= ed25519 鍵 / counts 等は触らない)。サーバ側
+/// は `ActorRow` をそのまま JSON にしているので `#[serde(default)]` で未来
+/// の追加フィールドを無視できる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActorProfile {
+    pub id: i64,
+    pub ap_id: String,
+    pub preferred_username: String,
+    pub host: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub moved_to_ap_id: Option<String>,
+    pub is_local: bool,
+    pub actor_type: String,
+    #[serde(default)]
+    pub manually_approves_followers: bool,
+}
+
+/// `GET /api/v1/actor/{id}/relationship` の応答 + `ActorWithRelationship` 内側。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Relationship {
+    pub following: bool,
+    #[serde(default)]
+    pub follow_state: Option<String>,
+    pub followed_by: bool,
+    /// local → target の follow 行 id (`pending` / `accepted` のときだけ Some)。
+    /// Profile `f` toggle で unfollow 経路を撃つときに使う ── relationship が
+    /// `rejected` / 行無しのときは `None` で、その状態では unfollow ボタンが
+    /// 表面に出ない (= UI 側で「現在 not following」を出す)。
+    #[serde(default)]
+    pub follow_id: Option<i64>,
+}
+
+impl Relationship {
+    /// 自己プロフィール用のニュートラル値。サーバが空 actor (= 自分) のときに
+    /// 返す `Relationship` と一致する。
+    #[must_use]
+    pub fn neutral() -> Self {
+        Self {
+            following: false,
+            follow_state: None,
+            followed_by: false,
+            follow_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
