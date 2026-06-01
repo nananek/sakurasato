@@ -96,6 +96,12 @@ struct Cli {
     /// 起動せずに組み込みテーマ名を列挙して終了。
     #[arg(long)]
     list_themes: bool,
+
+    /// TUI のログを追記するファイル。**未指定時は subscriber 自体を初期化
+    /// しない** ため log は端末に流れない (= alt screen 上で warn!/error! が
+    /// 描画と混ざらない)。デバッグ時はこの引数 + 別端末で `tail -f <path>`。
+    #[arg(long, env = "SAKURASATO_LOG_FILE")]
+    log_file: Option<PathBuf>,
 }
 
 fn resolve_suppression(cli: &Cli) -> ImageSuppression {
@@ -123,8 +129,8 @@ fn resolve_suppression(cli: &Cli) -> ImageSuppression {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+    init_tracing(cli.log_file.as_deref());
 
     if cli.list_themes {
         for name in Theme::builtin_names() {
@@ -206,15 +212,42 @@ fn default_socket_path() -> PathBuf {
     PathBuf::from("/run/sakurasato/local.sock")
 }
 
-fn init_tracing() {
-    // 端末を独占するので tracing は alt screen 上に出さないようにする。
-    // 既定は WARN、`SAKURASATO_LOG` または `RUST_LOG` で上書き。
+fn init_tracing(log_file: Option<&std::path::Path>) {
+    // 端末を独占するので tracing を stderr に出すと alt screen の描画と
+    // 同じ pty 上で混ざる ── ratatui の次フレームで上書きされるまで残骸が
+    // 視える (= warn! / error! が出るたび UI が "流れる")。
+    //
+    // `--log-file <path>` (`SAKURASATO_LOG_FILE`) が指定されたときだけ
+    // ファイルへ append する。未指定なら subscriber を init しない (=
+    // イベントは全部捨てられる)。デバッグ時は path 指定 + 別端末で
+    // `tail -f <path>` 想定。
+    //
+    // フィルタは `SAKURASATO_LOG` → `RUST_LOG` → `warn` の順で fallback。
+    let Some(path) = log_file else {
+        return;
+    };
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(err) => {
+            // alt screen に入る前なので 1 行だけ stderr に吐いて諦める。
+            eprintln!(
+                "sakurasato-tui: failed to open log file {}: {err}",
+                path.display(),
+            );
+            return;
+        }
+    };
     let filter = EnvFilter::try_from_env("SAKURASATO_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
         .unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
         .try_init();
 }
 
@@ -238,6 +271,7 @@ mod tests {
             no_previews: false,
             no_animations: false,
             list_themes: false,
+            log_file: None,
         }
     }
 
