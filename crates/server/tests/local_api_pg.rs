@@ -1158,10 +1158,9 @@ async fn insert_follow(
     state: sakurasato_core::model::FollowState,
 ) -> i64 {
     let ap_id = format!("https://test/follow/{follower_actor_id}-{followed_actor_id}");
-    let row =
-        repo::follow::insert_pending(pool, &ap_id, follower_actor_id, followed_actor_id)
-            .await
-            .unwrap();
+    let row = repo::follow::insert_pending(pool, &ap_id, follower_actor_id, followed_actor_id)
+        .await
+        .unwrap();
     if state != sakurasato_core::model::FollowState::Pending {
         repo::follow::set_state(pool, row.id, state).await.unwrap();
     }
