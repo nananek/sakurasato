@@ -110,6 +110,27 @@ async fn insert_note(
     content: &str,
     is_local: bool,
 ) -> i64 {
+    insert_note_with_visibility(
+        pool,
+        actor_id,
+        host,
+        ap_suffix,
+        content,
+        is_local,
+        Visibility::Public,
+    )
+    .await
+}
+
+async fn insert_note_with_visibility(
+    pool: &PgPool,
+    actor_id: i64,
+    host: &str,
+    ap_suffix: &str,
+    content: &str,
+    is_local: bool,
+    visibility: Visibility,
+) -> i64 {
     let ap_id = format!("https://{host}/notes/{ap_suffix}");
     let row = repo::note::insert(
         pool,
@@ -121,7 +142,7 @@ async fn insert_note(
             in_reply_to_ap_id: None,
             in_reply_to_note_id: None,
             summary: None,
-            visibility: Visibility::Public,
+            visibility,
             sensitive: false,
             to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
             cc_recipients: vec![],
@@ -281,4 +302,114 @@ async fn permalink_renders_local_note_with_escaped_content(pool: PgPool) {
         html.contains(r#"<a href="/users/alice""#),
         "actor link missing: {html}"
     );
+}
+
+/// **SECURITY (緊急 fix)**: `followers` 可視性の note は URL 直アクセスで漏れない。
+/// permalink は unauthenticated な公開 endpoint なので、AS2 audience に Public が
+/// 含まれない note は 404 で返して存在自体を秘匿する (Mastodon 同様)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn permalink_404_for_followers_only_note(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let id = insert_note_with_visibility(
+        &pool,
+        actor.id,
+        "example.test",
+        "1",
+        "followers-only secret",
+        true,
+        Visibility::Followers,
+    )
+    .await;
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    // HTML 経路
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/notes/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // AP JSON 経路でも漏れないこと (= followers note の to/cc が公開 fetch で取れない)
+    let resp = app
+        .oneshot(
+            Request::get(format!("/notes/{id}"))
+                .header(header::ACCEPT, "application/activity+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// 同じく `direct` (DM) 可視性も 404 で隠す。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn permalink_404_for_direct_note(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let id = insert_note_with_visibility(
+        &pool,
+        actor.id,
+        "example.test",
+        "1",
+        "direct dm secret",
+        true,
+        Visibility::Direct,
+    )
+    .await;
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/notes/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// 対照: `unlisted` は public timeline には載らないが、permalink は公開 (= URL
+/// を知っている人 / 連合相手 fetch が見られる慣習。Mastodon と同じ)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn permalink_200_for_unlisted_note(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let id = insert_note_with_visibility(
+        &pool,
+        actor.id,
+        "example.test",
+        "1",
+        "unlisted message",
+        true,
+        Visibility::Unlisted,
+    )
+    .await;
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/notes/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
