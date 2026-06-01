@@ -34,6 +34,8 @@
 //! - `GET /api/v1/follow-requests` ── 承認待ち follow 一覧 (M12 / Issue #66)
 //! - `POST /api/v1/follow-requests/{id}/approve` ── Accept 配送 + state 遷移
 //! - `POST /api/v1/follow-requests/{id}/reject` ── Reject 配送 + state 遷移
+//! - `POST /api/v1/follow` ── Follow を `delivery_queue` に投入 (M13 PR2 / Issue #79)
+//! - `DELETE /api/v1/follow/{id}` ── Undo Follow 送出 + follow 行削除 (M13 PR2)
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -50,6 +52,7 @@ use crate::state::AppState;
 pub mod actor;
 pub mod actor_admin;
 pub mod auth;
+pub mod follow;
 pub mod follow_request;
 pub mod media;
 pub mod media_proxy;
@@ -117,6 +120,11 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/follow-requests/{id}",
             axum::routing::delete(follow_request::delete),
         )
+        // M13 PR2 (Issue #79): TUI Profile 画面 / `:follow` コマンドが叩く。
+        // `POST` は冪等 (既存 accepted は no-op で 200 を返す)、
+        // `DELETE` は本人の follow のみ削除可能 (= 403 ガード)。
+        .route("/api/v1/follow", post(follow::create))
+        .route("/api/v1/follow/{id}", axum::routing::delete(follow::delete))
         // 全 `/api/v1/*` に Bearer 認証を要求する。`from_fn_with_state` で
         // middleware に `AppState` を渡し、`api_token` lookup に使う。
         .layer(axum::middleware::from_fn_with_state(

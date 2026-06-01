@@ -1398,3 +1398,319 @@ async fn actor_lookup_requires_auth(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ============================================================
+// M13 PR2 (Issue #79) — `POST /api/v1/follow` + `DELETE /api/v1/follow/{id}`
+// ============================================================
+
+/// `POST /api/v1/follow {actor_id}` ── 既に DB に居る remote actor を follow。
+/// `delivery_queue` に Follow が 1 行積まれ、`follow.state = pending` になる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_creates_pending_and_enqueues(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let mut bob = sample_remote_actor("bob", "remote.test");
+    bob.shared_inbox_url = Some("https://remote.test/inbox".into());
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({"actor_id": bob.id});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/follow")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["target_actor_id"], bob.id);
+    assert_eq!(json["state"], "pending");
+    assert_eq!(json["already_accepted"], false);
+    assert!(json["delivery_queue_id"].is_i64());
+    assert_eq!(json["inbox_url"], "https://remote.test/inbox");
+
+    // follow 行が pending で存在。
+    let follow_row = repo::follow::get_by_pair(&pool, me.id, bob.id)
+        .await
+        .unwrap()
+        .expect("follow row inserted");
+    assert_eq!(follow_row.state, "pending");
+
+    // delivery_queue に Follow が 1 行。
+    let count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) AS \"c!\" FROM delivery_queue WHERE inbox_url = $1",
+        "https://remote.test/inbox",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+/// 既存 `accepted` の follow を再 POST → idempotent (200 + `already_accepted=true`)、
+/// `delivery_queue` には 1 行も増えない (= 余分な Follow を再送しない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_idempotent_when_already_accepted(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    insert_follow(
+        &pool,
+        me.id,
+        bob.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({"actor_id": bob.id});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/follow")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["already_accepted"], true);
+    assert_eq!(json["state"], "accepted");
+    assert!(json["delivery_queue_id"].is_null());
+    assert!(json["inbox_url"].is_null());
+
+    // delivery_queue 行は 0 (= 既存 accepted のときは再送しない)。
+    let count: i64 = sqlx::query_scalar!("SELECT COUNT(*) AS \"c!\" FROM delivery_queue")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+/// 自分自身 (= local actor) を follow しようとすると 409 Conflict。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_rejects_self(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let body = serde_json::json!({"actor_id": me.id});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/follow")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+/// 入力 body で target を 1 つも指定しない → 400。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_400_when_no_target_specified(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/follow")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `actor_id` 経路で存在しない id → 404。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_404_when_actor_id_missing(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let body = serde_json::json!({"actor_id": 99999});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/follow")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `DELETE /api/v1/follow/{id}` で本人 follow → Undo Follow が enqueue され、
+/// follow 行は消える。activity.type=Undo, inline Follow object を検証。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn unfollow_enqueues_undo_and_deletes_row(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let mut bob = sample_remote_actor("bob", "remote.test");
+    bob.shared_inbox_url = Some("https://remote.test/inbox".into());
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+    let follow_id = insert_follow(
+        &pool,
+        me.id,
+        bob.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::delete(format!("/api/v1/follow/{follow_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["follow_id"], follow_id);
+    assert_eq!(json["target_ap_id"], bob.ap_id);
+    assert_eq!(json["inbox_url"], "https://remote.test/inbox");
+    assert!(json["delivery_queue_id"].is_i64());
+
+    // follow 行は消えた。
+    let row = repo::follow::get_by_pair(&pool, me.id, bob.id)
+        .await
+        .unwrap();
+    assert!(row.is_none(), "follow row must be deleted");
+
+    // delivery_queue に Undo Follow が 1 行積まれ、activity.type=Undo。
+    let activity: sqlx::types::Json<serde_json::Value> = sqlx::query_scalar!(
+        r#"SELECT activity AS "activity: sqlx::types::Json<serde_json::Value>"
+           FROM delivery_queue WHERE inbox_url = $1 LIMIT 1"#,
+        "https://remote.test/inbox",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let activity = activity.0;
+    assert_eq!(activity["type"], "Undo");
+    assert_eq!(activity["object"]["type"], "Follow");
+    assert_eq!(activity["object"]["actor"], me.ap_id);
+    assert_eq!(activity["object"]["object"], bob.ap_id);
+}
+
+/// `DELETE /api/v1/follow/{id}` で「他人の follow」を消そうとすると 403。
+/// (= 我々が follower でない follow 行をローカル API から触れない)
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn unfollow_403_when_not_owner(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let carol = repo::actor::insert(&pool, sample_remote_actor("carol", "other.test"))
+        .await
+        .unwrap();
+    // bob → carol の follow (= 我々の follow ではない)。
+    let follow_id = insert_follow(
+        &pool,
+        bob.id,
+        carol.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::delete(format!("/api/v1/follow/{follow_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // follow 行は残っている (削除されなかったことを確認)。
+    let row = repo::follow::get_by_pair(&pool, bob.id, carol.id)
+        .await
+        .unwrap();
+    assert!(row.is_some(), "other-owned follow must not be deleted");
+}
+
+/// `DELETE /api/v1/follow/{id}` で存在しない id → 404。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn unfollow_404_when_missing(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::delete("/api/v1/follow/99999")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// 認証無しは 401 (= auth middleware が body parse 前に弾く)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn follow_requires_auth(pool: PgPool) {
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/follow")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"actor_id": 1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
