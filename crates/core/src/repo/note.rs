@@ -302,10 +302,16 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> 
 /// 「`local_posts > 0 ? 1 : 0`」で接続している (= 投稿が 1 件でもあれば actor
 /// は active 扱い)。
 pub async fn count_local(pool: &PgPool) -> sqlx::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT count(*) FROM note WHERE is_local = TRUE")
-        .fetch_one(pool)
-        .await?;
-    Ok(row.0)
+    // **PR #103 review**: ランタイム文字列 (`sqlx::query_as("...")`) ではなく
+    // compile-time checked な `query_scalar!` を使い、スキーマ変更時に
+    // ビルドで検出できるようにする (CLAUDE.md §10 規約)。`count(*)` は
+    // PostgreSQL の慣習で常に非 NULL だが、sqlx の型は `Option<i64>` で
+    // 来るので `unwrap_or(0)` で剥がす。
+    let count: Option<i64> =
+        sqlx::query_scalar!("SELECT count(*) FROM note WHERE is_local = TRUE")
+            .fetch_one(pool)
+            .await?;
+    Ok(count.unwrap_or(0))
 }
 
 /// **M13 PR3 (Issue #79) `GET /api/v1/actor/{id}/notes`** ── 指定 actor が
