@@ -186,6 +186,54 @@ pub async fn create_follow_core(
     }
 
     let follow_ap_id = build_follow_ap_id(state, &local, target_actor.id);
+
+    // **Issue #113**: pending 行が既に存在するとき、`upsert_pending` は ON
+    // CONFLICT で同行を返すだけだが、後続の `enqueue_activity` を毎回叩いて
+    // しまい delivery_queue に同 activity が累積、配送 worker が成功するまで
+    // 相手側 inbox に Follow を投げ続けて重複 follow request が残る。事前に
+    // `get_by_pair` で既存行を確認し、pending なら early return で
+    // **enqueue を抑止** する (= worker の retry に任せる、明示 retry したい
+    // ときは `sakurasato-server deliver --queue-id N` で個別 flush)。
+    if let Some(existing) =
+        repo::follow::get_by_pair(state.pool(), local.id, target_actor.id)
+            .await
+            .map_err(|e| {
+                FollowError::Internal(
+                    anyhow::Error::new(e).context("get_by_pair before follow upsert"),
+                )
+            })?
+    {
+        match parse_follow_state(&existing)? {
+            FollowState::Accepted => {
+                return Ok(FollowOutcome {
+                    follow: existing,
+                    target: target_actor,
+                    queue_id: None,
+                    inbox_url: None,
+                    already_accepted: true,
+                });
+            }
+            FollowState::Pending => {
+                info!(
+                    follow_id = existing.id,
+                    target = %target_actor.ap_id,
+                    "existing pending follow row; not enqueueing duplicate (worker will retry)",
+                );
+                return Ok(FollowOutcome {
+                    follow: existing,
+                    target: target_actor,
+                    queue_id: None,
+                    inbox_url: None,
+                    already_accepted: false,
+                });
+            }
+            FollowState::Rejected => {
+                // 復活経路は `upsert_pending` の ON CONFLICT で rejected →
+                // pending に倒す。fall through で下の `upsert_pending` に進む。
+            }
+        }
+    }
+
     let row = repo::follow::upsert_pending(state.pool(), &follow_ap_id, local.id, target_actor.id)
         .await
         .map_err(|e| {
@@ -194,8 +242,8 @@ pub async fn create_follow_core(
 
     match parse_follow_state(&row)? {
         FollowState::Accepted => {
-            // Mastodon は accepted 状態で Follow を再投げると Accept を返さない
-            // ことがあるため、再送ぜずに idempotent 成功で返す。
+            // get_by_pair → upsert_pending の間に並行 Accept が来た稀なレース。
+            // 安全側で accepted 扱いで返す (= idempotent)。
             return Ok(FollowOutcome {
                 follow: row,
                 target: target_actor,
@@ -205,10 +253,8 @@ pub async fn create_follow_core(
             });
         }
         FollowState::Rejected => {
-            // `upsert_pending` 経路は `rejected` を `pending` に倒して復活させる
-            // 仕様 (= リモートが Unfollow → 再 Follow した時の永久ブロック回避)。
-            // ここに来ると `row.state` は既に `pending` だが、念のため
-            // 万一 `rejected` のまま返ってきたら Conflict 扱いする。
+            // upsert_pending で rejected → pending 復活を期待したが、その復活
+            // ロジックがコールド側で動かなかった場合の保険。
             return Err(FollowError::Conflict(format!(
                 "previous Follow to {target} was rejected and not revived; \
                  inspect follow row id={id}",
@@ -217,11 +263,7 @@ pub async fn create_follow_core(
             )));
         }
         FollowState::Pending => {
-            info!(
-                follow_id = row.id,
-                target = %target_actor.ap_id,
-                "existing pending follow row reused; re-queueing Follow delivery",
-            );
+            // 期待ケース: 新規 INSERT または rejected → pending 復活。
         }
     }
 
