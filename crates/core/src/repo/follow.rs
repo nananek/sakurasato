@@ -4,9 +4,11 @@
 // AP terminology and aliasing would harm readability.
 #![allow(clippy::similar_names)]
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use sqlx::types::Json;
 
-use crate::model::{FollowRow, FollowState};
+use crate::model::{ActorRow, FollowRow, FollowState};
 
 pub async fn insert_pending(
     pool: &PgPool,
@@ -288,4 +290,220 @@ pub async fn upsert_pending(
     )
     .fetch_one(pool)
     .await
+}
+
+/// `(follow + actor)` を結合した 1 行。
+///
+/// M13 PR3 (Issue #79) の `GET /api/v1/following` / `GET /api/v1/followers` で
+/// 返す。`actor` は「相手側」(`list_following` なら followed、`list_followers`
+/// なら follower)、`follow_state` は当該 follow 行の状態 (`pending` /
+/// `accepted` / `rejected`)。`list_following` / `list_followers` は accepted
+/// しか返さないので実質常に `"accepted"` だが、`pending` 含めて見るバリアントを
+/// 将来足せるよう持たせておく。
+///
+/// `follow_id` は **`follow.id`** で、ページネーションのカーソルに使う ──
+/// 自分が follow を「いつ張ったか」順 (= `follow.id` の単調列) で並べたい
+/// ため、`actor.id` ではなく `follow.id` を使う。
+#[derive(Debug)]
+pub struct FollowWithActor {
+    pub follow_id: i64,
+    pub follow_state: String,
+    pub follow_created_at: DateTime<Utc>,
+    pub actor: ActorRow,
+}
+
+/// **M13 PR3 (Issue #79) `GET /api/v1/following`** ── ローカル actor が
+/// `state = 'accepted'` で follow している actor を `follow.id DESC` 順
+/// (= 最近 follow した順) で列挙する。
+///
+/// pending / rejected は **含めない** ── TUI の `FollowList` 画面で「フォロー
+/// 中」と表示するのは accepted のみ。pending は別途 `follow-requests`
+/// 系統 API で管理する設計 (`#66`)。
+///
+/// `before_id = None` のとき最新から `limit` 件、`Some(x)` のとき
+/// `follow.id < x` の行のみ ── `note::list_home_timeline` と同じカーソル方式。
+pub async fn list_following(
+    pool: &PgPool,
+    local_actor_id: i64,
+    before_id: Option<i64>,
+    limit: i64,
+) -> sqlx::Result<Vec<FollowWithActor>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            f.id           AS "follow_id!",
+            f.state        AS "follow_state!",
+            f.created_at   AS "follow_created_at!",
+            a.id           AS "actor_id!",
+            a.ap_id        AS "actor_ap_id!",
+            a.preferred_username,
+            a.host,
+            a.display_name,
+            a.summary,
+            a.icon_url,
+            a.image_url,
+            a.inbox_url,
+            a.shared_inbox_url,
+            a.outbox_url,
+            a.followers_url,
+            a.following_url,
+            a.public_key_id,
+            a.public_key_pem,
+            a.ed25519_public_key_id,
+            a.ed25519_public_key_pem,
+            a.also_known_as as "also_known_as: Json<Vec<String>>",
+            a.moved_to_ap_id,
+            a.is_local,
+            a.actor_type,
+            a.manually_approves_followers,
+            a.fetched_at,
+            a.created_at   AS "actor_created_at!",
+            a.updated_at   AS "actor_updated_at!"
+        FROM follow f
+        JOIN actor a ON a.id = f.followed_actor_id
+        WHERE f.follower_actor_id = $1
+          AND f.state = 'accepted'
+          AND ($2::BIGINT IS NULL OR f.id < $2)
+        ORDER BY f.id DESC
+        LIMIT $3
+        "#,
+        local_actor_id,
+        before_id,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| FollowWithActor {
+            follow_id: r.follow_id,
+            follow_state: r.follow_state,
+            follow_created_at: r.follow_created_at,
+            actor: ActorRow {
+                id: r.actor_id,
+                ap_id: r.actor_ap_id,
+                preferred_username: r.preferred_username,
+                host: r.host,
+                display_name: r.display_name,
+                summary: r.summary,
+                icon_url: r.icon_url,
+                image_url: r.image_url,
+                inbox_url: r.inbox_url,
+                shared_inbox_url: r.shared_inbox_url,
+                outbox_url: r.outbox_url,
+                followers_url: r.followers_url,
+                following_url: r.following_url,
+                public_key_id: r.public_key_id,
+                public_key_pem: r.public_key_pem,
+                // local actor が混入したときも秘密鍵を API に運ばないよう明示的に
+                // 落とす。`ActorRow` は `#[serde(skip)]` で守られているが、二重
+                // 防御 (= API 内部のメモリ表現にも持ち込まない)。
+                private_key_pem: None,
+                ed25519_public_key_id: r.ed25519_public_key_id,
+                ed25519_public_key_pem: r.ed25519_public_key_pem,
+                ed25519_private_key_pem: None,
+                also_known_as: r.also_known_as,
+                moved_to_ap_id: r.moved_to_ap_id,
+                is_local: r.is_local,
+                actor_type: r.actor_type,
+                manually_approves_followers: r.manually_approves_followers,
+                fetched_at: r.fetched_at,
+                created_at: r.actor_created_at,
+                updated_at: r.actor_updated_at,
+            },
+        })
+        .collect())
+}
+
+/// **M13 PR3 (Issue #79) `GET /api/v1/followers`** ── ローカル actor を
+/// `state = 'accepted'` で follow している actor を `follow.id DESC` 順で
+/// 列挙する。`list_following` と対称で、`pending`/`rejected` は除外する。
+pub async fn list_followers(
+    pool: &PgPool,
+    local_actor_id: i64,
+    before_id: Option<i64>,
+    limit: i64,
+) -> sqlx::Result<Vec<FollowWithActor>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            f.id           AS "follow_id!",
+            f.state        AS "follow_state!",
+            f.created_at   AS "follow_created_at!",
+            a.id           AS "actor_id!",
+            a.ap_id        AS "actor_ap_id!",
+            a.preferred_username,
+            a.host,
+            a.display_name,
+            a.summary,
+            a.icon_url,
+            a.image_url,
+            a.inbox_url,
+            a.shared_inbox_url,
+            a.outbox_url,
+            a.followers_url,
+            a.following_url,
+            a.public_key_id,
+            a.public_key_pem,
+            a.ed25519_public_key_id,
+            a.ed25519_public_key_pem,
+            a.also_known_as as "also_known_as: Json<Vec<String>>",
+            a.moved_to_ap_id,
+            a.is_local,
+            a.actor_type,
+            a.manually_approves_followers,
+            a.fetched_at,
+            a.created_at   AS "actor_created_at!",
+            a.updated_at   AS "actor_updated_at!"
+        FROM follow f
+        JOIN actor a ON a.id = f.follower_actor_id
+        WHERE f.followed_actor_id = $1
+          AND f.state = 'accepted'
+          AND ($2::BIGINT IS NULL OR f.id < $2)
+        ORDER BY f.id DESC
+        LIMIT $3
+        "#,
+        local_actor_id,
+        before_id,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| FollowWithActor {
+            follow_id: r.follow_id,
+            follow_state: r.follow_state,
+            follow_created_at: r.follow_created_at,
+            actor: ActorRow {
+                id: r.actor_id,
+                ap_id: r.actor_ap_id,
+                preferred_username: r.preferred_username,
+                host: r.host,
+                display_name: r.display_name,
+                summary: r.summary,
+                icon_url: r.icon_url,
+                image_url: r.image_url,
+                inbox_url: r.inbox_url,
+                shared_inbox_url: r.shared_inbox_url,
+                outbox_url: r.outbox_url,
+                followers_url: r.followers_url,
+                following_url: r.following_url,
+                public_key_id: r.public_key_id,
+                public_key_pem: r.public_key_pem,
+                private_key_pem: None,
+                ed25519_public_key_id: r.ed25519_public_key_id,
+                ed25519_public_key_pem: r.ed25519_public_key_pem,
+                ed25519_private_key_pem: None,
+                also_known_as: r.also_known_as,
+                moved_to_ap_id: r.moved_to_ap_id,
+                is_local: r.is_local,
+                actor_type: r.actor_type,
+                manually_approves_followers: r.manually_approves_followers,
+                fetched_at: r.fetched_at,
+                created_at: r.actor_created_at,
+                updated_at: r.actor_updated_at,
+            },
+        })
+        .collect())
 }

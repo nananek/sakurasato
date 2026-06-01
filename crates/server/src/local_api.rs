@@ -36,6 +36,10 @@
 //! - `POST /api/v1/follow-requests/{id}/reject` ── Reject 配送 + state 遷移
 //! - `POST /api/v1/follow` ── Follow を `delivery_queue` に投入 (M13 PR2 / Issue #79)
 //! - `DELETE /api/v1/follow/{id}` ── Undo Follow 送出 + follow 行削除 (M13 PR2)
+//! - `GET /api/v1/following` ── 自分が follow している accepted 一覧 (M13 PR3)
+//! - `GET /api/v1/followers` ── 自分を follow している accepted 一覧 (M13 PR3)
+//! - `GET /api/v1/actor/{id}/notes` ── 当該 actor の Note 一覧。viewer 視点の
+//!   visibility filter 経由 (M13 PR3)
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -53,6 +57,7 @@ pub mod actor;
 pub mod actor_admin;
 pub mod auth;
 pub mod follow;
+pub mod follow_list;
 pub mod follow_request;
 pub mod media;
 pub mod media_proxy;
@@ -77,6 +82,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/actor", get(actor::lookup))
         .route("/api/v1/actor/{id}", get(actor::get_by_id))
         .route("/api/v1/actor/{id}/relationship", get(actor::relationship))
+        // M13 PR3 (Issue #79): Profile 画面下部の「最近の投稿」+ FollowList。
+        // visibility filter は viewer (= ローカル actor) 視点で評価する。
+        .route("/api/v1/actor/{id}/notes", get(actor::list_notes))
+        .route("/api/v1/following", get(follow_list::following))
+        .route("/api/v1/followers", get(follow_list::followers))
         .route("/api/v1/timeline/home", get(timeline::home))
         .route("/api/v1/notes", post(notes::create))
         .route("/api/v1/stream", get(stream::handle))

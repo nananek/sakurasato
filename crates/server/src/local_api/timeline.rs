@@ -31,8 +31,8 @@ use tracing::{error, warn};
 use crate::local_api::media::build_media_url;
 use crate::state::AppState;
 
-const LIMIT_DEFAULT: i64 = 40;
-const LIMIT_MAX: i64 = 80;
+pub(crate) const LIMIT_DEFAULT: i64 = 40;
+pub(crate) const LIMIT_MAX: i64 = 80;
 
 #[derive(Debug, Deserialize)]
 pub struct TimelineQuery {
@@ -90,7 +90,10 @@ pub struct ReactionSummaryDto {
 }
 
 impl TimelineNote {
-    fn from_entry_with_reactions(e: TimelineEntry, reactions: Vec<ReactionSummaryDto>) -> Self {
+    pub(crate) fn from_entry_with_reactions(
+        e: TimelineEntry,
+        reactions: Vec<ReactionSummaryDto>,
+    ) -> Self {
         Self {
             id: e.id,
             ap_id: e.ap_id,
@@ -120,7 +123,7 @@ impl TimelineNote {
 /// `build_media_url` で `https://<host>/media/<key>` に展開し、TUI が
 /// `/media/proxy?url=...` 越しに fetch できるようにする。remote emoji
 /// (= 元 URL の絶対 URL) はそのまま渡す。
-fn row_to_dto(host: &str, row: ReactionSummaryRow) -> ReactionSummaryDto {
+pub(crate) fn row_to_dto(host: &str, row: ReactionSummaryRow) -> ReactionSummaryDto {
     let emoji_image_url = match (row.is_local, row.image_key.as_ref()) {
         (Some(true), Some(key)) => Some(build_media_url(host, key)),
         (Some(false), Some(key)) => Some(key.clone()),
@@ -207,7 +210,7 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
     .into_response()
 }
 
-fn clamp_limit(req: Option<i64>) -> i64 {
+pub(crate) fn clamp_limit(req: Option<i64>) -> i64 {
     let l = req.unwrap_or(LIMIT_DEFAULT);
     l.clamp(1, LIMIT_MAX)
 }

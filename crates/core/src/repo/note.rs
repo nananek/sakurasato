@@ -295,3 +295,85 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> 
     .fetch_optional(pool)
     .await
 }
+
+/// **M13 PR3 (Issue #79) `GET /api/v1/actor/{id}/notes`** ── 指定 actor が
+/// author の Note を `note.id DESC` 順 (= 受信順) で列挙する。
+///
+/// ## Visibility filter
+///
+/// `viewer_actor_id` (= ローカル actor) の視点で見える投稿だけを返す:
+///
+/// - **author 自身** (`viewer_actor_id == author_actor_id`) → 全 visibility
+///   (自分の投稿は direct も含めて全部見える)。
+/// - **author 以外** → 以下のいずれか:
+///   - `visibility = 'public' | 'unlisted'` → 常に見える。
+///   - `visibility = 'followers'` → viewer が `state = 'accepted'` で author を
+///     follow しているときのみ見える。
+///   - `visibility = 'direct'` → viewer の `ap_id` が `to_recipients` または
+///     `cc_recipients` に含まれているときのみ見える。
+///
+/// `viewer_ap_id` は direct 判定の宛先一致用。JSON 配列で
+/// `[viewer_ap_id]` を作って `@>` (包含演算子) で問い合わせる ──
+/// `to_recipients` / `cc_recipients` は `jsonb` 配列なので index も
+/// (将来) GIN で効かせられる。
+///
+/// `before_id` / `limit` は `list_home_timeline` と同じカーソル方式。
+#[allow(clippy::similar_names)]
+pub async fn list_by_author(
+    pool: &PgPool,
+    author_actor_id: i64,
+    viewer_actor_id: i64,
+    viewer_ap_id: &str,
+    before_id: Option<i64>,
+    limit: i64,
+) -> sqlx::Result<Vec<TimelineEntry>> {
+    let viewer_inbox_array =
+        serde_json::to_value([viewer_ap_id]).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query_as!(
+        TimelineEntry,
+        r#"
+        SELECT
+            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,
+            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,
+            n.to_recipients as "to_recipients: Json<Vec<String>>",
+            n.cc_recipients as "cc_recipients: Json<Vec<String>>",
+            n.attachments as "attachments: Json<JsonValue>",
+            n.tags as "tags: Json<JsonValue>",
+            n.is_local, n.url, n.published_at, n.edited_at, n.created_at, n.updated_at,
+            a.ap_id AS actor_ap_id,
+            a.preferred_username AS actor_preferred_username,
+            a.display_name AS actor_display_name,
+            a.icon_url AS actor_icon_url
+        FROM note n
+        JOIN actor a ON a.id = n.actor_id
+        WHERE n.actor_id = $1
+          AND (
+            $1 = $2
+            OR n.visibility IN ('public', 'unlisted')
+            OR (
+              n.visibility = 'followers'
+              AND EXISTS (
+                SELECT 1 FROM follow
+                WHERE follower_actor_id = $2
+                  AND followed_actor_id = $1
+                  AND state = 'accepted'
+              )
+            )
+            OR (
+              n.visibility = 'direct'
+              AND (n.to_recipients @> $3::jsonb OR n.cc_recipients @> $3::jsonb)
+            )
+          )
+          AND ($4::BIGINT IS NULL OR n.id < $4)
+        ORDER BY n.id DESC
+        LIMIT $5
+        "#,
+        author_actor_id,
+        viewer_actor_id,
+        viewer_inbox_array,
+        before_id,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
