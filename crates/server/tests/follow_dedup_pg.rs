@@ -116,12 +116,13 @@ fn remote_actor(host: &str, user: &str) -> NewActor {
     }
 }
 
-async fn count_queue_for_actor(pool: &PgPool, actor_id: i64) -> i64 {
-    let row: (i64,) = sqlx::query_as("SELECT count(*) FROM delivery_queue WHERE actor_id = $1")
-        .bind(actor_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
+async fn count_queue_for_actor(pool: &PgPool, sender_actor_id: i64) -> i64 {
+    let row: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM delivery_queue WHERE sender_actor_id = $1")
+            .bind(sender_actor_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
     row.0
 }
 
