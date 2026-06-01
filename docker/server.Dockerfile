@@ -13,6 +13,9 @@ COPY crates ./crates
 COPY config ./config
 COPY migrations ./migrations
 COPY .sqlx ./.sqlx
+# `crates/core/build.rs` が `vendor/gemoji/emoji.json` を読んで Unicode emoji
+# テーブルを生成する (PR #122 で導入)。server build が core を引くので必須。
+COPY vendor ./vendor
 
 # BuildKit のキャッシュマウントで registry とビルド成果物を温存。
 # SQLX_OFFLINE=true で compile-time クエリ検証を .sqlx キャッシュから引く。
