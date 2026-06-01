@@ -1135,3 +1135,267 @@ async fn token_revoke_invalidates_existing_token(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ============================================================
+// M13 PR1 (Issue #79) — `/api/v1/actor` + relationship
+// ============================================================
+
+fn sample_remote_actor(username: &str, host: &str) -> sakurasato_core::repo::actor::NewActor {
+    let mut a = common::sample_local_actor(username, host);
+    a.is_local = false;
+    // remote actor は秘密鍵を持たない (= 我々の DB にコピーがある場合のみ
+    // 公開鍵を保持する想定)。
+    a.private_key_pem = None;
+    a.ed25519_private_key_pem = None;
+    a
+}
+
+#[allow(clippy::similar_names)] // follower/followed は AP の用語
+async fn insert_follow(
+    pool: &PgPool,
+    follower_actor_id: i64,
+    followed_actor_id: i64,
+    state: sakurasato_core::model::FollowState,
+) -> i64 {
+    let ap_id = format!("https://test/follow/{follower_actor_id}-{followed_actor_id}");
+    let row =
+        repo::follow::insert_pending(pool, &ap_id, follower_actor_id, followed_actor_id)
+            .await
+            .unwrap();
+    if state != sakurasato_core::model::FollowState::Pending {
+        repo::follow::set_state(pool, row.id, state).await.unwrap();
+    }
+    row.id
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_lookup_400_when_no_query_param(pool: PgPool) {
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/actor")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_lookup_by_ap_id_returns_db_hit_without_remote_fetch(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/actor?ap_id={}", bob.ap_id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["actor"]["ap_id"], bob.ap_id);
+    assert_eq!(json["actor"]["preferred_username"], "bob");
+    assert_eq!(json["actor"]["host"], "remote.test");
+    // 秘密鍵漏洩防御 (ActorRow `#[serde(skip)]` の確認)。
+    let body = serde_json::to_string(&json).unwrap();
+    assert!(!body.contains("private_key"), "private_key leaked: {body}");
+    // relationship は initial 状態 (フォロー無し)。
+    assert_eq!(json["relationship"]["following"], false);
+    assert!(json["relationship"]["follow_state"].is_null());
+    assert_eq!(json["relationship"]["followed_by"], false);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_get_by_id_404_when_missing(pool: PgPool) {
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/actor/99999")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_get_by_id_returns_actor(pool: PgPool) {
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/actor/{}", bob.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["actor"]["id"], bob.id);
+    assert_eq!(json["actor"]["ap_id"], bob.ap_id);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn relationship_neutral_for_self(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/actor/{}/relationship", me.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["following"], false);
+    assert!(json["follow_state"].is_null());
+    assert_eq!(json["followed_by"], false);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn relationship_reflects_follow_states(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let carol = repo::actor::insert(&pool, sample_remote_actor("carol", "remote.test"))
+        .await
+        .unwrap();
+
+    // me → bob は accepted (mutual の片方)。
+    insert_follow(
+        &pool,
+        me.id,
+        bob.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+    // bob → me も accepted (mutual)。
+    insert_follow(
+        &pool,
+        bob.id,
+        me.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+    // me → carol は pending (= まだ Accept が返ってきていない)。
+    insert_follow(
+        &pool,
+        me.id,
+        carol.id,
+        sakurasato_core::model::FollowState::Pending,
+    )
+    .await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state.clone());
+
+    // mutual case: following=true, followed_by=true。
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/actor/{}/relationship", bob.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["following"], true, "{json}");
+    assert_eq!(json["follow_state"], "accepted", "{json}");
+    assert_eq!(json["followed_by"], true, "{json}");
+
+    // pending case: following=false, follow_state=pending, followed_by=false。
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/actor/{}/relationship", carol.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["following"], false, "{json}");
+    assert_eq!(json["follow_state"], "pending", "{json}");
+    assert_eq!(json["followed_by"], false, "{json}");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn relationship_404_when_target_missing(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/actor/99999/relationship")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_lookup_requires_auth(pool: PgPool) {
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/actor?ap_id=https://x/users/y")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
