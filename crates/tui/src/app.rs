@@ -75,6 +75,10 @@ pub enum Focus {
     /// M12 (Issue #66): 鍵アカ運用の承認待ち follow 一覧画面。
     /// `:requests` で開く。`App::follow_requests` が `Some` のときのみ取りうる。
     Requests,
+    /// Issue #101: 絵文字検索モーダル。`Ctrl-E` (reaction prompt / compose 中)
+    /// で起動。`App::emoji_suggest` が `Some` のときのみ取りうる。Esc で
+    /// 直前 Focus (`ReactionPrompt` / `Compose`) に戻る。
+    EmojiSearch,
 }
 
 #[derive(Debug)]
@@ -138,11 +142,13 @@ pub struct App {
     /// M12 (Issue #66): 承認待ち follow 一覧画面の state。`:requests` で開く。
     /// `Focus::Requests` のあいだだけ `Some`。
     pub follow_requests: Option<crate::follow_requests::FollowRequestsScreen>,
-    /// Issue #101: 絵文字 shortcode サジェスト popup の state。reaction
-    /// prompt で `:` を打った瞬間に開く。focus は変えず popup overlay として
-    /// 表示するだけ ── reaction prompt の通常入力経路はそのまま生かしつつ、
-    /// `↑/↓/Tab/Enter/Esc` だけ popup が横取りする。
+    /// Issue #101: 絵文字検索モーダルの state。reaction prompt / compose
+    /// 中に `Ctrl-E` で開く専用 Focus。検索 buffer は独立で、部分一致 +
+    /// 前方一致優先の filter を持つ。
     pub emoji_suggest: Option<crate::emoji_suggest::EmojiSuggestState>,
+    /// Issue #101: 絵文字検索モーダルを閉じたときの戻り先 Focus
+    /// (`ReactionPrompt` / `Compose` のどちらか)。
+    pub emoji_search_return_focus: Option<Focus>,
 }
 
 impl App {
@@ -181,6 +187,7 @@ impl App {
             command: None,
             follow_requests: None,
             emoji_suggest: None,
+            emoji_search_return_focus: None,
         }
     }
 

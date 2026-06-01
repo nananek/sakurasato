@@ -1,55 +1,47 @@
-//! Issue #101: 絵文字 shortcode サジェスト popup の state。
+//! 絵文字検索モーダルの state。
 //!
-//! reaction prompt で `:` を打った瞬間に [`crate::runtime`] が
-//! `list_emojis("", LIMIT)` を 1 回叩いて [`EmojiSuggestState`] に詰め、
-//! 以降 popup 表示中は **client-side filter** で prefix 絞り込みをする
-//! (= API 再呼び出ししないことで入力レイテンシをゼロにする)。
+//! reaction prompt や compose で `Ctrl-E` を押すと開く。モーダル内に独立した
+//! search buffer を持ち、全文字を受理する。検索は **部分一致** (lowercase
+//! substring) で、前方一致のものを上位に並べる軽い重み付けを行う。
 //!
-//! prefix が初回取得時より長くなって候補 0 件になるケースは「shortcode が
-//! `LIMIT` を超えて存在し、初回取得に入っていなかった」可能性がある。お一人様
-//! サーバでこの状況になるのは稀 (= shortcode は手動 import で数十個程度)、
-//! 必要なら refetch のキー (例: `Ctrl-R`) を後追いで足す。
+//! ## キー操作 (モーダル open 中)
 //!
-//! 候補 0 件のときは popup を閉じる方針 (= 邪魔にならない)。
+//! - 通常文字 / Backspace ── search buffer を編集
+//! - `↑` / `↓` (or `Ctrl-P` / `Ctrl-N`) ── 候補移動
+//! - `Enter` ── 選択中 shortcode を `:foo:` で挿入し閉じる
+//! - `Esc` ── 何も挿入せず閉じる
 //!
-//! ## キー操作 (popup 表示中)
-//!
-//! - `↑` / `↓` / `Ctrl-P` / `Ctrl-N` ── カーソル移動
-//! - `Tab` / `Enter` ── 選択中 shortcode を `:foo:` で挿入し popup 閉じる
-//! - `Esc` ── popup 閉じる (テキスト挿入なし)
-//! - 通常文字入力 ── prefix 更新 + 再フィルタ
-//! - `:` ── popup 閉じる (= ユーザが自分で shortcode を書き終わった)
+//! 候補 0 件でも閉じない (= search buffer を消せば全候補が戻る)。
 
 use crate::client::EmojiItem;
 
-/// popup 1 ページに表示する最大候補数。多すぎると視界が埋まる。
+/// 候補表示の最大件数 (viewport から溢れる ぶんはスクロール)。
 pub const VISIBLE_MAX: usize = 8;
-/// API 初回 fetch の上限。server 側 `MAX_LIMIT` = 100 と揃える。
+/// 初回 fetch で取得する件数。server 側 `MAX_LIMIT = 100` と揃える。
 pub const FETCH_LIMIT: i64 = 100;
 
 #[derive(Debug, Clone, Default)]
 pub struct EmojiSuggestState {
     /// 初回 fetch で取得した全候補 (= filter 対象の母集団)。
     pub all: Vec<EmojiItem>,
-    /// `all` を `prefix` で絞った可視リスト。
+    /// `query` を `all` に当てた可視リスト (前方一致 → 部分一致の順)。
     pub filtered: Vec<EmojiItem>,
-    /// カーソル位置 (`filtered` のインデックス)。
+    /// `filtered` 内のカーソル位置。
     pub cursor: usize,
-    /// 現在の prefix (ASCII-lowercase)。
-    pub prefix: String,
+    /// 検索 buffer。reaction prompt buffer とは独立で、モーダル内専用。
+    pub query: String,
 }
 
 impl EmojiSuggestState {
-    /// 初回 fetch 結果で開く。
     #[must_use]
-    pub fn open(items: Vec<EmojiItem>, prefix: &str) -> Self {
+    pub fn open(items: Vec<EmojiItem>) -> Self {
         let mut s = Self {
             all: items,
             filtered: Vec::new(),
             cursor: 0,
-            prefix: String::new(),
+            query: String::new(),
         };
-        s.set_prefix(prefix);
+        s.recompute();
         s
     }
 
@@ -59,21 +51,16 @@ impl EmojiSuggestState {
         self.filtered.get(self.cursor)
     }
 
-    /// `prefix` を更新して `filtered` を再計算。cursor は 0 に戻す。
-    ///
-    /// `shortcode` 側も `to_ascii_lowercase` してから比較する ── server から
-    /// 返る `shortcode` は元のケースを保つ可能性がある (`is_valid_shortcode`
-    /// が大文字混じりを許容するため)。
-    pub fn set_prefix(&mut self, prefix: &str) {
-        let lc = prefix.to_ascii_lowercase();
-        self.filtered = self
-            .all
-            .iter()
-            .filter(|e| e.shortcode.to_ascii_lowercase().starts_with(&lc))
-            .cloned()
-            .collect();
-        self.prefix = lc;
-        self.cursor = 0;
+    /// search buffer に 1 文字追加。
+    pub fn insert_char(&mut self, c: char) {
+        self.query.push(c);
+        self.recompute();
+    }
+
+    /// search buffer から末尾 1 文字削除 (`pop()`)。
+    pub fn backspace(&mut self) {
+        self.query.pop();
+        self.recompute();
     }
 
     pub fn select_next(&mut self) {
@@ -94,10 +81,37 @@ impl EmojiSuggestState {
         }
     }
 
-    /// 候補があるかどうか。空なら popup を閉じる判定に使う。
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.filtered.is_empty()
+    /// query から `filtered` を再計算。前方一致をまとめて先頭に置き、その後に
+    /// 部分一致 (前方一致でないもの) を続ける。重複は無し (前方一致は部分
+    /// 一致を含む集合なので、後段で除外)。
+    fn recompute(&mut self) {
+        let q = self.query.to_ascii_lowercase();
+        if q.is_empty() {
+            self.filtered = self.all.clone();
+            self.cursor = 0;
+            return;
+        }
+        let mut prefix_hits: Vec<EmojiItem> = Vec::new();
+        let mut substr_hits: Vec<EmojiItem> = Vec::new();
+        for e in &self.all {
+            let lc = e.shortcode.to_ascii_lowercase();
+            if lc.starts_with(&q) {
+                prefix_hits.push(e.clone());
+            } else if lc.contains(&q) {
+                substr_hits.push(e.clone());
+            } else {
+                // aliases にもマッチするなら部分一致扱いで救済。
+                for alias in &e.aliases {
+                    if alias.to_ascii_lowercase().contains(&q) {
+                        substr_hits.push(e.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        prefix_hits.extend(substr_hits);
+        self.filtered = prefix_hits;
+        self.cursor = 0;
     }
 }
 
@@ -115,26 +129,71 @@ mod tests {
         }
     }
 
-    #[test]
-    fn opens_with_all_visible_when_prefix_empty() {
-        let s = EmojiSuggestState::open(vec![item("happy"), item("sad")], "");
-        assert_eq!(s.filtered.len(), 2);
-        assert_eq!(s.current().unwrap().shortcode, "happy");
+    fn item_with_alias(shortcode: &str, alias: &str) -> EmojiItem {
+        EmojiItem {
+            shortcode: shortcode.into(),
+            url: format!("https://x.test/media/emoji/local/{shortcode}.webp"),
+            media_type: "image/webp".into(),
+            category: None,
+            aliases: vec![alias.into()],
+        }
     }
 
     #[test]
-    fn prefix_filters_case_insensitive() {
-        // server から大文字混じりで返ってきても、prefix は ASCII-lowercase で
-        // 比較するので拾える。
-        let mut s = EmojiSuggestState::open(vec![item("Happy"), item("sad"), item("hand")], "");
-        s.set_prefix("Ha");
+    fn open_with_empty_query_shows_all() {
+        let s = EmojiSuggestState::open(vec![item("a"), item("b"), item("c")]);
+        assert_eq!(s.filtered.len(), 3);
+    }
+
+    #[test]
+    fn insert_char_filters_by_substring() {
+        let mut s = EmojiSuggestState::open(vec![
+            item("happy"),
+            item("sad"),
+            item("bonfire"),
+            item("firework"),
+        ]);
+        s.insert_char('f');
+        s.insert_char('i');
+        s.insert_char('r');
+        // `firework` (前方一致) → `bonfire` (部分一致) の順。
         let codes: Vec<&str> = s.filtered.iter().map(|e| e.shortcode.as_str()).collect();
-        assert_eq!(codes, vec!["Happy", "hand"]);
+        assert_eq!(codes, vec!["firework", "bonfire"]);
+    }
+
+    #[test]
+    fn backspace_restores_candidates() {
+        let mut s = EmojiSuggestState::open(vec![item("happy"), item("sad")]);
+        s.insert_char('z');
+        assert!(s.filtered.is_empty());
+        s.backspace();
+        assert_eq!(s.filtered.len(), 2);
+    }
+
+    #[test]
+    fn case_insensitive_match() {
+        let mut s = EmojiSuggestState::open(vec![item("Happy"), item("HOORAY"), item("sad")]);
+        s.insert_char('h');
+        let codes: Vec<&str> = s.filtered.iter().map(|e| e.shortcode.as_str()).collect();
+        assert_eq!(codes, vec!["Happy", "HOORAY"]);
+    }
+
+    #[test]
+    fn aliases_hit_as_substring() {
+        let mut s = EmojiSuggestState::open(vec![
+            item_with_alias("partying-face", "celebrate"),
+            item("sad"),
+        ]);
+        s.insert_char('c');
+        s.insert_char('e');
+        s.insert_char('l');
+        assert_eq!(s.filtered.len(), 1);
+        assert_eq!(s.filtered[0].shortcode, "partying-face");
     }
 
     #[test]
     fn cursor_wraps() {
-        let mut s = EmojiSuggestState::open(vec![item("a"), item("b"), item("c")], "");
+        let mut s = EmojiSuggestState::open(vec![item("a"), item("b"), item("c")]);
         s.select_next();
         s.select_next();
         s.select_next();
@@ -144,10 +203,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_filter_is_reflected() {
-        let mut s = EmojiSuggestState::open(vec![item("happy")], "");
-        s.set_prefix("zzz");
-        assert!(s.is_empty());
+    fn empty_result_does_not_panic_on_navigation() {
+        let mut s = EmojiSuggestState::open(vec![item("happy")]);
+        s.insert_char('z');
+        assert!(s.filtered.is_empty());
+        s.select_next();
+        s.select_prev();
         assert!(s.current().is_none());
     }
 }
