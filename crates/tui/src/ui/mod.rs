@@ -26,6 +26,7 @@ use ratatui_image::Image;
 
 use crate::app::{App, Focus, StatusKind};
 use crate::client::TimelineNote;
+use crate::follow_list::{FollowListMode, FollowListScreen};
 use crate::profile::ProfileScreen;
 use crate::theme::{Palette, Theme};
 
@@ -76,12 +77,18 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
 
     // M13 PR4: Profile が積まれているときは Timeline 領域を Profile で
     // 上書きする (compose / status バーは下に残す ── 終了したら Timeline に
-    // 戻る視覚的連続性のため)。
+    // 戻る視覚的連続性のため)。M13 PR5 で FollowList も同様に Timeline 領域を
+    // 占有する画面として描く。
     let mut profile_notes_rect = Rect::default();
-    let rows = if app.focus == Focus::Profile
+    let rows = if matches!(app.focus, Focus::Profile)
         && let Some(profile) = app.current_profile()
     {
         profile_notes_rect = render_profile_screen(frame, timeline_area, app, profile);
+        ScrollHits::default()
+    } else if matches!(app.focus, Focus::FollowList)
+        && let Some(fl) = app.follow_list.as_ref()
+    {
+        render_follow_list_screen(frame, timeline_area, app, fl);
         ScrollHits::default()
     } else {
         render_timeline(frame, timeline_area, app)
@@ -124,6 +131,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         render_alt_prompt(frame, status_area, &app.theme, p);
     }
 
+    // M13 PR5: `:` コマンドプロンプト。status バーに上書き表示する。
+    if app.focus == Focus::Command
+        && let Some(p) = app.command.as_ref()
+    {
+        render_command_prompt(frame, status_area, &app.theme, p);
+    }
+
     PanelRects {
         timeline: timeline_area,
         timeline_rows: rows,
@@ -157,6 +171,36 @@ fn render_reaction_prompt(
         Span::styled("▏", Style::default().fg(palette.accent)),
         Span::styled(
             "  Enter=send  Esc=cancel",
+            Style::default().fg(palette.muted),
+        ),
+    ]);
+    let p = Paragraph::new(line).style(Style::default().bg(palette.background));
+    frame.render_widget(p, area);
+}
+
+/// M13 PR5: `:` プロンプトを status バー位置に上書きする 1 行 overlay。
+fn render_command_prompt(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+    prompt: &crate::command::CommandPrompt,
+) {
+    let palette = &theme.palette;
+    frame.render_widget(Clear, area);
+    let line = Line::from(vec![
+        Span::styled(
+            "  : ",
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            prompt.buffer.clone(),
+            Style::default().fg(palette.foreground),
+        ),
+        Span::styled("▏", Style::default().fg(palette.accent)),
+        Span::styled(
+            "  Enter=run  Esc=cancel",
             Style::default().fg(palette.muted),
         ),
     ]);
@@ -576,6 +620,180 @@ fn profile_note_lines(
     out
 }
 
+/// M13 PR5: `FollowList` 画面 (= Timeline 領域に重ねる)。
+///
+/// 1 行目: タブ ([following] / [followers]) + 件数。
+/// 2 行目以降: 各エントリ (アバター / display name / acct / state)。
+#[allow(clippy::too_many_lines, reason = "FollowList 1 画面分の宣言的描画")]
+fn render_follow_list_screen(frame: &mut Frame<'_>, area: Rect, app: &App, fl: &FollowListScreen) {
+    let palette = &app.theme.palette;
+    let block = Block::default()
+        .title(Span::styled(
+            format!(
+                "  follow list — {} ({})  ",
+                fl.mode.label(),
+                fl.current().entries.len()
+            ),
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style(palette, app.focus == Focus::FollowList))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // 1 行目: タブインジケータ。
+    let header = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            tab_label(
+                FollowListMode::Following,
+                fl.mode == FollowListMode::Following,
+            ),
+            tab_style(palette, fl.mode == FollowListMode::Following),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            tab_label(
+                FollowListMode::Followers,
+                fl.mode == FollowListMode::Followers,
+            ),
+            tab_style(palette, fl.mode == FollowListMode::Followers),
+        ),
+        Span::styled(
+            "    [t=toggle  Enter=open profile  r=refresh  o=load more  Esc=back]",
+            Style::default().fg(palette.muted),
+        ),
+    ]);
+    let header_rect = Rect::new(inner.x, inner.y, inner.width, 1.min(inner.height));
+    let p = Paragraph::new(vec![header]);
+    frame.render_widget(p, header_rect);
+
+    let list_top = inner.y + header_rect.height;
+    let list_height = inner.height.saturating_sub(header_rect.height);
+    let list_rect = Rect::new(inner.x, list_top, inner.width, list_height);
+    if list_rect.height == 0 {
+        return;
+    }
+
+    let page = fl.current();
+    if page.entries.is_empty() {
+        let msg = if page.fetched {
+            format!("  (no {})", fl.mode.label())
+        } else {
+            "  loading…".to_string()
+        };
+        let para = Paragraph::new(Line::from(Span::styled(
+            msg,
+            Style::default().fg(palette.muted),
+        )));
+        frame.render_widget(para, list_rect);
+        return;
+    }
+
+    let avatar_enabled = app.images.enabled() && app.suppression.avatar;
+    let row_step: u16 = if avatar_enabled { 2 } else { 1 };
+    let visible = (list_rect.height / row_step) as usize;
+    let top = fl.top.min(page.entries.len().saturating_sub(1));
+    // 描画: 各エントリ 2 行 (avatar 有) または 1 行 (avatar 無)。
+    let mut avatar_overlays: Vec<(u16, &str)> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible * row_step as usize);
+    let mut row_cursor: u16 = 0;
+    for (offset, entry) in page.entries.iter().enumerate().skip(top).take(visible) {
+        if row_cursor + row_step > list_rect.height {
+            break;
+        }
+        let is_selected = offset == fl.selected;
+        let marker = if is_selected { "▍ " } else { "  " };
+        let marker_style = if is_selected {
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        let display = entry
+            .actor
+            .display_name
+            .clone()
+            .unwrap_or_else(|| entry.actor.preferred_username.clone());
+        let acct = format!("@{}@{}", entry.actor.preferred_username, entry.actor.host);
+        let state_color = match entry.follow_state.as_str() {
+            "accepted" => palette.success,
+            "pending" => palette.warning,
+            "rejected" => palette.error,
+            _ => palette.muted,
+        };
+        let avatar_pad = if avatar_enabled {
+            " ".repeat(usize::from(AVATAR_CELLS_W + 1))
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(avatar_pad.clone()),
+            Span::styled(marker.to_string(), marker_style),
+            Span::styled(
+                display,
+                Style::default()
+                    .fg(palette.foreground)
+                    .add_modifier(if is_selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::raw("  "),
+            Span::styled(acct, Style::default().fg(palette.muted)),
+            Span::raw("  "),
+            Span::styled(
+                format!("[{}]", entry.follow_state),
+                Style::default().fg(state_color),
+            ),
+        ]));
+        if row_step == 2 {
+            lines.push(Line::from(""));
+        }
+        if avatar_enabled && let Some(url) = entry.actor.icon_url.as_deref() {
+            let abs_y = list_rect.y + row_cursor;
+            avatar_overlays.push((abs_y, url));
+        }
+        row_cursor += row_step;
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, list_rect);
+
+    if avatar_enabled {
+        for (y, url) in avatar_overlays {
+            render_avatar(frame, app, list_rect.x, y, url);
+        }
+    }
+}
+
+fn tab_label(mode: FollowListMode, active: bool) -> String {
+    if active {
+        format!("[{}]", mode.label())
+    } else {
+        format!(" {} ", mode.label())
+    }
+}
+
+fn tab_style(palette: &Palette, active: bool) -> Style {
+    if active {
+        Style::default()
+            .fg(palette.accent_strong)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    }
+}
+
 fn render_avatar(frame: &mut Frame<'_>, app: &App, x: u16, y: u16, url: &str) {
     let rect = Rect::new(x, y, AVATAR_CELLS_W, AVATAR_CELLS_H);
     // 未取得ならフェッチを spawn (= 次フレームには Ready になる可能性がある)。
@@ -885,6 +1103,8 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::Suppression => "suppress",
         Focus::AltPrompt => "alt",
         Focus::Profile => "profile",
+        Focus::FollowList => "follow-list",
+        Focus::Command => "cmd",
     };
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -991,6 +1211,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "e", "react to selected note"),
         help_entry(palette, "i", "image suppression toggle"),
         help_entry(palette, "p", "open profile of author"),
+        help_entry(palette, ":", "command prompt"),
         Line::from(""),
         Line::from(Span::styled("compose", help_section(palette))),
         help_entry(palette, "Enter", "insert newline"),
@@ -1022,6 +1243,24 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "o", "load older notes"),
         help_entry(palette, "r", "refresh relationship + notes"),
         help_entry(palette, "Esc / q", "back to previous screen"),
+        Line::from(""),
+        Line::from(Span::styled("follow list", help_section(palette))),
+        help_entry(palette, "j / k", "next / prev entry"),
+        help_entry(palette, "t", "toggle following / followers"),
+        help_entry(palette, "Enter", "open profile"),
+        help_entry(palette, "o", "load more"),
+        help_entry(palette, "r", "refresh tab"),
+        help_entry(palette, "Esc / q", "back to timeline"),
+        Line::from(""),
+        Line::from(Span::styled("command mode (:)", help_section(palette))),
+        help_entry(palette, ":follow X", "follow @user@host or URL"),
+        help_entry(palette, ":unfollow X", "unfollow same"),
+        help_entry(palette, ":open X", "open profile (acct or URL)"),
+        help_entry(palette, ":lookup X", "alias of :open (Misskey 照会)"),
+        help_entry(palette, ":me", "open own profile"),
+        help_entry(palette, ":following", "open following list"),
+        help_entry(palette, ":followers", "open followers list"),
+        help_entry(palette, ":q / :quit", "exit TUI"),
         Line::from(""),
         Line::from(Span::styled(
             "press ? again to close",

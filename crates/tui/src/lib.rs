@@ -41,8 +41,10 @@
 pub mod alt_prompt;
 pub mod app;
 pub mod client;
+pub mod command;
 pub mod compose;
 pub mod event;
+pub mod follow_list;
 pub mod image_cache;
 pub mod picker;
 pub mod preview;

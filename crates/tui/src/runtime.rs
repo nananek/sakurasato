@@ -533,6 +533,36 @@ async fn apply_action(
         Action::ProfileToggleFollow => profile_toggle_follow(app, api).await,
         Action::ProfileBack => profile_back(app),
         Action::ProfileRefresh => profile_refresh(app, api, page_size).await,
+        Action::OpenCommand => open_command(app),
+        Action::CommandInsertChar(c) => {
+            if let Some(p) = app.command.as_mut() {
+                p.insert_char(c);
+            }
+        }
+        Action::CommandBackspace => {
+            if let Some(p) = app.command.as_mut() {
+                p.backspace();
+            }
+        }
+        Action::CommandSubmit => command_submit(app, api, page_size).await,
+        Action::CommandCancel => command_cancel(app),
+        Action::FollowListSelectNext => {
+            if let Some(fl) = app.follow_list.as_mut() {
+                fl.select_next();
+            }
+        }
+        Action::FollowListSelectPrev => {
+            if let Some(fl) = app.follow_list.as_mut() {
+                fl.select_prev();
+            }
+        }
+        Action::FollowListToggleMode => follow_list_toggle_mode(app, api, page_size).await,
+        Action::FollowListOpenSelected => {
+            follow_list_open_selected(app, api, page_size).await;
+        }
+        Action::FollowListLoadMore => follow_list_load_more(app, api, page_size).await,
+        Action::FollowListRefresh => follow_list_refresh(app, api, page_size).await,
+        Action::FollowListClose => follow_list_close(app),
     }
 }
 
@@ -727,7 +757,14 @@ async fn profile_toggle_follow(app: &mut App, api: &LocalApi) {
 fn profile_back(app: &mut App) {
     app.profile_stack.pop();
     if app.profile_stack.is_empty() {
-        app.focus = Focus::Timeline;
+        // M13 PR5: Profile を抜けたあと FollowList が下層に居れば戻る。
+        // 例: Timeline → `:following` → FollowList → Enter → Profile → Esc
+        // → FollowList。
+        app.focus = if app.follow_list.is_some() {
+            Focus::FollowList
+        } else {
+            Focus::Timeline
+        };
     }
 }
 
@@ -1184,7 +1221,11 @@ fn handle_click(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
     // クリックで明示的に閉じる従来挙動を維持 (既存テストの依存)。
     if matches!(
         app.focus,
-        Focus::Suppression | Focus::Picker | Focus::ReactionPrompt,
+        Focus::Suppression
+            | Focus::Picker
+            | Focus::ReactionPrompt
+            | Focus::AltPrompt
+            | Focus::Command,
     ) {
         return;
     }
@@ -1284,6 +1325,401 @@ fn visibility_steps(from: Visibility, to: Visibility) -> usize {
     let i = order.iter().position(|v| *v == from).unwrap_or(0);
     let j = order.iter().position(|v| *v == to).unwrap_or(0);
     (j + order.len() - i) % order.len()
+}
+
+// ── M13 PR5: Command prompt & FollowList ──────────────────────────────
+
+fn open_command(app: &mut App) {
+    // Timeline / FollowList から開ける。Profile からは PR4 keymap で `:` を
+    // 処理していないのでここに来ない (= 想定通り)。
+    app.command = Some(crate::command::CommandPrompt::new());
+    app.focus = Focus::Command;
+}
+
+fn command_cancel(app: &mut App) {
+    app.command = None;
+    app.focus = current_screen_focus(app);
+}
+
+/// Profile / `FollowList` が残っている場合はそこへ、両方無ければ Timeline へ
+/// 戻る ── command prompt を閉じたあとに使う共通関数。
+fn current_screen_focus(app: &App) -> Focus {
+    if !app.profile_stack.is_empty() {
+        Focus::Profile
+    } else if app.follow_list.is_some() {
+        Focus::FollowList
+    } else {
+        Focus::Timeline
+    }
+}
+
+async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
+    use crate::command::Command;
+    let Some(prompt) = app.command.take() else {
+        return;
+    };
+    app.focus = current_screen_focus(app);
+    let raw = prompt.buffer.trim().to_string();
+    let cmd = crate::command::parse(&raw);
+    match cmd {
+        Command::Quit => {
+            app.should_quit = true;
+        }
+        Command::Help => {
+            // Help overlay は Focus::Help。コマンド経路では明示的にトグルする。
+            app.focus = Focus::Help;
+        }
+        Command::OpenSelf => {
+            command_open_self(app, api, page_size).await;
+        }
+        Command::ListFollowing => {
+            open_follow_list(
+                app,
+                api,
+                page_size,
+                crate::follow_list::FollowListMode::Following,
+            )
+            .await;
+        }
+        Command::ListFollowers => {
+            open_follow_list(
+                app,
+                api,
+                page_size,
+                crate::follow_list::FollowListMode::Followers,
+            )
+            .await;
+        }
+        Command::Open(target) => {
+            command_open_target(app, api, page_size, &target).await;
+        }
+        Command::Follow(target) => {
+            command_follow_target(app, api, &target, false).await;
+        }
+        Command::Unfollow(target) => {
+            command_follow_target(app, api, &target, true).await;
+        }
+        Command::Invalid { reason } => {
+            app.set_status(
+                format!(":: {reason}"),
+                StatusKind::Warning,
+                Some(Duration::from_secs(5)),
+            );
+        }
+        Command::Unknown { name } => {
+            app.set_status(
+                format!("unknown command: :{name}"),
+                StatusKind::Warning,
+                Some(Duration::from_secs(4)),
+            );
+        }
+    }
+}
+
+async fn command_open_self(app: &mut App, api: &LocalApi, page_size: i64) {
+    let ap_id = app.whoami.ap_id.clone();
+    match api.lookup_actor_by_ap_id(&ap_id).await {
+        Ok(resp) => {
+            push_profile_from_lookup(app, api, page_size, resp).await;
+        }
+        Err(err) => {
+            app.set_status(
+                format!(":me failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(5)),
+            );
+        }
+    }
+}
+
+async fn command_open_target(
+    app: &mut App,
+    api: &LocalApi,
+    page_size: i64,
+    target: &crate::command::LookupTarget,
+) {
+    let resp = match target {
+        crate::command::LookupTarget::Acct(acct) => api.lookup_actor_by_acct(acct).await,
+        crate::command::LookupTarget::ApId(uri) => api.lookup_actor_by_ap_id(uri).await,
+    };
+    match resp {
+        Ok(r) => push_profile_from_lookup(app, api, page_size, r).await,
+        Err(err) => {
+            app.set_status(
+                format!(":open failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `lookup_actor_by_*` の戻りから Profile screen を構築して push。
+async fn push_profile_from_lookup(
+    app: &mut App,
+    api: &LocalApi,
+    page_size: i64,
+    resp: crate::client::ActorWithRelationship,
+) {
+    let actor_id = resp.actor.id;
+    let acct = format!("@{}@{}", resp.actor.preferred_username, resp.actor.host);
+    let notes = match api.list_actor_notes(actor_id, None, page_size).await {
+        Ok(t) => t,
+        Err(err) => {
+            warn!(
+                ?err,
+                actor_id, "actor notes fetch failed; opening with empty"
+            );
+            crate::client::TimelineResponse {
+                notes: Vec::new(),
+                next_before_id: None,
+            }
+        }
+    };
+    app.profile_stack.push(ProfileScreen::new(
+        resp.actor,
+        resp.relationship,
+        notes.notes,
+        notes.next_before_id,
+    ));
+    app.focus = Focus::Profile;
+    app.set_status(
+        format!("profile: {acct}"),
+        StatusKind::Info,
+        Some(Duration::from_secs(2)),
+    );
+}
+
+async fn command_follow_target(
+    app: &mut App,
+    api: &LocalApi,
+    target: &crate::command::LookupTarget,
+    unfollow: bool,
+) {
+    // 共通: target を解決して relationship を得る。
+    let resp = match target {
+        crate::command::LookupTarget::Acct(acct) => api.lookup_actor_by_acct(acct).await,
+        crate::command::LookupTarget::ApId(uri) => api.lookup_actor_by_ap_id(uri).await,
+    };
+    let resolved = match resp {
+        Ok(r) => r,
+        Err(err) => {
+            app.set_status(
+                format!(":(un)follow lookup failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+            return;
+        }
+    };
+    let acct_label = format!(
+        "@{}@{}",
+        resolved.actor.preferred_username, resolved.actor.host
+    );
+    if unfollow {
+        let Some(follow_id) = resolved.relationship.follow_id else {
+            app.set_status(
+                format!("not currently following {acct_label}"),
+                StatusKind::Warning,
+                Some(Duration::from_secs(4)),
+            );
+            return;
+        };
+        match api.unfollow(follow_id).await {
+            Ok(_) => {
+                app.set_status(
+                    format!("unfollowed {acct_label}"),
+                    StatusKind::Success,
+                    Some(Duration::from_secs(3)),
+                );
+            }
+            Err(err) => {
+                app.set_status(
+                    format!("unfollow failed: {err}"),
+                    StatusKind::Error,
+                    Some(Duration::from_secs(6)),
+                );
+            }
+        }
+    } else {
+        match api
+            .follow(&FollowTarget::for_actor_id(resolved.actor.id))
+            .await
+        {
+            Ok(r) => {
+                let label = if r.already_accepted {
+                    format!("already following {acct_label}")
+                } else {
+                    format!("follow requested → {acct_label}")
+                };
+                app.set_status(label, StatusKind::Success, Some(Duration::from_secs(3)));
+            }
+            Err(err) => {
+                app.set_status(
+                    format!("follow failed: {err}"),
+                    StatusKind::Error,
+                    Some(Duration::from_secs(6)),
+                );
+            }
+        }
+    }
+}
+
+async fn open_follow_list(
+    app: &mut App,
+    api: &LocalApi,
+    page_size: i64,
+    mode: crate::follow_list::FollowListMode,
+) {
+    let entries = fetch_follow_list_page(api, mode, None, page_size).await;
+    let mut screen = crate::follow_list::FollowListScreen::new(mode);
+    match entries {
+        Ok((rows, next)) => {
+            screen.current_mut().replace(rows, next);
+        }
+        Err(err) => {
+            app.set_status(
+                format!(":{} failed: {err}", mode.label()),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+            // 失敗しても画面は開く (= 空表示でユーザに状況を伝える)。
+        }
+    }
+    app.follow_list = Some(screen);
+    app.focus = Focus::FollowList;
+}
+
+async fn fetch_follow_list_page(
+    api: &LocalApi,
+    mode: crate::follow_list::FollowListMode,
+    before_id: Option<i64>,
+    page_size: i64,
+) -> Result<(Vec<crate::client::FollowListEntry>, Option<i64>), ApiError> {
+    let resp = match mode {
+        crate::follow_list::FollowListMode::Following => {
+            api.list_following(before_id, page_size).await?
+        }
+        crate::follow_list::FollowListMode::Followers => {
+            api.list_followers(before_id, page_size).await?
+        }
+    };
+    Ok((resp.entries, resp.next_before_id))
+}
+
+async fn follow_list_toggle_mode(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(fl) = app.follow_list.as_mut() else {
+        return;
+    };
+    fl.toggle_mode();
+    // 反対タブを 1 度も fetch していなかったら今 fetch する (= UX 待ちが
+    // 短い `:following` ↔ `:followers` 切替時にも常に直近データが見える)。
+    if !fl.current().fetched {
+        let mode = fl.mode;
+        let res = fetch_follow_list_page(api, mode, None, page_size).await;
+        if let Some(fl) = app.follow_list.as_mut() {
+            match res {
+                Ok((rows, next)) => fl.current_mut().replace(rows, next),
+                Err(err) => app.set_status(
+                    format!("{} fetch failed: {err}", mode.label()),
+                    StatusKind::Error,
+                    Some(Duration::from_secs(6)),
+                ),
+            }
+        }
+    }
+}
+
+async fn follow_list_open_selected(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(fl) = app.follow_list.as_ref() else {
+        return;
+    };
+    let Some(entry) = fl.current_entry() else {
+        app.set_status(
+            "no entry selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    };
+    let actor_id = entry.actor.id;
+    push_profile_for_actor_id(app, api, actor_id, page_size).await;
+}
+
+async fn follow_list_load_more(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(fl) = app.follow_list.as_ref() else {
+        return;
+    };
+    let page = fl.current();
+    if page.exhausted {
+        app.set_status(
+            "no more entries",
+            StatusKind::Info,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    }
+    let mode = fl.mode;
+    let before = page.next_before_id;
+    let res = fetch_follow_list_page(api, mode, before, page_size).await;
+    if let Some(fl) = app.follow_list.as_mut() {
+        match res {
+            Ok((rows, next)) => {
+                let n = rows.len();
+                fl.current_mut().append(rows, next);
+                app.set_status(
+                    format!("loaded {n} more"),
+                    StatusKind::Info,
+                    Some(Duration::from_secs(2)),
+                );
+            }
+            Err(err) => {
+                app.set_status(
+                    format!("load more failed: {err}"),
+                    StatusKind::Error,
+                    Some(Duration::from_secs(5)),
+                );
+            }
+        }
+    }
+}
+
+async fn follow_list_refresh(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(fl) = app.follow_list.as_ref() else {
+        return;
+    };
+    let mode = fl.mode;
+    let res = fetch_follow_list_page(api, mode, None, page_size).await;
+    if let Some(fl) = app.follow_list.as_mut() {
+        match res {
+            Ok((rows, next)) => {
+                fl.current_mut().replace(rows, next);
+                fl.selected = 0;
+                fl.top = 0;
+                app.set_status(
+                    format!("{} refreshed", mode.label()),
+                    StatusKind::Success,
+                    Some(Duration::from_secs(2)),
+                );
+            }
+            Err(err) => {
+                app.set_status(
+                    format!("refresh failed: {err}"),
+                    StatusKind::Error,
+                    Some(Duration::from_secs(5)),
+                );
+            }
+        }
+    }
+}
+
+fn follow_list_close(app: &mut App) {
+    app.follow_list = None;
+    // Profile stack が残っているケース (= FollowList → Profile → Esc → FollowList
+    // → Esc) は無い (Profile に行ったら follow_list はそのまま、profile_back で
+    // FollowList に戻る → Esc で本関数が呼ばれて follow_list が None になる)。
+    // よって profile_back のように分岐は要らず、必ず Timeline に戻る。
+    app.focus = Focus::Timeline;
 }
 
 /// 現在テーマ名 → 次に切り替えるテーマ名 (組み込み 3 種をぐるぐる)。
