@@ -52,6 +52,9 @@ pub struct PanelRects {
     /// M13 PR4: Profile 画面の notes 一覧領域 (= PageDown/Up 高さ算出用)。
     /// 非表示時は zero rect。
     pub profile_notes: Rect,
+    /// M12 (#66): Follow Requests 画面の一覧領域 (= `ensure_visible` 用)。
+    /// 非表示時は zero rect。
+    pub follow_requests: Rect,
 }
 
 /// タイムラインのスクロール可能領域内に並んだ note の行位置をビット圧縮せず
@@ -80,6 +83,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     // 戻る視覚的連続性のため)。M13 PR5 で FollowList も同様に Timeline 領域を
     // 占有する画面として描く。
     let mut profile_notes_rect = Rect::default();
+    let mut follow_requests_rect = Rect::default();
     let rows = if matches!(app.focus, Focus::Profile)
         && let Some(profile) = app.current_profile()
     {
@@ -93,7 +97,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     } else if matches!(app.focus, Focus::Requests)
         && let Some(fr) = app.follow_requests.as_ref()
     {
-        render_follow_requests_screen(frame, timeline_area, app, fr);
+        follow_requests_rect = render_follow_requests_screen(frame, timeline_area, app, fr);
         ScrollHits::default()
     } else {
         render_timeline(frame, timeline_area, app)
@@ -150,6 +154,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         help: help_area,
         picker_list,
         profile_notes: profile_notes_rect,
+        follow_requests: follow_requests_rect,
     }
 }
 
@@ -785,12 +790,16 @@ fn render_follow_list_screen(frame: &mut Frame<'_>, area: Rect, app: &App, fl: &
 ///
 /// シンプルなテキスト一覧 ── 各行に `[N]` `follower_ap_id` `received_at`。
 /// avatar overlay は不要 (= 承認可否判断に icon は要らない、`ap_id` で十分)。
+///
+/// 戻り値は `list_rect` ── main loop が次フレームの
+/// [`crate::follow_requests::FollowRequestsScreen::ensure_visible`] にこの
+/// 高さを渡すために使う。非表示時は zero rect。
 fn render_follow_requests_screen(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &App,
     fr: &crate::follow_requests::FollowRequestsScreen,
-) {
+) -> Rect {
     let palette = &app.theme.palette;
     let block = Block::default()
         .title(Span::styled(
@@ -820,7 +829,7 @@ fn render_follow_requests_screen(
     let list_height = inner.height.saturating_sub(header_rect.height);
     let list_rect = Rect::new(inner.x, list_top, inner.width, list_height);
     if list_rect.height == 0 {
-        return;
+        return list_rect;
     }
 
     if fr.items.is_empty() {
@@ -834,15 +843,21 @@ fn render_follow_requests_screen(
             Style::default().fg(palette.muted),
         )));
         frame.render_widget(para, list_rect);
-        return;
+        return list_rect;
     }
 
+    // `fr.top` を尊重して offset 描画 ── `top` の追従は
+    // [`crate::runtime::main_loop`] が
+    // [`crate::follow_requests::FollowRequestsScreen::ensure_visible`] を
+    // 毎フレーム呼ぶことで保証される (= timeline / follow_list と同パターン)。
     let visible = list_rect.height as usize;
+    let top = fr.top.min(fr.items.len().saturating_sub(1));
     let lines: Vec<Line<'static>> = fr
         .items
         .iter()
-        .take(visible)
         .enumerate()
+        .skip(top)
+        .take(visible)
         .map(|(idx, item)| {
             let selected = idx == fr.cursor;
             let marker = if selected { "▶ " } else { "  " };
@@ -869,6 +884,7 @@ fn render_follow_requests_screen(
         })
         .collect();
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), list_rect);
+    list_rect
 }
 
 fn tab_label(mode: FollowListMode, active: bool) -> String {

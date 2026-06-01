@@ -198,6 +198,13 @@ async fn main_loop(
         // (ensure_visible は二段スクロール禁止のための保険)。
         let approx_items = timeline_capacity.max(1) / 4;
         app.ensure_visible(approx_items.max(1));
+        // M12 (#66): Follow Requests 一覧画面のスクロール追従。1 行 = 1 件
+        // (アバター無し)。`last_rects.follow_requests` は直前フレームで
+        // 確定した一覧領域の Rect。
+        if let Some(fr) = app.follow_requests.as_mut() {
+            let viewport = last_rects.follow_requests.height as usize;
+            fr.ensure_visible(viewport);
+        }
 
         tokio::select! {
             biased;
@@ -1633,15 +1640,26 @@ async fn command_actor_lock(app: &mut App, api: &LocalApi, lock: bool) {
 
 /// M12 (#66): `:requests` 実行 ── 一覧画面を開く + 初回 fetch。失敗しても
 /// 画面は開く (= 空表示でユーザに通知)。
+///
+/// **PR #95 review fix**: `app.follow_requests = Some(...)` + `focus` 切替
+/// を `await` の **前** に行う。これにより fetch 中も `"loading…"` が描画
+/// され、`requests_refresh` と挙動が揃う。
 async fn command_open_requests(app: &mut App, api: &LocalApi) {
     let mut screen = crate::follow_requests::FollowRequestsScreen::new();
     screen.fetching = true;
-    match api.list_follow_requests().await {
+    app.follow_requests = Some(screen);
+    app.focus = Focus::Requests;
+    let result = api.list_follow_requests().await;
+    match result {
         Ok(resp) => {
-            screen.replace(resp.items);
+            if let Some(s) = app.follow_requests.as_mut() {
+                s.replace(resp.items);
+            }
         }
         Err(err) => {
-            screen.fetching = false;
+            if let Some(s) = app.follow_requests.as_mut() {
+                s.fetching = false;
+            }
             app.set_status(
                 format!(":requests fetch failed: {err}"),
                 StatusKind::Error,
@@ -1649,8 +1667,6 @@ async fn command_open_requests(app: &mut App, api: &LocalApi) {
             );
         }
     }
-    app.follow_requests = Some(screen);
-    app.focus = Focus::Requests;
 }
 
 /// `a` / `x` ── 選択中の row を approve / reject 配信し、成功すれば list から
