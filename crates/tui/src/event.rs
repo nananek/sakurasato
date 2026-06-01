@@ -113,6 +113,30 @@ pub enum Action {
     ProfileBack,
     /// M13 PR4: Profile 画面で `r` ── actor + relationship + 直近 notes を再取得。
     ProfileRefresh,
+    /// M13 PR5: コマンドプロンプトを開く (`:` キー)。
+    OpenCommand,
+    /// M13 PR5: コマンドプロンプト中の文字入力。
+    CommandInsertChar(char),
+    /// M13 PR5: コマンドプロンプト中の Backspace。
+    CommandBackspace,
+    /// M13 PR5: コマンドプロンプト中の Enter ── parse + 実行。
+    CommandSubmit,
+    /// M13 PR5: コマンドプロンプト中の Esc ── キャンセル。
+    CommandCancel,
+    /// M13 PR5: `FollowList` で次のエントリを選択。
+    FollowListSelectNext,
+    /// M13 PR5: `FollowList` で前のエントリを選択。
+    FollowListSelectPrev,
+    /// M13 PR5: `FollowList` で `t` ── following / followers タブ切替。
+    FollowListToggleMode,
+    /// M13 PR5: `FollowList` で `Enter` ── 選択行の actor の Profile を push。
+    FollowListOpenSelected,
+    /// M13 PR5: `FollowList` で `o` ── 古いページ追加取得。
+    FollowListLoadMore,
+    /// M13 PR5: `FollowList` で `r` ── 現在タブを再取得。
+    FollowListRefresh,
+    /// M13 PR5: `FollowList` で `Esc` / `q` ── 画面を閉じる。
+    FollowListClose,
 }
 
 /// crossterm イベント → Action。
@@ -146,6 +170,33 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::Suppression => translate_suppression_key(k),
         Focus::AltPrompt => translate_alt_prompt_key(k),
         Focus::Profile => translate_profile_key(k),
+        Focus::FollowList => translate_follow_list_key(k),
+        Focus::Command => translate_command_key(k),
+    }
+}
+
+fn translate_follow_list_key(k: KeyEvent) -> Action {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => Action::FollowListClose,
+        (KeyCode::Char('q'), m) if m.is_empty() => Action::FollowListClose,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::FollowListSelectNext,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::FollowListSelectPrev,
+        (KeyCode::Char('t'), m) if m.is_empty() => Action::FollowListToggleMode,
+        (KeyCode::Enter, _) => Action::FollowListOpenSelected,
+        (KeyCode::Char('o'), m) if m.is_empty() => Action::FollowListLoadMore,
+        (KeyCode::Char('r'), m) if m.is_empty() => Action::FollowListRefresh,
+        _ => Action::Noop,
+    }
+}
+
+fn translate_command_key(k: KeyEvent) -> Action {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Esc => Action::CommandCancel,
+        KeyCode::Enter => Action::CommandSubmit,
+        KeyCode::Backspace => Action::CommandBackspace,
+        KeyCode::Char(c) if !ctrl => Action::CommandInsertChar(c),
+        _ => Action::Noop,
     }
 }
 
@@ -194,6 +245,8 @@ fn translate_timeline_key(k: KeyEvent) -> Action {
         (KeyCode::Char('u'), m) if m.is_empty() => Action::UndoReactionOnSelected,
         // M13 PR4: p = 選択中の Note の author の Profile 画面を push。
         (KeyCode::Char('p'), m) if m.is_empty() => Action::OpenProfileFromSelected,
+        // M13 PR5: `:` でコマンドプロンプトを開く (vim 風)。
+        (KeyCode::Char(':'), m) if m.is_empty() => Action::OpenCommand,
         _ => Action::Noop,
     }
 }
@@ -608,6 +661,101 @@ mod tests {
                 Focus::Profile,
             ),
             Action::Quit,
+        ));
+    }
+
+    #[test]
+    fn timeline_colon_opens_command() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char(':'), KeyModifiers::NONE)),
+                Focus::Timeline,
+            ),
+            Action::OpenCommand,
+        ));
+    }
+
+    #[test]
+    fn command_focus_keys_route_correctly() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Esc, KeyModifiers::NONE)),
+                Focus::Command,
+            ),
+            Action::CommandCancel,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)),
+                Focus::Command,
+            ),
+            Action::CommandSubmit,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('f'), KeyModifiers::NONE)),
+                Focus::Command,
+            ),
+            Action::CommandInsertChar('f'),
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Backspace, KeyModifiers::NONE)),
+                Focus::Command,
+            ),
+            Action::CommandBackspace,
+        ));
+    }
+
+    #[test]
+    fn follow_list_focus_keys_route_correctly() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(matches!(
+                translate(Event::Key(key(code, KeyModifiers::NONE)), Focus::FollowList),
+                Action::FollowListClose,
+            ));
+        }
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)),
+                Focus::FollowList,
+            ),
+            Action::FollowListSelectNext,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('k'), KeyModifiers::NONE)),
+                Focus::FollowList,
+            ),
+            Action::FollowListSelectPrev,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('t'), KeyModifiers::NONE)),
+                Focus::FollowList,
+            ),
+            Action::FollowListToggleMode,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)),
+                Focus::FollowList,
+            ),
+            Action::FollowListOpenSelected,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('o'), KeyModifiers::NONE)),
+                Focus::FollowList,
+            ),
+            Action::FollowListLoadMore,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('r'), KeyModifiers::NONE)),
+                Focus::FollowList,
+            ),
+            Action::FollowListRefresh,
         ));
     }
 
