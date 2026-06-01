@@ -83,6 +83,54 @@ pub struct ServerConfig {
     pub local_api_listen: Option<String>,
     /// Single user actor handle (the only local user).
     pub user: String,
+    /// 任意のサーバ運営情報 (description / 管理者連絡先 / テーマ色等)。
+    /// `NodeInfo` の `metadata` に反映され、他鯖の探索系で表示される。
+    /// お一人様サーバなのでデフォルトは全フィールド `None` (= 何も出さない)。
+    #[serde(default)]
+    pub info: ServerInfo,
+}
+
+/// `NodeInfo.metadata` 経由で他鯖に公開するサーバ情報。
+///
+/// `config.toml` の `[server.info]` セクションで自由に書ける:
+///
+/// ```toml
+/// [server.info]
+/// name = "My Quiet Sakurasato"
+/// description = "neko の隠れ家。Mastodon / Misskey 連合。"
+/// admin_name = "neko"
+/// admin_contact = "mailto:neko@example.com"
+/// theme_color = "#ffb7c5"
+/// banner_url = "https://example.com/banner.webp"
+/// ```
+///
+/// すべて optional。空値は emit しない (= 他鯖が "null" を変な値と見なすのを防ぐ)。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ServerInfo {
+    /// 表示用サーバ名 (Mastodon の "Instance name" 相当)。未設定なら host を使う。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// サーバ説明文。Markdown は許可しないテキスト前提。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 管理者の表示名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_name: Option<String>,
+    /// 管理者連絡先 (`mailto:` URI 推奨)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_contact: Option<String>,
+    /// テーマ色 (`#rrggbb`)。Mastodon / Misskey の UI ハイライトに使われる慣習。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme_color: Option<String>,
+    /// バナー画像 URL (= サーバ紹介ページ用の横長画像)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner_url: Option<String>,
+    /// `ToS` / プライバシーポリシー URL。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms_url: Option<String>,
+    /// ソフトウェアリポジトリ (デフォルトは sakurasato 本家 ── fork した時の上書き用)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_url: Option<String>,
 }
 
 /// 抽象 listener (TCP / Unix domain socket)。`server` 側で `axum::serve` の

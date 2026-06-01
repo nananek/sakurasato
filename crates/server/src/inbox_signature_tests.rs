@@ -46,6 +46,7 @@ fn make_config() -> sakurasato_core::Config {
             public_listen: None,
             local_api_listen: None,
             user: "alice".into(),
+            info: sakurasato_core::config::ServerInfo::default(),
         },
         database: sakurasato_core::config::DatabaseConfig {
             url: "unused-by-tests".into(),
