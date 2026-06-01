@@ -49,13 +49,27 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use sakurasato_core::repo;
 
 use crate::state::AppState;
+
+/// versitygw 上で **public 配信が許可された** local emoji のキー prefix。
+/// `emoji import` で書き込まれる ── `media` table には載らない別系統なので、
+/// authorization 段で prefix チェックを通過させて S3 fetch に進ませる。
+const LOCAL_EMOJI_KEY_PREFIX: &str = "emoji/local/";
 
 pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     if !is_safe_key(&key) {
         tracing::warn!(key = %key, "media GET: rejected unsafe key");
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    // **SECURITY (IDOR fix)**: 任意 key で versitygw から fetch & 配信していた
+    // ため、attachment が followers/direct な note に紐付いていても URL を
+    // 知っていれば取れていた。`media` table を引いて kind / 紐付き note の
+    // visibility を見て、漏らしてよい key かを判定する。
+    if !authorized_for_public(&state, &key).await {
+        tracing::debug!(key = %key, "media GET: refusing non-public key");
+        return StatusCode::NOT_FOUND.into_response();
     }
     let bucket = state.config().storage.bucket.clone();
     let resp = match state
@@ -113,6 +127,65 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
         headers.insert(header::CONTENT_LENGTH, hv);
     }
     response
+}
+
+/// この key を public に配信してよいか判定する。
+///
+/// 分類:
+/// - `emoji/local/...` prefix → カスタム絵文字。AS2 `Emoji.icon.url` として
+///   連合相手が public fetch する慣習なので常に許可。
+/// - `media` table に対応 row あり:
+///   - `kind = avatar | header` → actor の icon/image として連合配信される
+///     ので public 許可。
+///   - `kind = attachment` + `note_id` あり + note が `public` / `unlisted`
+///     → permalink と同じく公開許可。
+///   - `kind = attachment` + (note 未紐付け or note が `followers` / `direct`)
+///     → 拒否 (404 で漏らさない)。
+/// - `media` table に row 無し → 不明な key、拒否。
+///
+/// **失敗時の方針**: DB エラー / lookup 失敗は安全側 = 拒否。許可漏れは
+/// ログだけ残し、攻撃的列挙には 404 を返す。
+async fn authorized_for_public(state: &AppState, key: &str) -> bool {
+    if key.starts_with(LOCAL_EMOJI_KEY_PREFIX) {
+        return true;
+    }
+    let media = match repo::media::get_by_storage_key(state.pool(), key).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::warn!(?err, key = %key, "media GET: storage_key lookup failed");
+            return false;
+        }
+    };
+    match media.kind.as_str() {
+        "avatar" | "header" => true,
+        "attachment" => {
+            let Some(note_id) = media.note_id else {
+                // 孤児 attachment (アップロード後に投稿に紐付かなかった) は
+                // 連合にも出ていないので公開する筋がない。
+                return false;
+            };
+            match repo::note::get_by_id(state.pool(), note_id).await {
+                Ok(Some(n)) => matches!(n.visibility.as_str(), "public" | "unlisted"),
+                Ok(None) => false,
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        key = %key,
+                        note_id,
+                        "media GET: parent note lookup failed",
+                    );
+                    false
+                }
+            }
+        }
+        other => {
+            // schema CHECK で 3 種に絞っているが、将来種別が増えたとき
+            // 「明示的に許可していない種別は配信しない」フェイルセーフ。
+            tracing::warn!(key = %key, kind = %other, "media GET: unknown kind");
+            false
+        }
+    }
 }
 
 /// versitygw に渡す前に key の妥当性を検証する。
