@@ -253,6 +253,27 @@ fn render_alt_prompt(
     frame.render_widget(p, area);
 }
 
+/// `Paragraph::wrap` 後にこの `Line` が消費する行数を概算する。
+///
+/// **Issue #104**: 旧実装は各 `Line` を 1 行と仮定して `row_cursor` を進め、
+/// 長文 note の content が折り返されると次 note のアバター画像位置がズレた。
+/// `Line::width()` (= span 合計 display width) を viewport 幅で割って `ceil`
+/// する。`Wrap { trim: false }` の word boundary とは完全一致しないが、
+/// note 表示用途では 1 行誤差程度に収まる。
+///
+/// `viewport_width = 0` のときは安全に 1 を返す (= 行が消えないように)。
+/// 空 Line も 1 行扱い (ratatui の挙動と一致)。
+fn wrapped_line_height(line: &Line<'_>, viewport_width: u16) -> u16 {
+    if viewport_width == 0 {
+        return 1;
+    }
+    let w = u16::try_from(line.width()).unwrap_or(u16::MAX);
+    if w == 0 {
+        return 1;
+    }
+    w.div_ceil(viewport_width)
+}
+
 fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
     let palette = &app.theme.palette;
     let block = Block::default()
@@ -309,9 +330,20 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
         let note = &app.notes[idx];
         let is_selected = idx == app.selected;
         let block_lines = note_lines(note, palette, is_selected, inner.width, header_indent);
-        let consumed = u16::try_from(block_lines.len()).unwrap_or(u16::MAX);
+
+        // **Issue #104**: 各 Line の **wrap 後の高さ** を計算して row_cursor を
+        // 進める。`note_lines` が組む Line は 1 行扱いだが、Paragraph::wrap で
+        // 折り返されると実際は複数行になる ── content が長い note の次行に
+        // 次 note のアバターが乗ってしまうバグの原因だった。
+        // `Line::width()` (= span 合計 display width) を viewport 幅で割って
+        // ceil する。`Wrap { trim: false }` は word boundary 優先だが、
+        // word 境界の有無で多少ズレることがあるのは許容 (= 1 行ズレ程度)。
+        let consumed_total: u16 = block_lines
+            .iter()
+            .map(|l| wrapped_line_height(l, inner.width))
+            .fold(0u16, u16::saturating_add);
         let visible_top = inner.y + row_cursor;
-        let visible_height = consumed.min(inner.height - row_cursor);
+        let visible_height = consumed_total.min(inner.height - row_cursor);
         hits.push(idx, visible_top, visible_height);
 
         if avatar_enabled
@@ -325,8 +357,9 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
             if row_cursor >= inner.height {
                 break;
             }
+            let h = wrapped_line_height(&l, inner.width);
             lines.push(l);
-            row_cursor += 1;
+            row_cursor = row_cursor.saturating_add(h);
         }
         idx += 1;
     }
