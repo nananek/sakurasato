@@ -27,6 +27,7 @@ fn make_config(user: &str, host: &str) -> sakurasato_core::Config {
             local_api_listen: None,
             user: user.into(),
             info: sakurasato_core::config::ServerInfo::default(),
+            auto_approve_followers_for_followees: false,
         },
         database: sakurasato_core::config::DatabaseConfig {
             url: "unused-by-tests".into(),

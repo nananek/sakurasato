@@ -31,6 +31,7 @@ fn make_config() -> Config {
             local_api_listen: None,
             user: "me".into(),
             info: ServerInfo::default(),
+            auto_approve_followers_for_followees: false,
         },
         database: DatabaseConfig {
             url: "unused".into(),

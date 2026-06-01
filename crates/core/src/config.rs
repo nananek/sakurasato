@@ -88,6 +88,21 @@ pub struct ServerConfig {
     /// お一人様サーバなのでデフォルトは全フィールド `None` (= 何も出さない)。
     #[serde(default)]
     pub info: ServerInfo,
+    /// 鍵アカ運用 (`actor.manually_approves_followers = TRUE`) のとき、
+    /// **自分が follow している (or pending を送出中の) 相手からの inbound
+    /// Follow を auto-Accept する** 緩和フラグ。
+    ///
+    /// デフォルト `false` (= 従来挙動)。`true` のときの動作:
+    /// - `dispatch::handler::handle_follow` の lock 分岐の **前** に判定
+    /// - `follow` 表で `(follower = local_actor, followed = signer)` の行が
+    ///   `accepted` または `pending` で存在 → lock を respect せず Accept パスへ
+    /// - それ以外 → 従来どおり pending 据え置き (= 手動承認)
+    ///
+    /// ユースケース: 鍵アカ運用中でも、こちらから既に follow を投げて関係を
+    /// 築いている相手からのフォローバックや retry は手動承認の手間を省きたい
+    /// (= 双方向 follow の慣習を維持)。
+    #[serde(default)]
+    pub auto_approve_followers_for_followees: bool,
 }
 
 /// `NodeInfo.metadata` 経由で他鯖に公開するサーバ情報。

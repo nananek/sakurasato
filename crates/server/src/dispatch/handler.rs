@@ -58,6 +58,10 @@ fn ensure_same_host(other_uri: &str, signer_ap_id: &str, kind: &str) -> anyhow::
 /// 5. Accept activity を組み立て、`enqueue_activity` で `signer.inbox_url`
 ///    宛に配送キューに積む。常駐 worker がループで送出する (#23 暫定の server
 ///    直配送)。
+#[allow(
+    clippy::too_many_lines,
+    reason = "lock 緩和分岐 + Accept enqueue を 1 関数で抱える"
+)]
 pub(crate) async fn handle_follow(
     state: &AppState,
     signer: &ActorRow,
@@ -123,24 +127,63 @@ pub(crate) async fn handle_follow(
         );
         return Ok(());
     } else if followed.manually_approves_followers {
-        // **Issue #66 (鍵アカ運用)**: followed actor が manually approves で、
-        // かつ既存 Follow 行が `pending` の場合は Accept を queue せず据え置く。
-        // 承認は管理 CLI (`sakurasato-server follow-request approve --id N`)
-        // で明示的に実行する想定。
+        // **緩和判定**: `auto_approve_followers_for_followees = true` のとき、
+        // 自分が既に follow している (or pending 送出中の) 相手からの inbound
+        // Follow は手動承認をスキップして Accept パスへ。双方向 follow の
+        // 慣習を維持しつつ鍵アカ運用の手間を減らす opt-in 動作。
         //
-        // `Accepted` ブランチでこの分岐より前に return しているのは意図的:
-        // 以前 unlock 状態で受理した Follow が `accepted` のまま残っている
-        // ところに lock 後の retry 配送が来た場合、相手側は accepted のはず
-        // なので Accept を返してあげないと延々と pending 扱いされる。
-        // (lock した瞬間に従来フォロワーを切るのではなく、新規 Follow だけ
-        // 承認制に切替える設計)
-        info!(
-            follow_id = row.id,
-            follower = %signer.ap_id,
-            followed = %followed.ap_id,
-            "follow-request received (manually_approves_followers); awaiting CLI approval",
-        );
-        return Ok(());
+        // - `(follower = followed = local_actor, followed = signer)` の reverse
+        //   方向 follow 行を見て `accepted` / `pending` なら信頼関係ありと判定。
+        // - 既に retry / mutual follow なら本判定は skip され Accept 経路へ。
+        // - DB エラーは「分からない」= 安全側 = manual approval 待ちにフォール
+        //   バック (= warn ログのみ)。
+        let mutual_path = if state.config().server.auto_approve_followers_for_followees {
+            match repo::follow::get_by_pair(state.pool(), followed.id, signer.id).await {
+                Ok(Some(existing)) => matches!(existing.state.as_str(), "accepted" | "pending",),
+                Ok(None) => false,
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        follower = %signer.ap_id,
+                        followed = %followed.ap_id,
+                        "auto_approve_followers_for_followees lookup failed; falling back to manual approval",
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if mutual_path {
+            info!(
+                follow_id = row.id,
+                follower = %signer.ap_id,
+                followed = %followed.ap_id,
+                "auto-approving inbound Follow (mutual / already-following relationship)",
+            );
+            // fall through to Accept enqueue + state transition.
+        } else {
+            // **Issue #66 (鍵アカ運用)**: followed actor が manually approves
+            // で、かつ既存 Follow 行が `pending` の場合は Accept を queue せず
+            // 据え置く。承認は管理 CLI
+            // (`sakurasato-server follow-request approve --id N`) で明示実行
+            // する想定。
+            //
+            // `Accepted` ブランチでこの分岐より前に return しているのは意図的:
+            // 以前 unlock 状態で受理した Follow が `accepted` のまま残ってい
+            // るところに lock 後の retry 配送が来た場合、相手側は accepted の
+            // はずなので Accept を返してあげないと延々と pending 扱いされる。
+            // (lock した瞬間に従来フォロワーを切るのではなく、新規 Follow だけ
+            // 承認制に切替える設計)
+            info!(
+                follow_id = row.id,
+                follower = %signer.ap_id,
+                followed = %followed.ap_id,
+                "follow-request received (manually_approves_followers); awaiting CLI approval",
+            );
+            return Ok(());
+        }
     }
 
     let accept_activity = build_accept_activity(state, &followed, activity, row.id);
