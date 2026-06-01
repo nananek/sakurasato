@@ -137,6 +137,15 @@ pub enum Action {
     FollowListRefresh,
     /// M13 PR5: `FollowList` で `Esc` / `q` ── 画面を閉じる。
     FollowListClose,
+    /// Issue #101: 絵文字サジェスト popup 表示中の `↓` ── 次候補へ。
+    EmojiSuggestDown,
+    /// Issue #101: 絵文字サジェスト popup 表示中の `↑` ── 前候補へ。
+    EmojiSuggestUp,
+    /// Issue #101: 絵文字サジェスト popup 表示中の `Tab` ── 選択中の shortcode
+    /// を `:foo:` 形式で reaction prompt buffer に挿入し popup を閉じる。
+    /// `Enter` は既存の `ReactionPromptSubmit` に乗せて popup open 時のみ
+    /// confirm として流用する (runtime 側で分岐)。
+    EmojiSuggestConfirm,
     /// M12 (#66): `:lock` ── 鍵アカ運用に切替 (`POST /api/v1/actor/lock`)。
     ActorLock,
     /// M12 (#66): `:unlock` ── 鍵アカ解除。
@@ -370,6 +379,12 @@ fn translate_reaction_prompt_key(k: KeyEvent) -> Action {
     match k.code {
         KeyCode::Esc => Action::ReactionPromptCancel,
         KeyCode::Enter => Action::ReactionPromptSubmit,
+        // Issue #101: 絵文字サジェスト popup ナビゲーション。popup が開いて
+        // いない時は runtime 側で Noop に倒す (= reaction prompt 入力に影響
+        // させない)。
+        KeyCode::Tab => Action::EmojiSuggestConfirm,
+        KeyCode::Up => Action::EmojiSuggestUp,
+        KeyCode::Down => Action::EmojiSuggestDown,
         KeyCode::Backspace => Action::ReactionPromptBackspace,
         KeyCode::Char(c) if !ctrl => Action::ReactionPromptInsertChar(c),
         _ => Action::Noop,

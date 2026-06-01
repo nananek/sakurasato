@@ -88,6 +88,38 @@ pub async fn get_local_by_shortcode(
     .await
 }
 
+/// Local emoji を shortcode 前方一致で検索する。TUI のサジェスト UI
+/// (Issue #101) が `:foo` まで打った段階で叩く。
+///
+/// - 前方一致は ASCII-lowercase 比較 (shortcode は元から ASCII)。
+/// - `limit` は呼び出し側で 1..=100 にクランプ済みの想定。負値は 0 件扱い。
+/// - 結果は shortcode ASC でソート (= 安定した popup 表示)。
+pub async fn list_local_by_prefix(
+    pool: &PgPool,
+    prefix: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<EmojiRow>> {
+    let pat = format!("{}%", prefix.to_ascii_lowercase());
+    sqlx::query_as!(
+        EmojiRow,
+        r#"
+        SELECT
+            id, shortcode, host, category,
+            aliases as "aliases: Json<Vec<String>>",
+            image_key, media_type, ap_id, is_local, created_at, updated_at
+        FROM emoji
+        WHERE host IS NULL
+          AND lower(shortcode) LIKE $1
+        ORDER BY shortcode ASC
+        LIMIT $2
+        "#,
+        pat,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Remote custom emoji の upsert 入力 (M8 PR2)。
 ///
 /// `image_url` は連合先サーバの実 URL (= `Emoji.icon.url`)。本 PR では

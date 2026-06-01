@@ -56,6 +56,7 @@ use crate::state::AppState;
 pub mod actor;
 pub mod actor_admin;
 pub mod auth;
+pub mod emojis;
 pub mod follow;
 pub mod follow_list;
 pub mod follow_request;
@@ -107,6 +108,7 @@ pub fn router(state: AppState) -> Router {
         )
         // M8: ローカル user が自分の Note にリアクションを付けて連合先に通知。
         // POST = 作成 (EmojiReact / Like)、DELETE = 取り消し (Undo)。
+        .route("/api/v1/emojis", get(emojis::list))
         .route("/api/v1/reactions", post(reactions::create))
         .route(
             "/api/v1/reactions/{id}",

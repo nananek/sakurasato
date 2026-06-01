@@ -416,6 +416,21 @@ impl LocalApi {
         decode_json(resp).await
     }
 
+    /// `GET /api/v1/emojis?prefix=...&limit=...` ── ローカル絵文字候補
+    /// (Issue #101)。reaction prompt の shortcode サジェスト popup で使う。
+    ///
+    /// `prefix` は server 側で `is_valid_shortcode` の文字集合 (ASCII
+    /// alphanumeric + `_` + `-`) に縛られるので URL エンコード不要。本クライ
+    /// アント側でも事前に同集合で trim/filter してから渡すこと。
+    pub async fn list_emojis(
+        &self,
+        prefix: &str,
+        limit: i64,
+    ) -> Result<EmojiListResponse, ApiError> {
+        let path = format!("/api/v1/emojis?prefix={prefix}&limit={limit}");
+        self.get_json(&path).await
+    }
+
     /// `POST /api/v1/actor/lock` ── 鍵アカ運用に切替 (Issue #66 / M12)。
     pub async fn actor_lock(&self) -> Result<LockResponse, ApiError> {
         self.post_json_no_body("/api/v1/actor/lock").await
@@ -815,6 +830,24 @@ pub struct UnfollowResponse {
     pub target_ap_id: String,
     pub delivery_queue_id: i64,
     pub inbox_url: String,
+}
+
+/// `GET /api/v1/emojis` の各要素。
+/// `server::local_api::emojis::EmojiItem` と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmojiItem {
+    pub shortcode: String,
+    pub url: String,
+    pub media_type: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmojiListResponse {
+    pub items: Vec<EmojiItem>,
 }
 
 /// `POST /api/v1/actor/{lock,unlock}` のレスポンス。

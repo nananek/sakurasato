@@ -127,6 +127,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     {
         render_reaction_prompt(frame, status_area, &app.theme, p);
     }
+    // Issue #101: 絵文字サジェスト popup。reaction prompt の上に重ねる。
+    if app.focus == Focus::ReactionPrompt
+        && let Some(s) = app.emoji_suggest.as_ref()
+    {
+        render_emoji_suggest(frame, area, &app.theme, s);
+    }
 
     // M9 PR2: 視覚刺激抑制トグル overlay。
     if app.focus == Focus::Suppression {
@@ -156,6 +162,96 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         profile_notes: profile_notes_rect,
         follow_requests: follow_requests_rect,
     }
+}
+
+/// Issue #101: 絵文字サジェスト popup。中央下寄せに小さなパネルを浮かべ、
+/// 候補を縦に並べる。テキストのみ (= 画像 URL は今は使わない、`image_url`
+/// を将来描画するときは ratatui-image 経由で各行に重ねる)。
+fn render_emoji_suggest(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+    state: &crate::emoji_suggest::EmojiSuggestState,
+) {
+    let palette = &theme.palette;
+    if state.is_empty() {
+        return;
+    }
+    // 候補数 (最大 VISIBLE_MAX) + border + ヘッダ 1 行。
+    let visible = state.filtered.len().min(crate::emoji_suggest::VISIBLE_MAX);
+    let h = u16::try_from(visible).unwrap_or(8) + 3;
+    let w = 36u16.min(area.width.saturating_sub(4));
+    // 中央下寄せ ── reaction prompt (status バー行) のすぐ上に出す。
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + area.height.saturating_sub(h).saturating_sub(2);
+    let rect = Rect::new(x, y, w, h.min(area.height));
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!("  emoji ({})  ", state.filtered.len()),
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.accent))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    frame.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let scroll_top = scroll_window_top(state.cursor, visible, state.filtered.len());
+    let lines: Vec<Line<'static>> = state
+        .filtered
+        .iter()
+        .enumerate()
+        .skip(scroll_top)
+        .take(visible)
+        .map(|(idx, item)| {
+            let selected = idx == state.cursor;
+            let marker = if selected { "▶ " } else { "  " };
+            let marker_style = if selected {
+                Style::default()
+                    .fg(palette.accent_strong)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.muted)
+            };
+            let mut spans = vec![
+                Span::styled(marker.to_string(), marker_style),
+                Span::styled(
+                    format!(":{}:", item.shortcode),
+                    Style::default().fg(palette.foreground),
+                ),
+            ];
+            if let Some(cat) = item.category.as_deref()
+                && !cat.is_empty()
+            {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("[{cat}]"),
+                    Style::default().fg(palette.muted),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// カーソルが見える位置に scroll する単純な top 算出。
+fn scroll_window_top(cursor: usize, visible: usize, total: usize) -> usize {
+    if total <= visible || cursor < visible {
+        return 0;
+    }
+    let max_top = total.saturating_sub(visible);
+    cursor
+        .saturating_sub(visible.saturating_sub(1))
+        .min(max_top)
 }
 
 /// 入力プロンプトを status バー位置に上書き表示する。1 行。
