@@ -180,6 +180,90 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml ps
 docker compose -f docker-compose.yml -f docker-compose.ghcr.yml logs -f server
 ```
 
+### 3.7 (任意) 外部 managed 構成 ── Neon + Cloudflare R2 等
+
+§3.1〜§3.6 の本流は postgres + versitygw を **ローカル compose 内で立てる前提**。リソース制約のあるホスト (例: 962MB RAM クラスの VPS) ではコンテナを 2 つ削って外部 managed サービスへ逃がしたい場合がある。
+
+設定面では `crates/core/src/config.rs` の `DatabaseConfig` / `StorageConfig` が env による完全上書きを許しているので、**コンテナ起動レイヤで postgres / versitygw を外す + server に managed サービスの接続情報を env 注入する** だけで切替できる。
+
+実証: 2026-05-31 / 962MB VPS 上で Neon (managed Postgres) + Cloudflare R2 (S3 互換) の組合せで連合が成立、アイドル時 RAM は server + media-proxy + cloudflared で計 45 MiB 程度。
+
+#### overlay 例
+
+```yaml
+# docker-compose.managed.yml ── §3.3 で書いた docker-compose.override.yml と
+# 同居させ、compose の左→右で順に重ねる:
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.ghcr.yml \
+#                  -f docker-compose.managed.yml up -d
+
+services:
+  # `disabled` profile は通常起動では空集合に該当しないので、これらは
+  # `compose up` の対象から外れる (= イメージ pull もコンテナ作成も走らない)。
+  postgres:
+    profiles: ["disabled"]
+  versitygw:
+    profiles: ["disabled"]
+
+  server:
+    # base compose の depends_on を打ち消し、media-proxy だけに依存させる
+    # (postgres / versitygw は外部 managed なので docker が待つ意味がない)。
+    # `!override` は Compose CLI v2.13+ で利用可能。
+    depends_on: !override
+      media-proxy:
+        condition: service_started
+    environment:
+      # ─── Neon ─────────────────────────────────────────────
+      # `{password}` placeholder は SAKURASATO_DATABASE__PASSWORD_FILE の
+      # 内容で実行時置換される (RFC 3986 percent-encoded)。
+      SAKURASATO_DATABASE__URL: "postgres://nekonon:{password}@ep-xxxx.region.aws.neon.tech/sakurasato?sslmode=require"
+      SAKURASATO_DATABASE__PASSWORD_FILE: "/run/secrets/neon_password"
+      # ─── Cloudflare R2 ───────────────────────────────────
+      SAKURASATO_STORAGE__ENDPOINT: "https://<account-id>.r2.cloudflarestorage.com"
+      SAKURASATO_STORAGE__BUCKET: "sakurasato-media"
+      SAKURASATO_STORAGE__REGION: "auto"
+      SAKURASATO_STORAGE__ACCESS_KEY_ID: "<R2 API token access key>"
+      SAKURASATO_STORAGE__SECRET_ACCESS_KEY_FILE: "/run/secrets/r2_secret_access_key"
+    secrets:
+      - neon_password
+      - r2_secret_access_key
+
+secrets:
+  neon_password:
+    file: ./secrets/neon_password.txt
+  r2_secret_access_key:
+    file: ./secrets/r2_secret_access_key.txt
+```
+
+secrets ファイルの権限は §3.2 と同じ運用 (`secrets/` = `chmod 700`、各ファイル = `chmod 644`)。base compose 側で参照されている `postgres_password` / `s3_secret_key` は server 側で env を上書きしているので未使用になるが、サービス定義に残っていてもエラーにはならない (= base 側を編集する必要はない)。
+
+#### Neon 注意点
+
+- **`?sslmode=require` 必須**。Neon は平文接続を受け付けない。
+- Neon のダッシュボードから払い出される接続文字列には `channel_binding=require` が付いていることがある。sqlx 0.9 はこのパラメタを認識せず起動毎に `unknown URL parameter: channel_binding` の WARN を吐くため、`DatabaseConfig::resolved_url` 側で**実行時に剥がす** (Issue #74)。channel binding は Neon 側で TLS 終端時に強制されており、クライアント側の advisory フラグは外しても接続安全性に影響しない (結局 `SCRAM-SHA-256-PLUS` を要求される)。
+- `init` で `sqlx::migrate!` が走るため、`docker compose run --rm server init` をそのまま実行すれば Neon DB にマイグレーションが適用される。
+
+#### Cloudflare R2 注意点
+
+- **バケットは事前に R2 ダッシュボードで作成しておくこと**。sakurasato は `CreateBucket` を呼ばないので、存在しないとメディアアップロードで 404 になる。
+- **region は文字列 `"auto"`** を渡す。R2 は単一 region 扱い。
+- **`force_path_style(true)`** ([`crates/server/src/state.rs`](crates/server/src/state.rs) `build_s3_client`) は R2 でも問題ない。R2 は path-style / virtual-hosted-style の両方を受ける。
+- R2 API token は読み取り + 書き込み権限のある **`Object Read & Write`** スコープで発行する。
+
+#### init 後の動作確認
+
+`init` は actor の生成と DB マイグレーションだけで、**storage に対しては一切 I/O を出さない**。R2 credentials の入力ミス (例: `access_key_id` のタイポ / 誤ったバケット名) は init では検知できず、最初のメディアアップロード (= TUI でのアイコン変更や添付投稿) まで顕在化しない。`up -d` 後は以下を踏むのが安全:
+
+```bash
+# 1. server の起動ログを見て、DB 接続失敗 / `endpoint` resolve 失敗が無いことを確認
+docker compose ... logs -f server
+
+# 2. TUI でアイコンを差し替えるか、画像添付の投稿を 1 回試して 200 を確認
+#    (失敗ログは `tracing` レベル WARN/ERROR で出る)
+```
+
+DB と storage の片方ずつしか壊れていないと server は起動できてしまうので、メディアアップロードまで通って初めて managed 構成全体が成立したと言える。
+
 ---
 
 ## 4. Cloudflare Tunnel の設定
