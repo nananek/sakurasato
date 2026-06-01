@@ -489,6 +489,262 @@ class TestReactionInbound:
         )
 
 
+# ── 6.5. Visibility matrix (public / unlisted / followers / direct) ──
+
+
+class TestVisibilityMatrix:
+    """visibility 4 種類が両方向で正しく動くことを確認する。
+
+    送信側 (`crates/server/src/local_api/notes.rs::recipients_for`) と
+    受信側 (`crates/server/src/dispatch/note.rs::derive_visibility`) の両方の
+    AP semantics を Mastodon と Sakurasato で対称的に観測する。
+
+    Mastodon の visibility 用語との対応:
+    - sakurasato `public`     ↔ mastodon `public`
+    - sakurasato `unlisted`   ↔ mastodon `unlisted`
+    - sakurasato `followers`  ↔ mastodon `private`  (= followers-only)
+    - sakurasato `direct`     ↔ mastodon `direct`
+
+    依存順序: 本 class は `TestFollow` と `TestNoteFromSakurasato` /
+    `TestNoteFromMastodon` の **後** に走る前提。Bob ⇄ me の相互フォローが
+    accepted になっていれば良い。各テスト冒頭で `mastodon.follow(...)` を
+    idempotent に叩いて暗黙の前提を明示前提に置き換える。
+    """
+
+    # ── SK → MA (送信側 recipients_for の検証) ────────────
+
+    def test_sakurasato_public_reaches_mastodon_home_and_public(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        accounts = mastodon.search_accounts(f"me@{SAKURASATO_DOMAIN}", resolve=True)
+        assert accounts
+        mastodon.follow(accounts[0]["id"])
+
+        marker = f"vis-out-public-{int(time.time() * 1000)}"
+        sakurasato.create_note(f"public: {marker}", visibility="public")
+
+        # public は `to=[Public], cc=[followers]` で、follower (Bob) の home と
+        # 連合 public TL の双方に乗る。
+        poll_until(
+            lambda: any(
+                marker in (s.get("content") or "")
+                for s in mastodon.home_timeline(limit=40)
+            ),
+            desc=f"public note {marker} on Mastodon home",
+        )
+        poll_until(
+            lambda: any(
+                marker in (s.get("content") or "")
+                for s in mastodon.public_timeline(limit=40)
+            ),
+            desc=f"public note {marker} on Mastodon public TL",
+        )
+
+    def test_sakurasato_unlisted_on_home_but_not_public(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        accounts = mastodon.search_accounts(f"me@{SAKURASATO_DOMAIN}", resolve=True)
+        assert accounts
+        mastodon.follow(accounts[0]["id"])
+
+        marker = f"vis-out-unlisted-{int(time.time() * 1000)}"
+        sakurasato.create_note(f"unlisted: {marker}", visibility="unlisted")
+
+        # unlisted は `to=[followers], cc=[Public]`。follower (Bob) の home には
+        # 乗るが Mastodon の public TL には載らない仕様 (Mastodon の AS2 解釈)。
+        poll_until(
+            lambda: any(
+                marker in (s.get("content") or "")
+                for s in mastodon.home_timeline(limit=40)
+            ),
+            desc=f"unlisted note {marker} on Mastodon home (Bob is follower)",
+        )
+        # public TL に出ないことを 5 秒待ってから確認 (= 配送猶予)。
+        time.sleep(5)
+        assert not any(
+            marker in (s.get("content") or "")
+            for s in mastodon.public_timeline(limit=40)
+        ), f"unlisted note {marker} unexpectedly appeared on Mastodon public TL"
+
+    def test_sakurasato_followers_only_reaches_followers(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        accounts = mastodon.search_accounts(f"me@{SAKURASATO_DOMAIN}", resolve=True)
+        assert accounts
+        mastodon.follow(accounts[0]["id"])
+
+        marker = f"vis-out-followers-{int(time.time() * 1000)}"
+        sakurasato.create_note(f"followers: {marker}", visibility="followers")
+
+        # followers は `to=[followers], cc=[]`。Bob は me の follower なので
+        # home に届くが、public TL には載らない。
+        poll_until(
+            lambda: any(
+                marker in (s.get("content") or "")
+                for s in mastodon.home_timeline(limit=40)
+            ),
+            desc=f"followers-only note {marker} on Mastodon home (Bob is follower)",
+        )
+        time.sleep(5)
+        assert not any(
+            marker in (s.get("content") or "")
+            for s in mastodon.public_timeline(limit=40)
+        ), f"followers-only note {marker} unexpectedly appeared on Mastodon public TL"
+
+    @pytest.mark.skip(
+        reason=(
+            "Issue #98: SK→MA direct reply が Mastodon 側で `private` "
+            "(followers-only) と認識される。原因 (recipients_for 出力か "
+            "build_create_activity か Mastodon 側仕様か) は別 issue で調査。"
+        )
+    )
+    def test_sakurasato_direct_visibility_observed_on_mastodon(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        # direct は `to=[], cc=[]` + reply parent / mention を to に積む。
+        # 本テストの検証ポイントは **AP 上で direct として配送されているか**
+        # (= recipients_for の Direct 分岐が正しく動いている)。
+        #
+        # mention 経路は `@bob@mastodon` のような短ホストで `parse_mentions` が
+        # `!host_slice.contains('.')` で弾く (= 本番ホスト名で問題ないが test
+        # 環境互換が無い) ので、**reply parent 経路** で direct を成立させる:
+        #   1) Bob が public で seed を投稿
+        #   2) Sakurasato が ingest して ap_id を握る
+        #   3) Sakurasato から direct + `in_reply_to_ap_id` で返信
+        #
+        # Mastodon の `/api/v1/conversations` 集計は `tag.Mention` を要求する
+        # が、reply parent 単独だと `mention_tags` が空になり conversation row
+        # は作られない。そこで **Mastodon に AP id で検索させて status を引き、
+        # `status.visibility == "direct"` を直接アサート** することで、配送と
+        # visibility 判定の双方を検証する。
+        seed_marker = f"vis-out-direct-seed-{int(time.time() * 1000)}"
+        mastodon.create_status(f"seed: {seed_marker}")
+
+        def find_seed() -> str | None:
+            for n in sakurasato.home_timeline(limit=40):
+                if seed_marker in (n.get("content") or ""):
+                    return n.get("ap_id")
+            return None
+
+        seed_ap = poll_until(
+            find_seed, desc=f"Sakurasato has seed {seed_marker}"
+        )
+
+        marker = f"vis-out-direct-{int(time.time() * 1000)}"
+        direct_note = sakurasato.create_note(
+            f"direct reply: {marker}",
+            visibility="direct",
+            in_reply_to_ap_id=seed_ap,
+        )
+        direct_ap_id = direct_note["ap_id"]
+
+        # Mastodon に AP URI で検索させて status row を取得 (inbox 受領で row
+        # が作られている、search?resolve=true でも拾える)。
+        def lookup_status() -> dict | None:
+            resp = mastodon.http.get(
+                "/api/v2/search",
+                params={
+                    "q": direct_ap_id,
+                    "resolve": "true",
+                    "type": "statuses",
+                },
+                headers={"Authorization": f"Bearer {mastodon.token}"},
+            )
+            if resp.status_code != 200:
+                return None
+            statuses = resp.json().get("statuses") or []
+            return statuses[0] if statuses else None
+
+        status = poll_until(
+            lookup_status,
+            desc=f"Mastodon ingested direct reply {marker}",
+        )
+        assert status.get("visibility") == "direct", (
+            f"Mastodon must see this as direct, got "
+            f"visibility={status.get('visibility')!r} status={status}"
+        )
+
+    # ── MA → SK (受信側 derive_visibility の検証) ───────────
+
+    def test_mastodon_public_appears_on_sakurasato_home(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        marker = f"vis-in-public-{int(time.time() * 1000)}"
+        mastodon.create_status(f"public-in: {marker}", visibility="public")
+        poll_until(
+            lambda: any(
+                marker in (n.get("content") or "")
+                for n in sakurasato.home_timeline(limit=40)
+            ),
+            desc=f"Mastodon public note {marker} on Sakurasato home",
+        )
+
+    def test_mastodon_unlisted_appears_on_sakurasato_home(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        marker = f"vis-in-unlisted-{int(time.time() * 1000)}"
+        mastodon.create_status(f"unlisted-in: {marker}", visibility="unlisted")
+        # Mastodon の unlisted は `to=[followers], cc=[Public]`。
+        # `derive_visibility` で `Unlisted` 判定され、Sakurasato 側 home には
+        # 載る (followee 投稿経路) ── home filter は `visibility <> 'direct'` のみ。
+        poll_until(
+            lambda: any(
+                marker in (n.get("content") or "")
+                for n in sakurasato.home_timeline(limit=40)
+            ),
+            desc=f"Mastodon unlisted note {marker} on Sakurasato home",
+        )
+
+    def test_mastodon_followers_only_appears_on_sakurasato_home(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        marker = f"vis-in-followers-{int(time.time() * 1000)}"
+        mastodon.create_status(f"followers-in: {marker}", visibility="private")
+        # Mastodon `private` は `to=[<actor>/followers]`。sakurasato は bob を
+        # follow 済みなので、bob 側 inbox 経由で me に届く。
+        # `derive_visibility` は `Followers` と判定し home に載る。
+        poll_until(
+            lambda: any(
+                marker in (n.get("content") or "")
+                for n in sakurasato.home_timeline(limit=40)
+            ),
+            desc=f"Mastodon followers-only note {marker} on Sakurasato home",
+        )
+
+    def test_mastodon_direct_excluded_from_sakurasato_home(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        # Mastodon direct は `to=[<mentioned actor uri>]` + cc 空。
+        # me 宛 mention で direct を投げ、ingest はされるが
+        # `list_home_timeline` の `n.visibility <> 'direct'` で home から除外
+        # されることを確認する。
+        marker = f"vis-in-direct-{int(time.time() * 1000)}"
+        mastodon.create_status(
+            f"@me@{SAKURASATO_DOMAIN} direct-in: {marker}",
+            visibility="direct",
+        )
+
+        # 配送タイミングを保証するため、別途 public sentinel を投げて
+        # それが home に出たら direct の配送も完了している判定にする。
+        sentinel = f"vis-in-direct-sentinel-{int(time.time() * 1000)}"
+        mastodon.create_status(f"sentinel: {sentinel}", visibility="public")
+        poll_until(
+            lambda: any(
+                sentinel in (n.get("content") or "")
+                for n in sakurasato.home_timeline(limit=40)
+            ),
+            desc=(
+                f"sentinel {sentinel} on Sakurasato home "
+                "(implies direct delivery also completed)"
+            ),
+        )
+        # その時点で direct marker が home にないことを確認 (= filter 動作)。
+        tl = sakurasato.home_timeline(limit=80)
+        assert not any(marker in (n.get("content") or "") for n in tl), (
+            f"direct note {marker} unexpectedly appeared on Sakurasato home"
+        )
+
+
 # ── 7. Move (skipped: 2nd account が必要) ──────────────────
 
 
