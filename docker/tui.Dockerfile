@@ -66,7 +66,10 @@ COPY vendor ./vendor
 # SQLX_OFFLINE=true は workspace 内で sqlx を使う他クレートのコンパイル時クエリ
 # 検証用 (TUI 自身は DB を直接叩かないので不要だが、workspace ビルド共通の
 # キャッシュを揃えるため server / media-proxy と同じ env を指定する)。
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+#
+# registry cache の `id=` を service ごとに分ける根拠は server.Dockerfile 参照
+# (= compose 並列ビルドの race 回避)。
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=sakurasato-tui-registry \
     --mount=type=cache,target=/build/target,id=sakurasato-tui-target \
     SQLX_OFFLINE=true cargo build --release --target x86_64-unknown-linux-musl -p sakurasato-tui && \
     cp target/x86_64-unknown-linux-musl/release/sakurasato-tui /sakurasato-tui

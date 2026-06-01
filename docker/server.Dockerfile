@@ -19,7 +19,14 @@ COPY vendor ./vendor
 
 # BuildKit のキャッシュマウントで registry とビルド成果物を温存。
 # SQLX_OFFLINE=true で compile-time クエリ検証を .sqlx キャッシュから引く。
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+#
+# `id=` を service ごとに分ける ── 同じ compose ビルドで server / media-proxy /
+# tui 等が並列に走るときに registry cache mount (default sharing=shared) を
+# 共有していると、cargo の crate 展開が race して
+# `.cargo-ok File exists (os error 17)` で 1 ビルドが死ぬ。
+# 別 `id=` を割り当てれば物理的に別キャッシュになるので衝突しない
+# (= disk 使用量は数倍になるが、registry cache は warm でも < 500MB 程度)。
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=sakurasato-server-registry \
     --mount=type=cache,target=/build/target,id=sakurasato-server-target \
     SQLX_OFFLINE=true cargo build --release --target x86_64-unknown-linux-musl -p sakurasato-server && \
     cp target/x86_64-unknown-linux-musl/release/sakurasato-server /sakurasato-server

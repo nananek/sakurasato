@@ -17,7 +17,9 @@ COPY .sqlx ./.sqlx
 # テーブルを生成する (PR #122 で導入)。media-proxy build が core を引くので必須。
 COPY vendor ./vendor
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+# registry cache の `id=` を service ごとに分ける根拠は server.Dockerfile 参照
+# (= compose 並列ビルドの race 回避)。
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=sakurasato-media-proxy-registry \
     --mount=type=cache,target=/build/target,id=sakurasato-media-proxy-target \
     SQLX_OFFLINE=true cargo build --release --target x86_64-unknown-linux-musl -p sakurasato-media-proxy && \
     cp target/x86_64-unknown-linux-musl/release/sakurasato-media-proxy /sakurasato-media-proxy
