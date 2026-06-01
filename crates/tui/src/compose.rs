@@ -351,16 +351,26 @@ impl Compose {
         self.buffer.split('\n').collect()
     }
 
-    /// カーソルが何行目の何列 (char 数) にあるか。
-    /// 返り値は `(row, col_chars)`。
+    /// カーソルが何行目の何 cell 列にあるか。返り値は `(row, col_cells)`。
+    ///
+    /// **Issue #105**: 旧実装は `chars().count()` で char 数を返していたが、
+    /// 日本語や絵文字のような east-asian wide 文字 (= 端末上 2 cell) は
+    /// 1 char しか進めず ratatui の `set_cursor_position` 引数とズレた。
+    /// `unicode-width` の `UnicodeWidthStr` で display width (= cell 数) を
+    /// 返すことでカーソル描画と実際の文字位置を一致させる。
+    ///
+    /// 結合文字や zero-width (= 0 を返す) は `UnicodeWidthStr` の規約どおり
+    /// 加算しないので、grapheme cluster の重ね書きも自然に揃う。
     pub fn cursor_row_col(&self) -> (usize, usize) {
+        use unicode_width::UnicodeWidthStr;
+
         let head = &self.buffer[..self.cursor];
         let row = head.bytes().filter(|&b| b == b'\n').count();
-        let col = match head.rfind('\n') {
-            Some(i) => head[i + 1..].chars().count(),
-            None => head.chars().count(),
+        let line_head = match head.rfind('\n') {
+            Some(i) => &head[i + 1..],
+            None => head,
         };
-        (row, col)
+        (row, UnicodeWidthStr::width(line_head))
     }
 }
 
@@ -429,6 +439,38 @@ mod tests {
         assert_eq!(c.cursor_row_col(), (1, 2));
         let ls = c.lines();
         assert_eq!(ls, vec!["a", "bc"]);
+    }
+
+    /// **Issue #105**: 日本語 (east-asian wide) は端末上 2 cell を占めるので、
+    /// カーソル col は char 数ではなく display width で測る。
+    #[test]
+    fn cursor_col_counts_east_asian_wide_chars_as_two_cells() {
+        let mut c = Compose::new();
+        c.insert_char('こ'); // 2 cell
+        c.insert_char('ん'); // 2 cell
+        c.insert_char('a'); // 1 cell
+        assert_eq!(c.cursor_row_col(), (0, 5));
+    }
+
+    /// 絵文字 (Emoji presentation) も 2 cell として扱う。
+    #[test]
+    fn cursor_col_counts_emoji_as_two_cells() {
+        let mut c = Compose::new();
+        c.insert_char('a'); // 1
+        c.insert_char('🌸'); // 2
+        c.insert_char('b'); // 1
+        assert_eq!(c.cursor_row_col(), (0, 4));
+    }
+
+    /// 改行後の col 計算も display width。
+    #[test]
+    fn cursor_col_resets_per_line_with_wide_chars() {
+        let mut c = Compose::new();
+        c.insert_char('あ'); // line 0: 2 cell
+        c.insert_newline();
+        c.insert_char('a'); // line 1: 1 cell
+        c.insert_char('ん'); // line 1: +2 = 3 cell
+        assert_eq!(c.cursor_row_col(), (1, 3));
     }
 
     #[test]
