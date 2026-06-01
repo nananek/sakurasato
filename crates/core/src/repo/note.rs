@@ -296,6 +296,19 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> 
     .await
 }
 
+/// `NodeInfo.usage.localPosts` 用 ── `is_local = true` の Note の総数を返す。
+///
+/// お一人様サーバなので件数は単純なスカラで十分。直近の `active_users` 推定にも
+/// 「`local_posts > 0 ? 1 : 0`」で接続している (= 投稿が 1 件でもあれば actor
+/// は active 扱い)。
+pub async fn count_local(pool: &PgPool) -> sqlx::Result<i64> {
+    // count(*) は常に非 NULL だが sqlx の型推論では Option<i64> になる。
+    let count: Option<i64> = sqlx::query_scalar!("SELECT count(*) FROM note WHERE is_local = TRUE")
+        .fetch_one(pool)
+        .await?;
+    Ok(count.unwrap_or(0))
+}
+
 /// **M13 PR3 (Issue #79) `GET /api/v1/actor/{id}/notes`** ── 指定 actor が
 /// author の Note を `note.id DESC` 順 (= 受信順) で列挙する。
 ///

@@ -14,7 +14,9 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use image::{ImageBuffer, ImageFormat, Rgba};
 use sakurasato_core::Config;
-use sakurasato_core::config::{DatabaseConfig, MediaProxyConfig, ServerConfig, StorageConfig};
+use sakurasato_core::config::{
+    DatabaseConfig, MediaProxyConfig, ServerConfig, ServerInfo, StorageConfig,
+};
 use sakurasato_media_proxy::ProxyState;
 use serde_json::Value;
 use tower::ServiceExt;
@@ -28,6 +30,7 @@ fn make_config() -> Config {
             public_listen: None,
             local_api_listen: None,
             user: "me".into(),
+            info: ServerInfo::default(),
         },
         database: DatabaseConfig {
             url: "unused".into(),

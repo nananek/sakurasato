@@ -10,6 +10,22 @@ bind = "0.0.0.0:8080"
 local_api_socket = "/run/sakurasato/local.sock"
 user = "me"
 
+# ── サーバ情報 (任意 / NodeInfo metadata 経由で他鯖に公開) ───────────────
+# `[server.info]` を空にしておくと NodeInfo metadata は `{}` で従来挙動。
+# 入れた項目だけ emit される (=空文字 / 未設定キーは出さない)。
+# overlay TOML / env (`SAKURASATO_SERVER__INFO__DESCRIPTION` 等) でも上書き可。
+#
+# [server.info]
+# name = "My Quiet Sakurasato"
+# description = "neko の隠れ家。Mastodon / Misskey 連合。"
+# admin_name = "neko"
+# admin_contact = "mailto:neko@example.com"
+# theme_color = "#ffb7c5"
+# banner_url = "https://example.com/banner.webp"
+# terms_url = "https://example.com/terms"
+# repository_url = "https://github.com/nananek/sakurasato"
+[server.info]
+
 # ── #69: Listener transport の URI 表現 (任意設定) ───────────────────────
 #
 # 公開 AP / ローカル API それぞれ `tcp://host:port` または `unix:/path` を

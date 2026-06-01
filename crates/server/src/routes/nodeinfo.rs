@@ -1,14 +1,20 @@
 //! `NodeInfo` 2.1 discovery + payload.
 //!
-//! See <http://nodeinfo.diaspora.software/>. M3a returns static counts (one
-//! local user, zero posts); M3c refreshes the post / active-user counters
-//! from the DB once write paths exist.
+//! See <http://nodeinfo.diaspora.software/>.
+//!
+//! - `local_posts` は `is_local = TRUE` の Note を DB から集計する。
+//! - `active_*` はお一人様サーバ前提で「`local_posts` > 0 ? 1 : 0」(= 投稿が
+//!   1 件でもあれば actor は active 扱い)。
+//! - `metadata` は `config.server.info` (= `ServerInfo`) を反映する。空なら
+//!   `{}` で従来挙動を保つ。
 
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
+use sakurasato_core::repo;
 use serde::Serialize;
+use tracing::warn;
 
 use crate::state::AppState;
 
@@ -77,7 +83,28 @@ pub struct UsersUsage {
     pub active_halfyear: u64,
 }
 
-pub async fn v2_1(State(_state): State<AppState>) -> Response {
+pub async fn v2_1(State(state): State<AppState>) -> Response {
+    // local_posts は DB から動的に集計する。失敗時は 0 にフォールバック
+    // (= NodeInfo は読み取り API で全体障害を引き起こすほどクリティカルでない、
+    // warn ログだけ残す)。`u64` キャストは件数なので非負。
+    let local_posts: u64 = match repo::note::count_local(state.pool()).await {
+        Ok(n) => u64::try_from(n).unwrap_or(0),
+        Err(err) => {
+            warn!(?err, "nodeinfo: count_local failed; returning 0");
+            0
+        }
+    };
+    // お一人様サーバなので投稿が 1 件でもあれば active 扱い。
+    let active = u64::from(local_posts > 0);
+
+    let metadata = serde_json::to_value(&state.config().server.info).unwrap_or_else(|err| {
+        warn!(
+            ?err,
+            "nodeinfo: failed to serialize server.info; emitting {{}}"
+        );
+        serde_json::json!({})
+    });
+
     let body = NodeInfo {
         version: "2.1",
         software: Software {
@@ -92,15 +119,14 @@ pub async fn v2_1(State(_state): State<AppState>) -> Response {
         },
         open_registrations: false,
         usage: Usage {
-            // お一人様サーバ。posts は M3c で DB から拾うまで 0。
             users: UsersUsage {
                 total: 1,
-                active_month: 1,
-                active_halfyear: 1,
+                active_month: active,
+                active_halfyear: active,
             },
-            local_posts: 0,
+            local_posts,
         },
-        metadata: serde_json::json!({}),
+        metadata,
     };
     let mut headers = HeaderMap::new();
     headers.insert(
