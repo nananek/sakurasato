@@ -367,6 +367,9 @@ fn translate_compose_key(k: KeyEvent) -> Action {
         KeyCode::Char('a') if ctrl => Action::OpenPicker(PickerMode::Attachment),
         // M7: Ctrl-D で末尾の添付を 1 件外す (compose に居ながらの取り消し)。
         KeyCode::Char('d') if ctrl => Action::PopAttachment,
+        // Issue #101: Ctrl-E で絵文字検索モーダル。compose 本文に :shortcode:
+        // を挿入する用途。reaction prompt と同じバインド。
+        KeyCode::Char('e') if ctrl => Action::OpenEmojiSearch,
         KeyCode::Backspace => Action::Backspace,
         KeyCode::Delete => Action::DeleteForward,
         KeyCode::Left => Action::MoveLeft,
