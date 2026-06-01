@@ -437,41 +437,42 @@ async fn apply_action(
         }
         Action::OpenReactionPrompt => open_reaction_prompt(app),
         Action::ReactionPromptInsertChar(c) => {
-            reaction_prompt_insert(app, api, c).await;
+            if let Some(p) = app.reaction_prompt.as_mut() {
+                p.insert_char(c);
+            }
         }
         Action::ReactionPromptBackspace => {
-            reaction_prompt_backspace(app);
+            if let Some(p) = app.reaction_prompt.as_mut() {
+                p.backspace();
+            }
         }
         Action::ReactionPromptSubmit => {
-            // Issue #101: popup open 中は Enter を confirm として横取り。
-            if app.emoji_suggest.is_some() {
-                emoji_suggest_confirm(app);
-            } else {
-                submit_reaction(app, api, page_size).await;
-            }
+            submit_reaction(app, api, page_size).await;
         }
         Action::ReactionPromptCancel => {
-            // Issue #101: popup open 中は Esc で popup だけ閉じる (= reaction
-            // prompt 自体は閉じない、テキスト入力に戻る)。
-            if app.emoji_suggest.is_some() {
-                app.emoji_suggest = None;
-            } else {
-                close_reaction_prompt(app);
-            }
+            close_reaction_prompt(app);
         }
-        Action::EmojiSuggestDown => {
+        Action::OpenEmojiSearch => open_emoji_search(app, api).await,
+        Action::EmojiSearchDown => {
             if let Some(s) = app.emoji_suggest.as_mut() {
                 s.select_next();
             }
         }
-        Action::EmojiSuggestUp => {
+        Action::EmojiSearchUp => {
             if let Some(s) = app.emoji_suggest.as_mut() {
                 s.select_prev();
             }
         }
-        Action::EmojiSuggestConfirm => {
-            if app.emoji_suggest.is_some() {
-                emoji_suggest_confirm(app);
+        Action::EmojiSearchConfirm => emoji_search_confirm(app),
+        Action::EmojiSearchCancel => emoji_search_cancel(app),
+        Action::EmojiSearchInsertChar(c) => {
+            if let Some(s) = app.emoji_suggest.as_mut() {
+                s.insert_char(c);
+            }
+        }
+        Action::EmojiSearchBackspace => {
+            if let Some(s) = app.emoji_suggest.as_mut() {
+                s.backspace();
             }
         }
         Action::ToggleSuppression => toggle_suppression_overlay(app),
@@ -945,124 +946,78 @@ fn close_reaction_prompt(app: &mut App) {
     app.focus = Focus::Timeline;
 }
 
-/// Issue #101: reaction prompt の文字入力ハンドラ。
-///
-/// 入力する文字によって絵文字サジェスト popup を開閉する:
-/// - `:` を打った時、直前に shortcode 開始済みでないなら popup を開く
-///   (`list_emojis(prefix="")` で初回 fetch、母集団を確保)。
-/// - popup が開いている間、shortcode 文字 (`[a-z0-9_-]`) なら prefix 更新。
-///   他の文字は popup を閉じる (例: 終端 `:` を含む)。
-async fn reaction_prompt_insert(app: &mut App, api: &LocalApi, c: char) {
-    if let Some(p) = app.reaction_prompt.as_mut() {
-        p.insert_char(c);
-    } else {
-        return;
+/// Issue #101: 絵文字検索モーダルを開く。`Ctrl-E` (reaction prompt focus 中)
+/// で発火。server `GET /api/v1/emojis` で母集団を 1 回 fetch し、独立した
+/// `EmojiSuggestState` (= search buffer + filter) で `Focus::EmojiSearch`
+/// に遷移する。失敗時は status line に出してモーダルは開かない。
+async fn open_emoji_search(app: &mut App, api: &LocalApi) {
+    // 戻り先 Focus を覚える (= 通常 ReactionPrompt、compose が起動側に
+    // なったら Compose)。
+    let return_focus = match app.focus {
+        Focus::ReactionPrompt | Focus::Compose => app.focus,
+        _ => return,
+    };
+    match api.list_emojis("", crate::emoji_suggest::FETCH_LIMIT).await {
+        Ok(resp) => {
+            app.emoji_suggest = Some(crate::emoji_suggest::EmojiSuggestState::open(resp.items));
+            app.emoji_search_return_focus = Some(return_focus);
+            app.focus = Focus::EmojiSearch;
+        }
+        Err(err) => {
+            tracing::warn!(?err, "emoji search fetch failed");
+            app.set_status(
+                format!("emoji search failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(5)),
+            );
+        }
     }
-    if app.emoji_suggest.is_some() {
-        if is_shortcode_char(c) {
-            // popup 表示中の prefix 更新。
-            let prefix = current_emoji_prefix(app);
-            if let Some(s) = app.emoji_suggest.as_mut() {
-                s.set_prefix(&prefix);
-                if s.is_empty() {
-                    app.emoji_suggest = None;
+}
+
+/// 選択中の絵文字を `:foo:` 形式で挿入し、モーダルを閉じて戻り先 Focus へ。
+fn emoji_search_confirm(app: &mut App) {
+    let shortcode = app
+        .emoji_suggest
+        .as_ref()
+        .and_then(|s| s.current().map(|item| item.shortcode.clone()));
+    let Some(shortcode) = shortcode else {
+        // 候補なし → 何も挿入せず閉じる。
+        emoji_search_cancel(app);
+        return;
+    };
+    let inserted = format!(":{shortcode}:");
+    // 戻り先 (= ReactionPrompt or Compose) の buffer に追記。
+    let return_focus = app
+        .emoji_search_return_focus
+        .unwrap_or(Focus::ReactionPrompt);
+    match return_focus {
+        Focus::ReactionPrompt => {
+            if let Some(p) = app.reaction_prompt.as_mut() {
+                for ch in inserted.chars() {
+                    p.insert_char(ch);
                 }
             }
-        } else {
-            // 終端 `:` を含む shortcode 外の文字 → popup 閉じる
-            // (ユーザが shortcode を打ち終わったか、別の文字を続けたか)。
-            app.emoji_suggest = None;
         }
-    } else if c == ':' {
-        // 新規 popup 開始 ── 初回 fetch (= 母集団確保)。失敗時は status へ。
-        match api.list_emojis("", crate::emoji_suggest::FETCH_LIMIT).await {
-            Ok(resp) => {
-                let state = crate::emoji_suggest::EmojiSuggestState::open(resp.items, "");
-                if !state.is_empty() {
-                    app.emoji_suggest = Some(state);
-                }
-            }
-            Err(err) => {
-                tracing::warn!(?err, "emoji suggest fetch failed");
+        Focus::Compose => {
+            for ch in inserted.chars() {
+                app.compose.insert_char(ch);
             }
         }
+        _ => {}
     }
-}
-
-/// Backspace ハンドラ。popup 表示中は prefix の長さに応じて閉じる。
-fn reaction_prompt_backspace(app: &mut App) {
-    if let Some(p) = app.reaction_prompt.as_mut() {
-        p.backspace();
-    } else {
-        return;
-    }
-    if app.emoji_suggest.is_some() {
-        let prefix = current_emoji_prefix(app);
-        // shortcode 開始の `:` まで消えた (= buffer 末尾に `:` が無い) なら閉じる。
-        if !buffer_ends_with_open_shortcode(app) {
-            app.emoji_suggest = None;
-        } else if let Some(s) = app.emoji_suggest.as_mut() {
-            s.set_prefix(&prefix);
-            if s.is_empty() {
-                app.emoji_suggest = None;
-            }
-        }
-    }
-}
-
-/// reaction prompt buffer の末尾から、直近の `:` 以降を prefix として取り出す。
-/// `is_shortcode_char` 文字だけが続く前提なので、`:` 探索だけで足りる。
-fn current_emoji_prefix(app: &App) -> String {
-    let Some(p) = app.reaction_prompt.as_ref() else {
-        return String::new();
-    };
-    p.buffer
-        .rsplit_once(':')
-        .map_or_else(String::new, |(_, after)| after.to_string())
-}
-
-/// buffer 末尾に「開いたままの `:foo` shortcode」があるかどうか。
-/// 末尾の `:` + 任意の shortcode 文字 のシーケンス。
-fn buffer_ends_with_open_shortcode(app: &App) -> bool {
-    let Some(p) = app.reaction_prompt.as_ref() else {
-        return false;
-    };
-    let Some(idx) = p.buffer.rfind(':') else {
-        return false;
-    };
-    p.buffer[idx + 1..].chars().all(is_shortcode_char)
-}
-
-const fn is_shortcode_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '-'
-}
-
-/// Issue #101: 選択中の絵文字を `:foo:` 形式で挿入し popup を閉じる。
-/// reaction prompt buffer 末尾の「開いたままの `:prefix`」を `:foo:` で
-/// 置換する (= 末尾の `:` から後ろを削って `:foo:` を append)。
-fn emoji_suggest_confirm(app: &mut App) {
-    let Some(s) = app.emoji_suggest.as_ref() else {
-        return;
-    };
-    let Some(item) = s.current() else {
-        app.emoji_suggest = None;
-        return;
-    };
-    let shortcode = item.shortcode.clone();
     app.emoji_suggest = None;
-    if let Some(p) = app.reaction_prompt.as_mut()
-        && let Some(idx) = p.buffer.rfind(':')
-    {
-        p.buffer.truncate(idx);
-        // `MAX_CHARS` 制約は insert_char に乗せる ── shortcode 長 +2 だけ
-        // 直接書き足す方が安全 (= 既に 254 文字打ってあったら最後の数文字が
-        // 切れるが、reaction の長文入力は実用上稀)。
-        p.buffer.push(':');
-        for ch in shortcode.chars() {
-            p.insert_char(ch);
-        }
-        p.insert_char(':');
-    }
+    app.emoji_search_return_focus = None;
+    app.focus = return_focus;
+}
+
+/// モーダルを閉じる (= テキスト挿入なし)。
+fn emoji_search_cancel(app: &mut App) {
+    let return_focus = app
+        .emoji_search_return_focus
+        .take()
+        .unwrap_or(Focus::ReactionPrompt);
+    app.emoji_suggest = None;
+    app.focus = return_focus;
 }
 
 async fn submit_reaction(app: &mut App, api: &LocalApi, page_size: i64) {

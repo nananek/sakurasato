@@ -137,15 +137,23 @@ pub enum Action {
     FollowListRefresh,
     /// M13 PR5: `FollowList` で `Esc` / `q` ── 画面を閉じる。
     FollowListClose,
-    /// Issue #101: 絵文字サジェスト popup 表示中の `↓` ── 次候補へ。
-    EmojiSuggestDown,
-    /// Issue #101: 絵文字サジェスト popup 表示中の `↑` ── 前候補へ。
-    EmojiSuggestUp,
-    /// Issue #101: 絵文字サジェスト popup 表示中の `Tab` ── 選択中の shortcode
-    /// を `:foo:` 形式で reaction prompt buffer に挿入し popup を閉じる。
-    /// `Enter` は既存の `ReactionPromptSubmit` に乗せて popup open 時のみ
-    /// confirm として流用する (runtime 側で分岐)。
-    EmojiSuggestConfirm,
+    /// Issue #101: 絵文字検索モーダルを開く (= reaction prompt / compose で
+    /// `Ctrl-E`)。runtime が server `GET /api/v1/emojis` を叩いて母集団を
+    /// 確保したあと `Focus::EmojiSearch` に切替える。
+    OpenEmojiSearch,
+    /// 絵文字検索モーダル中の `↓` (or `Ctrl-N`) ── 次候補へ。
+    EmojiSearchDown,
+    /// 絵文字検索モーダル中の `↑` (or `Ctrl-P`) ── 前候補へ。
+    EmojiSearchUp,
+    /// 絵文字検索モーダル中の `Enter` ── 選択中 shortcode を `:foo:` 形式で
+    /// 戻り先 (`ReactionPrompt` / `Compose`) の buffer に挿入し閉じる。
+    EmojiSearchConfirm,
+    /// 絵文字検索モーダル中の `Esc` ── 何も挿入せず閉じる。
+    EmojiSearchCancel,
+    /// 絵文字検索モーダル中の文字入力。
+    EmojiSearchInsertChar(char),
+    /// 絵文字検索モーダル中の Backspace。
+    EmojiSearchBackspace,
     /// M12 (#66): `:lock` ── 鍵アカ運用に切替 (`POST /api/v1/actor/lock`)。
     ActorLock,
     /// M12 (#66): `:unlock` ── 鍵アカ解除。
@@ -200,6 +208,25 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::FollowList => translate_follow_list_key(k),
         Focus::Command => translate_command_key(k),
         Focus::Requests => translate_requests_key(k),
+        Focus::EmojiSearch => translate_emoji_search_key(k),
+    }
+}
+
+/// Issue #101: 絵文字検索モーダルのキー操作。
+fn translate_emoji_search_key(k: KeyEvent) -> Action {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Esc => Action::EmojiSearchCancel,
+        KeyCode::Enter => Action::EmojiSearchConfirm,
+        KeyCode::Up => Action::EmojiSearchUp,
+        KeyCode::Down => Action::EmojiSearchDown,
+        KeyCode::Char('p') if ctrl => Action::EmojiSearchUp,
+        KeyCode::Char('n') if ctrl => Action::EmojiSearchDown,
+        KeyCode::Backspace => Action::EmojiSearchBackspace,
+        // 任意の通常文字 (= 大小文字 / 記号も含む) を検索 buffer に流す。
+        // Ctrl 押下中の文字 (= shortcut の取り違え) は無視。
+        KeyCode::Char(c) if !ctrl => Action::EmojiSearchInsertChar(c),
+        _ => Action::Noop,
     }
 }
 
@@ -340,6 +367,9 @@ fn translate_compose_key(k: KeyEvent) -> Action {
         KeyCode::Char('a') if ctrl => Action::OpenPicker(PickerMode::Attachment),
         // M7: Ctrl-D で末尾の添付を 1 件外す (compose に居ながらの取り消し)。
         KeyCode::Char('d') if ctrl => Action::PopAttachment,
+        // Issue #101: Ctrl-E で絵文字検索モーダル。compose 本文に :shortcode:
+        // を挿入する用途。reaction prompt と同じバインド。
+        KeyCode::Char('e') if ctrl => Action::OpenEmojiSearch,
         KeyCode::Backspace => Action::Backspace,
         KeyCode::Delete => Action::DeleteForward,
         KeyCode::Left => Action::MoveLeft,
@@ -379,12 +409,9 @@ fn translate_reaction_prompt_key(k: KeyEvent) -> Action {
     match k.code {
         KeyCode::Esc => Action::ReactionPromptCancel,
         KeyCode::Enter => Action::ReactionPromptSubmit,
-        // Issue #101: 絵文字サジェスト popup ナビゲーション。popup が開いて
-        // いない時は runtime 側で Noop に倒す (= reaction prompt 入力に影響
-        // させない)。
-        KeyCode::Tab => Action::EmojiSuggestConfirm,
-        KeyCode::Up => Action::EmojiSuggestUp,
-        KeyCode::Down => Action::EmojiSuggestDown,
+        // Issue #101: 絵文字検索モーダルを Ctrl-E で起動。reaction prompt
+        // の通常入力には影響させない (= モーダル内に独立した search buffer)。
+        KeyCode::Char('e') if ctrl => Action::OpenEmojiSearch,
         KeyCode::Backspace => Action::ReactionPromptBackspace,
         KeyCode::Char(c) if !ctrl => Action::ReactionPromptInsertChar(c),
         _ => Action::Noop,

@@ -127,8 +127,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     {
         render_reaction_prompt(frame, status_area, &app.theme, p);
     }
-    // Issue #101: 絵文字サジェスト popup。reaction prompt の上に重ねる。
-    if app.focus == Focus::ReactionPrompt
+    // Issue #101: 絵文字検索モーダル。reaction prompt や compose の上に
+    // 中央オーバーレイで描画。
+    if app.focus == Focus::EmojiSearch
         && let Some(s) = app.emoji_suggest.as_ref()
     {
         render_emoji_suggest(frame, area, &app.theme, s);
@@ -164,9 +165,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     }
 }
 
-/// Issue #101: 絵文字サジェスト popup。中央下寄せに小さなパネルを浮かべ、
-/// 候補を縦に並べる。テキストのみ (= 画像 URL は今は使わない、`image_url`
-/// を将来描画するときは ratatui-image 経由で各行に重ねる)。
+/// Issue #101: 絵文字検索モーダル。中央に検索 buffer + 候補リストを描く。
+/// 候補 0 件でも閉じない (= search buffer を消せば全候補が戻る)。
 fn render_emoji_suggest(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -174,21 +174,18 @@ fn render_emoji_suggest(
     state: &crate::emoji_suggest::EmojiSuggestState,
 ) {
     let palette = &theme.palette;
-    if state.is_empty() {
-        return;
-    }
-    // 候補数 (最大 VISIBLE_MAX) + border + ヘッダ 1 行。
-    let visible = state.filtered.len().min(crate::emoji_suggest::VISIBLE_MAX);
-    let h = u16::try_from(visible).unwrap_or(8) + 3;
-    let w = 36u16.min(area.width.saturating_sub(4));
-    // 中央下寄せ ── reaction prompt (status バー行) のすぐ上に出す。
+    let visible_max = crate::emoji_suggest::VISIBLE_MAX;
+    let visible = state.filtered.len().min(visible_max).max(1);
+    // 中央寄せ ── 検索 buffer 1 行 + ヘルプ 1 行 + 区切り 1 行 + 候補 visible 行 + border 2 行。
+    let h = u16::try_from(visible).unwrap_or(8) + 5;
+    let w = 48u16.min(area.width.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + area.height.saturating_sub(h).saturating_sub(2);
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h.min(area.height));
 
     let block = Block::default()
         .title(Span::styled(
-            format!("  emoji ({})  ", state.filtered.len()),
+            format!("  emoji search ({})  ", state.filtered.len()),
             Style::default()
                 .fg(palette.accent_strong)
                 .add_modifier(Modifier::BOLD),
@@ -204,14 +201,42 @@ fn render_emoji_suggest(
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let scroll_top = scroll_window_top(state.cursor, visible, state.filtered.len());
-    let lines: Vec<Line<'static>> = state
-        .filtered
-        .iter()
-        .enumerate()
-        .skip(scroll_top)
-        .take(visible)
-        .map(|(idx, item)| {
+    // 1 行目: 検索 buffer (= ユーザの入力)。
+    let query_line = Line::from(vec![
+        Span::styled(
+            "  / ",
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(state.query.clone(), Style::default().fg(palette.foreground)),
+        Span::styled("▏", Style::default().fg(palette.accent)),
+    ]);
+    // 2 行目: ヘルプ。
+    let help_line = Line::from(Span::styled(
+        "  [↑↓ navigate  Enter=insert  Esc=cancel]",
+        Style::default().fg(palette.muted),
+    ));
+    // 3 行目以降: 候補リスト。
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible + 3);
+    lines.push(query_line);
+    lines.push(help_line);
+    lines.push(Line::from(""));
+
+    if state.filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no matches)",
+            Style::default().fg(palette.muted),
+        )));
+    } else {
+        let scroll_top = scroll_window_top(state.cursor, visible, state.filtered.len());
+        for (idx, item) in state
+            .filtered
+            .iter()
+            .enumerate()
+            .skip(scroll_top)
+            .take(visible)
+        {
             let selected = idx == state.cursor;
             let marker = if selected { "▶ " } else { "  " };
             let marker_style = if selected {
@@ -237,9 +262,9 @@ fn render_emoji_suggest(
                     Style::default().fg(palette.muted),
                 ));
             }
-            Line::from(spans)
-        })
-        .collect();
+            lines.push(Line::from(spans));
+        }
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1350,6 +1375,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::FollowList => "follow-list",
         Focus::Command => "cmd",
         Focus::Requests => "requests",
+        Focus::EmojiSearch => "emoji",
     };
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -1480,8 +1506,15 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "e", "open reaction prompt"),
         help_entry(palette, ":foo:", "local custom emoji"),
         help_entry(palette, "👍 / 🎉", "Unicode emoji"),
+        help_entry(palette, "Ctrl-E", "open emoji search modal"),
         help_entry(palette, "Enter", "send"),
         help_entry(palette, "Esc", "cancel"),
+        Line::from(""),
+        Line::from(Span::styled("emoji search modal", help_section(palette))),
+        help_entry(palette, "type", "substring filter (prefix prioritized)"),
+        help_entry(palette, "↑ / ↓", "navigate candidates"),
+        help_entry(palette, "Enter", "insert :shortcode: and close"),
+        help_entry(palette, "Esc", "cancel without inserting"),
         Line::from(""),
         Line::from(Span::styled("profile", help_section(palette))),
         help_entry(palette, "j / k", "next / prev note"),
