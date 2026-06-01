@@ -90,6 +90,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     {
         render_follow_list_screen(frame, timeline_area, app, fl);
         ScrollHits::default()
+    } else if matches!(app.focus, Focus::Requests)
+        && let Some(fr) = app.follow_requests.as_ref()
+    {
+        render_follow_requests_screen(frame, timeline_area, app, fr);
+        ScrollHits::default()
     } else {
         render_timeline(frame, timeline_area, app)
     };
@@ -776,6 +781,96 @@ fn render_follow_list_screen(frame: &mut Frame<'_>, area: Rect, app: &App, fl: &
     }
 }
 
+/// M12 (#66): 鍵アカ承認待ち follow 一覧画面。
+///
+/// シンプルなテキスト一覧 ── 各行に `[N]` `follower_ap_id` `received_at`。
+/// avatar overlay は不要 (= 承認可否判断に icon は要らない、`ap_id` で十分)。
+fn render_follow_requests_screen(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    fr: &crate::follow_requests::FollowRequestsScreen,
+) {
+    let palette = &app.theme.palette;
+    let block = Block::default()
+        .title(Span::styled(
+            format!("  follow requests — pending ({})  ", fr.items.len()),
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style(palette, app.focus == Focus::Requests))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let header = Line::from(vec![Span::styled(
+        "  [j/k=move  a=approve  x=reject  r=refresh  Esc=back]",
+        Style::default().fg(palette.muted),
+    )]);
+    let header_rect = Rect::new(inner.x, inner.y, inner.width, 1.min(inner.height));
+    frame.render_widget(Paragraph::new(vec![header]), header_rect);
+
+    let list_top = inner.y + header_rect.height;
+    let list_height = inner.height.saturating_sub(header_rect.height);
+    let list_rect = Rect::new(inner.x, list_top, inner.width, list_height);
+    if list_rect.height == 0 {
+        return;
+    }
+
+    if fr.items.is_empty() {
+        let msg = if fr.fetching {
+            "  loading…"
+        } else {
+            "  (no pending follow requests)"
+        };
+        let para = Paragraph::new(Line::from(Span::styled(
+            msg.to_string(),
+            Style::default().fg(palette.muted),
+        )));
+        frame.render_widget(para, list_rect);
+        return;
+    }
+
+    let visible = list_rect.height as usize;
+    let lines: Vec<Line<'static>> = fr
+        .items
+        .iter()
+        .take(visible)
+        .enumerate()
+        .map(|(idx, item)| {
+            let selected = idx == fr.cursor;
+            let marker = if selected { "▶ " } else { "  " };
+            let marker_style = if selected {
+                Style::default()
+                    .fg(palette.accent_strong)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.muted)
+            };
+            Line::from(vec![
+                Span::styled(marker.to_string(), marker_style),
+                Span::styled(
+                    format!("[{}] ", item.id),
+                    Style::default().fg(palette.muted),
+                ),
+                Span::styled(
+                    item.follower_ap_id.clone(),
+                    Style::default().fg(palette.foreground),
+                ),
+                Span::raw("  "),
+                Span::styled(item.received_at.clone(), Style::default().fg(palette.muted)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), list_rect);
+}
+
 fn tab_label(mode: FollowListMode, active: bool) -> String {
     if active {
         format!("[{}]", mode.label())
@@ -1105,6 +1200,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::Profile => "profile",
         Focus::FollowList => "follow-list",
         Focus::Command => "cmd",
+        Focus::Requests => "requests",
     };
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -1168,6 +1264,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     clippy::many_single_char_names,
     reason = "矩形 w/h/x/y は ratatui 慣習"
 )]
+#[allow(clippy::too_many_lines, reason = "help は宣言的でひと固まり")]
 fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
     let palette = &theme.palette;
     // 中央に max(60, area.width * 0.6) x min(20, area.height - 4) を浮かべる。
@@ -1260,7 +1357,21 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, ":me", "open own profile"),
         help_entry(palette, ":following", "open following list"),
         help_entry(palette, ":followers", "open followers list"),
+        help_entry(palette, ":lock", "key-only mode (鍵アカ) on"),
+        help_entry(palette, ":unlock", "key-only mode off"),
+        help_entry(palette, ":requests", "pending follow requests"),
         help_entry(palette, ":q / :quit", "exit TUI"),
+        Line::from(""),
+        Line::from(Span::styled("follow requests", help_section(palette))),
+        help_entry(palette, "j / k", "next / prev request"),
+        help_entry(palette, "a", "approve selected"),
+        help_entry(palette, "x", "reject selected"),
+        help_entry(palette, "r", "refresh list"),
+        help_entry(palette, "Esc / q", "back to timeline"),
+        Line::from(""),
+        Line::from(Span::styled("compose alt submit", help_section(palette))),
+        help_entry(palette, "F2", "send (always works)"),
+        help_entry(palette, "Ctrl-Enter", "send (Kitty/WezTerm/Alacritty 等)"),
         Line::from(""),
         Line::from(Span::styled(
             "press ? again to close",

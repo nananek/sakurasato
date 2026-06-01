@@ -137,6 +137,24 @@ pub enum Action {
     FollowListRefresh,
     /// M13 PR5: `FollowList` で `Esc` / `q` ── 画面を閉じる。
     FollowListClose,
+    /// M12 (#66): `:lock` ── 鍵アカ運用に切替 (`POST /api/v1/actor/lock`)。
+    ActorLock,
+    /// M12 (#66): `:unlock` ── 鍵アカ解除。
+    ActorUnlock,
+    /// M12 (#66): `:requests` ── 承認待ち follow 一覧画面を push。
+    OpenFollowRequests,
+    /// M12 (#66): 一覧画面でカーソル下移動。
+    RequestsSelectNext,
+    /// M12 (#66): 一覧画面でカーソル上移動。
+    RequestsSelectPrev,
+    /// M12 (#66): 一覧画面で `a` ── 選択行を approve。
+    RequestsApproveSelected,
+    /// M12 (#66): 一覧画面で `x` ── 選択行を reject。
+    RequestsRejectSelected,
+    /// M12 (#66): 一覧画面で `r` ── 再取得。
+    RequestsRefresh,
+    /// M12 (#66): 一覧画面で `Esc` / `q` ── 画面を閉じる。
+    RequestsClose,
 }
 
 /// crossterm イベント → Action。
@@ -172,6 +190,20 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::Profile => translate_profile_key(k),
         Focus::FollowList => translate_follow_list_key(k),
         Focus::Command => translate_command_key(k),
+        Focus::Requests => translate_requests_key(k),
+    }
+}
+
+fn translate_requests_key(k: KeyEvent) -> Action {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => Action::RequestsClose,
+        (KeyCode::Char('q'), m) if m.is_empty() => Action::RequestsClose,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::RequestsSelectNext,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::RequestsSelectPrev,
+        (KeyCode::Char('a'), m) if m.is_empty() => Action::RequestsApproveSelected,
+        (KeyCode::Char('x'), m) if m.is_empty() => Action::RequestsRejectSelected,
+        (KeyCode::Char('r'), m) if m.is_empty() => Action::RequestsRefresh,
+        _ => Action::Noop,
     }
 }
 

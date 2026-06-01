@@ -13,6 +13,9 @@
 //! - `:lookup <acct-or-url>` ── `:open` のエイリアス (Misskey 風呼称)
 //! - `:me` ── 自分の Profile を push
 //! - `:following` / `:followers` ── `FollowList` を push
+//! - `:lock` ── 鍵アカ運用に切替 (M12 Issue #66)
+//! - `:unlock` ── 鍵アカ解除 (pending は auto-accept されない)
+//! - `:requests` ── 承認待ち follow 一覧画面 (`a` = approve / `x` = reject)
 //! - `:q` / `:quit` ── 終了
 //! - `:help` / `:?` ── ヘルプ overlay を開く
 //!
@@ -71,6 +74,12 @@ pub enum Command {
     OpenSelf,
     ListFollowing,
     ListFollowers,
+    /// M12 (#66): 鍵アカ運用に切替 (`manually_approves_followers = true`)。
+    Lock,
+    /// M12 (#66): 鍵アカ運用を解除。pending follow は auto-accept されない。
+    Unlock,
+    /// M12 (#66): 承認待ち follow 一覧画面を開く。`a` で approve / `x` で reject。
+    OpenRequests,
     Help,
     Quit,
     /// 引数不足 / 形式エラー。`reason` を status に出す。
@@ -102,6 +111,10 @@ pub fn parse(raw: &str) -> Command {
         "me" => no_arg(&rest, Command::OpenSelf, "me"),
         "following" => no_arg(&rest, Command::ListFollowing, "following"),
         "followers" => no_arg(&rest, Command::ListFollowers, "followers"),
+        // M12 (#66): 鍵アカ管理。`requests` は承認待ち一覧画面を開く。
+        "lock" => no_arg(&rest, Command::Lock, "lock"),
+        "unlock" => no_arg(&rest, Command::Unlock, "unlock"),
+        "requests" => no_arg(&rest, Command::OpenRequests, "requests"),
         "help" | "?" => Command::Help,
         "q" | "quit" => Command::Quit,
         other => Command::Unknown { name: other.into() },
@@ -305,6 +318,20 @@ mod tests {
     #[test]
     fn parse_unknown_command() {
         assert!(matches!(parse("nuke"), Command::Unknown { .. }));
+    }
+
+    #[test]
+    fn parse_lock_unlock_no_args() {
+        assert_eq!(parse("lock"), Command::Lock);
+        assert_eq!(parse("unlock"), Command::Unlock);
+        assert!(matches!(parse("lock extra"), Command::Invalid { .. }));
+        assert!(matches!(parse("unlock extra"), Command::Invalid { .. }));
+    }
+
+    #[test]
+    fn parse_requests_no_args() {
+        assert_eq!(parse("requests"), Command::OpenRequests);
+        assert!(matches!(parse("requests extra"), Command::Invalid { .. }));
     }
 
     #[test]

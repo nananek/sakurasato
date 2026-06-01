@@ -129,7 +129,8 @@ sakurasato-server token list
 |---|---|
 | 文字 | 本文に入力 |
 | `Enter` | 改行 |
-| `Ctrl-Enter` | 送信 |
+| `Ctrl-Enter` | 送信 (Kitty / WezTerm / Alacritty 等の Kitty keyboard protocol 対応端末のみ) |
+| `F2` | 送信 (どの端末でも効く恒久 alias) |
 | `Ctrl-W` | CW (content warning) フィールド toggle |
 | `Ctrl-V` | 可視性 cycle ── `public` → `unlisted` → `followers` → `direct` → `public` |
 | `Ctrl-S` | sensitive フラグ toggle |
@@ -138,6 +139,8 @@ sakurasato-server token list
 | `Esc` | compose を離脱 |
 
 添付は最大 **4 件**。
+
+> **送信キーの端末互換**: `Ctrl-Enter` は端末が Kitty keyboard protocol (CSI u) を喋れる必要があります (Kitty / WezTerm / Alacritty / foot 等)。xterm / GNOME Terminal / Konsole / tmux 経由など普通の VT 端末では区別できず改行扱いになるので、**`F2`** を使うのが最も確実です。
 
 ### 3.3 File picker (アイコン / ヘッダ / 添付の選択時)
 
@@ -210,6 +213,24 @@ sakurasato-server token list
 
 `?` 再押下で閉じる。なお現状 18 行に clamp されておりスクロールできず、後半のセクション (command mode 等) が画面外で見えない既知の問題があります ([#90](https://github.com/nananek/sakurasato/issues/90))。本ドキュメントが現状最も網羅的な keymap 一覧です。
 
+### 3.9 Follow requests 画面 (`:requests` で起動)
+
+鍵アカ運用 (`actor.manually_approves_followers = true`、`:lock` で切替) のとき、新規 Follow は auto-Accept されず `pending` のまま溜まる ── それを一覧して個別に承認 / 拒否する画面。
+
+| Key | 動作 |
+|---|---|
+| `j` / `k` (or `↑` / `↓`) | カーソル移動 |
+| `a` | 選択行を **approve** (Accept 配送 + state 遷移) |
+| `x` | 選択行を **reject** (Reject 配送 + state 遷移) |
+| `r` | 一覧を再取得 |
+| `Esc` / `q` | 画面を閉じる (Timeline に戻る) |
+
+各行は `[<follow_id>] <follower_ap_id>  <received_at>` の形で 1 行表示。approve / reject 成功時はその行が即座にリストから消えます。
+
+**注意 1**: `:unlock` しても既に pending の Follow が auto-accept されることはありません ([CLAUDE.md §5.1](../CLAUDE.md))。明示的に `a` で approve する必要があります (= Mastodon と同じ作法、lock 解除事故で全 pending を取り込む暴発を防ぐ)。
+
+**注意 2**: 既存の `accepted` フォロワーが Mastodon 側で Follow を retry してきたケース (`row.state = accepted` で着信) は lock 後でも引き続き Accept が自動で返ります。`:lock` した瞬間に従来フォロワーを切るのではなく、**新規 Follow だけ承認制に切替える** 設計です。
+
 ---
 
 ## 4. Command mode (`:`)
@@ -227,6 +248,9 @@ Timeline focus で `:` を押すと 1 行入力プロンプトが開く。`Enter
 | `:me` | 自分の profile |
 | `:following` | following リスト |
 | `:followers` | followers リスト |
+| `:lock` | 鍵アカ運用に切替 (`manually_approves_followers = true`、actor `Update` 配送) |
+| `:unlock` | 鍵アカ解除 (pending follow は auto-accept されない) |
+| `:requests` | 承認待ち follow 一覧画面を開く (= [§3.9](#39-follow-requests-鍵アカ承認画面-で起動)) |
 | `:help` / `:?` | help overlay |
 | `:q` / `:quit` | TUI 終了 |
 

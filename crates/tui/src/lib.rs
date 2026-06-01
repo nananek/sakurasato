@@ -45,6 +45,7 @@ pub mod command;
 pub mod compose;
 pub mod event;
 pub mod follow_list;
+pub mod follow_requests;
 pub mod image_cache;
 pub mod picker;
 pub mod preview;

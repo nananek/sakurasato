@@ -72,6 +72,9 @@ pub enum Focus {
     /// M13 PR5 (Issue #79): vim 風コマンドプロンプト `:` 入力中。
     /// `App::command` が `Some` のときのみ取りうる。
     Command,
+    /// M12 (Issue #66): 鍵アカ運用の承認待ち follow 一覧画面。
+    /// `:requests` で開く。`App::follow_requests` が `Some` のときのみ取りうる。
+    Requests,
 }
 
 #[derive(Debug)]
@@ -132,6 +135,9 @@ pub struct App {
     /// M13 PR5 (Issue #79): `:` プロンプトの入力 state。`Focus::Command` の
     /// あいだだけ `Some`。Esc キャンセル / Enter で実行。
     pub command: Option<crate::command::CommandPrompt>,
+    /// M12 (Issue #66): 承認待ち follow 一覧画面の state。`:requests` で開く。
+    /// `Focus::Requests` のあいだだけ `Some`。
+    pub follow_requests: Option<crate::follow_requests::FollowRequestsScreen>,
 }
 
 impl App {
@@ -168,6 +174,7 @@ impl App {
             profile_stack: Vec::new(),
             follow_list: None,
             command: None,
+            follow_requests: None,
         }
     }
 
