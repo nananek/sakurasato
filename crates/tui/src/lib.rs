@@ -38,6 +38,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod alt_prompt;
 pub mod app;
 pub mod client;
 pub mod compose;

@@ -494,6 +494,29 @@ async fn apply_action(
             };
             app.set_status(msg, StatusKind::Info, Some(Duration::from_secs(3)));
         }
+        Action::ReplyToSelected => start_reply(app),
+        Action::UndoReactionOnSelected => undo_reaction(app, api, page_size).await,
+        Action::AltPromptInsertChar(c) => {
+            if let Some(p) = app.alt_prompt.as_mut() {
+                p.insert_char(c);
+            }
+        }
+        Action::AltPromptBackspace => {
+            if let Some(p) = app.alt_prompt.as_mut() {
+                p.backspace();
+            }
+        }
+        Action::AltPromptSubmit => submit_alt_prompt(app, api, upload_tx),
+        Action::AltPromptCancel => {
+            if let Some(p) = app.alt_prompt.take() {
+                app.set_status(
+                    format!("upload cancelled: {}", p.label),
+                    StatusKind::Info,
+                    Some(Duration::from_secs(2)),
+                );
+            }
+            app.focus = Focus::Compose;
+        }
     }
 }
 
@@ -503,6 +526,72 @@ fn toggle_suppression_overlay(app: &mut App) {
     } else {
         app.focus = Focus::Suppression;
         app.suppression_cursor = 0;
+    }
+}
+
+fn start_reply(app: &mut App) {
+    let Some(note) = app.notes.get(app.selected) else {
+        app.set_status(
+            "no note selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    };
+    // 親 note のラベルは「@user@host: 抜粋 (60 文字)」。author host が無い
+    // ローカル post も `@user` だけは出るので識別子として使える。
+    let mut excerpt: String = note.content.chars().take(60).collect();
+    if note.content.chars().count() > 60 {
+        excerpt.push('…');
+    }
+    excerpt = excerpt.replace('\n', " ");
+    let label = format!("@{}: {}", note.actor_preferred_username, excerpt);
+    app.compose.set_reply_target(note.ap_id.clone(), label);
+    app.focus = Focus::Compose;
+    app.set_status(
+        format!("replying to #{}", note.id),
+        StatusKind::Info,
+        Some(Duration::from_secs(3)),
+    );
+}
+
+async fn undo_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(note) = app.notes.get(app.selected) else {
+        app.set_status(
+            "no note selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    };
+    let note_id = note.id;
+    let Some(reaction_id) = app.last_reaction_ids.get(&note_id).copied() else {
+        app.set_status(
+            "no recent reaction to undo on this note",
+            StatusKind::Warning,
+            Some(Duration::from_secs(3)),
+        );
+        return;
+    };
+    match api.delete_reaction(reaction_id).await {
+        Ok(()) => {
+            app.last_reaction_ids.remove(&note_id);
+            app.set_status(
+                "reaction removed",
+                StatusKind::Success,
+                Some(Duration::from_secs(3)),
+            );
+            if let Ok(resp) = api.timeline_home(None, page_size).await {
+                app.replace_timeline(resp.notes, resp.next_before_id);
+            }
+        }
+        Err(err) => {
+            app.set_status(
+                format!("undo failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
     }
 }
 
@@ -541,6 +630,10 @@ async fn submit_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
 
     match api.create_reaction(note_id, &content).await {
         Ok(resp) => {
+            // M13 PR6: 取り消し (`u`) で参照するため reaction id を覚えておく。
+            // 同じ note に上書きすると以前の id が落ちるが、サーバは 1 user 1
+            // reaction 制約があるので「最後の 1 件」だけ追えれば足りる。
+            app.last_reaction_ids.insert(note_id, resp.id);
             app.set_status(
                 format!(
                     "reacted with {} ({} queued)",
@@ -625,22 +718,61 @@ fn picker_activate(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<Uploa
                 .and_then(std::ffi::OsStr::to_str)
                 .unwrap_or("(file)")
                 .to_string();
+            // M13 PR6: Attachment は alt text プロンプトを挟む。Avatar/Header
+            // は alt text 概念が無い (= AP `name` を載せる先が無い) ので
+            // 即時アップロード。
+            if mode == PickerMode::Attachment {
+                close_picker(app, true);
+                app.alt_prompt = Some(crate::alt_prompt::AltPrompt::new(mode, path, label));
+                app.focus = Focus::AltPrompt;
+                app.set_status(
+                    "alt text (Enter to submit / Esc to skip & cancel)",
+                    StatusKind::Info,
+                    None,
+                );
+                return;
+            }
             app.pending_uploads = app.pending_uploads.saturating_add(1);
             app.set_status(
                 format!("uploading {label} as {}...", mode.label()),
                 StatusKind::Info,
                 None,
             );
-            // close_picker は attachment モードなら自動で Compose に戻る。
             close_picker(app, false);
             let api = api.clone();
             let tx = upload_tx.clone();
             tokio::spawn(async move {
-                let outcome = run_upload(api, mode, path, label).await;
+                let outcome = run_upload(api, mode, path, label, None).await;
                 let _ = tx.send(outcome).await;
             });
         }
     }
+}
+
+/// M13 PR6: alt text 入力確定 → upload kick。空入力 (Enter のみ) でも
+/// 通る ── 空文字は `run_upload` 側で `None` 同等扱い。
+fn submit_alt_prompt(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<UploadOutcome>) {
+    let Some(prompt) = app.alt_prompt.take() else {
+        return;
+    };
+    let alt = prompt.alt_text().to_string();
+    let alt_arg = if alt.is_empty() { None } else { Some(alt) };
+    let mode = prompt.mode;
+    let path = prompt.path;
+    let label = prompt.label;
+    app.focus = Focus::Compose;
+    app.pending_uploads = app.pending_uploads.saturating_add(1);
+    app.set_status(
+        format!("uploading {label} as {}...", mode.label()),
+        StatusKind::Info,
+        None,
+    );
+    let api = api.clone();
+    let tx = upload_tx.clone();
+    tokio::spawn(async move {
+        let outcome = run_upload(api, mode, path, label, alt_arg).await;
+        let _ = tx.send(outcome).await;
+    });
 }
 
 /// アップロード前の TUI 側ファイルサイズ上限 (25 MiB)。`config/default.toml`
@@ -658,6 +790,7 @@ async fn run_upload(
     mode: PickerMode,
     path: std::path::PathBuf,
     label: String,
+    alt: Option<String>,
 ) -> UploadOutcome {
     // ファイルを読む **前** にメタデータで上限チェック。`tokio::fs::read`
     // はサイズ無制限に Vec に積むので、4 GiB 動画を選んでも握り込んで
@@ -690,7 +823,10 @@ async fn run_upload(
             };
         }
     };
-    let media = match api.upload_media(mode.as_kind(), None, bytes).await {
+    let media = match api
+        .upload_media(mode.as_kind(), alt.as_deref(), bytes)
+        .await
+    {
         Ok(m) => m,
         Err(err) => {
             return UploadOutcome::Failed {
@@ -854,7 +990,7 @@ async fn submit_note(app: &mut App, api: &LocalApi) {
         visibility: Some(app.compose.visibility().as_wire().to_string()),
         sensitive: Some(app.compose.sensitive()),
         language: None,
-        in_reply_to_ap_id: None,
+        in_reply_to_ap_id: app.compose.in_reply_to_ap_id().map(str::to_string),
         attachment_ids: app.compose.attachment_ids(),
     };
     match api.create_note(&req).await {
@@ -895,6 +1031,7 @@ fn visibility_steps(from: Visibility, to: Visibility) -> usize {
         Visibility::Public,
         Visibility::Unlisted,
         Visibility::Followers,
+        Visibility::Direct,
     ];
     let i = order.iter().position(|v| *v == from).unwrap_or(0);
     let j = order.iter().position(|v| *v == to).unwrap_or(0);
@@ -1007,9 +1144,12 @@ mod tests {
             visibility_steps(Visibility::Public, Visibility::Followers),
             2
         );
+        // M13 PR6: Direct を含む 4 値 cycle に拡張。
+        assert_eq!(visibility_steps(Visibility::Public, Visibility::Direct), 3);
         assert_eq!(
             visibility_steps(Visibility::Followers, Visibility::Public),
-            1
+            2
         );
+        assert_eq!(visibility_steps(Visibility::Direct, Visibility::Public), 1);
     }
 }
