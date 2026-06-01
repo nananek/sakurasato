@@ -50,6 +50,26 @@ MASTODON_TOKEN_FILE = os.environ.get(
     "MASTODON_TOKEN_FILE", "/mastodon-tokens/bob.token"
 )
 
+# ── Nekonoverse env (#58 PR2a) ───────────────────────────────
+# Nekonoverse は Mastodon 互換 API (`POST /api/v1/accounts` で headless 登録)
+# を提供する。PR2a smoke では bob の user-level token は取らず、
+# Mastodon 互換の **public** エンドポイント (`/api/v1/accounts/lookup`
+# と `/api/v1/accounts/{id}/followers`) だけで sks → nkv Follow round-trip
+# を検証する ── user-level token を headless で取るには OAuth code dance か
+# DB 直 seed が必要で、PR2a の smoke スコープを越える。PR2b で post / reaction
+# が必要になった時点で token 経路を追加する。
+NEKONOVERSE_BASE_URL = os.environ.get("NEKONOVERSE_BASE_URL", "https://nekonoverse")
+NEKONOVERSE_DOMAIN = os.environ.get("NEKONOVERSE_DOMAIN", "nekonoverse")
+NEKONOVERSE_USERNAME = os.environ.get("NEKONOVERSE_USERNAME", "bob")
+
+# どの counterpart instance を待つかを env でゲートする。compose 側で
+# 該当しないターゲットを `"0"` に倒すことで、Mastodon stack で立ってない
+# Nekonoverse / 逆も含めた wait 失敗を避ける。
+# - 既存 Mastodon stack は env を設定しないので `"1"` (= 従来挙動) に倒れる。
+# - Nekonoverse stack は MASTODON_ENABLED=0 / NEKONOVERSE_ENABLED=1 を渡す。
+MASTODON_ENABLED = os.environ.get("MASTODON_ENABLED", "1") != "0"
+NEKONOVERSE_ENABLED = os.environ.get("NEKONOVERSE_ENABLED", "0") == "1"
+
 # 連合経路の伝搬は Mastodon の Sidekiq queue 経由なので秒〜10 秒オーダで
 # 揺れる。ローカル sqlx 経路は サブ秒。Sidekiq の retry は初回失敗から
 # 15-30s 後なので、初回 enqueue が遅れたケースでも吸収できる長さを取る。
@@ -266,6 +286,23 @@ class SakurasatoClient:
             return  # 既に無い → no-op
         resp.raise_for_status()
 
+    def following(self, *, limit: int = 40) -> list[dict]:
+        """`GET /api/v1/following` ── accepted な follow 先一覧 (M13 PR3)。
+
+        #58 PR2a: TUI で `:follow @bob` した結果 Accept まで通ったかの assertion
+        に使う ── status line は「follow requested」のまま遷移しないので、
+        local API の following list を polling して accepted を確認する。
+
+        サーバの wire shape は `{entries, next_before_id}` で、各 entry は
+        `{follow_id, follow_state, follow_created_at, actor}` (= ``ActorRow``)。
+        """
+        resp = self._local.get(
+            "/api/v1/following", params={"limit": str(limit)}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("entries", data) if isinstance(data, dict) else data
+
     # ── public AP / WebFinger ────────────────────────────────
     def webfinger(self, acct: str) -> dict:
         resp = self._public.get(
@@ -451,7 +488,12 @@ def wait_for_instances() -> None:
         timeout=120,
     )
     # Mastodon 側: `/api/v1/instance` が 200 で返れば puma が live。
-    wait_for_http(f"{MASTODON_BASE_URL}/api/v1/instance", timeout=240)
+    # `MASTODON_ENABLED=0` で skip 可能 (= Nekonoverse stack 等で立てない時)。
+    if MASTODON_ENABLED:
+        wait_for_http(f"{MASTODON_BASE_URL}/api/v1/instance", timeout=240)
+    # Nekonoverse 側: 同じく `/api/v1/instance` が 200 で ready。
+    if NEKONOVERSE_ENABLED:
+        wait_for_http(f"{NEKONOVERSE_BASE_URL}/api/v1/instance", timeout=240)
 
 
 @pytest.fixture(scope="session")
@@ -491,3 +533,164 @@ def mastodon(mastodon_token: str):
         yield client
     finally:
         client.close()
+
+
+# ── Nekonoverse: Mastodon 互換 API クライアント (#58 PR2a) ───────
+#
+# Nekonoverse は Mastodon-style `/api/v1/*` を喋るので shape は近いが、
+# 接続先 / fixture 名 / 認証経路が違うので別クラスにする
+# (MastodonClient を継承しない ── 将来 Nekonoverse 固有 endpoint が増えた
+# ときに同 class で破綻させないため)。
+#
+# PR2a スコープでは **bearer token を持たない** ── bob の user-level token を
+# headless で得るには OAuth code dance か DB 直 seed が必要で、smoke 1 本の
+# ためにそこまで踏み込むのはオーバー。Mastodon 互換の `/api/v1/accounts/lookup`
+# と `/api/v1/accounts/{id}/followers` はどちらも **public** で叩けるので、
+# Follow + Accept round-trip の verify はそれだけで完結する。
+class NekonoverseClient:
+    """Nekonoverse REST API + AP エンドポイントを叩く薄いラッパ。
+
+    現状 (PR2a) は Follow / Accept smoke で使う最低限の **public** メソッド
+    だけを生やす。後続 PR2b で post / reaction / reply が必要になったら、
+    user-level token 取得経路と auth-required endpoint を追加する。
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        domain: str,
+        username: str,
+    ) -> None:
+        self.base_url = base_url
+        self.domain = domain
+        self.username = username
+        self.http = httpx.Client(base_url=base_url, timeout=20, verify=_SSL_VERIFY)
+
+    def close(self) -> None:
+        self.http.close()
+
+    # ── public Mastodon-compat ───────────────────────────────
+    def lookup_account(self, acct: str) -> dict:
+        """`GET /api/v1/accounts/lookup` ── acct → account JSON (public)。
+
+        Mastodon 仕様で auth 不要。Bob の id を取り出して
+        `followers(id)` に渡す経路。`acct` は `local-username` 形式
+        (= `bob`) でも `user@domain` 形式でも引ける。
+        """
+        resp = self.http.get(
+            "/api/v1/accounts/lookup", params={"acct": acct}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def followers(self, account_id: str) -> list[dict]:
+        """`GET /api/v1/accounts/{id}/followers` ── public。Follow + Accept の検証で使う。"""
+        resp = self.http.get(f"/api/v1/accounts/{account_id}/followers")
+        resp.raise_for_status()
+        return resp.json()
+
+    # ── AP / WebFinger ───────────────────────────────────────
+    def webfinger(self, acct: str) -> dict:
+        resp = self.http.get(
+            "/.well-known/webfinger", params={"resource": f"acct:{acct}"}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+@pytest.fixture(scope="session")
+def nekonoverse():
+    client = NekonoverseClient(
+        base_url=NEKONOVERSE_BASE_URL,
+        domain=NEKONOVERSE_DOMAIN,
+        username=NEKONOVERSE_USERNAME,
+    )
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+# ── tmux driver fixtures (#58 PR2a) ───────────────────────────
+#
+# `scripts/tmux-e2e/conftest.py` を本 image では `/tests/tmux_driver.py`
+# として配置している (Dockerfile.tmux 参照)。`TmuxSession` / `_run_lib` /
+# `_unique_session_name` を import して、ローカル fixture として再エクスポート
+# する。`SAKURASATO_TUI_BIN` env でバイナリ path を上書き可能。
+#
+# fixture を本 conftest で生やすのは collection 順を制御するため
+# (= import side effect で session 起動 fixture を勝手に増やしたくない)。
+try:
+    from tmux_driver import TmuxSession as _TmuxSession  # noqa: F401
+    from tmux_driver import _run_lib as _tmux_run_lib  # type: ignore[attr-defined]
+    from tmux_driver import _unique_session_name as _tmux_session_name  # type: ignore[attr-defined]
+    _TMUX_DRIVER_AVAILABLE = True
+except ImportError:
+    _TMUX_DRIVER_AVAILABLE = False
+
+
+@pytest.fixture
+def tmux_tui():
+    """`/usr/local/bin/sakurasato-tui` を tmux pty 内で起動する factory。
+
+    Usage::
+
+        def test_smoke(tmux_tui, sakurasato_socket_path, sakurasato_token_file):
+            tui = tmux_tui(sakurasato_socket_path, sakurasato_token_file)
+            tui.wait_until_text("timeline", 30)
+            tui.send_keys(":quit", "Enter")
+
+    引数:
+
+    - ``socket_path``: server の UDS パス。`SAKURASATO_SOCKET` env で TUI に渡る。
+    - ``token_file``: Bearer トークンファイル path。`--token-file` 引数で渡る。
+    - ``*extra_args``: 例えば ``"--no-images"`` (CI のテキスト UI 強制)。
+    - ``label``: tmux session 名のヒント。
+
+    tmux / TUI binary が無い環境では fixture 取得時に `pytest.skip()` する
+    (= mastodon-only stack で誤って collect された時の保護)。
+    """
+    if not _TMUX_DRIVER_AVAILABLE:
+        pytest.skip("tmux_driver helper not available — wrong test image?")
+
+    started: list = []
+
+    def factory(
+        socket_path: str,
+        token_file: str,
+        *extra_args: str,
+        label: str = "tui",
+    ):
+        bin_path = os.environ.get("SAKURASATO_TUI_BIN", "sakurasato-tui")
+        name = _tmux_session_name(label)
+        cmd = (
+            "env",
+            f"SAKURASATO_SOCKET={socket_path}",
+            bin_path,
+            "--token-file",
+            token_file,
+            *extra_args,
+        )
+        _tmux_run_lib("tmux_start", name, *cmd)
+        session = _TmuxSession(name)
+        started.append(session)
+        return session
+
+    try:
+        yield factory
+    finally:
+        for s in started:
+            s.kill()
+
+
+@pytest.fixture(scope="session")
+def sakurasato_socket_path() -> str:
+    """`SakurasatoClient.socket_path` と同じ値を fixture 化して TUI 側にも渡せるように。"""
+    return SAKURASATO_LOCAL_API_SOCKET
+
+
+@pytest.fixture(scope="session")
+def sakurasato_token_file() -> str:
+    """`SAKURASATO_TOKEN_FILE` のパス本体 (= `--token-file` に渡す用)。"""
+    return SAKURASATO_TOKEN_FILE

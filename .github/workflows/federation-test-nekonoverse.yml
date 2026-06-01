@@ -1,0 +1,83 @@
+name: Federation Test (Nekonoverse / tmux TUI)
+
+# 連合テスト (tmux pty + httpx + 実 sakurasato-tui binary) の自動駆動。
+# Issue #58 (#120 PR2a): Nekonoverse 相手に sakurasato TUI を tmux 内で実
+# pty 駆動して、Follow / Reaction / Reply 等のシナリオを programmatic に
+# 確かめる。PR2a 時点では Follow + Accept の smoke 1 本だけ。
+#
+# 起動契機:
+#   - nightly cron (UTC 19:30 = JST 04:30 ── mastodon と 30 分ずらして
+#     runner 競合を緩める)
+#   - workflow_dispatch (= UI から手動キック)
+#
+# required check には **しない**。理由:
+#   - 外部 image (ghcr.io/nekonoverse/nekonoverse-backend:latest) の更新
+#     タイミングで不安定化し得る。
+#   - TUI build (cargo) + Nekonoverse の uvicorn migration + Sidekiq 相当の
+#     worker drain で 5-15 分かかる ── PR ごとに required にすると開発体験を
+#     損なう。
+#
+# 失敗時の調査:
+#   1. Actions タブの個別 run ログ
+#   2. "Collect logs on failure" step の出力 (各 service の tail-300)
+#   3. tmux capture-pane の最終画面は pytest 側の AssertionError 本文に
+#      `lib.sh` stderr として埋め込まれる
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 19 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: federation-test-nekonoverse
+  cancel-in-progress: false
+
+jobs:
+  nekonoverse:
+    name: Nekonoverse (tmux TUI)
+    runs-on: ubuntu-latest
+    # TUI binary build (cargo) + Nekonoverse image pull + DB migrate +
+    # bob seed + Follow round-trip で全体 45 分上限。Mastodon stack より
+    # 大きく取るのは cargo build の cold cache が長いため。
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: docker compose version
+        run: docker compose version
+
+      # BuildKit cache を効かせる: tui-builder stage の cargo target を再利用。
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run pytest stack
+        run: ./scripts/federation-test/pytest.sh nekonoverse
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          set +e
+          project="sakurasato-fed-nekonoverse-pytest"
+          compose_file="compose/docker-compose.federation-nekonoverse.yml"
+          for svc in sakurasato-server sakurasato-media-proxy \
+                     nekonoverse-app nekonoverse-worker \
+                     sakurasato-token-issuer nekonoverse-bob-issuer; do
+            echo "==> ${svc} logs"
+            docker compose -p "$project" -f "$compose_file" \
+              --profile pytest logs --no-color --tail=300 "$svc" || true
+          done
+          echo "==> pytest logs"
+          docker compose -p "$project" -f "$compose_file" \
+            --profile pytest logs --no-color --tail=500 pytest || true
+
+      - name: Tear down on failure
+        if: always()
+        run: |
+          project="sakurasato-fed-nekonoverse-pytest"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-nekonoverse.yml \
+            --profile pytest down -v --remove-orphans || true

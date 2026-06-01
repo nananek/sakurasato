@@ -74,24 +74,25 @@ tmux_start() {
 }
 
 # sakurasato-tui を新規 tmux session で起動する thin wrapper。
-# Usage: tmux_start_tui <session> <socket_path> <token> [args...]
+# Usage: tmux_start_tui <session> <socket_path> <token_file_path> [args...]
 #
-# SAKURASATO_TUI_BIN env var でバイナリ path を上書きできる
-# (= テスト stub / cargo build 済み path / 本番 path を切替)。
+# 環境変数 / CLI 引数の対応:
+#   - socket  → `SAKURASATO_SOCKET` env (`--socket` の env 形)
+#   - token   → `--token-file <path>` 引数 (= `--token` 直渡しは /proc/<pid>/environ
+#     から覗かれるため避ける)
+# `SAKURASATO_TUI_BIN` env でバイナリ path を上書き可能。
+# `--no-images` を含む追加 args は呼び出し側が `[args...]` で渡す
+# (= CI でテキスト UI 強制したい等)。
 tmux_start_tui() {
     if [[ $# -lt 3 ]]; then
-        echo "tmux_start_tui: usage: tmux_start_tui <session> <socket> <token> [args...]" >&2
+        echo "tmux_start_tui: usage: tmux_start_tui <session> <socket> <token_file> [args...]" >&2
         return 64
     fi
-    local session="$1" socket="$2" token="$3"
+    local session="$1" socket="$2" token_file="$3"
     shift 3
     local bin="${SAKURASATO_TUI_BIN:-sakurasato-tui}"
-    # TUI バイナリの env で socket / token を渡す。CLI 引数の形は
-    # crates/tui の clap で確定したら追従させる ── 現状の dryrun では
-    # env だけで成立しているはず。
-    SAKURASATO_LOCAL_API_SOCKET="$socket" \
-    SAKURASATO_LOCAL_API_TOKEN="$token" \
-        tmux_start "$session" "$bin" "$@"
+    SAKURASATO_SOCKET="$socket" \
+        tmux_start "$session" "$bin" --token-file "$token_file" "$@"
 }
 
 # send-keys ラッパ。可変長引数をそのまま tmux に渡す。
