@@ -834,15 +834,68 @@ pub struct UnfollowResponse {
 
 /// `GET /api/v1/emojis` の各要素。
 /// `server::local_api::emojis::EmojiItem` と JSON 形を合わせる。
+///
+/// `kind` で custom (画像 emoji) と unicode (Unicode emoji ─
+/// `sakurasato_core::unicode_emoji`) を区別する。サーバが返すのは
+/// 現状 `EmojiKind::Custom` のみで、`EmojiKind::Unicode` は TUI 側で
+/// 静的テーブルから注入する。
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmojiItem {
+    /// `"custom"` | `"unicode"`。デフォルトは `Custom` で、古い server
+    /// (= `kind` フィールド未対応) と通信した場合も画像 emoji として扱う。
+    #[serde(default)]
+    pub kind: EmojiKind,
     pub shortcode: String,
+    /// custom emoji の画像 URL。unicode は空文字 (= 画像 fetch しない)。
     pub url: String,
+    /// custom emoji の MIME type。unicode は空文字。
     pub media_type: String,
     #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Unicode emoji の codepoint 文字列 (ZWJ シーケンス含む可)。`Custom`
+    /// では `None`。配信時の AP `content` はこの値をそのまま流す。
+    #[serde(default)]
+    pub codepoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmojiKind {
+    #[default]
+    Custom,
+    Unicode,
+}
+
+impl EmojiItem {
+    /// AP `content` (= リアクション送信 / `:foo:` 挿入のときに使う文字列) を返す。
+    /// Custom は `:shortcode:` 形式、Unicode は emoji の生 codepoint。
+    ///
+    /// **Invariant**: Unicode entry は必ず `codepoint = Some(_)` で構築される
+    /// (build.rs 経由で gemoji 由来、`EmojiSuggestState::open` 内で組み立て、
+    /// server 側は Unicode を返さない)。fallback の `shortcode.clone()` は
+    /// 「`:foo:` が AP `content` に流れて Misskey / Mastodon 非互換」になる
+    /// 経路なので、debug build では `debug_assert!` で早期検出する
+    /// ([review #122] minor 2 対応)。release build では fallback を実行して
+    /// **panic はしない** ── リアクション 1 件のために TUI を落とすより、
+    /// 相手側の reaction parser に拒否させた方が被害が小さい。
+    #[must_use]
+    pub fn content_token(&self) -> String {
+        match self.kind {
+            EmojiKind::Custom => format!(":{}:", self.shortcode),
+            EmojiKind::Unicode => {
+                debug_assert!(
+                    self.codepoint.is_some(),
+                    "Unicode EmojiItem must have codepoint (shortcode={})",
+                    self.shortcode,
+                );
+                self.codepoint
+                    .clone()
+                    .unwrap_or_else(|| self.shortcode.clone())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -63,17 +63,6 @@ pub enum Action {
     PickerCancel,
     /// M7: 直近の添付を 1 件外す (compose focus 中)。
     PopAttachment,
-    /// M8 PR3: タイムラインで選択中の Note に対するリアクション送信プロンプトを
-    /// 開く。`note_id` を後段で確定するため、ペイロードは載せない。
-    OpenReactionPrompt,
-    /// プロンプト中の文字入力。
-    ReactionPromptInsertChar(char),
-    /// プロンプト中の Backspace。
-    ReactionPromptBackspace,
-    /// プロンプト中の Enter ── 入力済み content を `POST /api/v1/reactions` へ。
-    ReactionPromptSubmit,
-    /// プロンプト中の Esc ── キャンセル。
-    ReactionPromptCancel,
     /// M9 PR2: 視覚刺激抑制 overlay を開く / 閉じる。
     ToggleSuppression,
     /// suppression overlay 上のカーソル移動。
@@ -137,18 +126,20 @@ pub enum Action {
     FollowListRefresh,
     /// M13 PR5: `FollowList` で `Esc` / `q` ── 画面を閉じる。
     FollowListClose,
-    /// Issue #101: 絵文字検索モーダルを開く (= reaction prompt / compose で
-    /// `Ctrl-E`)。runtime が server `GET /api/v1/emojis` を叩いて母集団を
-    /// 確保したあと `Focus::EmojiSearch` に切替える。
+    /// Issue #118 (Issue #101 後継): 絵文字検索モーダルを開く。
+    /// Timeline `e` (= 選択中 Note に即リアクション送信) と Compose `Ctrl-E`
+    /// (= 本文 buffer に `:shortcode:` / Unicode 1 字を挿入) の両起動経路で
+    /// 共通の Action。モード判定は runtime 側が現在 Focus から行う。
     OpenEmojiSearch,
     /// 絵文字検索モーダル中の `↓` (or `Ctrl-N`) ── 次候補へ。
     EmojiSearchDown,
     /// 絵文字検索モーダル中の `↑` (or `Ctrl-P`) ── 前候補へ。
     EmojiSearchUp,
-    /// 絵文字検索モーダル中の `Enter` ── 選択中 shortcode を `:foo:` 形式で
-    /// 戻り先 (`ReactionPrompt` / `Compose`) の buffer に挿入し閉じる。
+    /// 絵文字検索モーダル中の `Enter` ── モードに応じて確定。
+    /// `Mode::ReactToNote(_)` なら即リアクション送信、`Mode::InsertIntoCompose`
+    /// なら compose 本文に `:shortcode:` / Unicode 1 字を挿入する。
     EmojiSearchConfirm,
-    /// 絵文字検索モーダル中の `Esc` ── 何も挿入せず閉じる。
+    /// 絵文字検索モーダル中の `Esc` ── 何もせず閉じる。
     EmojiSearchCancel,
     /// 絵文字検索モーダル中の文字入力。
     EmojiSearchInsertChar(char),
@@ -201,7 +192,6 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::Compose => translate_compose_key(k),
         Focus::Help => translate_help_key(k),
         Focus::Picker => translate_picker_key(k),
-        Focus::ReactionPrompt => translate_reaction_prompt_key(k),
         Focus::Suppression => translate_suppression_key(k),
         Focus::AltPrompt => translate_alt_prompt_key(k),
         Focus::Profile => translate_profile_key(k),
@@ -301,9 +291,10 @@ fn translate_timeline_key(k: KeyEvent) -> Action {
         (KeyCode::Char('A'), _) => Action::OpenPicker(PickerMode::Avatar),
         (KeyCode::Char('H'), _) => Action::OpenPicker(PickerMode::Header),
         (KeyCode::Char(';'), m) if m.is_empty() => Action::OpenPicker(PickerMode::Attachment),
-        // M8 PR3: e = react ─ 選択中の Note にリアクションを付けるための
-        // プロンプトを開く。
-        (KeyCode::Char('e'), m) if m.is_empty() => Action::OpenReactionPrompt,
+        // Issue #118: e = 絵文字検索モーダルを直起動 (= 旧 reaction prompt
+        // 経路は廃止)。選択中 Note への即リアクションを `ReactToNote` mode
+        // で送る。
+        (KeyCode::Char('e'), m) if m.is_empty() => Action::OpenEmojiSearch,
         // M9 PR2: i = 視覚刺激抑制 overlay を開く ("images" の頭文字)。
         // Compose 中は `i` が本文に挿入されるので timeline focus 限定。
         (KeyCode::Char('i'), m) if m.is_empty() => Action::ToggleSuppression,
@@ -400,20 +391,6 @@ fn translate_picker_key(k: KeyEvent) -> Action {
         (KeyCode::Backspace, _) => Action::PickerParent,
         // `.` で隠しファイルトグル ── vim の :set hidden! 風。
         (KeyCode::Char('.'), m) if m.is_empty() => Action::PickerToggleHidden,
-        _ => Action::Noop,
-    }
-}
-
-fn translate_reaction_prompt_key(k: KeyEvent) -> Action {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    match k.code {
-        KeyCode::Esc => Action::ReactionPromptCancel,
-        KeyCode::Enter => Action::ReactionPromptSubmit,
-        // Issue #101: 絵文字検索モーダルを Ctrl-E で起動。reaction prompt
-        // の通常入力には影響させない (= モーダル内に独立した search buffer)。
-        KeyCode::Char('e') if ctrl => Action::OpenEmojiSearch,
-        KeyCode::Backspace => Action::ReactionPromptBackspace,
-        KeyCode::Char(c) if !ctrl => Action::ReactionPromptInsertChar(c),
         _ => Action::Noop,
     }
 }
@@ -543,53 +520,14 @@ mod tests {
     }
 
     #[test]
-    fn timeline_e_opens_reaction_prompt() {
+    fn timeline_e_opens_emoji_search() {
+        // Issue #118: 旧 reaction prompt 経路は廃止、`e` で直接モーダル起動。
         assert!(matches!(
             translate(
                 Event::Key(key(KeyCode::Char('e'), KeyModifiers::NONE)),
                 Focus::Timeline,
             ),
-            Action::OpenReactionPrompt,
-        ));
-    }
-
-    #[test]
-    fn reaction_prompt_keys_route_correctly() {
-        assert!(matches!(
-            translate(
-                Event::Key(key(KeyCode::Esc, KeyModifiers::NONE)),
-                Focus::ReactionPrompt,
-            ),
-            Action::ReactionPromptCancel,
-        ));
-        assert!(matches!(
-            translate(
-                Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)),
-                Focus::ReactionPrompt,
-            ),
-            Action::ReactionPromptSubmit,
-        ));
-        assert!(matches!(
-            translate(
-                Event::Key(key(KeyCode::Char('a'), KeyModifiers::NONE)),
-                Focus::ReactionPrompt,
-            ),
-            Action::ReactionPromptInsertChar('a'),
-        ));
-        assert!(matches!(
-            translate(
-                Event::Key(key(KeyCode::Backspace, KeyModifiers::NONE)),
-                Focus::ReactionPrompt,
-            ),
-            Action::ReactionPromptBackspace,
-        ));
-        // Ctrl-C は ReactionPrompt focus でも Quit に勝つ。
-        assert!(matches!(
-            translate(
-                Event::Key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-                Focus::ReactionPrompt,
-            ),
-            Action::Quit,
+            Action::OpenEmojiSearch,
         ));
     }
 

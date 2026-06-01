@@ -117,6 +117,12 @@ cargo run -p sakurasato-tui
 
 MIT © 2026 [nananek](https://github.com/nananek)
 
+### サードパーティ
+
+- TUI 絵文字検索の Unicode → shortcode マッピングに [github/gemoji](https://github.com/github/gemoji)
+  (MIT © 2019 GitHub, Inc.) の `db/emoji.json` を `vendor/gemoji/` に同梱して使用しています。
+  LICENSE 全文は [`vendor/gemoji/LICENSE`](vendor/gemoji/LICENSE) を参照。
+
 ## 名前の由来
 
 神里綾華（原神）にちなむ。家名「神里（**Kamisato**）」の「**里（sato）**」に「**桜（sakura）**」を重ねた造語で、「**桜の里**」とも読めます。氷の静謐さがコンセプト（視覚刺激を抑えた落ち着き）とも響き合います。

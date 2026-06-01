@@ -52,9 +52,6 @@ pub enum Focus {
     Help,
     /// M7: ファイルピッカ。`App::picker` が `Some` のときだけ取りうる。
     Picker,
-    /// M8 PR3: リアクション送信プロンプト。`App::reaction_prompt` が `Some` の
-    /// ときだけ取りうる。
-    ReactionPrompt,
     /// M9 PR2: 視覚刺激抑制トグル overlay。各要素 (avatar / attachment /
     /// emoji / preview / animation) を on/off できる。
     Suppression,
@@ -75,9 +72,10 @@ pub enum Focus {
     /// M12 (Issue #66): 鍵アカ運用の承認待ち follow 一覧画面。
     /// `:requests` で開く。`App::follow_requests` が `Some` のときのみ取りうる。
     Requests,
-    /// Issue #101: 絵文字検索モーダル。`Ctrl-E` (reaction prompt / compose 中)
-    /// で起動。`App::emoji_suggest` が `Some` のときのみ取りうる。Esc で
-    /// 直前 Focus (`ReactionPrompt` / `Compose`) に戻る。
+    /// Issue #118 (Issue #101 後継): 絵文字検索モーダル。Timeline `e` で「選択
+    /// 中 Note への即リアクション」モード、Compose `Ctrl-E` で「本文への
+    /// 挿入」モードとして起動。`App::emoji_suggest` が `Some` のときのみ
+    /// 取りうる。Esc で起動元に戻る (= Timeline か Compose、`mode` 由来)。
     EmojiSearch,
 }
 
@@ -110,9 +108,6 @@ pub struct App {
     /// M7: 進行中のアップロードジョブ数。0 でも picker を閉じてよい。
     /// UI のステータスバーに `↑ N` として出す。
     pub pending_uploads: u32,
-    /// M8 PR3: リアクション送信プロンプト。`Focus::ReactionPrompt` 中のみ
-    /// 表示される。
-    pub reaction_prompt: Option<crate::reaction_prompt::ReactionPrompt>,
     /// M9 PR2: 視覚刺激抑制 (要素別 on/off)。`avatar`/`attachment`/`emoji`/
     /// `preview`/`animation` のフラグセット。`ImageCache` / `PreviewCache`
     /// の `enabled()` と組で見られる ── どちらかが off なら描画パスを抜く。
@@ -142,13 +137,12 @@ pub struct App {
     /// M12 (Issue #66): 承認待ち follow 一覧画面の state。`:requests` で開く。
     /// `Focus::Requests` のあいだだけ `Some`。
     pub follow_requests: Option<crate::follow_requests::FollowRequestsScreen>,
-    /// Issue #101: 絵文字検索モーダルの state。reaction prompt / compose
-    /// 中に `Ctrl-E` で開く専用 Focus。検索 buffer は独立で、部分一致 +
-    /// 前方一致優先の filter を持つ。
+    /// Issue #118 (Issue #101 後継): 絵文字検索モーダルの state。Timeline `e`
+    /// では `Mode::ReactToNote(note_id)`、Compose `Ctrl-E` では
+    /// `Mode::InsertIntoCompose` で開く。閉じたときの戻り先 Focus は
+    /// `mode` から決まる (= `ReactToNote` → Timeline、`InsertIntoCompose`
+    /// → Compose)。検索 buffer は独立。
     pub emoji_suggest: Option<crate::emoji_suggest::EmojiSuggestState>,
-    /// Issue #101: 絵文字検索モーダルを閉じたときの戻り先 Focus
-    /// (`ReactionPrompt` / `Compose` のどちらか)。
-    pub emoji_search_return_focus: Option<Focus>,
 }
 
 impl App {
@@ -177,7 +171,6 @@ impl App {
             picker: None,
             previews,
             pending_uploads: 0,
-            reaction_prompt: None,
             suppression,
             suppression_cursor: 0,
             alt_prompt: None,
@@ -187,7 +180,6 @@ impl App {
             command: None,
             follow_requests: None,
             emoji_suggest: None,
-            emoji_search_return_focus: None,
         }
     }
 

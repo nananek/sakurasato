@@ -24,6 +24,10 @@ chrono.workspace = true
 # reqwest を引かず軽い url crate だけで完結する。
 url.workspace = true
 
+[build-dependencies]
+serde = { workspace = true }
+serde_json.workspace = true
+
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }
 serde_json.workspace = true

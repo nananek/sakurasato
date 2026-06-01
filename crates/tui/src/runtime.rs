@@ -435,23 +435,6 @@ async fn apply_action(
                 );
             }
         }
-        Action::OpenReactionPrompt => open_reaction_prompt(app),
-        Action::ReactionPromptInsertChar(c) => {
-            if let Some(p) = app.reaction_prompt.as_mut() {
-                p.insert_char(c);
-            }
-        }
-        Action::ReactionPromptBackspace => {
-            if let Some(p) = app.reaction_prompt.as_mut() {
-                p.backspace();
-            }
-        }
-        Action::ReactionPromptSubmit => {
-            submit_reaction(app, api, page_size).await;
-        }
-        Action::ReactionPromptCancel => {
-            close_reaction_prompt(app);
-        }
         Action::OpenEmojiSearch => open_emoji_search(app, api).await,
         Action::EmojiSearchDown => {
             if let Some(s) = app.emoji_suggest.as_mut() {
@@ -463,7 +446,7 @@ async fn apply_action(
                 s.select_prev();
             }
         }
-        Action::EmojiSearchConfirm => emoji_search_confirm(app),
+        Action::EmojiSearchConfirm => emoji_search_confirm(app, api, page_size).await,
         Action::EmojiSearchCancel => emoji_search_cancel(app),
         Action::EmojiSearchInsertChar(c) => {
             if let Some(s) = app.emoji_suggest.as_mut() {
@@ -927,40 +910,41 @@ async fn undo_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
     }
 }
 
-fn open_reaction_prompt(app: &mut App) {
-    let Some(note) = app.notes.get(app.selected) else {
-        app.set_status(
-            "no note selected",
-            StatusKind::Warning,
-            Some(Duration::from_secs(2)),
-        );
-        return;
-    };
-    app.reaction_prompt = Some(crate::reaction_prompt::ReactionPrompt::new(note.id));
-    app.focus = Focus::ReactionPrompt;
-}
-
-fn close_reaction_prompt(app: &mut App) {
-    app.reaction_prompt = None;
-    app.emoji_suggest = None;
-    app.focus = Focus::Timeline;
-}
-
-/// Issue #101: 絵文字検索モーダルを開く。`Ctrl-E` (reaction prompt focus 中)
-/// で発火。server `GET /api/v1/emojis` で母集団を 1 回 fetch し、独立した
-/// `EmojiSuggestState` (= search buffer + filter) で `Focus::EmojiSearch`
-/// に遷移する。失敗時は status line に出してモーダルは開かない。
+/// Issue #118: 絵文字検索モーダルを開く。
+///
+/// 起動経路は 2 つ:
+///   - Timeline `e` → 選択中 Note への即時リアクション送信
+///     (`Mode::ReactToNote(note_id)`)
+///   - Compose `Ctrl-E` → 本文 buffer に `:shortcode:` / Unicode 1 字を挿入
+///     (`Mode::InsertIntoCompose`)
+///
+/// モードは現在の Focus から自動判定。`Mode::ReactToNote` で選択中 Note が
+/// 存在しないときは status 警告だけ出してモーダルは開かない。
+///
+/// server `/api/v1/emojis` から custom emoji を fetch し、`EmojiSuggestState`
+/// が静的 Unicode emoji を merge する。fetch 失敗時はモーダル開かず status
+/// 表示 ── Timeline `e` 経路ではユーザ側で再試行できる。
 async fn open_emoji_search(app: &mut App, api: &LocalApi) {
-    // 戻り先 Focus を覚える (= 通常 ReactionPrompt、compose が起動側に
-    // なったら Compose)。
-    let return_focus = match app.focus {
-        Focus::ReactionPrompt | Focus::Compose => app.focus,
+    let mode = match app.focus {
+        Focus::Timeline => {
+            let Some(note) = app.notes.get(app.selected) else {
+                app.set_status(
+                    "no note selected",
+                    StatusKind::Warning,
+                    Some(Duration::from_secs(2)),
+                );
+                return;
+            };
+            crate::emoji_suggest::Mode::ReactToNote(note.id)
+        }
+        Focus::Compose => crate::emoji_suggest::Mode::InsertIntoCompose,
         _ => return,
     };
     match api.list_emojis("", crate::emoji_suggest::FETCH_LIMIT).await {
         Ok(resp) => {
-            app.emoji_suggest = Some(crate::emoji_suggest::EmojiSuggestState::open(resp.items));
-            app.emoji_search_return_focus = Some(return_focus);
+            app.emoji_suggest = Some(crate::emoji_suggest::EmojiSuggestState::open(
+                mode, resp.items,
+            ));
             app.focus = Focus::EmojiSearch;
         }
         Err(err) => {
@@ -974,68 +958,55 @@ async fn open_emoji_search(app: &mut App, api: &LocalApi) {
     }
 }
 
-/// 選択中の絵文字を `:foo:` 形式で挿入し、モーダルを閉じて戻り先 Focus へ。
-fn emoji_search_confirm(app: &mut App) {
-    let shortcode = app
-        .emoji_suggest
-        .as_ref()
-        .and_then(|s| s.current().map(|item| item.shortcode.clone()));
-    let Some(shortcode) = shortcode else {
-        // 候補なし → 何も挿入せず閉じる。
+/// Enter 確定: モードに応じて即リアクション送信 or 本文挿入。
+///
+/// `Mode::ReactToNote(note_id)` の場合は `POST /api/v1/reactions` を打ち、
+/// 成功なら timeline を再取得して reaction count を反映する。失敗は status
+/// に出してモーダルだけ閉じる (= ユーザ操作を奪い続けない)。
+///
+/// `Mode::InsertIntoCompose` の場合は `EmojiItem::content_token()` を compose
+/// 本文に挿入し、Compose focus に戻る。
+async fn emoji_search_confirm(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(state) = app.emoji_suggest.as_ref() else {
+        return;
+    };
+    let mode = state.mode;
+    let Some(item) = state.current().cloned() else {
+        // 候補なし → 何もせず閉じる。
         emoji_search_cancel(app);
         return;
     };
-    let inserted = format!(":{shortcode}:");
-    // 戻り先 (= ReactionPrompt or Compose) の buffer に追記。
-    let return_focus = app
-        .emoji_search_return_focus
-        .unwrap_or(Focus::ReactionPrompt);
-    match return_focus {
-        Focus::ReactionPrompt => {
-            if let Some(p) = app.reaction_prompt.as_mut() {
-                for ch in inserted.chars() {
-                    p.insert_char(ch);
-                }
-            }
+    let token = item.content_token();
+    app.emoji_suggest = None;
+
+    match mode {
+        crate::emoji_suggest::Mode::ReactToNote(note_id) => {
+            app.focus = Focus::Timeline;
+            send_reaction(app, api, note_id, &token, page_size).await;
         }
-        Focus::Compose => {
-            for ch in inserted.chars() {
+        crate::emoji_suggest::Mode::InsertIntoCompose => {
+            for ch in token.chars() {
                 app.compose.insert_char(ch);
             }
+            app.focus = Focus::Compose;
         }
-        _ => {}
     }
-    app.emoji_suggest = None;
-    app.emoji_search_return_focus = None;
-    app.focus = return_focus;
 }
 
-/// モーダルを閉じる (= テキスト挿入なし)。
+/// Esc キャンセル: 何もせずモーダルを閉じ、モード由来の元 Focus に戻る。
 fn emoji_search_cancel(app: &mut App) {
-    let return_focus = app
-        .emoji_search_return_focus
-        .take()
-        .unwrap_or(Focus::ReactionPrompt);
+    let mode = app.emoji_suggest.as_ref().map(|s| s.mode);
     app.emoji_suggest = None;
-    app.focus = return_focus;
+    app.focus = match mode {
+        Some(crate::emoji_suggest::Mode::InsertIntoCompose) => Focus::Compose,
+        _ => Focus::Timeline,
+    };
 }
 
-async fn submit_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
-    let Some(prompt) = app.reaction_prompt.as_ref() else {
-        return;
-    };
-    if prompt.is_empty() {
-        app.set_status(
-            "reaction is empty",
-            StatusKind::Warning,
-            Some(Duration::from_secs(2)),
-        );
-        return;
-    }
-    let note_id = prompt.note_id;
-    let content = prompt.buffer.trim().to_string();
-
-    match api.create_reaction(note_id, &content).await {
+/// `POST /api/v1/reactions` 本体。Timeline `e` 経路で確定した `content` を
+/// 送る。成功時は timeline を再取得して reaction count を反映する。
+async fn send_reaction(app: &mut App, api: &LocalApi, note_id: i64, content: &str, page_size: i64) {
+    match api.create_reaction(note_id, content).await {
         Ok(resp) => {
             // M13 PR6: 取り消し (`u`) で参照するため reaction id を覚えておく。
             // 同じ note に上書きすると以前の id が落ちるが、サーバは 1 user 1
@@ -1049,6 +1020,10 @@ async fn submit_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
                 StatusKind::Success,
                 Some(Duration::from_secs(3)),
             );
+            // 成功 → タイムラインを取り直して reaction count を反映。
+            if let Ok(resp) = api.timeline_home(None, page_size).await {
+                app.replace_timeline(resp.notes, resp.next_before_id);
+            }
         }
         Err(err) => {
             app.set_status(
@@ -1056,15 +1031,7 @@ async fn submit_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
                 StatusKind::Error,
                 Some(Duration::from_secs(6)),
             );
-            // 失敗時はプロンプトを残したままにしてユーザが修正できるようにする。
-            return;
         }
-    }
-    close_reaction_prompt(app);
-
-    // 成功 → タイムラインを取り直して reaction count を反映。
-    if let Ok(resp) = api.timeline_home(None, page_size).await {
-        app.replace_timeline(resp.notes, resp.next_before_id);
     }
 }
 
@@ -1337,17 +1304,13 @@ fn handle_upload_outcome(app: &mut App, outcome: UploadOutcome) {
 
 fn handle_click(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
     // [[m9-pr2-review]] Finding 1: overlay 系 focus (Suppression / Picker /
-    // ReactionPrompt) の最中は背後パネルへの hit test を抜けさせない ──
-    // クリックでサイレントに overlay が閉じてしまい、背後のノートが選択
-    // されたり compose にフォーカスが奪われるのを防ぐ。Help は overlay 中の
-    // クリックで明示的に閉じる従来挙動を維持 (既存テストの依存)。
+    // EmojiSearch / AltPrompt / Command) の最中は背後パネルへの hit test を
+    // 抜けさせない ── クリックでサイレントに overlay が閉じてしまい、背後の
+    // ノートが選択されたり compose にフォーカスが奪われるのを防ぐ。Help は
+    // overlay 中のクリックで明示的に閉じる従来挙動を維持 (既存テストの依存)。
     if matches!(
         app.focus,
-        Focus::Suppression
-            | Focus::Picker
-            | Focus::ReactionPrompt
-            | Focus::AltPrompt
-            | Focus::Command,
+        Focus::Suppression | Focus::Picker | Focus::EmojiSearch | Focus::AltPrompt | Focus::Command,
     ) {
         return;
     }
@@ -2114,7 +2077,7 @@ mod tests {
 
     #[test]
     fn click_in_overlay_focus_is_ignored() {
-        // [[m9-pr2-review]] Finding 1: Suppression / Picker / ReactionPrompt
+        // [[m9-pr2-review]] Finding 1: Suppression / Picker / EmojiSearch
         // が開いている間のクリックは背後パネルへ抜けない (= overlay が
         // サイレントに閉じてノートが選択される事故を防ぐ)。
         let mut app = make_test_app();
@@ -2123,7 +2086,7 @@ mod tests {
             compose: ratatui::layout::Rect::new(0, 24, 80, 5),
             ..ui::PanelRects::default()
         };
-        for focus in [Focus::Suppression, Focus::Picker, Focus::ReactionPrompt] {
+        for focus in [Focus::Suppression, Focus::Picker, Focus::EmojiSearch] {
             app.focus = focus;
             handle_click(&mut app, &rects, 10, 5);
             assert_eq!(

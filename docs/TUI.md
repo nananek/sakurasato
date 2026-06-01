@@ -116,7 +116,7 @@ sakurasato-server token list
 | `A` | アバター変更 (file picker) |
 | `H` | ヘッダ画像変更 (file picker) |
 | `;` | 添付画像 picker (compose に持ち越し) |
-| `e` | 選択中 note にリアクション |
+| `e` | 選択中 note にリアクション (絵文字検索モーダルを直起動 → Enter で即送信) |
 | `i` | 視覚刺激抑制 overlay を開く |
 | `p` | 選択中 note の作者 profile を push |
 | `:` | command prompt |
@@ -152,18 +152,29 @@ sakurasato-server token list
 | `.` | hidden file 表示 toggle |
 | `Esc` / `q` | キャンセル |
 
-### 3.4 Reaction prompt (`e` で起動)
+### 3.4 絵文字検索モーダル
+
+Timeline で `e` を押すと「選択中 Note への即時リアクション」モードで、
+Compose で `Ctrl-E` を押すと「本文に `:shortcode:` / Unicode 1 字を挿入」
+モードで起動します。同じ overlay を 2 つのモードで使い回す構成です。
 
 | Key | 動作 |
 |---|---|
-| 文字 | shortcode / Unicode を入力 |
-| `Enter` | 送信 |
-| `Esc` | キャンセル |
+| 文字 | 検索 buffer に入力 (部分一致 + 前方一致優先) |
+| `Backspace` | 検索 buffer から 1 文字削除 |
+| `↑` / `↓` (or `Ctrl-P` / `Ctrl-N`) | 候補移動 |
+| `Enter` | モードに応じて確定 (即リアクション送信 / 本文に挿入) |
+| `Esc` | 何もせず閉じる |
 
-入力形式:
+候補は 2 ソースを merge:
 
-- `:foo:` ── ローカルカスタム絵文字 (= サーバの emoji DB)
-- `👍` `🎉` `❤️` 等 ── Unicode emoji (Misskey/Mastodon 互換)
+- **カスタム絵文字** (`:foo:`) ── サーバの emoji DB から取得 (`/api/v1/emojis`)。
+  選択中の絵文字は modal のプレビュー枠に画像表示 (`ratatui-image`)。
+- **Unicode 絵文字** (`:grinning:` → `😀`、`:+1:` → `👍` 等) ── TUI に焼き込み
+  済みの shortcode テーブル ([github/gemoji](https://github.com/github/gemoji)
+  由来、MIT)。プレビュー枠には codepoint を中央に表示。
+
+候補 0 件でも閉じません (= 検索 buffer を消せば全候補が戻ります)。
 
 ### 3.5 Profile 画面
 
