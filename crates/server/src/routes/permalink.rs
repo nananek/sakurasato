@@ -65,7 +65,7 @@ pub async fn handle(
     if !matches!(note.visibility.as_str(), "public" | "unlisted") {
         tracing::debug!(
             note_id = id,
-            visibility = %note.visibility,
+            visibility = note.visibility.as_str(),
             "permalink: refusing to serve non-public note",
         );
         return StatusCode::NOT_FOUND.into_response();

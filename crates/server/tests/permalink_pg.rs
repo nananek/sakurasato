@@ -122,6 +122,11 @@ async fn insert_note(
     .await
 }
 
+/// **意図的な簡略化**: `to_recipients` は visibility に関わらず常に `as:Public`
+/// を入れる。permalink の visibility filter は `note.visibility` カラムを見る
+/// 設計で、本 helper は filter の挙動だけ検証する用途。`to_recipients` ベースの
+/// 判定 (= AS2 audience の解釈) を直接検証するテストが必要になった時点で、
+/// この helper を分ける or 引数化する。
 async fn insert_note_with_visibility(
     pool: &PgPool,
     actor_id: i64,
@@ -371,9 +376,23 @@ async fn permalink_404_for_direct_note(pool: PgPool) {
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::routes::router(state);
 
+    // HTML 経路
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/notes/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // AP JSON 経路でも漏れないこと (= direct note の to/cc が公開 fetch で取れない)
     let resp = app
         .oneshot(
             Request::get(format!("/notes/{id}"))
+                .header(header::ACCEPT, "application/activity+json")
                 .body(Body::empty())
                 .unwrap(),
         )
