@@ -92,7 +92,7 @@ pub async fn get_local_by_shortcode(
 /// (Issue #101) が `:foo` まで打った段階で叩く。
 ///
 /// - 前方一致は ASCII-lowercase 比較 (shortcode は元から ASCII)。
-/// - `limit` は呼び出し側で 1..=100 にクランプ済みの想定。負値は 0 件扱い。
+/// - `limit` は呼び出し側で 1..=`MAX_LIMIT` にクランプ済みの想定。負値は 0 件扱い。
 /// - 結果は shortcode ASC でソート (= 安定した popup 表示)。
 pub async fn list_local_by_prefix(
     pool: &PgPool,
@@ -110,6 +110,69 @@ pub async fn list_local_by_prefix(
         FROM emoji
         WHERE host IS NULL
           AND lower(shortcode) LIKE $1
+        ORDER BY shortcode ASC
+        LIMIT $2
+        "#,
+        pat,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// LIKE/`ILIKE` pattern 内の特殊文字 (`\`, `%`, `_`) を `\` でエスケープする。
+///
+/// SQL 側で `ESCAPE '\'` を指定して使う。`is_valid_shortcode` の文字集合に
+/// 載らない `%` 等を TUI 検索バッファに打たれても、全件マッチ等の劣化挙動に
+/// ならないようにする。
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Local emoji を shortcode / aliases の部分一致で検索する (Issue #130)。
+///
+/// 部分一致は `ILIKE %query% ESCAPE '\'` で大文字小文字を無視する。aliases は
+/// JSONB の `text[]` 要素を `jsonb_array_elements_text` で展開して各要素に
+/// 同じパターンを当てる。
+///
+/// - `query` が空 (trim 後) なら [`list_local_by_prefix`] にフォールバックする
+///   (= 既存挙動: 全件を shortcode ASC で `limit` 件返す)。
+/// - `limit` は呼び出し側で 1..=`MAX_LIMIT` にクランプ済みの想定。
+/// - 結果は shortcode ASC でソート。サーバ側で前方一致を上位に並べる重み付けは
+///   行わない ── TUI 側 `recompute()` で再ソートする責務分離。
+pub async fn search_local_by_substring(
+    pool: &PgPool,
+    query: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<EmojiRow>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return list_local_by_prefix(pool, "", limit).await;
+    }
+    let pat = format!("%{}%", escape_like(q));
+    sqlx::query_as!(
+        EmojiRow,
+        r#"
+        SELECT
+            id, shortcode, host, category,
+            aliases as "aliases: Json<Vec<String>>",
+            image_key, media_type, ap_id, is_local, created_at, updated_at
+        FROM emoji
+        WHERE host IS NULL
+          AND (
+              shortcode ILIKE $1 ESCAPE '\'
+              OR EXISTS (
+                  SELECT 1 FROM jsonb_array_elements_text(aliases) AS a
+                  WHERE a ILIKE $1 ESCAPE '\'
+              )
+          )
         ORDER BY shortcode ASC
         LIMIT $2
         "#,
