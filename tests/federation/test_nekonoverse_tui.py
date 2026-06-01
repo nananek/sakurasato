@@ -1,4 +1,4 @@
-"""Sakurasato TUI × Nekonoverse 連合シナリオ (#58 / #120 PR2a + PR2b)。
+"""Sakurasato TUI × Nekonoverse 連合シナリオ (#58 / #120 PR2a + PR2b + PR2c)。
 
 PR2a (smoke 1 本):
 
@@ -6,22 +6,25 @@ PR2a (smoke 1 本):
      ── ``:`` で command prompt を開き ``:follow bob@nekonoverse`` → Accept
      round-trip までを確認する (= TUI 経路で follow が確立する)。
 
-PR2b (本 PR で追加):
+PR2b:
 
   2. ``test_bob_note_appears_in_sks_timeline``
      ── bob が nkv 側で note 投稿 → 連合配送で sks home timeline に出現する
      ことを確認 (= 取得側 = sks の inbox / TL の受領パス)。
 
-シナリオ外 (= PR2c 以降 / 他 PR で必要に応じて):
+PR2c (本 PR で追加):
 
-- **sks → bob リアクション** (#118 Enter 回帰テスト) ── PR2b 着手時に
-  ``POST /api/v1/reactions`` が remote note に対して 404
-  ``"reactions to remote notes are not supported yet"`` を返す **server 側
-  ギャップ** が判明したため、本 PR では実装を見送る。TUI 側の Enter 経路
-  そのものは tmux 経由で fire することは検証済 (= status line に上記 404 が
-  出るところまで送れる)。サーバ側ギャップを別 issue で先に閉じてから
-  リアクション連合シナリオを追加する流れに倒した。
-- カスタム emoji reaction (`:shortcode:` 形式の `tag.Emoji` 込み連合)
+  3. ``test_unicode_reaction_propagates_to_bob_status``
+     ── bob が note 投稿 → sks TUI で ``e`` → ``+1`` → Enter → ``Like``
+     activity を nkv inbox に配送し、bob 側 status で reaction (👍) として
+     observable になることを確認する (= #118 Enter 回帰テスト + 配送経路)。
+  4. ``test_custom_emoji_reaction_propagates_to_bob_status``
+     ── 事前に sks に import 済みのテスト用 custom emoji を `e:sakurasato:Enter`
+     で送り、``EmojiReact`` + ``tag.Emoji`` を nkv に届けて bob 側 status の
+     reactions に並ぶことを確認する。
+
+シナリオ外 (= 別 PR で追加 OK):
+
 - Reply / Move / Actor Update
 
 実行前提:
@@ -45,6 +48,8 @@ flakiness 対策:
 """
 from __future__ import annotations
 
+import os
+import re
 import uuid
 
 import pytest
@@ -264,11 +269,251 @@ def test_bob_note_appears_in_sks_timeline(
     )
 
 
-# NOTE (PR2b 設計時): sks TUI から bob (= remote actor) の note に対する
-# リアクション送信は `POST /api/v1/reactions` が
-# `404 "reactions to remote notes are not supported yet"`
-# (`crates/server/src/local_api/reactions.rs:77`) で弾かれる。TUI 側の
-# `e` → `Enter` 経路 (= #118 で塞いだ binding) は本 PR の手動 tmux 駆動で
-# fire することを確認済だが、server 側ギャップを別 PR で先に閉じる方が
-# きれいなので、本 PR ではリアクション連合シナリオを実装しない。サーバ側が
-# remote note への reaction を出せるようになった時点で、テストを生やす。
+# ── PR2c: sks TUI → bob's remote note にリアクション → nkv 側 status 反映 ──
+#
+# PR2b 時点で塞がっていた server 側 `is_local` ガード (= "reactions to remote
+# notes are not supported yet" 404) は PR #127 (`1bd72b6`) で撤去済 ──
+# `crates/server/src/local_api/reactions.rs:73-80` の入口対称化により remote
+# Note への `POST /api/v1/reactions` が 201 を返し、note 作者 inbox を含めて
+# `delivery_queue` に積む経路が完成した。本 PR では TUI `e` 経路 (= #118 で
+# `OpenEmojiSearch` に統合した binding) で実際に連合到達することを確認する。
+#
+# 観測モデル:
+#
+# Unicode `+1` (= 👍) の場合、sks は **`Like` activity** に `content: "👍"`
+# を載せて配送する (`reactions.rs::build_reaction_activity` の Unicode 分岐)。
+# Nekonoverse の `handlers/like.py::handle_like` は `content` が単一絵文字
+# なら絵文字として保存するので、bob 側 `get_status` の `reactions` /
+# `emoji_reactions` に 👍 1 件として並ぶ。`favourites_count` (= ⭐の数だけ
+# 集計) ではなく `reactions` で観測する。
+#
+# Custom emoji `:sakurasato_test:` の場合、sks は **`EmojiReact`** + `tag:
+# [Emoji]` + `_misskey_reaction` を載せる (`reactions.rs::build_reaction_activity`
+# の Custom 分岐)。nkv の `handle_like` / `handle_emoji_react` は `content`
+# / `_misskey_reaction` のどちらでも reaction に格納する経路があるので、
+# bob 側 status の `reactions` に `:sakurasato_test:` 由来の 1 件が並ぶ。
+
+
+# 検索クエリ → modal 内で先頭 (= prefix 一致トップ) に来る項目に絞れる
+# 文字列を選ぶ。`+1` は `+1` (= 👍) 1 件で確定する。custom は env で渡される
+# shortcode prefix (= `sakurasato_test` の `sakurasato` 部分) を打って
+# `sakurasato_test` を先頭に呼ぶ。
+UNICODE_QUERY = "+1"
+UNICODE_CODEPOINT = "👍"
+CUSTOM_SHORTCODE = os.environ.get("SAKURASATO_SEED_EMOJI_SHORTCODE", "sakurasato_test")
+# `sakurasato_test` の前方一致が一意になる入力 (= `sakurasato` まで打てば
+# 他の Unicode emoji や custom と衝突しない)。
+CUSTOM_QUERY = CUSTOM_SHORTCODE.split("_", 1)[0]
+
+
+def _open_tui_and_wait_for_note(
+    tmux_tui,
+    sakurasato_socket_path: str,
+    sakurasato_token_file: str,
+    marker: str,
+    label: str,
+):
+    """TUI を起動し、bob 由来 note の `marker` が timeline に見えるまで待つ。
+
+    `r` (refresh) を 1 度だけ叩くのは、TUI 起動直後の初回 fetch と federation
+    着信のタイミングが揃わない場合の保険。bob note は `published_at` 最新で
+    `ORDER BY n.id DESC` の先頭 (= `selected = 0`) に来るので、選択操作は不要。
+    """
+    tui = tmux_tui(
+        sakurasato_socket_path,
+        sakurasato_token_file,
+        "--no-images",
+        label=label,
+    )
+    tui.wait_until_text(r"@me", 30)
+    tui.send_keys("r")
+    # marker は `hello PR2c react-uni-xxxx` のような形なので、後半 hex を
+    # 抜き出して厳格に当てる ── 同 stack 内の他テストが残した marker と
+    # 取り違えないため。
+    tui.wait_until_text(re.escape(marker), 60)
+    return tui
+
+
+def _bob_posts_and_waits_for_sks(
+    sakurasato: SakurasatoClient,
+    nekonoverse: NekonoverseClient,
+    marker: str,
+) -> dict:
+    """bob が note 投稿 → sks home_timeline に federate されるまで待つ。
+
+    返り値: ``{"sks_note_id": int, "nkv_status_id": str, "ap_id": str,
+    "marker": str}`` ── sks 側の local note id (= `note.id`) は TUI 経由の
+    reaction 送出側からは不要だが、デバッグ時に grep しやすいので一緒に拾う。
+    """
+    posted = nekonoverse.create_status(marker, visibility="public")
+    note_uri = posted["uri"]
+    nkv_status_id = posted["id"]
+    assert note_uri, f"create_status did not return uri: {posted}"
+
+    def find_note():
+        try:
+            timeline = sakurasato.home_timeline(limit=80)
+        except Exception:  # noqa: BLE001
+            return None
+        for note in timeline:
+            if note.get("ap_id") == note_uri or note.get("uri") == note_uri:
+                return note
+        return None
+
+    sks_note = poll_until(
+        find_note,
+        timeout=120,
+        interval=3,
+        desc=f"bob note {note_uri} federated into sks home timeline",
+    )
+    return {
+        "sks_note_id": sks_note.get("id"),
+        "nkv_status_id": nkv_status_id,
+        "ap_id": note_uri,
+        "marker": marker,
+    }
+
+
+def _nkv_status_has_reaction(
+    nekonoverse: NekonoverseClient,
+    status_id: str,
+    *,
+    needle: str,
+) -> bool:
+    """nkv `get_status` の reactions / emoji_reactions に `needle` 由来の
+    1 件以上が見えるかを判定する。
+
+    Mastodon 互換層は ``reactions`` (ReactionSummary[]) / ``emoji_reactions``
+    (EmojiReaction[]) の 2 つで集計を返す。Unicode の場合 ``name`` が
+    そのまま codepoint、custom の場合 ``:shortcode:`` 形式 (host suffix 込みの
+    こともある)。どちらでも 1 件以上あれば成功にする。
+    """
+    try:
+        status = nekonoverse.get_status(status_id)
+    except Exception:  # noqa: BLE001
+        return False
+    for r in status.get("reactions") or []:
+        name = r.get("name") or r.get("content") or ""
+        if needle in name and r.get("count", 0) >= 1:
+            return True
+    for r in status.get("emoji_reactions") or []:
+        name = r.get("name") or r.get("content") or ""
+        if needle in name and r.get("count", 0) >= 1:
+            return True
+    return False
+
+
+def _send_reaction_via_emoji_modal(tui, query: str) -> None:
+    """TUI `e` で emoji 検索モーダルを開き、`query` を打って Enter で送出する。
+
+    モーダルタイトルは ``  emoji search · react (<N>)  `` 形式なので、
+    `emoji search` で待つ。candidate list は ``▶ <codepoint> :<shortcode>:``
+    形式なので、Enter 後の status バー (= ``reacted with ...``) を確認する。
+    """
+    # Open the emoji search modal (= Issue #118 が Timeline `e` を
+    # `OpenEmojiSearch` に統合した経路)。
+    tui.send_keys("e")
+    tui.wait_until_text(r"emoji search", 10)
+    # query を 1 文字ずつ送る ── tmux send-keys は引数を逐次 literal で
+    # 送ってくれるので、まとめて 1 引数で渡しても可。`+` を含むので shell
+    # interpretation の罠を避けるため 1 文字 1 引数で送る。
+    for ch in query:
+        tui.send_keys(ch)
+    tui.send_keys("Enter")
+    # `send_reaction` の成功時 status: `reacted with <token> (<N> queued)`。
+    # 失敗時 status: `reaction failed: ...`。前者で固定。
+    tui.wait_until_text(r"reacted with", 15)
+
+
+def _quit_tui(tui) -> None:
+    """TUI を `:quit` で綺麗に閉じる。teardown でも kill されるので best-effort。"""
+    try:
+        tui.send_keys(":", "quit", "Enter")
+        tui.wait_until_text(r"\$", 5)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@pytest.mark.timeout(300)
+def test_unicode_reaction_propagates_to_bob_status(
+    tmux_tui,
+    sakurasato_socket_path: str,
+    sakurasato_token_file: str,
+    bob_followed_by_sks,
+    sakurasato: SakurasatoClient,
+    nekonoverse: NekonoverseClient,
+) -> None:
+    """sks TUI で bob の remote note に Unicode `+1` → nkv 側 reaction 反映。
+
+    server 側の `is_local` ガード撤去 (PR #127) を、TUI `e` 経路 + 実 federation
+    込みで end-to-end に検証する。
+    """
+    _ = bob_followed_by_sks
+    marker = f"react-uni-{uuid.uuid4().hex[:8]}"
+    fed = _bob_posts_and_waits_for_sks(sakurasato, nekonoverse, marker)
+
+    tui = _open_tui_and_wait_for_note(
+        tmux_tui,
+        sakurasato_socket_path,
+        sakurasato_token_file,
+        marker,
+        label="react_unicode",
+    )
+    try:
+        _send_reaction_via_emoji_modal(tui, UNICODE_QUERY)
+
+        poll_until(
+            lambda: _nkv_status_has_reaction(
+                nekonoverse, fed["nkv_status_id"], needle=UNICODE_CODEPOINT
+            ),
+            timeout=120,
+            interval=3,
+            desc=f"nkv status {fed['nkv_status_id']} got Unicode reaction {UNICODE_CODEPOINT}",
+        )
+    finally:
+        _quit_tui(tui)
+
+
+@pytest.mark.timeout(300)
+def test_custom_emoji_reaction_propagates_to_bob_status(
+    tmux_tui,
+    sakurasato_socket_path: str,
+    sakurasato_token_file: str,
+    bob_followed_by_sks,
+    sakurasato: SakurasatoClient,
+    nekonoverse: NekonoverseClient,
+) -> None:
+    """sks TUI で bob の remote note に custom emoji `:sakurasato_test:` → nkv 反映。
+
+    `EmojiReact` + `tag.Emoji` + `_misskey_reaction` の 3 形式併載 (sks 側
+    `build_reaction_activity` の custom 分岐) を Nekonoverse の `handle_like` /
+    `handle_emoji_react` が拾えることを確認する。emoji は import 1-shot
+    service (`sakurasato-emoji-import`) で事前に DB に乗っている前提。
+    """
+    _ = bob_followed_by_sks
+    marker = f"react-custom-{uuid.uuid4().hex[:8]}"
+    fed = _bob_posts_and_waits_for_sks(sakurasato, nekonoverse, marker)
+
+    tui = _open_tui_and_wait_for_note(
+        tmux_tui,
+        sakurasato_socket_path,
+        sakurasato_token_file,
+        marker,
+        label="react_custom",
+    )
+    try:
+        _send_reaction_via_emoji_modal(tui, CUSTOM_QUERY)
+
+        poll_until(
+            lambda: _nkv_status_has_reaction(
+                nekonoverse, fed["nkv_status_id"], needle=CUSTOM_SHORTCODE
+            ),
+            timeout=120,
+            interval=3,
+            desc=(
+                f"nkv status {fed['nkv_status_id']} got custom reaction "
+                f":{CUSTOM_SHORTCODE}:"
+            ),
+        )
+    finally:
+        _quit_tui(tui)
