@@ -13,6 +13,11 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use sakurasato_core::model::Visibility;
+use sakurasato_core::repo;
+use sakurasato_core::repo::actor::NewActor;
+use sakurasato_core::repo::media::NewMedia;
+use sakurasato_core::repo::note::NewNote;
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -95,4 +100,230 @@ async fn media_rejects_double_slash(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── IDOR fix: authorization layer のテスト ───────────────────────────
+//
+// 本テスト群は S3 が居ない環境を前提に、authorization が通過すると S3 接続
+// 失敗で **500** に倒れ、authorization が拒否すると **404** に倒れる差で
+// 「authorization 層が効いている」ことを確認する。S3 まで届かない (= 早期
+// reject) は 404、S3 まで届いた (= 許可) は 500 という対比。
+
+fn seed_local_actor(username: &str, host: &str) -> NewActor {
+    let ap_id = format!("https://{host}/users/{username}");
+    NewActor {
+        ap_id: ap_id.clone(),
+        preferred_username: username.into(),
+        host: host.into(),
+        display_name: None,
+        summary: None,
+        icon_url: None,
+        image_url: None,
+        inbox_url: format!("{ap_id}/inbox"),
+        shared_inbox_url: Some(format!("https://{host}/inbox")),
+        outbox_url: Some(format!("{ap_id}/outbox")),
+        followers_url: Some(format!("{ap_id}/followers")),
+        following_url: Some(format!("{ap_id}/following")),
+        public_key_id: format!("{ap_id}#main-key"),
+        public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----".into(),
+        private_key_pem: Some(
+            "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----".into(),
+        ),
+        ed25519_public_key_id: None,
+        ed25519_public_key_pem: None,
+        ed25519_private_key_pem: None,
+        also_known_as: vec![],
+        moved_to_ap_id: None,
+        is_local: true,
+        actor_type: "Person".into(),
+        manually_approves_followers: false,
+    }
+}
+
+fn new_media(storage_key: &str, kind: &str, owner_actor_id: i64) -> NewMedia {
+    NewMedia {
+        storage_key: storage_key.into(),
+        media_type: "image/webp".into(),
+        width: 256,
+        height: 256,
+        byte_size: 1024,
+        kind: kind.into(),
+        alt_text: None,
+        owner_actor_id,
+    }
+}
+
+fn new_note(actor_id: i64, ap_suffix: &str, visibility: Visibility) -> NewNote {
+    NewNote {
+        ap_id: format!("https://example.test/notes/{ap_suffix}"),
+        actor_id,
+        content: "test".into(),
+        language: None,
+        in_reply_to_ap_id: None,
+        in_reply_to_note_id: None,
+        summary: None,
+        visibility,
+        sensitive: false,
+        to_recipients: vec![],
+        cc_recipients: vec![],
+        attachments: serde_json::json!([]),
+        tags: serde_json::json!([]),
+        is_local: true,
+        url: None,
+        published_at: chrono::Utc::now(),
+    }
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn media_unknown_key_returns_404(pool: PgPool) {
+    // media table に行が無い key は authorization で拒否 → 404。
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/media/nonexistent.webp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn media_orphan_attachment_returns_404(pool: PgPool) {
+    // kind=attachment + note_id NULL は孤児 → 404。
+    let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    repo::media::insert(&pool, new_media("orphan.webp", "attachment", actor.id))
+        .await
+        .unwrap();
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/media/orphan.webp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn media_attachment_on_followers_note_returns_404(pool: PgPool) {
+    // followers-only note に紐付いた attachment は永遠に漏らさない。
+    let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let note = repo::note::insert(&pool, new_note(actor.id, "1", Visibility::Followers))
+        .await
+        .unwrap();
+    let media = repo::media::insert(&pool, new_media("priv.webp", "attachment", actor.id))
+        .await
+        .unwrap();
+    repo::media::attach_to_note(&pool, &[media.id], actor.id, note.id)
+        .await
+        .unwrap();
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/media/priv.webp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn media_attachment_on_direct_note_returns_404(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let note = repo::note::insert(&pool, new_note(actor.id, "2", Visibility::Direct))
+        .await
+        .unwrap();
+    let media = repo::media::insert(&pool, new_media("dm.webp", "attachment", actor.id))
+        .await
+        .unwrap();
+    repo::media::attach_to_note(&pool, &[media.id], actor.id, note.id)
+        .await
+        .unwrap();
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(Request::get("/media/dm.webp").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn media_attachment_on_public_note_reaches_s3(pool: PgPool) {
+    // public note 紐付け attachment は authorization 通過 → S3 fetch で 500。
+    let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let note = repo::note::insert(&pool, new_note(actor.id, "3", Visibility::Public))
+        .await
+        .unwrap();
+    let media = repo::media::insert(&pool, new_media("pub.webp", "attachment", actor.id))
+        .await
+        .unwrap();
+    repo::media::attach_to_note(&pool, &[media.id], actor.id, note.id)
+        .await
+        .unwrap();
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(Request::get("/media/pub.webp").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn media_avatar_reaches_s3(pool: PgPool) {
+    // kind=avatar は actor の icon として常に public → 通過、S3 で 500。
+    let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    repo::media::insert(&pool, new_media("av.webp", "avatar", actor.id))
+        .await
+        .unwrap();
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(Request::get("/media/av.webp").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn media_emoji_prefix_reaches_s3(pool: PgPool) {
+    // emoji/local/<shortcode>.webp は media table を経由せず prefix で許可。
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/media/emoji/local/foo.webp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
