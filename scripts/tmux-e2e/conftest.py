@@ -177,7 +177,7 @@ def tmux_session() -> Iterator:
 
 
 @pytest.fixture
-def tmux_tui(tmux_session) -> Iterator:
+def tmux_tui() -> Iterator:
     """sakurasato-tui を tmux 内で起動するファクトリ fixture。
 
     PR2 以降の実シナリオで使う想定。PR1 (= 本 PR) では実 TUI 連携が
