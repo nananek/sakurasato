@@ -31,7 +31,13 @@ COPY .sqlx ./.sqlx
 COPY vendor ./vendor
 
 # `-p sakurasato-tui` だけ build。server / media-proxy は別 image。
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+#
+# `id=sakurasato-tui-registry` を `docker/tui.Dockerfile` と揃える ── 両者は
+# 同 compose stack で並列ビルドされない (= tui.Dockerfile は本番 compose 用 /
+# 本 Dockerfile は federation test pytest 用)。federation stack 側では本
+# Dockerfile.tmux が server.Dockerfile + media-proxy.Dockerfile と並列に走るが、
+# それぞれが別 `id=` を持つので registry mount は衝突しない。
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=sakurasato-tui-registry \
     --mount=type=cache,target=/build/target,id=sakurasato-tui-target \
     SQLX_OFFLINE=true cargo build --release \
         --target x86_64-unknown-linux-musl \
