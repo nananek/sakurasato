@@ -35,12 +35,17 @@ struct GeneratedKeys {
 
 pub async fn run(config: Config, args: InitArgs) -> anyhow::Result<()> {
     let state = AppState::from_config(config).await?;
-
     MIGRATOR
         .run(state.pool())
         .await
         .context("apply pending DB migrations")?;
+    run_with_state(&state, args).await
+}
 
+/// `run` の本体。テストから `AppState::from_pool` で組み立てた state を
+/// 渡せるように分離してある (Issue #73 検証用)。
+#[allow(clippy::too_many_lines)]
+pub async fn run_with_state(state: &AppState, args: InitArgs) -> anyhow::Result<()> {
     let username = args
         .username
         .clone()
@@ -54,6 +59,21 @@ pub async fn run(config: Config, args: InitArgs) -> anyhow::Result<()> {
     let existing = repo::actor::get_by_ap_id(state.pool(), &ap_id)
         .await
         .context("check for existing actor")?;
+    // **Issue #73**: `[server].user` を変えて `init --force` を叩いたとき、
+    // 同 ap_id (新 user) では当たらず `existing = None` になる。しかし古い
+    // 別 user の local actor 行が DB に残っているので、それを引いて削除候補
+    // に含める ── 「ローカルは常に 1 actor」不変条件を維持する。
+    //
+    // `--force` 無しでこれが見つかった場合は、ユーザが意図せず user を
+    // 変更してしまった可能性が高いので明示的に失敗させる (= 黙って 2 actor
+    // 並存にしない)。
+    let stale_local: Vec<_> = if existing.is_some() {
+        Vec::new()
+    } else {
+        repo::actor::list_local(state.pool())
+            .await
+            .context("list local actors")?
+    };
     if existing.is_some() && !args.force {
         info!(
             ap_id = %ap_id,
@@ -61,12 +81,40 @@ pub async fn run(config: Config, args: InitArgs) -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    if !stale_local.is_empty() && !args.force {
+        let old_aps: Vec<_> = stale_local.iter().map(|a| a.ap_id.clone()).collect();
+        bail!(
+            "config server.user has changed; existing local actor(s) {old_aps:?} would be \
+             stranded if a new actor for {ap_id} is created. Pass --force to delete the old \
+             actor(s) and re-key (destructive: federation with the old user will break).",
+        );
+    }
     if existing.is_some() {
         warn!(
             ap_id = %ap_id,
             "--force requested: re-keying the local actor will break federation with anyone who cached the old public key",
         );
     }
+    if !stale_local.is_empty() {
+        let old_aps: Vec<_> = stale_local.iter().map(|a| a.ap_id.clone()).collect();
+        warn!(
+            old_aps = ?old_aps,
+            new_ap_id = %ap_id,
+            "--force requested with changed server.user: deleting stale local actor(s)",
+        );
+    }
+    // 鍵アカ lock state を `--force` 再鍵化で引き継ぐ判定 (= 既存 actor、または
+    // user 変更で消える stale actor のどちらかが lock 中なら新 actor も lock)。
+    let inherited_lock = existing
+        .as_ref()
+        .map(|e| e.manually_approves_followers)
+        .or_else(|| {
+            stale_local
+                .iter()
+                .find(|a| a.manually_approves_followers)
+                .map(|_| true)
+        })
+        .unwrap_or(false);
 
     info!(
         rsa_bits = RSA_BITS,
@@ -102,25 +150,34 @@ pub async fn run(config: Config, args: InitArgs) -> anyhow::Result<()> {
         moved_to_ap_id: None,
         is_local: true,
         actor_type: "Person".into(),
-        // 鍵アカフラグ (Issue #66 / M12):
+        // 鍵アカフラグ (Issue #66 / M12 + #73):
         //   - 新規 init: `args.locked` をそのまま反映 (default = false)。
         //   - `--force` 再鍵化: 既存 lock 状態を **保つ**。`--locked` 単独で
         //     unlock → lock の片方向のみ可。lock → unlock したいときは
         //     再鍵化後に `actor unlock` を叩く運用 (= 鍵更新と state 変更を
         //     別操作に分離して、誤って lock を解除する事故を防ぐ)。
-        manually_approves_followers: args.locked
-            || existing
-                .as_ref()
-                .is_some_and(|e| e.manually_approves_followers),
+        //   - `server.user` 変更時 (#73): 旧 actor が lock 中だったら新
+        //     actor にも引き継ぐ (= ユーザの「鍵アカ運用」意図を user 名
+        //     変更の事故で失わせない)。`inherited_lock` で判定済。
+        manually_approves_followers: args.locked || inherited_lock,
     };
 
     // 既存削除と新規挿入は同一トランザクションで実行する。途中でクラッシュ
     // しても actor を消したまま終わる事故を防ぐ。
+    //
+    // `existing` (同 ap_id の actor 行) と `stale_local` (異なる ap_id の
+    // 古い local actor 行) の両方を消し切ってから insert することで、
+    // `is_local = TRUE` の行が常に 1 件以下になる不変条件を保つ。
     let mut tx = state.pool().begin().await.context("begin transaction")?;
     if let Some(prev) = existing.as_ref() {
         repo::actor::delete_by_id(&mut *tx, prev.id)
             .await
             .context("delete previous local actor")?;
+    }
+    for stale in &stale_local {
+        repo::actor::delete_by_id(&mut *tx, stale.id)
+            .await
+            .with_context(|| format!("delete stale local actor {}", stale.ap_id))?;
     }
     let inserted = repo::actor::insert(&mut *tx, new)
         .await

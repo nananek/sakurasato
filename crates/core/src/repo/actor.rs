@@ -170,6 +170,32 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<ActorRow>>
     .await
 }
 
+/// すべての local actor (= `is_local = true`) を列挙する。
+///
+/// お一人様 server では通常 1 行だが、`init --force` で `[server].user` が
+/// 変更された場合に **旧 actor を取りこぼさず削除** するため使う
+/// (Issue #73)。
+pub async fn list_local(pool: &PgPool) -> sqlx::Result<Vec<ActorRow>> {
+    sqlx::query_as!(
+        ActorRow,
+        r#"
+        SELECT
+            id, ap_id, preferred_username, host, display_name, summary,
+            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
+            followers_url, following_url, public_key_id, public_key_pem,
+            private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
+            also_known_as as "also_known_as: Json<Vec<String>>",
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
+        FROM actor WHERE is_local = TRUE
+        ORDER BY id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Look an actor up by its `ap_id` (canonical `ActivityPub` URI).
 pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<ActorRow>> {
     sqlx::query_as!(
