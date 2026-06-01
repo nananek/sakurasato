@@ -244,20 +244,35 @@ services:
     profiles: [pytest]
     restart: "no"
 
-  # Nekonoverse 側に bob アカウントを headless 登録する (= WebFinger で引ける
-  # 状態にする)。PR2a スコープでは user-level token は取らない ── pytest 側は
-  # public な `/api/v1/accounts/lookup` + `/api/v1/accounts/{id}/followers` で
-  # Follow + Accept round-trip を検証する。alpine + curl + jq の最小構成。
+  # Nekonoverse 側に bob アカウントを headless 登録 + user-level OAuth token を
+  # **DB 直 seed** する (#58 / #120 PR2b)。token は共有 named volume
+  # `nekonoverse_tokens` に `bob.token` として書き出し、pytest 側で
+  # `NEKONOVERSE_TOKEN_FILE` 経由で読む (= Mastodon stack の Doorkeeper 直 seed
+  # と同じ pattern)。
+  #
+  # OAuth `authorization_code` dance を回避し DB 直 INSERT に倒した経緯は
+  # `seed-bob.sh` の冒頭コメント参照 (Nekonoverse は password grant が無く、
+  # authorize 経路は CSRF + 強制同意画面で curl 完走コストが高いため)。
   nekonoverse-bob-issuer:
     image: alpine:3.21
+    # postgresql-client を追加 (#120 PR2b で oauth_tokens 直 seed に使う)。
+    # 既存 curl / jq / ca-certificates と同じ apk 行に並べる。
     command: >
-      sh -c "apk add --no-cache curl jq ca-certificates >/dev/null &&
+      sh -c "apk add --no-cache curl jq ca-certificates postgresql-client >/dev/null &&
              cp /certs/ca.crt /usr/local/share/ca-certificates/test-ca.crt &&
              update-ca-certificates >/dev/null &&
              /seed-bob.sh"
     environment:
       NKV_BASE: https://nekonoverse
       SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      # DB 直 seed 用接続情報 (postgres-neko service と整合)。
+      NKV_DB_HOST: postgres-neko
+      NKV_DB_PORT: "5432"
+      NKV_DB_USER: nekonoverse
+      NKV_DB_NAME: nekonoverse
+      NKV_DB_PASSWORD: testpass
+      # 共有 volume `nekonoverse_tokens` の mount 先と一致させる。
+      NKV_TOKEN_OUT: /nkv-tokens/bob.token
     depends_on:
       nekonoverse-app:
         condition: service_healthy
@@ -265,9 +280,13 @@ services:
         condition: service_started
       certs:
         condition: service_completed_successfully
+      postgres-neko:
+        condition: service_healthy
     volumes:
       - certs:/certs:ro
       - ./federation-test/nekonoverse-federation/seed-bob.sh:/seed-bob.sh:ro
+      # 書き出した token を pytest と共有する (本サービスは RW、pytest は RO)。
+      - nekonoverse_tokens:/nkv-tokens
     networks:
       - nekonoverse-fed
     profiles: [pytest]
@@ -292,6 +311,9 @@ services:
       NEKONOVERSE_BASE_URL: https://nekonoverse
       NEKONOVERSE_DOMAIN: nekonoverse
       NEKONOVERSE_USERNAME: bob
+      # bob 用 OAuth Bearer (PR2b で DB 直 seed)。`nekonoverse-bob-issuer` が
+      # 書き出した raw token をここで読む。
+      NEKONOVERSE_TOKEN_FILE: /nkv-tokens/bob.token
       # Mastodon stack を立てていないので autouse wait を OFF にする。
       MASTODON_ENABLED: "0"
       NEKONOVERSE_ENABLED: "1"
@@ -317,6 +339,9 @@ services:
     volumes:
       - certs:/certs:ro
       - sakurasato_local_api:/home/nonroot:ro
+      # bob token は read-only でマウント (= pytest からは読むだけ、issue は
+      # `nekonoverse-bob-issuer` のみが行う)。
+      - nekonoverse_tokens:/nkv-tokens:ro
     networks:
       - nekonoverse-fed
     profiles: [pytest]
@@ -328,6 +353,9 @@ volumes:
   # sakurasato local API UDS + token を pytest と共有する。Mastodon stack と
   # 名前を揃えてあるので、CI から見たときに同じ意味合いで覗ける。
   sakurasato_local_api:
+  # bob 用 OAuth Bearer (raw token) を nekonoverse-bob-issuer → pytest で共有
+  # する named volume (#120 PR2b)。
+  nekonoverse_tokens:
 
 networks:
   nekonoverse-fed:

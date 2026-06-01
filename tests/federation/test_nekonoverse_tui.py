@@ -1,33 +1,40 @@
-"""Sakurasato TUI × Nekonoverse smoke (#58 / #120 PR2a).
+"""Sakurasato TUI × Nekonoverse 連合シナリオ (#58 / #120 PR2a + PR2b)。
 
-シナリオ 1: ``follow_post`` (= 本 PR で扱うのは Follow + Accept まで)
+PR2a (smoke 1 本):
 
-  1. sakurasato-tui を tmux pty で起動し、timeline が描画されるまで待つ。
-  2. ``:`` で command prompt を開き、``:follow bob@nekonoverse`` を入力。
-  3. 連合経由で Nekonoverse 側から ``Accept`` が戻ってくるのを、
-     **sakurasato 側の local API** (`SakurasatoClient`) で確認する
-     (= ``/api/v1/whoami`` / フォロー状態を覗ける public 経路は無いため、
-     UDS 側で詰めるのが現状の正解)。
-  4. Nekonoverse 側でも bob の followers リストに sakurasato:me が
-     現れるのを ``NekonoverseClient`` (httpx で Mastodon 互換 public API
-     ``/accounts/lookup`` + ``/accounts/{id}/followers`` を叩く) で確認。
+  1. ``test_follow_bob_round_trips_to_accept``
+     ── ``:`` で command prompt を開き ``:follow bob@nekonoverse`` → Accept
+     round-trip までを確認する (= TUI 経路で follow が確立する)。
 
-シナリオ外 (= PR2b 以降):
+PR2b (本 PR で追加):
 
-- nkv 側で bob が note 投稿 → sks TL に出現
-- カスタム / Unicode emoji リアクション (#118 回帰テスト)
+  2. ``test_bob_note_appears_in_sks_timeline``
+     ── bob が nkv 側で note 投稿 → 連合配送で sks home timeline に出現する
+     ことを確認 (= 取得側 = sks の inbox / TL の受領パス)。
+
+シナリオ外 (= PR2c 以降 / 他 PR で必要に応じて):
+
+- **sks → bob リアクション** (#118 Enter 回帰テスト) ── PR2b 着手時に
+  ``POST /api/v1/reactions`` が remote note に対して 404
+  ``"reactions to remote notes are not supported yet"`` を返す **server 側
+  ギャップ** が判明したため、本 PR では実装を見送る。TUI 側の Enter 経路
+  そのものは tmux 経由で fire することは検証済 (= status line に上記 404 が
+  出るところまで送れる)。サーバ側ギャップを別 issue で先に閉じてから
+  リアクション連合シナリオを追加する流れに倒した。
+- カスタム emoji reaction (`:shortcode:` 形式の `tag.Emoji` 込み連合)
 - Reply / Move / Actor Update
 
 実行前提:
 
 - ``compose/docker-compose.federation-nekonoverse.yml`` の ``pytest`` profile
-  が起動済み (= ``sakurasato_local_api`` 共有 volume が pytest コンテナに見える)。
+  が起動済み。``sakurasato_local_api`` (sks UDS + token) と
+  ``nekonoverse_tokens`` (bob 用 OAuth Bearer, PR2b で導入) が pytest コンテナに
+  見える状態。
 - TUI バイナリは Dockerfile.tmux で ``/usr/local/bin/sakurasato-tui`` に
   焼かれている。
-- ``SAKURASATO_TOKEN_FILE`` は ``sakurasato-token-issuer`` 1-shot コンテナが
-  書いた状態。Nekonoverse 側 token は **PR2a スコープ外** ── public な
-  ``/api/v1/accounts/lookup`` + ``/api/v1/accounts/{id}/followers`` だけで
-  Follow + Accept round-trip を verify する。
+- ``SAKURASATO_TOKEN_FILE`` は ``sakurasato-token-issuer`` 1-shot コンテナが、
+  ``NEKONOVERSE_TOKEN_FILE`` は ``nekonoverse-bob-issuer`` 1-shot コンテナが
+  書いた状態。
 
 flakiness 対策:
 
@@ -37,6 +44,8 @@ flakiness 対策:
   ``TMUX_E2E_POLL_INTERVAL`` (default 0.2s) で更新する。
 """
 from __future__ import annotations
+
+import uuid
 
 import pytest
 
@@ -53,6 +62,49 @@ from conftest import (
 BOB_LOCAL = "bob"
 BOB_ACCT = f"{BOB_LOCAL}@{NEKONOVERSE_DOMAIN}"
 SKS_ACCT = f"me@{SAKURASATO_DOMAIN}"
+
+
+# ── 共有 setup helpers (PR2b で追加) ──────────────────────────
+
+
+@pytest.fixture(scope="session")
+def bob_followed_by_sks(sakurasato: SakurasatoClient):
+    """sks が bob を follow した accepted 状態を保証する session-scoped fixture。
+
+    PR2b の `test_bob_note_appears_in_sks_timeline` は前提として「sks が bob を
+    follow 済」が必要 (= bob の public note が sks の inbox に届くため)。
+    `POST /api/v1/follow` は冪等 (PR #114) なので、PR2a の TUI 経由 follow
+    が既に成立していても安全に再叩きできる ── session scope に倒して 1 回
+    だけ叩くことで test 間の連合遅延蓄積を抑える。
+
+    TUI 経路 (= PR2a の `:follow` コマンド) ではなく local API 直叩き経路を
+    使う ── (a) TUI 起動を伴わないので fast、(b) PR2a test と test 順序が
+    入れ替わっても挙動が変わらない、(c) PR2a が `:follow` 経路の責任を持つ。
+    """
+    # 既に follow 済なら no-op (`already_accepted=True` で返ってくる)。
+    resp = sakurasato.follow(BOB_ACCT)
+    follow_id = resp["follow_id"]
+
+    # `already_accepted` が真なら poll 不要、即返す。新規 enqueue の場合は
+    # state が `pending` から `accepted` に遷移するのを待つ。
+    if resp.get("already_accepted"):
+        yield {"follow_id": follow_id, "fresh": False}
+        return
+
+    def follow_accepted() -> bool:
+        try:
+            for f in sakurasato.following(limit=80):
+                actor = f.get("actor") or {}
+                host = (actor.get("host") or "").lower()
+                name = (actor.get("preferred_username") or "").lower()
+                if name == BOB_LOCAL and host == NEKONOVERSE_DOMAIN.lower():
+                    return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    poll_until(follow_accepted, timeout=120, interval=2, desc="sks following bob (fixture setup)")
+    yield {"follow_id": follow_id, "fresh": True}
 
 
 def _send_follow_command(tui, acct: str) -> None:
@@ -148,3 +200,75 @@ def test_follow_bob_round_trips_to_accept(
         tui.wait_until_text(r"\$", 5)
     except Exception:  # noqa: BLE001
         pass
+
+
+# ── PR2b: bob 投稿 → sks home_timeline 受領 ───────────────────
+
+
+def _post_marker() -> str:
+    """テスト毎にユニークな本文 marker。
+
+    短い hex (= UUID first 8) を末尾に付けて、過去テスト残骸 / 他テストとの
+    取り違えを防ぐ。`hello PR2b post 1a2b3c4d` のような形。
+    """
+    return f"hello PR2b post {uuid.uuid4().hex[:8]}"
+
+
+@pytest.mark.timeout(300)
+def test_bob_note_appears_in_sks_timeline(
+    bob_followed_by_sks,
+    sakurasato: SakurasatoClient,
+    nekonoverse: NekonoverseClient,
+) -> None:
+    """bob が nkv で投稿 → sks home timeline に federate されることを確認 (PR2b)。
+
+    fixture `bob_followed_by_sks` で「sks → bob follow accepted」が成立済の状態。
+    bob は public note を 1 本投稿し、sks の `/api/v1/timeline/home` を polling
+    して同 note (URI 一致) が出現するまで待つ。
+
+    TUI 経路は本シナリオでは使わない ── 受領 (inbox dispatch + DB 反映) の
+    end-to-end を見たいだけなので、TUI 表示 layer を挟まずに最短経路で読む。
+    TUI の note 描画自体は PR2a の `test_follow_bob_round_trips_to_accept` で
+    `@me` ステータスバーや command prompt 経路で部分的にカバーされる。
+    """
+    _ = bob_followed_by_sks  # fixture 使用が分かるよう明示参照
+    marker = _post_marker()
+
+    # 1. bob 側で投稿。`uri` (AP id) は sks 側で `ap_id` 列に保存されるので
+    #    一致 key にできる。
+    posted = nekonoverse.create_status(marker, visibility="public")
+    note_uri = posted["uri"]
+    assert note_uri, f"create_status did not return uri: {posted}"
+
+    # 2. sks home_timeline が note を取り込むまで polling。連合配送
+    #    (nkv POST /inbox の Create + sks 側 inbox handler) + sks home TL
+    #    取り込みの全フェーズで 60-90s 程度見ておく。
+    def note_in_home() -> bool:
+        try:
+            timeline = sakurasato.home_timeline(limit=80)
+        except Exception:  # noqa: BLE001
+            return False
+        for note in timeline:
+            if note.get("ap_id") == note_uri:
+                return True
+            # `ap_id` が field 名違いで来た時のフォールバック
+            if note.get("uri") == note_uri:
+                return True
+        return False
+
+    poll_until(
+        note_in_home,
+        timeout=120,
+        interval=3,
+        desc=f"bob note {note_uri} in sks home timeline",
+    )
+
+
+# NOTE (PR2b 設計時): sks TUI から bob (= remote actor) の note に対する
+# リアクション送信は `POST /api/v1/reactions` が
+# `404 "reactions to remote notes are not supported yet"`
+# (`crates/server/src/local_api/reactions.rs:77`) で弾かれる。TUI 側の
+# `e` → `Enter` 経路 (= #118 で塞いだ binding) は本 PR の手動 tmux 駆動で
+# fire することを確認済だが、server 側ギャップを別 PR で先に閉じる方が
+# きれいなので、本 PR ではリアクション連合シナリオを実装しない。サーバ側が
+# remote note への reaction を出せるようになった時点で、テストを生やす。

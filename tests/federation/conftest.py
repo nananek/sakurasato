@@ -50,17 +50,22 @@ MASTODON_TOKEN_FILE = os.environ.get(
     "MASTODON_TOKEN_FILE", "/mastodon-tokens/bob.token"
 )
 
-# ── Nekonoverse env (#58 PR2a) ───────────────────────────────
-# Nekonoverse は Mastodon 互換 API (`POST /api/v1/accounts` で headless 登録)
-# を提供する。PR2a smoke では bob の user-level token は取らず、
-# Mastodon 互換の **public** エンドポイント (`/api/v1/accounts/lookup`
-# と `/api/v1/accounts/{id}/followers`) だけで sks → nkv Follow round-trip
-# を検証する ── user-level token を headless で取るには OAuth code dance か
-# DB 直 seed が必要で、PR2a の smoke スコープを越える。PR2b で post / reaction
-# が必要になった時点で token 経路を追加する。
+# ── Nekonoverse env (#58 PR2a → PR2b) ────────────────────────
+# Nekonoverse は Mastodon 互換 API を提供する。PR2a smoke では bob の
+# user-level token は取らず public エンドポイントだけで Follow round-trip を
+# 検証した。**PR2b で bob 用 OAuth Bearer の DB 直 seed 経路を追加** ──
+# `nekonoverse-bob-issuer` (compose) が `oauth_tokens` テーブルに INSERT した
+# raw token を共有 named volume `nekonoverse_tokens` 経由でファイル受領する。
+# fixture は `NEKONOVERSE_TOKEN_FILE` env のパスを `_read_token_file` で開く。
 NEKONOVERSE_BASE_URL = os.environ.get("NEKONOVERSE_BASE_URL", "https://nekonoverse")
 NEKONOVERSE_DOMAIN = os.environ.get("NEKONOVERSE_DOMAIN", "nekonoverse")
 NEKONOVERSE_USERNAME = os.environ.get("NEKONOVERSE_USERNAME", "bob")
+# PR2b: docstring 記載の実体パスをデフォルトに (compose env で常に上書き)。
+# 直接 pytest 起動 / debug 時に env 未設定でも `FileNotFoundError` で
+# 即落ちる方が、Bearer 無し silent 401 のデバッグより速いので default に倒す。
+NEKONOVERSE_TOKEN_FILE = os.environ.get(
+    "NEKONOVERSE_TOKEN_FILE", "/nkv-tokens/bob.token"
+)
 
 # どの counterpart instance を待つかを env でゲートする。compose 側で
 # 該当しないターゲットを `"0"` に倒すことで、Mastodon stack で立ってない
@@ -303,6 +308,17 @@ class SakurasatoClient:
         data = resp.json()
         return data.get("entries", data) if isinstance(data, dict) else data
 
+    def follow(self, acct: str) -> dict:
+        """`POST /api/v1/follow` ── M13 PR2 由来。**冪等** (PR #114 で重複防止)。
+
+        body は `{"acct": "user@host"}`。レスポンスに `already_accepted` /
+        `already_pending` フラグが乗るので、fixture から「既に follow 済」を
+        判定して poll をスキップできる。
+        """
+        resp = self._local.post("/api/v1/follow", json={"acct": acct})
+        resp.raise_for_status()
+        return resp.json()
+
     # ── public AP / WebFinger ────────────────────────────────
     def webfinger(self, acct: str) -> dict:
         resp = self._public.get(
@@ -535,24 +551,25 @@ def mastodon(mastodon_token: str):
         client.close()
 
 
-# ── Nekonoverse: Mastodon 互換 API クライアント (#58 PR2a) ───────
+# ── Nekonoverse: Mastodon 互換 API クライアント (#58 PR2a → PR2b) ───
 #
 # Nekonoverse は Mastodon-style `/api/v1/*` を喋るので shape は近いが、
 # 接続先 / fixture 名 / 認証経路が違うので別クラスにする
 # (MastodonClient を継承しない ── 将来 Nekonoverse 固有 endpoint が増えた
 # ときに同 class で破綻させないため)。
 #
-# PR2a スコープでは **bearer token を持たない** ── bob の user-level token を
-# headless で得るには OAuth code dance か DB 直 seed が必要で、smoke 1 本の
-# ためにそこまで踏み込むのはオーバー。Mastodon 互換の `/api/v1/accounts/lookup`
-# と `/api/v1/accounts/{id}/followers` はどちらも **public** で叩けるので、
-# Follow + Accept round-trip の verify はそれだけで完結する。
+# **PR2b**: bob の user-level OAuth Bearer を `oauth_tokens` 直 seed で受領
+# できるようになったので、auth 必須エンドポイント (status post / reaction /
+# verify_credentials) を生やす。public-only PR2a 経路 (`lookup_account` /
+# `followers`) は破壊しないよう同居させる。`token` は optional ── public-only
+# テストは token 渡さずインスタンス化可能。
 class NekonoverseClient:
     """Nekonoverse REST API + AP エンドポイントを叩く薄いラッパ。
 
-    現状 (PR2a) は Follow / Accept smoke で使う最低限の **public** メソッド
-    だけを生やす。後続 PR2b で post / reaction / reply が必要になったら、
-    user-level token 取得経路と auth-required endpoint を追加する。
+    `token` を渡すと auth 必須エンドポイント (`create_status` /
+    `verify_credentials` / `get_status` 等) が叩けるようになる。token 無しでも
+    public エンドポイント (`lookup_account` / `followers` / `webfinger`) は
+    引き続き使える ── PR2a の `test_nekonoverse_tui` がそのまま壊れない。
     """
 
     def __init__(
@@ -561,14 +578,29 @@ class NekonoverseClient:
         base_url: str,
         domain: str,
         username: str,
+        token: str | None = None,
     ) -> None:
         self.base_url = base_url
         self.domain = domain
         self.username = username
+        self._token = token
         self.http = httpx.Client(base_url=base_url, timeout=20, verify=_SSL_VERIFY)
 
     def close(self) -> None:
         self.http.close()
+
+    # ── auth helper ──────────────────────────────────────────
+    @property
+    def token(self) -> str:
+        if self._token is None:
+            raise RuntimeError(
+                "NekonoverseClient was constructed without a token "
+                "but an auth-required endpoint was called"
+            )
+        return self._token
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"}
 
     # ── public Mastodon-compat ───────────────────────────────
     def lookup_account(self, acct: str) -> dict:
@@ -590,6 +622,52 @@ class NekonoverseClient:
         resp.raise_for_status()
         return resp.json()
 
+    # ── auth required (PR2b) ─────────────────────────────────
+    def verify_credentials(self) -> dict:
+        """`GET /api/v1/accounts/verify_credentials` ── token が valid か疎通確認。"""
+        resp = self.http.get(
+            "/api/v1/accounts/verify_credentials", headers=self._auth_headers()
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def create_status(
+        self,
+        content: str,
+        *,
+        visibility: str = "public",
+        spoiler_text: str | None = None,
+        in_reply_to_id: str | None = None,
+    ) -> dict:
+        """`POST /api/v1/statuses` ── bob として note 投稿。
+
+        sks がフォロー済みなら bob の public note は sks 側に federate される。
+        `id` (UUID) / `uri` (AP id) を取り出して、sks の home timeline で同じ
+        note が見えるかの assertion 鍵にする。
+        """
+        body: dict[str, Any] = {"status": content, "visibility": visibility}
+        if spoiler_text:
+            body["spoiler_text"] = spoiler_text
+        if in_reply_to_id:
+            body["in_reply_to_id"] = in_reply_to_id
+        resp = self.http.post(
+            "/api/v1/statuses", json=body, headers=self._auth_headers()
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_status(self, status_id: str) -> dict:
+        """`GET /api/v1/statuses/{id}` ── bob の view から見た note JSON。
+
+        reaction が sks → nkv に届いたかを `reactions` (Misskey 互換) /
+        `favourites_count` (Mastodon 互換) どちらかで読む経路。
+        """
+        resp = self.http.get(
+            f"/api/v1/statuses/{status_id}", headers=self._auth_headers()
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # ── AP / WebFinger ───────────────────────────────────────
     def webfinger(self, acct: str) -> dict:
         resp = self.http.get(
@@ -600,11 +678,17 @@ class NekonoverseClient:
 
 
 @pytest.fixture(scope="session")
-def nekonoverse():
+def nekonoverse_token() -> str:
+    return _read_token_file(NEKONOVERSE_TOKEN_FILE, label="nekonoverse")
+
+
+@pytest.fixture(scope="session")
+def nekonoverse(nekonoverse_token: str):
     client = NekonoverseClient(
         base_url=NEKONOVERSE_BASE_URL,
         domain=NEKONOVERSE_DOMAIN,
         username=NEKONOVERSE_USERNAME,
+        token=nekonoverse_token,
     )
     try:
         yield client
