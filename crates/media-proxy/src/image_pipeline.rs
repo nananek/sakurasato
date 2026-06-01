@@ -194,7 +194,13 @@ fn process_still(
     })
 }
 
-/// animated 経路 (#129)。frame ごとに resize して `webp::AnimEncoder` に積む。
+/// animated 経路 (#129)。decoder iterator から 1 frame ずつ取り出して resize
+/// → `ResizedFrame` に蓄積する **単一パス** 実装。元バッファを Vec に溜め込んで
+/// から resize するとピーク時に「`DecodedFrame` `Vec` + `ResizedFrame` `Vec`」の二重
+/// 保持になるため、frame ごとに decode → resize → push → 元 buffer drop の
+/// 順で進める。また `MAX_ANIMATED_FRAMES` 超過は `next()` を **呼ぶ前** に
+/// 判定して、N+1 番目の decode が走らないようにする (=「意図 = `N` 件まで
+/// 保管 + `N+1` 件目以降は decode しない」を実装上も担保)。
 fn process_animated(
     input: &[u8],
     format: ImageFormat,
@@ -202,9 +208,10 @@ fn process_animated(
     max_pixels: u64,
 ) -> Result<ProcessedImage, ApiError> {
     let limits = make_limits(max_pixels);
-    let frames = decode_animation(input, format, limits)?;
+    let (resized_frames, canvas_w, canvas_h) =
+        decode_and_resize_animation(input, format, limits, variant)?;
 
-    if frames.is_empty() {
+    if resized_frames.is_empty() {
         // animated と検出したが実は 0 frame だった ── 壊れた input。
         return Err(ApiError::unsupported_media(
             "decode_failed",
@@ -214,34 +221,14 @@ fn process_animated(
 
     // 1 frame しか取れなかった場合は still と同等。animated WebP の
     // VP8X オーバーヘッドが無駄なので still encoder で出す。
-    if frames.len() == 1 {
-        let only = &frames[0];
-        let resized = resize_frame_buffer(&only.buffer, variant);
-        let (out_w, out_h) = (resized.width(), resized.height());
-        let bytes = encode_still_webp(&resized)?;
+    if resized_frames.len() == 1 {
+        let only = &resized_frames[0];
+        let bytes = encode_still_webp(&only.rgba)?;
         return Ok(ProcessedImage {
             bytes,
             content_type: "image/webp",
-            width: out_w,
-            height: out_h,
-        });
-    }
-
-    // 各 frame を canvas ボックスに resize。canvas 寸法は最初の frame の
-    // resized サイズで固定 ── animated WebP は全 frame が canvas 内に
-    // 同じ寸法で並ぶ前提なので、frame ごとに resize 結果が違うサイズに
-    // なるのを避けるため明示寸法でリサイズする。
-    let (canvas_w, canvas_h) = {
-        let first_resized = resize_frame_buffer(&frames[0].buffer, variant);
-        (first_resized.width(), first_resized.height())
-    };
-
-    let mut resized_frames: Vec<ResizedFrame> = Vec::with_capacity(frames.len());
-    for frame in &frames {
-        let resized = resize_frame_exact(&frame.buffer, canvas_w, canvas_h);
-        resized_frames.push(ResizedFrame {
-            rgba: resized,
-            delay_ms: frame.delay_ms,
+            width: canvas_w,
+            height: canvas_h,
         });
     }
 
@@ -271,30 +258,54 @@ fn encode_still_webp(rgba: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> Result<Bytes, Api
     Ok(Bytes::from(out))
 }
 
-/// 中間表現: 各 frame の RGBA buffer + 表示時間 (ms)。
-struct DecodedFrame {
-    buffer: ImageBuffer<Rgba<u8>, Vec<u8>>,
-    /// 当該 frame の表示時間 (ms)。GIF / APNG / WebP の delay を統一形式で持つ。
-    delay_ms: u32,
-}
-
 /// resize 後の frame。canvas 寸法に揃った RGBA + 表示時間 (ms)。
 struct ResizedFrame {
     rgba: ImageBuffer<Rgba<u8>, Vec<u8>>,
     delay_ms: u32,
 }
 
-/// format に応じて全 frame を decode。フレーム数上限と画素上限は
-/// この関数内で強制する。
-fn decode_animation(
+/// format に応じて decoder を開き、frame を単一パスで resize して
+/// `Vec<ResizedFrame>` + canvas 寸法 (= 最初の frame の resized サイズ) を返す。
+/// 各 decoder は `image::Frames<'_>` を yield するが、lifetime が decoder に
+/// 紐付くため、format ごとに decoder のライフタイムを `process_frames` の
+/// 呼び出し内に閉じる構造にしてある。
+fn decode_and_resize_animation(
     input: &[u8],
     format: ImageFormat,
     limits: image::Limits,
-) -> Result<Vec<DecodedFrame>, ApiError> {
+    variant: Variant,
+) -> Result<(Vec<ResizedFrame>, u32, u32), ApiError> {
     match format {
-        ImageFormat::Gif => decode_gif_frames(input, limits),
-        ImageFormat::Png => decode_apng_frames(input, limits),
-        ImageFormat::WebP => decode_animated_webp_frames(input, limits),
+        ImageFormat::Gif => {
+            let mut decoder = GifDecoder::new(Cursor::new(input)).map_err(|e| {
+                ApiError::unsupported_media("decode_failed", format!("gif open: {e}"))
+            })?;
+            decoder.set_limits(limits).map_err(|e| {
+                ApiError::unsupported_media("decode_failed", format!("gif limits: {e}"))
+            })?;
+            process_frames(decoder.into_frames(), variant)
+        }
+        ImageFormat::Png => {
+            let mut decoder = PngDecoder::new(Cursor::new(input)).map_err(|e| {
+                ApiError::unsupported_media("decode_failed", format!("png open: {e}"))
+            })?;
+            decoder.set_limits(limits).map_err(|e| {
+                ApiError::unsupported_media("decode_failed", format!("png limits: {e}"))
+            })?;
+            let apng = decoder
+                .apng()
+                .map_err(|e| ApiError::unsupported_media("decode_failed", format!("apng: {e}")))?;
+            process_frames(apng.into_frames(), variant)
+        }
+        ImageFormat::WebP => {
+            let mut decoder = WebPDecoder::new(Cursor::new(input)).map_err(|e| {
+                ApiError::unsupported_media("decode_failed", format!("webp open: {e}"))
+            })?;
+            decoder.set_limits(limits).map_err(|e| {
+                ApiError::unsupported_media("decode_failed", format!("webp limits: {e}"))
+            })?;
+            process_frames(decoder.into_frames(), variant)
+        }
         // is_animated_bytes が true を返したのに format がここに来るのは
         // ありえない。is_animated_bytes との不整合は internal error。
         other => Err(ApiError::internal(
@@ -304,63 +315,62 @@ fn decode_animation(
     }
 }
 
-fn decode_gif_frames(input: &[u8], limits: image::Limits) -> Result<Vec<DecodedFrame>, ApiError> {
-    let mut decoder = GifDecoder::new(Cursor::new(input))
-        .map_err(|e| ApiError::unsupported_media("decode_failed", format!("gif open: {e}")))?;
-    decoder
-        .set_limits(limits)
-        .map_err(|e| ApiError::unsupported_media("decode_failed", format!("gif limits: {e}")))?;
-    collect_frames(decoder.into_frames())
-}
-
-fn decode_apng_frames(input: &[u8], limits: image::Limits) -> Result<Vec<DecodedFrame>, ApiError> {
-    let mut decoder = PngDecoder::new(Cursor::new(input))
-        .map_err(|e| ApiError::unsupported_media("decode_failed", format!("png open: {e}")))?;
-    decoder
-        .set_limits(limits)
-        .map_err(|e| ApiError::unsupported_media("decode_failed", format!("png limits: {e}")))?;
-    let apng = decoder
-        .apng()
-        .map_err(|e| ApiError::unsupported_media("decode_failed", format!("apng: {e}")))?;
-    collect_frames(apng.into_frames())
-}
-
-fn decode_animated_webp_frames(
-    input: &[u8],
-    limits: image::Limits,
-) -> Result<Vec<DecodedFrame>, ApiError> {
-    let mut decoder = WebPDecoder::new(Cursor::new(input))
-        .map_err(|e| ApiError::unsupported_media("decode_failed", format!("webp open: {e}")))?;
-    decoder
-        .set_limits(limits)
-        .map_err(|e| ApiError::unsupported_media("decode_failed", format!("webp limits: {e}")))?;
-    collect_frames(decoder.into_frames())
-}
-
-fn collect_frames(frames: image::Frames<'_>) -> Result<Vec<DecodedFrame>, ApiError> {
-    let mut out: Vec<DecodedFrame> = Vec::new();
-    for frame_res in frames {
+/// `frames` から 1 frame ずつ取り出し、その場で resize → `ResizedFrame` に
+/// 蓄積する。canvas 寸法は 1 frame 目の aspect-preserving resize 結果で確定し、
+/// 2 frame 目以降は `resize_exact` で同寸法に揃える (animated WebP の
+/// VP8X canvas 前提)。
+///
+/// `MAX_ANIMATED_FRAMES` 超過は **`next()` を呼ぶ前** に判定する ── for ループ
+/// だと `iter.next()` の後に body が走るため N+1 番目の decode が発生してしまう。
+/// 明示 `loop { check; next; ... }` で N+1 件目以降は decode しない契約。
+fn process_frames(
+    mut frames: image::Frames<'_>,
+    variant: Variant,
+) -> Result<(Vec<ResizedFrame>, u32, u32), ApiError> {
+    let mut out: Vec<ResizedFrame> = Vec::new();
+    let mut canvas_w: u32 = 0;
+    let mut canvas_h: u32 = 0;
+    loop {
         if out.len() >= MAX_ANIMATED_FRAMES {
             return Err(ApiError::too_large(format!(
                 "animated input exceeds {MAX_ANIMATED_FRAMES} frames",
             )));
         }
+        let Some(frame_res) = frames.next() else {
+            break;
+        };
         let frame = frame_res.map_err(|e| {
             ApiError::unsupported_media("decode_failed", format!("frame decode: {e}"))
         })?;
-        let (num, den) = frame.delay().numer_denom_ms();
-        // image crate は delay を `Ratio<u32>` 相当 (numer/denom ms) で返す。
-        // 0 除算ガードと 0 ms フレームの底上げ ── 0 ms 連発は libwebp 側で
-        // timestamp 衝突を起こすため最低 10 ms に底上げする (Misskey 等の
-        // 観測値より下回らない安全マージン)。
-        let raw_ms = num.checked_div(den).unwrap_or(0);
-        let delay_ms = raw_ms.max(10);
-        out.push(DecodedFrame {
-            buffer: frame.into_buffer(),
+        let delay_ms = compute_delay_ms(frame.delay());
+        let buffer = frame.into_buffer();
+        let resized = if out.is_empty() {
+            // 1 frame 目: variant ボックスに aspect-preserving resize し canvas 確定。
+            let r = resize_frame_buffer(&buffer, variant);
+            canvas_w = r.width();
+            canvas_h = r.height();
+            r
+        } else {
+            // 2 frame 目以降: canvas 寸法に exact resize。
+            resize_frame_exact(&buffer, canvas_w, canvas_h)
+        };
+        // `buffer` (= 元寸法の入力 frame) はこのスコープ末尾で drop。
+        // = `out` には resize 後の小さい RGBA だけが残る = ピーク 2 重保持なし。
+        out.push(ResizedFrame {
+            rgba: resized,
             delay_ms,
         });
     }
-    Ok(out)
+    Ok((out, canvas_w, canvas_h))
+}
+
+/// `image::Delay` から表示時間 (ms) を取り出す。0 ms フレームは libwebp 側で
+/// timestamp 衝突を起こすため最低 10 ms に底上げする (Misskey 等の観測値より
+/// 下回らない安全マージン)。0 除算 (`den == 0`) も同じく 10 ms に倒す。
+fn compute_delay_ms(delay: image::Delay) -> u32 {
+    let (num, den) = delay.numer_denom_ms();
+    let raw_ms = num.checked_div(den).unwrap_or(0);
+    raw_ms.max(10)
 }
 
 /// アスペクト比を保ったままボックス内に収める resize (still と同じ挙動)。
@@ -404,6 +414,9 @@ fn encode_animated_webp(
     let mut config = webp::WebPConfig::new()
         .map_err(|()| ApiError::internal("encode_failed", "WebPConfig::new failed"))?;
     config.lossless = 1;
+    // 注: libwebp の lossless モードでは `quality` は視覚品質ではなく
+    // **圧縮努力量** (0=低圧縮高速, 100=高圧縮低速) を意味する。emoji /
+    // avatar 用途は通常 small payload なので「並み程度の努力量」= 80 で十分。
     config.quality = 80.0;
 
     let mut encoder = webp::AnimEncoder::new(width, height, &config);
@@ -748,6 +761,73 @@ mod tests {
         );
         let out = process(&bytes, Variant::Emoji, 1_000_000).unwrap();
         assert!(is_animated_webp(&out.bytes));
+    }
+
+    #[test]
+    fn frame_count_exceeding_max_is_rejected() {
+        // MAX_ANIMATED_FRAMES + 1 frame の GIF を組んで too_large が返ることを
+        // 確認する。N+1 frame 目の decode が走らない契約は process_frames
+        // のロジック側でカバー (= ここではエラー path に倒れるかどうかだけ)。
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame};
+        let mut out = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut out);
+            encoder.set_repeat(Repeat::Infinite).unwrap();
+            for i in 0..=MAX_ANIMATED_FRAMES {
+                #[allow(clippy::cast_possible_truncation)]
+                let shade = (i % 256) as u8;
+                let buf: ImageBuffer<Rgba<u8>, Vec<u8>> =
+                    ImageBuffer::from_fn(8, 8, |_, _| Rgba([shade, 0, 0, 255]));
+                let frame = Frame::from_parts(buf, 0, 0, Delay::from_numer_denom_ms(40, 1));
+                encoder.encode_frame(frame).unwrap();
+            }
+        }
+        let err = process(&out, Variant::Emoji, 10_000_000).unwrap_err();
+        assert_eq!(err.reason, "too_large");
+    }
+
+    #[test]
+    fn single_frame_apng_falls_back_to_still() {
+        // APNG (= acTL chunk あり) だが frame は 1 枚だけ。is_animated_bytes が
+        // animated と判定 → process_animated に入る → resized_frames.len() == 1
+        // で still encoder にフォールバック。出力 WebP は VP8X.animation flag /
+        // ANIM chunk を **持たない** ことを確認 (= 余計な animated container を
+        // 巻かない)。
+        use png::Encoder;
+        let mut out = Vec::new();
+        {
+            let mut encoder = Encoder::new(&mut out, 16, 16);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_animated(1, 0).unwrap();
+            encoder.set_frame_delay(40, 1000).unwrap();
+            let mut writer = encoder.write_header().unwrap();
+            let frame: Vec<u8> = (0..16 * 16).flat_map(|_| [255u8, 0, 0, 255]).collect();
+            writer.write_image_data(&frame).unwrap();
+            writer.finish().unwrap();
+        }
+        // 前提: acTL chunk が乗っているので animated 判定が走る。
+        assert!(has_apng_actl_chunk(&out));
+        let result = process(&out, Variant::Emoji, 1_000_000).unwrap();
+        assert_eq!(result.content_type, "image/webp");
+        assert!(
+            !is_animated_webp(&result.bytes),
+            "1-frame APNG must fall back to still WebP"
+        );
+    }
+
+    #[test]
+    fn compute_delay_ms_floors_to_10ms() {
+        use image::Delay;
+        // 0 ms (例: 即座次フレームを宣言する 0 delay) → 10 ms に底上げ
+        assert_eq!(compute_delay_ms(Delay::from_numer_denom_ms(0, 1)), 10);
+        // 5 ms (10 ms 未満) → 10 ms に底上げ
+        assert_eq!(compute_delay_ms(Delay::from_numer_denom_ms(5, 1)), 10);
+        // 40 ms (常識的な GIF 25 fps) はそのまま
+        assert_eq!(compute_delay_ms(Delay::from_numer_denom_ms(40, 1)), 40);
+        // 100 ms (10 fps) もそのまま
+        assert_eq!(compute_delay_ms(Delay::from_numer_denom_ms(100, 1)), 100);
     }
 
     #[test]
