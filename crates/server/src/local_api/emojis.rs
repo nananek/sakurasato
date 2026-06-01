@@ -34,9 +34,21 @@ pub struct ListQuery {
     pub limit: Option<i64>,
 }
 
+/// `kind` 識別子。現状サーバは `"custom"` (ローカル import 済み画像 emoji)
+/// のみ返す。`"unicode"` は TUI 側が `sakurasato_core::unicode_emoji` 由来で
+/// クライアント内マージする際に発行するため、サーバが直接返すことは無いが
+/// 型としては将来余地として残しておく (= 別経路で server 経由になっても
+/// JSON shape を変えずに済む)。
 #[derive(Debug, Serialize)]
 pub struct EmojiItem {
+    /// `"custom"` か `"unicode"`。古いクライアントは `kind` を見ない前提で
+    /// もそのまま動く ── custom emoji は `url` / `media_type` が必須で揃って
+    /// いる従来形と互換。
+    pub kind: &'static str,
     pub shortcode: String,
+    /// custom emoji は media 配信 URL、unicode は空文字 (= TUI 側で画像表示
+    /// せず文字描画する判定に使う)。`Option` ではなく空文字としているのは
+    /// 既存クライアント (`url: String`) の互換性を壊さないため。
     pub url: String,
     pub media_type: String,
     pub category: Option<String>,
@@ -64,6 +76,7 @@ pub async fn list(State(state): State<AppState>, Query(q): Query<ListQuery>) -> 
     let items: Vec<EmojiItem> = rows
         .into_iter()
         .map(|row| EmojiItem {
+            kind: "custom",
             url: build_media_url(host, &row.image_key),
             shortcode: row.shortcode,
             media_type: row.media_type,

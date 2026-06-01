@@ -120,19 +120,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         Rect::default()
     };
 
-    // M8 PR3: リアクション入力プロンプト。timeline 直下、compose の手前に
-    // 1 行の overlay として出す ── focus = ReactionPrompt のときだけ。
-    if app.focus == Focus::ReactionPrompt
-        && let Some(p) = app.reaction_prompt.as_ref()
-    {
-        render_reaction_prompt(frame, status_area, &app.theme, p);
-    }
-    // Issue #101: 絵文字検索モーダル。reaction prompt や compose の上に
-    // 中央オーバーレイで描画。
+    // Issue #118: 絵文字検索モーダル。Timeline / Compose の上に中央 overlay
+    // で描画する (= 旧 reaction prompt 経路は廃止、`e` で直接ここに来る)。
     if app.focus == Focus::EmojiSearch
         && let Some(s) = app.emoji_suggest.as_ref()
     {
-        render_emoji_suggest(frame, area, &app.theme, s);
+        render_emoji_suggest(frame, area, app, s);
     }
 
     // M9 PR2: 視覚刺激抑制トグル overlay。
@@ -165,27 +158,57 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     }
 }
 
-/// Issue #101: 絵文字検索モーダル。中央に検索 buffer + 候補リストを描く。
+/// Issue #118: 絵文字検索モーダル。
+///
+/// レイアウト (上から):
+///   - 検索 buffer (1 行)
+///   - ヘルプ (1 行)
+///   - 余白 (1 行)
+///   - **プレビュー枠** (`PREVIEW_ROWS` 行) ── custom はカーソル中の画像を
+///     キャッシュ経由で `ratatui-image` 描画、Unicode は codepoint を中央に
+///     大きく文字描画。`emoji` suppression が off のときは枠ごと省く。
+///   - 候補リスト (`VISIBLE_MAX` 行まで、cursor で自動スクロール)
+///
 /// 候補 0 件でも閉じない (= search buffer を消せば全候補が戻る)。
 fn render_emoji_suggest(
     frame: &mut Frame<'_>,
     area: Rect,
-    theme: &Theme,
+    app: &App,
     state: &crate::emoji_suggest::EmojiSuggestState,
 ) {
-    let palette = &theme.palette;
+    /// プレビュー枠の高さ (border 込みのモーダル外寸ではなく **inner** の行数)。
+    /// 画像枠は最低 5 行確保しないと Kitty graphics protocol で潰れて見えない。
+    const PREVIEW_ROWS: u16 = 6;
+
+    let palette = &app.theme.palette;
     let visible_max = crate::emoji_suggest::VISIBLE_MAX;
     let visible = state.filtered.len().min(visible_max).max(1);
-    // 中央寄せ ── 検索 buffer 1 行 + ヘルプ 1 行 + 区切り 1 行 + 候補 visible 行 + border 2 行。
-    let h = u16::try_from(visible).unwrap_or(8) + 5;
-    let w = 48u16.min(area.width.saturating_sub(4));
+    let show_preview = app.suppression.is_on(crate::suppression::Element::Emoji);
+    let mode_label = match state.mode {
+        crate::emoji_suggest::Mode::ReactToNote(_) => "react",
+        crate::emoji_suggest::Mode::InsertIntoCompose => "insert",
+    };
+    let enter_label = match state.mode {
+        crate::emoji_suggest::Mode::ReactToNote(_) => "Enter=send",
+        crate::emoji_suggest::Mode::InsertIntoCompose => "Enter=insert",
+    };
+
+    // モーダル外寸: 検索 1 + ヘルプ 1 + 余白 1 + (preview + 余白 1) + 候補 visible + border 2。
+    let preview_block = if show_preview { PREVIEW_ROWS + 1 } else { 0 };
+    let h_inner = 1 + 1 + 1 + preview_block + u16::try_from(visible).unwrap_or(8);
+    let h = h_inner + 2; // borders top + bottom
+    let w = 56u16.min(area.width.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h.min(area.height));
 
     let block = Block::default()
         .title(Span::styled(
-            format!("  emoji search ({})  ", state.filtered.len()),
+            format!(
+                "  emoji search · {} ({})  ",
+                mode_label,
+                state.filtered.len()
+            ),
             Style::default()
                 .fg(palette.accent_strong)
                 .add_modifier(Modifier::BOLD),
@@ -201,71 +224,206 @@ fn render_emoji_suggest(
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    // 1 行目: 検索 buffer (= ユーザの入力)。
-    let query_line = Line::from(vec![
-        Span::styled(
-            "  / ",
-            Style::default()
-                .fg(palette.accent_strong)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(state.query.clone(), Style::default().fg(palette.foreground)),
-        Span::styled("▏", Style::default().fg(palette.accent)),
-    ]);
-    // 2 行目: ヘルプ。
-    let help_line = Line::from(Span::styled(
-        "  [↑↓ navigate  Enter=insert  Esc=cancel]",
-        Style::default().fg(palette.muted),
-    ));
-    // 3 行目以降: 候補リスト。
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible + 3);
-    lines.push(query_line);
-    lines.push(help_line);
-    lines.push(Line::from(""));
+    // inner を縦に分割: 検索 1 / ヘルプ 1 / 余白 1 / (preview / 余白 1) / 候補 残り。
+    let constraints: Vec<Constraint> = if show_preview {
+        vec![
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(PREVIEW_ROWS),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ]
+    } else {
+        vec![
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ]
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
 
+    let query_area = chunks[0];
+    let help_area = chunks[1];
+    let (preview_area, list_area) = if show_preview {
+        (Some(chunks[3]), chunks[5])
+    } else {
+        (None, chunks[3])
+    };
+
+    // 検索 buffer 行。
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "  / ",
+                Style::default()
+                    .fg(palette.accent_strong)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(state.query.clone(), Style::default().fg(palette.foreground)),
+            Span::styled("▏", Style::default().fg(palette.accent)),
+        ])),
+        query_area,
+    );
+    // ヘルプ行。
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  [↑↓ navigate  {enter_label}  Esc=cancel]"),
+            Style::default().fg(palette.muted),
+        ))),
+        help_area,
+    );
+
+    // プレビュー枠。
+    if let Some(prev_area) = preview_area {
+        render_emoji_preview(frame, prev_area, app, state);
+    }
+
+    // 候補リスト。
+    render_emoji_list(frame, list_area, palette, state, visible);
+}
+
+/// `render_emoji_suggest` から呼ぶ候補リスト描画。
+fn render_emoji_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    palette: &Palette,
+    state: &crate::emoji_suggest::EmojiSuggestState,
+    visible: usize,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible);
     if state.filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no matches)",
             Style::default().fg(palette.muted),
         )));
-    } else {
-        let scroll_top = scroll_window_top(state.cursor, visible, state.filtered.len());
-        for (idx, item) in state
-            .filtered
-            .iter()
-            .enumerate()
-            .skip(scroll_top)
-            .take(visible)
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+    let scroll_top = scroll_window_top(state.cursor, visible, state.filtered.len());
+    for (idx, item) in state
+        .filtered
+        .iter()
+        .enumerate()
+        .skip(scroll_top)
+        .take(visible)
+    {
+        let selected = idx == state.cursor;
+        let marker = if selected { "▶ " } else { "  " };
+        let marker_style = if selected {
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        // Unicode entry は `:shortcode: 👍` で codepoint を行頭近くに併記。
+        // ratatui の Line は単一フォントなので画像サムネは入れず、文字表示で
+        // 代用する (= プレビュー枠が大きい絵を担当する)。
+        let codepoint_hint = item.codepoint.as_deref().unwrap_or("").to_string();
+        let mut spans = vec![Span::styled(marker.to_string(), marker_style)];
+        if !codepoint_hint.is_empty() {
+            spans.push(Span::styled(
+                codepoint_hint,
+                Style::default().fg(palette.foreground),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            format!(":{}:", item.shortcode),
+            Style::default().fg(palette.foreground),
+        ));
+        if let Some(cat) = item.category.as_deref()
+            && !cat.is_empty()
         {
-            let selected = idx == state.cursor;
-            let marker = if selected { "▶ " } else { "  " };
-            let marker_style = if selected {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("[{cat}]"),
+                Style::default().fg(palette.muted),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// `render_emoji_suggest` から呼ぶプレビュー描画。
+///
+/// - custom emoji: media-proxy 経由で取得済みなら `ratatui-image` で描画、
+///   未取得なら fetch を `ensure()` し、描画では「loading…」を出す。
+/// - Unicode emoji: codepoint 文字列を枠中央に大きく表示。フォント拡大は
+///   端末側でしか効かないので「ASCII で大きく」までは出来ないが、目立つ
+///   位置と色を当てて存在感を出す。
+fn render_emoji_preview(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    state: &crate::emoji_suggest::EmojiSuggestState,
+) {
+    let palette = &app.theme.palette;
+    let Some(item) = state.current() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "  (no candidate)",
+            Style::default().fg(palette.muted),
+        )));
+        frame.render_widget(p, area);
+        return;
+    };
+
+    match item.kind {
+        crate::client::EmojiKind::Unicode => {
+            // codepoint を枠中央に大きめに置く。フォントサイズは端末依存だが、
+            // 中央寄せ + 上下マージンで「ここに 1 個だけある」感は出る。
+            let cp = item.codepoint.as_deref().unwrap_or(item.shortcode.as_str());
+            let mid_row = area.y + area.height / 2;
+            let mid_area = Rect::new(area.x, mid_row, area.width, 1);
+            let p = Paragraph::new(Line::from(Span::styled(
+                cp.to_string(),
                 Style::default()
                     .fg(palette.accent_strong)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(palette.muted)
-            };
-            let mut spans = vec![
-                Span::styled(marker.to_string(), marker_style),
-                Span::styled(
-                    format!(":{}:", item.shortcode),
-                    Style::default().fg(palette.foreground),
-                ),
-            ];
-            if let Some(cat) = item.category.as_deref()
-                && !cat.is_empty()
-            {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    format!("[{cat}]"),
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(ratatui::layout::Alignment::Center);
+            frame.render_widget(p, mid_area);
+        }
+        crate::client::EmojiKind::Custom => {
+            // custom emoji は image cache から protocol を引いて描画する。
+            // suppression::Emoji が off の場合はそもそもこの関数を呼ばない
+            // ([[render_emoji_suggest]] 側で枠ごと省略済み)。
+            if item.url.is_empty() {
+                let p = Paragraph::new(Line::from(Span::styled(
+                    "  (no image url)",
                     Style::default().fg(palette.muted),
-                ));
+                )));
+                frame.render_widget(p, area);
+                return;
             }
-            lines.push(Line::from(spans));
+            // 中央に正方枠を切る (= 画像はだいたい正方形)。
+            let side = area.width.min(area.height * 2);
+            let img_w = side.min(area.width);
+            let img_h = (img_w / 2).min(area.height);
+            let img_x = area.x + (area.width.saturating_sub(img_w)) / 2;
+            let img_y = area.y + (area.height.saturating_sub(img_h)) / 2;
+            let img_area = Rect::new(img_x, img_y, img_w, img_h);
+
+            app.images.ensure(&item.url, img_area);
+            if let Some(proto) = app.images.get(&item.url) {
+                let widget = Image::new(proto.as_ref());
+                frame.render_widget(widget, img_area);
+            } else {
+                let p = Paragraph::new(Line::from(Span::styled(
+                    "  loading…",
+                    Style::default().fg(palette.muted),
+                )))
+                .alignment(ratatui::layout::Alignment::Center);
+                frame.render_widget(p, area);
+            }
         }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// カーソルが見える位置に scroll する単純な top 算出。
@@ -277,36 +435,6 @@ fn scroll_window_top(cursor: usize, visible: usize, total: usize) -> usize {
     cursor
         .saturating_sub(visible.saturating_sub(1))
         .min(max_top)
-}
-
-/// 入力プロンプトを status バー位置に上書き表示する。1 行。
-fn render_reaction_prompt(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    theme: &Theme,
-    prompt: &crate::reaction_prompt::ReactionPrompt,
-) {
-    let palette = &theme.palette;
-    frame.render_widget(Clear, area);
-    let line = Line::from(vec![
-        Span::styled(
-            "  react › ",
-            Style::default()
-                .fg(palette.accent_strong)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            prompt.buffer.clone(),
-            Style::default().fg(palette.foreground),
-        ),
-        Span::styled("▏", Style::default().fg(palette.accent)),
-        Span::styled(
-            "  Enter=send  Esc=cancel",
-            Style::default().fg(palette.muted),
-        ),
-    ]);
-    let p = Paragraph::new(line).style(Style::default().bg(palette.background));
-    frame.render_widget(p, area);
 }
 
 /// M13 PR5: `:` プロンプトを status バー位置に上書きする 1 行 overlay。
@@ -1368,7 +1496,6 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::Compose => "compose",
         Focus::Help => "help",
         Focus::Picker => "picker",
-        Focus::ReactionPrompt => "react",
         Focus::Suppression => "suppress",
         Focus::AltPrompt => "alt",
         Focus::Profile => "profile",
@@ -1480,7 +1607,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "A", "upload avatar"),
         help_entry(palette, "H", "upload header"),
         help_entry(palette, ";", "attach image (picker)"),
-        help_entry(palette, "e", "react to selected note"),
+        help_entry(palette, "e", "react: open emoji search modal"),
         help_entry(palette, "i", "image suppression toggle"),
         help_entry(palette, "p", "open profile of author"),
         help_entry(palette, ":", "command prompt"),
@@ -1502,19 +1629,31 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, ".", "toggle hidden files"),
         help_entry(palette, "Esc / q", "cancel picker"),
         Line::from(""),
-        Line::from(Span::styled("reactions", help_section(palette))),
-        help_entry(palette, "e", "open reaction prompt"),
-        help_entry(palette, ":foo:", "local custom emoji"),
-        help_entry(palette, "👍 / 🎉", "Unicode emoji"),
-        help_entry(palette, "Ctrl-E", "open emoji search modal"),
-        help_entry(palette, "Enter", "send"),
-        help_entry(palette, "Esc", "cancel"),
-        Line::from(""),
         Line::from(Span::styled("emoji search modal", help_section(palette))),
-        help_entry(palette, "type", "substring filter (prefix prioritized)"),
+        help_entry(
+            palette,
+            "e (timeline)",
+            "open modal → Enter で即リアクション送信",
+        ),
+        help_entry(
+            palette,
+            "Ctrl-E (compose)",
+            "open modal → Enter で本文に挿入",
+        ),
+        help_entry(
+            palette,
+            "type",
+            "substring filter (prefix prioritized, alias 可)",
+        ),
         help_entry(palette, "↑ / ↓", "navigate candidates"),
-        help_entry(palette, "Enter", "insert :shortcode: and close"),
-        help_entry(palette, "Esc", "cancel without inserting"),
+        help_entry(palette, "Enter", "confirm (mode に応じて 送信 / 挿入)"),
+        help_entry(palette, "Esc", "cancel (何もしない)"),
+        help_entry(palette, ":foo:", "local custom emoji (画像プレビュー)"),
+        help_entry(
+            palette,
+            "👍 / 🎉 etc.",
+            "Unicode emoji (gemoji 由来 shortcode)",
+        ),
         Line::from(""),
         Line::from(Span::styled("profile", help_section(palette))),
         help_entry(palette, "j / k", "next / prev note"),

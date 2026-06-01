@@ -4,9 +4,9 @@
 //! 空入力 (Enter のみ) の場合は alt 無しで送る ── server 側 `upload_media`
 //! は `alt` クエリ空文字を None と同じ扱いにする。
 //!
-//! 構造は [`crate::reaction_prompt::ReactionPrompt`] と並列。`buffer` だけを
-//! 持ち、Picker から渡ってきた `path` / `kind_label` / `kind` を保持して
-//! `Action::AltPromptSubmit` で `run_upload` に渡す。
+//! 1 行入力 overlay の単純な state ── `buffer` だけを持ち、Picker から渡って
+//! きた `path` / `kind_label` / `kind` を保持して `Action::AltPromptSubmit`
+//! で `run_upload` に渡す。
 
 use crate::picker::PickerMode;
 

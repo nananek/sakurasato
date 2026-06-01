@@ -6,6 +6,7 @@ pub mod config;
 pub mod model;
 pub mod net_guard;
 pub mod repo;
+pub mod unicode_emoji;
 
 pub use config::{Config, Listen};
 
