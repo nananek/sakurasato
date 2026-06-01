@@ -49,6 +49,28 @@ pub async fn handle(
         }
     };
 
+    // **SECURITY (緊急 fix)**: visibility filter ── permalink は
+    // unauthenticated な公開 endpoint なので、AS2 audience に Public が
+    // 含まれない note (`followers` / `direct`) は **URL を知っていても
+    // 漏らさない**。404 で返して存在自体を秘匿する (Mastodon の慣習と同じ)。
+    //
+    // - `public`: to に `as:Public` → 公開
+    // - `unlisted`: cc に `as:Public` → 公開 (= 連合相手の fetch にも応答する慣習)
+    // - `followers`: to に followers-only → permalink では 404
+    // - `direct`: to に mentioned actor のみ → permalink では 404
+    //
+    // Sakurasato はお一人様サーバなので「ログイン済み follower かを判定する
+    // permalink 認証」は提供しない (= TUI 経由で読む)。`note.visibility` は
+    // `crates/core/src/model.rs::Visibility::as_str` と同形の小文字 enum 文字列。
+    if !matches!(note.visibility.as_str(), "public" | "unlisted") {
+        tracing::debug!(
+            note_id = id,
+            visibility = note.visibility.as_str(),
+            "permalink: refusing to serve non-public note",
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     let actor = match repo::actor::get_by_id(state.pool(), note.actor_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
