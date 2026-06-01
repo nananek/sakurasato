@@ -1,0 +1,158 @@
+name: Release Validation (main PR)
+
+# develop → main の release PR でのみ発火する重量級ゲート。
+# 通常の develop 内 PR では発火しない (= 開発体験は ci.yml + claude-review に
+# 任せる)。release 前に「distroless build が全部通る」「compose stack が
+# 起動して well-known が応答する」という 2 つの実機チェックを通す。
+#
+# 関連 workflow:
+#   - federation-test.yml / federation-test-nekonoverse.yml: 同じく main PR
+#     で発火する E2E (実 Mastodon / Nekonoverse 相手の連合検証)
+#   - publish.yml: tag push で動く実 push (本 workflow は build/load のみで
+#     push しない)
+#
+# branch protection (= required status checks) の登録は GitHub UI で行う必要
+# あり (この workflow を有効化しただけでは required にはならない)。CLAUDE.md
+# §11 の required checks 一覧に従って nananek が設定する。
+
+on:
+  pull_request:
+    branches: [main]
+    # docs only の release PR は build / smoke 影響なし。
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  # 手動再走 (= image build キャッシュが腐ったときの強制再走など)。
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同 PR への push 連発で並列起動しないよう、PR 単位で集約する。
+concurrency:
+  group: release-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 4 イメージ並列 build。push せず load して compose smoke 側に流す。
+  #     publish.yml と独立した cache scope を使い、release 検証時に publish
+  #     キャッシュを汚さない。Dockerfile 単独の health を per-image で見るため
+  #     matrix に分けた (= どの 1 つが壊れたかが Actions UI 上で即わかる)。
+  build-images:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            dockerfile: docker/server.Dockerfile
+          - name: media-proxy
+            dockerfile: docker/media-proxy.Dockerfile
+          - name: versitygw
+            dockerfile: docker/versitygw.Dockerfile
+          - name: tui
+            dockerfile: docker/tui.Dockerfile
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.name }} (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          # `load: true` で runner ローカルの dockerd に load する ── 別 job
+          # からは見えないが、build 失敗をこのジョブ単独で検出するための
+          # 動作確認になる。stack-smoke 側は compose build で同じキャッシュを
+          # ヒットさせて再 build する。
+          load: true
+          tags: sakurasato-${{ matrix.name }}:release-validation
+          cache-from: type=gha,scope=release-validation-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=release-validation-${{ matrix.name }}
+          provenance: false
+          sbom: false
+
+  # ── compose stack を実機で立ち上げて well-known が応答するか確認。
+  #     build-images 完了後に走る (= 4 イメージが全部 build できる前提で進む)。
+  #     compose build は同じ cache-from を共有するのでほぼ cache hit。
+  stack-smoke:
+    name: Stack smoke (compose up + nodeinfo probe)
+    runs-on: ubuntu-latest
+    needs: build-images
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      # 本番 compose は secrets/{postgres_password,s3_secret_key}.txt を bind
+      # mount する設計 (CLAUDE.md §7.1 / §8)。CI では一過性の値を生成する ──
+      # tear down 時に named volume ごと消えるので persistence なし。
+      # secrets/ ディレクトリは 0700、ファイルは 0644 (rootless postgres uid 70
+      # が読めるため。詳細 [[compose-secret-perms]])。
+      - name: Generate ephemeral secrets
+        run: |
+          chmod 700 secrets
+          openssl rand -hex 32 > secrets/postgres_password.txt
+          openssl rand -hex 32 > secrets/s3_secret_key.txt
+          chmod 644 secrets/postgres_password.txt secrets/s3_secret_key.txt
+
+      # docker compose v2 は actions runner 標準。dev overlay で server / postgres /
+      # versitygw を 127.0.0.1 に露出 (runner から HTTP probe できるため)。
+      # `--build` は build-images の GHA cache を共有してほぼ cache hit。
+      - name: Compose up (build + start)
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+
+      # postgres healthcheck は compose 側に定義済み。server には healthcheck
+      # 未定義 (M14 で追加検討) なので、HTTP 層で probe する。
+      # `/.well-known/nodeinfo` は actor 未初期化でも静的応答する (M3a 実装、
+      # `crates/server/src/routes/nodeinfo.rs`)。
+      - name: Wait for server to respond
+        run: |
+          # 最大 90s 待つ (= 3s * 30 retry)。--retry-connrefused で listen 前の
+          # connect refused も retry 対象にする (server cold start でよくある)。
+          curl --fail --silent --show-error \
+               --retry 30 --retry-delay 3 --retry-connrefused \
+               --max-time 5 \
+               http://127.0.0.1:8080/.well-known/nodeinfo
+          echo  # 改行
+          # 余裕で 200 を返したのを確認したら nodeinfo 本体 (2.1 schema) も
+          # 取得して、href がパースできることを軽く check。
+          curl --fail --silent --show-error --max-time 5 \
+               http://127.0.0.1:8080/nodeinfo/2.1 | head -c 200
+          echo
+
+      # 失敗時の調査材料。`compose ps` で各サービスの最終 state、`logs` で
+      # tail-200 を回収する。secrets はログに出ない (env で渡してない) ので
+      # 漏洩リスクなし。
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          set +e
+          echo "==> docker compose ps"
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml ps
+          for svc in postgres versitygw media-proxy server; do
+            echo "==> $svc logs (tail 200)"
+            docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+              logs --no-color --tail=200 "$svc" || true
+          done
+
+      - name: Tear down
+        if: always()
+        run: |
+          # `-v` で named volume も削除 (= postgres_data / versitygw_data /
+          # media_sock / local_sock)。CI は使い捨て。
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v
+          # 念のため生成 secret も消す (= 後段の workflow / ジョブで参照不可に
+          # する。GHA runner は使い捨てだが defense-in-depth)。
+          rm -f secrets/postgres_password.txt secrets/s3_secret_key.txt

@@ -9,13 +9,9 @@ name: Federation Test (Nekonoverse / tmux TUI)
 #   - nightly cron (UTC 19:30 = JST 04:30 ── mastodon と 30 分ずらして
 #     runner 競合を緩める)
 #   - workflow_dispatch (= UI から手動キック)
-#
-# required check には **しない**。理由:
-#   - 外部 image (ghcr.io/nekonoverse/nekonoverse-backend:latest) の更新
-#     タイミングで不安定化し得る。
-#   - TUI build (cargo) + Nekonoverse の uvicorn migration + Sidekiq 相当の
-#     worker drain で 5-15 分かかる ── PR ごとに required にすると開発体験を
-#     損なう。
+#   - **main 向け PR** (= develop → main の release PR)。required check 化を
+#     想定し、release 前に必ず通す。develop 向け PR では発火させない
+#     (TUI cargo build + 外部 image 依存で 5-15 分 = 開発体験を損なうため)。
 #
 # 失敗時の調査:
 #   1. Actions タブの個別 run ログ
@@ -27,6 +23,11 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "30 19 * * *"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
 
 permissions:
   contents: read

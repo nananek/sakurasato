@@ -300,11 +300,31 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 ### CI / 自動化（`.github/`）
 - **CI** (`ci.yml`): `cargo fmt --check` / `clippy -D warnings` / `test`。`main`・`develop` の push と PR。required status check = `ci`。`Cargo.toml` が無い間はスキップして緑（M1 で本稼働）。
 - **Publish** (`publish.yml`): タグ push (`YYYY.MM.patch`) と `develop` push で発火。ghcr に `sakurasato-{server,media-proxy,versitygw}` を public で push する。BuildKit + GitHub Actions cache (`type=gha,scope=<name>`) を使うことで 3 イメージ並列ビルドが現実時間内に収まる。**新しい deploy host は `docker compose -f docker-compose.yml -f docker-compose.ghcr.yml pull` で取得**（§9 参照）。
+- **Release Validation** (`release-validation.yml`): **`main` 向け PR でのみ発火** する重量級ゲート。`develop` 内 PR では発火しない（= 開発体験は ci.yml + claude-review に任せる）。2 ジョブ:
+  - `build-images` — server / media-proxy / versitygw / tui の 4 Dockerfile を `linux/amd64` で並列 build (load only、ghcr push なし)。どの 1 つが壊れたかが matrix UI で即わかる。
+  - `stack-smoke` — secrets を ephemeral 生成 → `docker compose up -d --build` (dev overlay で 8080/5432/7070 を 127.0.0.1 露出) → `/.well-known/nodeinfo` と `/nodeinfo/2.1` を curl --retry で probe → `down -v`。「binary が起動しない / config パース不能 / DB migration 失敗」を release 前に検出する。
 - **CodeQL** (`codeql.yml`): Rust SAST（`build-mode: none`）。`.rs`/`Cargo.*` 変更時と週次。
 - **Dependency Review** (`dependency-review.yml`): high 以上で fail、GPL/AGPL/SSPL を deny（MIT 維持）。
+- **Federation Test (Mastodon)** (`federation-test.yml`): pytest + httpx で Sakurasato ↔ Mastodon の連合を programmatic に駆動。nightly cron (UTC 19:00) / `workflow_dispatch` / **`main` 向け PR** で発火 (= release 前の必須通過)。develop PR では発火しない。
+- **Federation Test (Nekonoverse / tmux TUI)** (`federation-test-nekonoverse.yml`): tmux pty + 実 sakurasato-tui binary で Sakurasato ↔ Nekonoverse を駆動。nightly cron (UTC 19:30) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
 - **Claude PR レビュー** (`claude-review.yml`): `anthropics/claude-code-action@v1`、認証 **`secrets.CLAUDE_CODE_OAUTH_TOKEN`**。PR 自動 + `@claude` メンション、verdict 付き top-level コメントを必ず投稿。
 - **Dependabot** (`dependabot.yml`): `cargo`/`github-actions`/`docker` を週次更新。
 - **アラート**: Dependabot alerts / 自動セキュリティ修正 / secret scanning + push protection 有効化済み。
+
+### `main` 向け PR の required status checks
+
+`develop` → `main` の release PR は GitHub branch protection で以下を **必須** に設定する (= GitHub UI > Settings > Branches で `main` を編集 → Require status checks to pass before merging に列挙)。`develop` 向け PR では `ci` と `claude-review` のみが required。
+
+| Check | Workflow | 目的 |
+|---|---|---|
+| `ci` | `ci.yml` | fmt / clippy / test (= 全 PR で必須) |
+| `claude-review` | `claude-review.yml` | verdict コメント (= 全 PR で必須) |
+| `Mastodon (programmatic)` | `federation-test.yml` | 実 Mastodon との連合疎通 |
+| `Nekonoverse (tmux TUI)` | `federation-test-nekonoverse.yml` | 実 Nekonoverse との TUI 連合 |
+| `Build server` / `Build media-proxy` / `Build versitygw` / `Build tui` | `release-validation.yml` (matrix) | 4 Dockerfile が個別に build できる |
+| `Stack smoke (compose up + nodeinfo probe)` | `release-validation.yml` | compose stack が起動して well-known が応答 |
+
+新 workflow 追加時は本表と `release-validation.yml` 双方の更新を忘れない。
 
 ### 要設定の secret
 - **`CLAUDE_CODE_OAUTH_TOKEN`** — Claude PR レビュー用。`gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo nananek/sakurasato`（iikanji と同じ値でOK）。
