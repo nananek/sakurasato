@@ -23,9 +23,18 @@ pub enum Command {
     Serve,
     /// Bootstrap the single local user actor and instance.actor.
     Init(InitArgs),
-    /// Attempt a single outbound delivery from the queue. Used in M3b-2 to
-    /// hand-fire delivery rows from local federation tests (M3b-3 will
-    /// replace this with a resident worker loop).
+    /// Flush a single outbound delivery from the queue (運用 retry 用)。
+    ///
+    /// 配送 worker は通常自動で retry を回すが、以下のケースで個別 flush が要る:
+    /// - **Issue #113 経由**: 既存 pending follow が ある状態で再度 follow を
+    ///   叩いたとき、本 CLI は重複 enqueue を抑止して "no-op" 返却する。
+    ///   元の `delivery_queue` 行が失敗していたら本コマンドで明示再送する。
+    /// - worker の retry 上限を使い切って `failed` で諦めた行を再投入する
+    ///   (= 相手側障害が長期化した場合)。
+    ///
+    /// `queue_id` は `psql` で `SELECT id, status, last_error FROM delivery_queue
+    /// WHERE status IN ('pending','failed') ORDER BY id DESC LIMIT 20;` 等で
+    /// 列挙する。本 CLI は意図的に list 機能を持たない (= 攻撃面を増やさない)。
     Deliver(DeliverArgs),
     /// Manage local API tokens (Bearer auth for the Unix-socket API).
     Token(TokenArgs),

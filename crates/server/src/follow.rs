@@ -131,18 +131,26 @@ impl From<sqlx::Error> for FollowError {
     }
 }
 
-/// `create_follow_core` の結果。
+/// `create_follow_core` の結果。`queue_id` / `inbox_url` が `None` になる
+/// ケースは 3 つあり、3 つの bool フラグで意味を明確に区別する:
 ///
-/// 既存 `accepted` 行を再叩きした場合は `queue_id` / `inbox_url` を `None` で
-/// 返し (= Follow を再送しない)、`already_accepted` を `true` にする。
-/// `pending` の再 enqueue や rejected → pending 復活時は `Some` が入る。
+/// 1. `already_accepted = true` ── 既存 `accepted` 行を再叩き。Follow を再送
+///    しない。
+/// 2. `already_pending = true` (Issue #113) ── 既存 `pending` 行を再叩き。
+///    Follow を再送せず、配送 worker の retry に任せる。明示 retry したい
+///    ときは `sakurasato-server deliver --queue-id N`。
+/// 3. 上 2 つとも `false` で `queue_id = Some` ── 新規 INSERT または
+///    `rejected → pending` 復活で Follow を `delivery_queue` に積んだ正常系。
 #[derive(Debug, Clone)]
 pub struct FollowOutcome {
     pub follow: FollowRow,
     pub target: ActorRow,
     pub queue_id: Option<i64>,
     pub inbox_url: Option<String>,
+    /// 既存 `accepted` 行を再叩き ── 何もせず idempotent 成功で返す印。
     pub already_accepted: bool,
+    /// **Issue #113**: 既存 `pending` 行を再叩き ── enqueue 抑止の印。
+    pub already_pending: bool,
 }
 
 /// `delete_follow_core` の結果。Undo Follow activity を必ず 1 行 enqueue する。
@@ -162,6 +170,10 @@ pub struct UnfollowOutcome {
 ///    `Acct` 経路は [`ensure_webfinger_host_match`] で cross-domain hijack を弾く。
 /// 3. self-follow / `rejected` 復活ガード / 既存 `accepted` short-circuit。
 /// 4. 決定論的 `follow-cli-{follower}-{followed}` で `upsert_pending` + enqueue。
+#[allow(
+    clippy::too_many_lines,
+    reason = "follow フロー全体 (validate / pre-check / upsert / enqueue) を 1 関数で抱える"
+)]
 pub async fn create_follow_core(
     state: &AppState,
     target: FollowTarget,
@@ -186,6 +198,53 @@ pub async fn create_follow_core(
     }
 
     let follow_ap_id = build_follow_ap_id(state, &local, target_actor.id);
+
+    // **Issue #113**: pending 行が既に存在するとき、`upsert_pending` は ON
+    // CONFLICT で同行を返すだけだが、後続の `enqueue_activity` を毎回叩いて
+    // しまい delivery_queue に同 activity が累積、配送 worker が成功するまで
+    // 相手側 inbox に Follow を投げ続けて重複 follow request が残る。事前に
+    // `get_by_pair` で既存行を確認し、pending なら early return で
+    // **enqueue を抑止** する (= worker の retry に任せる、明示 retry したい
+    // ときは `sakurasato-server deliver --queue-id N` で個別 flush)。
+    if let Some(existing) = repo::follow::get_by_pair(state.pool(), local.id, target_actor.id)
+        .await
+        .map_err(|e| {
+            FollowError::Internal(anyhow::Error::new(e).context("get_by_pair before follow upsert"))
+        })?
+    {
+        match parse_follow_state(&existing)? {
+            FollowState::Accepted => {
+                return Ok(FollowOutcome {
+                    follow: existing,
+                    target: target_actor,
+                    queue_id: None,
+                    inbox_url: None,
+                    already_accepted: true,
+                    already_pending: false,
+                });
+            }
+            FollowState::Pending => {
+                info!(
+                    follow_id = existing.id,
+                    target = %target_actor.ap_id,
+                    "existing pending follow row; not enqueueing duplicate (worker will retry)",
+                );
+                return Ok(FollowOutcome {
+                    follow: existing,
+                    target: target_actor,
+                    queue_id: None,
+                    inbox_url: None,
+                    already_accepted: false,
+                    already_pending: true,
+                });
+            }
+            FollowState::Rejected => {
+                // 復活経路は `upsert_pending` の ON CONFLICT で rejected →
+                // pending に倒す。fall through で下の `upsert_pending` に進む。
+            }
+        }
+    }
+
     let row = repo::follow::upsert_pending(state.pool(), &follow_ap_id, local.id, target_actor.id)
         .await
         .map_err(|e| {
@@ -194,21 +253,20 @@ pub async fn create_follow_core(
 
     match parse_follow_state(&row)? {
         FollowState::Accepted => {
-            // Mastodon は accepted 状態で Follow を再投げると Accept を返さない
-            // ことがあるため、再送ぜずに idempotent 成功で返す。
+            // get_by_pair → upsert_pending の間に並行 Accept が来た稀なレース。
+            // 安全側で accepted 扱いで返す (= idempotent)。
             return Ok(FollowOutcome {
                 follow: row,
                 target: target_actor,
                 queue_id: None,
                 inbox_url: None,
                 already_accepted: true,
+                already_pending: false,
             });
         }
         FollowState::Rejected => {
-            // `upsert_pending` 経路は `rejected` を `pending` に倒して復活させる
-            // 仕様 (= リモートが Unfollow → 再 Follow した時の永久ブロック回避)。
-            // ここに来ると `row.state` は既に `pending` だが、念のため
-            // 万一 `rejected` のまま返ってきたら Conflict 扱いする。
+            // upsert_pending で rejected → pending 復活を期待したが、その復活
+            // ロジックがコールド側で動かなかった場合の保険。
             return Err(FollowError::Conflict(format!(
                 "previous Follow to {target} was rejected and not revived; \
                  inspect follow row id={id}",
@@ -217,11 +275,7 @@ pub async fn create_follow_core(
             )));
         }
         FollowState::Pending => {
-            info!(
-                follow_id = row.id,
-                target = %target_actor.ap_id,
-                "existing pending follow row reused; re-queueing Follow delivery",
-            );
+            // 期待ケース: 新規 INSERT または rejected → pending 復活。
         }
     }
 
@@ -241,6 +295,7 @@ pub async fn create_follow_core(
         queue_id: Some(queued.id),
         inbox_url: Some(inbox),
         already_accepted: false,
+        already_pending: false,
     })
 }
 
@@ -352,6 +407,19 @@ pub async fn run_with_state(state: &AppState, args: FollowArgs) -> anyhow::Resul
     if outcome.already_accepted {
         println!(
             "already following {target}: follow_id={id} state=accepted (no Follow sent)",
+            target = outcome.target.ap_id,
+            id = outcome.follow.id,
+        );
+        return Ok(());
+    }
+    if outcome.already_pending {
+        // **Issue #113**: 既存 pending 行への再叩き ── enqueue 抑止。配送
+        // worker が retry を回す前提。明示 retry したいときは `deliver
+        // --queue-id N` で個別 flush できる。
+        println!(
+            "follow already pending for {target}: follow_id={id} state=pending \
+             (worker will retry; use `sakurasato-server deliver --queue-id N` \
+             to flush manually)",
             target = outcome.target.ap_id,
             id = outcome.follow.id,
         );

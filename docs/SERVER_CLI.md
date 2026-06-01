@@ -102,13 +102,59 @@ sakurasato-server init
 
 ## 4. `deliver`
 
-`delivery_queue` から 1 行を手動 flush します。配送ワーカが正常運用中であれば不要で、開発 / トラブルシュート時のデバッグ用。
+`delivery_queue` から 1 行を手動 flush します。配送ワーカが通常は自動 retry を回すので普段は不要ですが、**運用 retry の正規ルート** として残してあります (= 完全に裏で動かす設計ではなく、操作可能なエスケープハッチを残す方針)。
 
 ```bash
 sakurasato-server deliver --queue-id <id>
 ```
 
-`queue_id` を一覧する CLI は意図的に用意していません (= 攻撃面を増やさない方針)。`psql` で `SELECT id, target_inbox, status FROM delivery_queue WHERE status != 'delivered';` を叩く想定。
+### 4.1 想定ユースケース
+
+#### (a) Follow 重複抑止後の明示 retry (Issue #113)
+
+`sakurasato-server follow <acct>` は既存 pending 行があると **新規 enqueue を抑止** します (= 同じ Follow が相手側で累積するのを防ぐため)。元の `delivery_queue` 行が失敗していて再送したいときは:
+
+```bash
+# 1) 失敗中の Follow を探す
+psql ... -c "SELECT id, target_inbox, status, last_error FROM delivery_queue \
+             WHERE status IN ('pending','failed') ORDER BY id DESC LIMIT 20;"
+
+# 2) 該当 id を再 flush
+sakurasato-server deliver --queue-id 42
+```
+
+#### (b) worker の retry 上限到達後の復活
+
+配送ワーカは指数バックオフで一定回数 retry した後 `status = 'failed'` で諦めます。相手側の長期障害が回復した後は本 CLI で再投入します:
+
+```bash
+psql ... -c "SELECT id FROM delivery_queue WHERE status = 'failed';"
+sakurasato-server deliver --queue-id 42
+```
+
+### 4.2 queue 行の手動クリーンアップ
+
+完全に諦めた `failed` 行を一括掃除したいときは psql で直叩き:
+
+```sql
+-- 30 日以上前の failed 行を全削除 (お一人様サーバの整備)
+DELETE FROM delivery_queue
+ WHERE status = 'failed'
+   AND created_at < now() - interval '30 days';
+```
+
+専用 CLI は意図的に持たず、`psql` 直叩きを運用前提にしています (= 攻撃面を増やさない / 削除タイミングは運用者判断)。
+
+### 4.3 一覧の取得
+
+`queue_id` を列挙する CLI は意図的に用意していません。`psql` で直接見るのが正規ルート:
+
+```bash
+psql ... -c "SELECT id, target_inbox, status, last_attempt_at, last_error \
+             FROM delivery_queue \
+             WHERE status != 'delivered' \
+             ORDER BY id DESC LIMIT 20;"
+```
 
 ---
 
