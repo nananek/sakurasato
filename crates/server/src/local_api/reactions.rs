@@ -4,8 +4,9 @@
 //!
 //! ## 流れ (`POST`)
 //!
-//! 1. body の `note_id` を解決し、ローカルの `note` 行が見つかることを確認。
-//!    （remote Note 受信は本 PR では未実装なので `note.is_local` 必須）
+//! 1. body の `note_id` を解決し、`note` 行が見つかることを確認 ── local / remote
+//!    どちらでも可。remote note への反応は `enqueue_reaction_delivery` 側で
+//!    note 作者 inbox を必ず宛先に含めるので相手に届く。
 //! 2. `content` を検証:
 //!    - 空 / 長すぎは 400。
 //!    - `:foo:` 形式ならローカル emoji 行を引いて `emoji_id` を紐付け、
@@ -71,13 +72,7 @@ pub async fn create(
         Err(resp) => return resp,
     };
     let note = match repo::note::get_by_id(state.pool(), req.note_id).await {
-        Ok(Some(n)) if n.is_local => n,
-        Ok(Some(_)) => {
-            return error_with_body(
-                StatusCode::NOT_FOUND,
-                "reactions to remote notes are not supported yet",
-            );
-        }
+        Ok(Some(n)) => n,
         Ok(None) => {
             return error_with_body(StatusCode::NOT_FOUND, "note not found");
         }

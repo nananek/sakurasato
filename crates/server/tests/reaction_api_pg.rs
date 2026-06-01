@@ -728,3 +728,203 @@ async fn delete_emoji_reaction_undo_preserves_misskey_reaction(pool: PgPool) {
     assert_eq!(object["_misskey_reaction"], ":blob_party:");
     assert_eq!(object["tag"][0]["name"], ":blob_party:");
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// PR2c (#120): POST /api/v1/reactions が remote note にも到達することの確認。
+// `enqueue_reaction_delivery` 側は既に note 作者 inbox を含める実装だったが、
+// `POST` 経路が `is_local` で 404 弾きしていた。ガード解除のリグレッション。
+// ────────────────────────────────────────────────────────────────────────
+
+/// remote note への Unicode リアクション (Like) は CREATED を返し、
+/// `Like` activity が **note 作者 (remote) の shared inbox** に enqueue される。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_unicode_reaction_on_remote_note_targets_author(pool: PgPool) {
+    let alice = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let charlie = repo::actor::insert(&pool, sample_remote_actor("charlie", "remote.test"))
+        .await
+        .unwrap();
+    let remote_note_ap = "https://remote.test/users/charlie/notes/123";
+    let note_id = seed_remote_note(&pool, charlie.id, remote_note_ap).await;
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({"note_id": note_id, "content": "👍"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/reactions")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = read_json(resp).await;
+    assert_eq!(body["queued_deliveries"], 1);
+
+    let queued = list_delivery_queue(&pool).await;
+    assert_eq!(queued.len(), 1, "note 作者 inbox に 1 件 (followers 0)");
+    let (inbox, activity) = &queued[0];
+    assert_eq!(inbox, "https://remote.test/inbox");
+    assert_eq!(activity["type"], "Like");
+    assert_eq!(activity["actor"], alice.ap_id);
+    assert_eq!(activity["object"], remote_note_ap);
+    assert_eq!(activity["content"], "👍");
+    assert!(activity.get("_misskey_reaction").is_none());
+    assert!(activity.get("tag").is_none());
+}
+
+/// remote note への custom emoji リアクション (`EmojiReact`) は CREATED を返し、
+/// `EmojiReact` activity が `_misskey_reaction` / `tag.Emoji` 込みで
+/// **note 作者 inbox** に enqueue される。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_emoji_reaction_on_remote_note_targets_author(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let charlie = repo::actor::insert(&pool, sample_remote_actor("charlie", "remote.test"))
+        .await
+        .unwrap();
+    let remote_note_ap = "https://remote.test/users/charlie/notes/456";
+    let note_id = seed_remote_note(&pool, charlie.id, remote_note_ap).await;
+    repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "blob_party".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/blob_party.webp".into(),
+            media_type: "image/webp".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({"note_id": note_id, "content": ":blob_party:"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/reactions")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let queued = list_delivery_queue(&pool).await;
+    assert_eq!(queued.len(), 1, "note 作者 inbox に 1 件");
+    let (inbox, activity) = &queued[0];
+    assert_eq!(inbox, "https://remote.test/inbox");
+    assert_eq!(activity["type"], "EmojiReact");
+    assert_eq!(activity["object"], remote_note_ap);
+    assert_eq!(activity["content"], ":blob_party:");
+    assert_eq!(activity["_misskey_reaction"], ":blob_party:");
+    let tag = activity["tag"].as_array().expect("tag is array");
+    assert_eq!(tag.len(), 1);
+    assert_eq!(tag[0]["type"], "Emoji");
+    assert_eq!(tag[0]["name"], ":blob_party:");
+    assert_eq!(tag[0]["icon"]["mediaType"], "image/webp");
+}
+
+/// 「remote note 作者 = 自分のフォロワー」のとき、`BTreeSet` 重複除去で
+/// 同じ `shared_inbox_url` は 1 行になる (= 二重配送しない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_reaction_on_remote_note_dedupes_when_author_is_follower(pool: PgPool) {
+    let alice = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let charlie = repo::actor::insert(&pool, sample_remote_actor("charlie", "remote.test"))
+        .await
+        .unwrap();
+    // charlie はフォロワー兼 note 作者。shared_inbox_url が同じになる。
+    accepted_follow(&pool, charlie.id, alice.id).await;
+    let remote_note_ap = "https://remote.test/users/charlie/notes/789";
+    let note_id = seed_remote_note(&pool, charlie.id, remote_note_ap).await;
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({"note_id": note_id, "content": "👍"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/reactions")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let queued = list_delivery_queue(&pool).await;
+    assert_eq!(
+        queued.len(),
+        1,
+        "shared_inbox_url が同じ場合は dedup されて 1 件"
+    );
+}
+
+/// 同じ remote note + content の二度目の POST は冪等 (CREATED は返るが
+/// `queued_deliveries == 0`、`delivery_queue` は変わらない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_reaction_on_remote_note_is_idempotent(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let charlie = repo::actor::insert(&pool, sample_remote_actor("charlie", "remote.test"))
+        .await
+        .unwrap();
+    let remote_note_ap = "https://remote.test/users/charlie/notes/901";
+    let note_id = seed_remote_note(&pool, charlie.id, remote_note_ap).await;
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state.clone());
+
+    let body = serde_json::json!({"note_id": note_id, "content": "👍"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/reactions")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let app2 = sakurasato_server::local_api::router(state);
+    let resp2 = app2
+        .oneshot(
+            Request::post("/api/v1/reactions")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::CREATED);
+    let body2 = read_json(resp2).await;
+    assert_eq!(
+        body2["queued_deliveries"], 0,
+        "既存行を返したときは再配送しない"
+    );
+
+    let queued = list_delivery_queue(&pool).await;
+    assert_eq!(queued.len(), 1, "初回 POST の 1 件のみ");
+}
