@@ -87,6 +87,18 @@ pub enum Action {
     SuppressionEnableAll,
     /// Esc ── overlay を閉じる。
     SuppressionClose,
+    /// M13 PR6: 選択中の Note への返信を開始 (= Compose に `in_reply_to` をセット)。
+    ReplyToSelected,
+    /// M13 PR6: 選択中の Note への自分の直近リアクションを取り消す。
+    UndoReactionOnSelected,
+    /// M13 PR6: alt text 入力中の文字入力。
+    AltPromptInsertChar(char),
+    /// M13 PR6: alt text プロンプトの Backspace。
+    AltPromptBackspace,
+    /// M13 PR6: Enter ── alt text 確定で upload を kick。
+    AltPromptSubmit,
+    /// M13 PR6: Esc ── alt text プロンプトをキャンセル (= アップロードを破棄)。
+    AltPromptCancel,
 }
 
 /// crossterm イベント → Action。
@@ -118,6 +130,7 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::Picker => translate_picker_key(k),
         Focus::ReactionPrompt => translate_reaction_prompt_key(k),
         Focus::Suppression => translate_suppression_key(k),
+        Focus::AltPrompt => translate_alt_prompt_key(k),
     }
 }
 
@@ -147,6 +160,21 @@ fn translate_timeline_key(k: KeyEvent) -> Action {
         // M9 PR2: i = 視覚刺激抑制 overlay を開く ("images" の頭文字)。
         // Compose 中は `i` が本文に挿入されるので timeline focus 限定。
         (KeyCode::Char('i'), m) if m.is_empty() => Action::ToggleSuppression,
+        // M13 PR6: R = 返信 (大文字 ── refresh `r` と衝突しないように)。
+        (KeyCode::Char('R'), _) => Action::ReplyToSelected,
+        // M13 PR6: u = 自分が直近に付けた reaction を取り消し。
+        (KeyCode::Char('u'), m) if m.is_empty() => Action::UndoReactionOnSelected,
+        _ => Action::Noop,
+    }
+}
+
+fn translate_alt_prompt_key(k: KeyEvent) -> Action {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Esc => Action::AltPromptCancel,
+        KeyCode::Enter => Action::AltPromptSubmit,
+        KeyCode::Backspace => Action::AltPromptBackspace,
+        KeyCode::Char(c) if !ctrl => Action::AltPromptInsertChar(c),
         _ => Action::Noop,
     }
 }
@@ -432,6 +460,60 @@ mod tests {
                 Focus::Suppression,
             ),
             Action::SuppressionEnableAll,
+        ));
+    }
+
+    #[test]
+    fn timeline_capital_r_replies() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+                Focus::Timeline,
+            ),
+            Action::ReplyToSelected,
+        ));
+    }
+
+    #[test]
+    fn timeline_u_undoes_reaction() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('u'), KeyModifiers::NONE)),
+                Focus::Timeline,
+            ),
+            Action::UndoReactionOnSelected,
+        ));
+    }
+
+    #[test]
+    fn alt_prompt_keys_route_correctly() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Esc, KeyModifiers::NONE)),
+                Focus::AltPrompt,
+            ),
+            Action::AltPromptCancel,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)),
+                Focus::AltPrompt,
+            ),
+            Action::AltPromptSubmit,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('a'), KeyModifiers::NONE)),
+                Focus::AltPrompt,
+            ),
+            Action::AltPromptInsertChar('a'),
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Backspace, KeyModifiers::NONE)),
+                Focus::AltPrompt,
+            ),
+            Action::AltPromptBackspace,
         ));
     }
 

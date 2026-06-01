@@ -13,12 +13,15 @@
 use std::str::FromStr;
 
 /// 投稿エディタの可視性。`server::local_api::notes::CreateNoteRequest::visibility`
-/// のスペックに合わせて 3 値 (direct は M? 以降)。
+/// と揃え、M13 PR6 で `direct` (DM) を追加して 4 値。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
     Public,
     Unlisted,
     Followers,
+    /// M13 PR6 / Issue #79: DM。`content` 中の `@user@host` mention で宛先を解決
+    /// する (= server 側 #65 経路と同じ)。followers にも broadcast されない。
+    Direct,
 }
 
 impl Visibility {
@@ -27,6 +30,7 @@ impl Visibility {
             Self::Public => "public",
             Self::Unlisted => "unlisted",
             Self::Followers => "followers",
+            Self::Direct => "direct",
         }
     }
 
@@ -35,16 +39,19 @@ impl Visibility {
             Self::Public => "public",
             Self::Unlisted => "unlisted",
             Self::Followers => "followers",
+            Self::Direct => "direct",
         }
     }
 
-    /// 連続押し時のサイクル順。`public → unlisted → followers → public`。
+    /// 連続押し時のサイクル順。
+    /// `public → unlisted → followers → direct → public`。
     #[must_use]
     pub fn cycle(self) -> Self {
         match self {
             Self::Public => Self::Unlisted,
             Self::Unlisted => Self::Followers,
-            Self::Followers => Self::Public,
+            Self::Followers => Self::Direct,
+            Self::Direct => Self::Public,
         }
     }
 }
@@ -56,6 +63,7 @@ impl FromStr for Visibility {
             "public" => Ok(Self::Public),
             "unlisted" => Ok(Self::Unlisted),
             "followers" => Ok(Self::Followers),
+            "direct" => Ok(Self::Direct),
             _ => Err("invalid visibility"),
         }
     }
@@ -89,6 +97,12 @@ pub struct Compose {
     /// M7: 添付メディア。`submit` 時に `attachment_ids` として送る。最大件数
     /// は server 側 (`ATTACHMENT_MAX = 4`) と合わせる。
     attachments: Vec<AttachmentRef>,
+    /// M13 PR6 / Issue #79: 返信先 Note の `ap_id`。`submit_note` で
+    /// `CreateNoteRequest::in_reply_to_ap_id` として送る。
+    in_reply_to_ap_id: Option<String>,
+    /// M13 PR6: 返信先 Note のヘッダ表示用ラベル (author handle + 抜粋)。
+    /// レンダリングだけが用途で wire には載らない。
+    reply_parent_label: Option<String>,
 }
 
 /// 添付の最大件数 (= server 側 `ATTACHMENT_MAX`)。Mastodon と揃え。
@@ -105,6 +119,8 @@ impl Default for Compose {
             visibility: Visibility::Public,
             max_chars: 5000,
             attachments: Vec::new(),
+            in_reply_to_ap_id: None,
+            reply_parent_label: None,
         }
     }
 }
@@ -157,6 +173,23 @@ impl Compose {
         self.editing_cw = false;
         self.sensitive = false;
         self.attachments.clear();
+        self.in_reply_to_ap_id = None;
+        self.reply_parent_label = None;
+    }
+
+    /// M13 PR6: 返信モードに切り替える。`label` は画面上部の親 note 表示用。
+    /// `clear` が呼ばれるまで保持され、`submit_note` で wire に乗る。
+    pub fn set_reply_target(&mut self, ap_id: String, label: String) {
+        self.in_reply_to_ap_id = Some(ap_id);
+        self.reply_parent_label = Some(label);
+    }
+
+    pub fn in_reply_to_ap_id(&self) -> Option<&str> {
+        self.in_reply_to_ap_id.as_deref()
+    }
+
+    pub fn reply_parent_label(&self) -> Option<&str> {
+        self.reply_parent_label.as_deref()
     }
 
     pub fn attachments(&self) -> &[AttachmentRef] {
@@ -432,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn visibility_cycles_through_three() {
+    fn visibility_cycles_through_four() {
         let mut c = Compose::new();
         assert_eq!(c.visibility(), Visibility::Public);
         c.cycle_visibility();
@@ -440,7 +473,27 @@ mod tests {
         c.cycle_visibility();
         assert_eq!(c.visibility(), Visibility::Followers);
         c.cycle_visibility();
+        assert_eq!(c.visibility(), Visibility::Direct);
+        c.cycle_visibility();
         assert_eq!(c.visibility(), Visibility::Public);
+    }
+
+    #[test]
+    fn direct_round_trips_via_from_str() {
+        assert_eq!(Visibility::from_str("direct").unwrap(), Visibility::Direct);
+        assert_eq!(Visibility::Direct.as_wire(), "direct");
+    }
+
+    #[test]
+    fn reply_target_is_carried_until_clear() {
+        let mut c = Compose::new();
+        assert!(c.in_reply_to_ap_id().is_none());
+        c.set_reply_target("https://x/notes/1".into(), "@a@b: hello".into());
+        assert_eq!(c.in_reply_to_ap_id(), Some("https://x/notes/1"));
+        assert_eq!(c.reply_parent_label(), Some("@a@b: hello"));
+        c.clear();
+        assert!(c.in_reply_to_ap_id().is_none());
+        assert!(c.reply_parent_label().is_none());
     }
 
     #[test]

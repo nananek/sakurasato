@@ -7,6 +7,7 @@
 //! - **scroll**: タイムラインの先頭から表示開始するインデックス (`top`)。
 //! - **selected**: ハイライトされている note の index (`top` 以上)。
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::client::{NoteCreatedPayload, TimelineNote, Whoami};
@@ -57,6 +58,9 @@ pub enum Focus {
     /// M9 PR2: 視覚刺激抑制トグル overlay。各要素 (avatar / attachment /
     /// emoji / preview / animation) を on/off できる。
     Suppression,
+    /// M13 PR6: 添付アップロード時の alt text 入力プロンプト。
+    /// `App::alt_prompt` が `Some` のときのみ取りうる。
+    AltPrompt,
 }
 
 #[derive(Debug)]
@@ -98,6 +102,14 @@ pub struct App {
     /// M9 PR2: suppression overlay 上のカーソル位置。`Focus::Suppression` で
     /// 開く。`Element::all()` の index。
     pub suppression_cursor: usize,
+    /// M13 PR6: 添付アップロード時の alt text 入力プロンプト。
+    /// `Focus::AltPrompt` 中のみ表示。
+    pub alt_prompt: Option<crate::alt_prompt::AltPrompt>,
+    /// M13 PR6: 自分が直近に付けたリアクションの id を `note_id` 別に覚える。
+    /// `u` (undo reaction) で `DELETE /api/v1/reactions/{id}` に渡す。
+    /// TUI 再起動で消える ── 永続性は不要 (= サーバが真実、TUI はキャッシュ
+    /// に過ぎない)。
+    pub last_reaction_ids: HashMap<i64, i64>,
 }
 
 impl App {
@@ -129,6 +141,8 @@ impl App {
             reaction_prompt: None,
             suppression,
             suppression_cursor: 0,
+            alt_prompt: None,
+            last_reaction_ids: HashMap::new(),
         }
     }
 

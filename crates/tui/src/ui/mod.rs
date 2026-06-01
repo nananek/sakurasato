@@ -102,6 +102,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         render_suppression_overlay(frame, area, app);
     }
 
+    // M13 PR6: alt text 入力プロンプト。status バーに上書き表示する。
+    if app.focus == Focus::AltPrompt
+        && let Some(p) = app.alt_prompt.as_ref()
+    {
+        render_alt_prompt(frame, status_area, &app.theme, p);
+    }
+
     PanelRects {
         timeline: timeline_area,
         timeline_rows: rows,
@@ -144,6 +151,36 @@ fn render_reaction_prompt(
 fn compose_height(app: &App) -> u16 {
     // 投稿フォーカス中は 5 行、それ以外は 3 行 (header + 入力 1 行 + spacer)。
     if app.focus == Focus::Compose { 7 } else { 3 }
+}
+
+/// alt text プロンプトを status バーに上書きする 1 行 overlay。
+fn render_alt_prompt(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+    prompt: &crate::alt_prompt::AltPrompt,
+) {
+    let palette = &theme.palette;
+    frame.render_widget(Clear, area);
+    let line = Line::from(vec![
+        Span::styled(
+            format!("  alt for {} › ", prompt.label),
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            prompt.buffer.clone(),
+            Style::default().fg(palette.foreground),
+        ),
+        Span::styled("▏", Style::default().fg(palette.accent)),
+        Span::styled(
+            "  Enter=upload  Esc=cancel",
+            Style::default().fg(palette.muted),
+        ),
+    ]);
+    let p = Paragraph::new(line).style(Style::default().bg(palette.background));
+    frame.render_widget(p, area);
 }
 
 fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
@@ -412,6 +449,7 @@ fn truncate_for_width(s: &str, max: u16) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_compose(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let palette = &app.theme.palette;
     let header = Line::from(vec![
@@ -472,6 +510,15 @@ fn render_compose(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // M13 PR6: 返信モードは親 note のラベルを 1 行目に固定表示する。
+    if let Some(label) = app.compose.reply_parent_label() {
+        lines.push(Line::from(Span::styled(
+            format!("↳ {label}"),
+            Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
     if app.compose.editing_cw() {
         // CW 行にフォーカス表示。
         let cw_line = if app.compose.cw().is_empty() {
@@ -502,13 +549,18 @@ fn render_compose(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // カーソル位置 (本文行のみ)。CW 編集中は CW 行の末尾に出す。
     if app.focus == Focus::Compose {
+        // M13 PR6: 返信ラベル行 (= 1 行先頭固定) があれば本文行を 1 行ずらす。
+        let reply_offset = usize::from(app.compose.reply_parent_label().is_some());
         let (row, col) = if app.compose.editing_cw() {
-            (0, "CW> ".chars().count() + app.compose.cw().chars().count())
+            (
+                reply_offset,
+                "CW> ".chars().count() + app.compose.cw().chars().count(),
+            )
         } else {
             let (r, c) = app.compose.cursor_row_col();
             // CW 行が乗っている場合は +1。
-            let offset = u16::from(app.compose.editing_cw());
-            (r + usize::from(offset), c)
+            let cw_offset = usize::from(app.compose.editing_cw());
+            (r + reply_offset + cw_offset, c)
         };
         let cx = inner.x + u16::try_from(col).unwrap_or(0);
         let cy = inner.y + u16::try_from(row).unwrap_or(0);
@@ -527,6 +579,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::Picker => "picker",
         Focus::ReactionPrompt => "react",
         Focus::Suppression => "suppress",
+        Focus::AltPrompt => "alt",
     };
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
