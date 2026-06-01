@@ -6,10 +6,9 @@ name: Federation Test (Mastodon)
 # 起動契機:
 #   - nightly cron (UTC 19:00 = JST 04:00)
 #   - workflow_dispatch (= UI から手動キック)
-#
-# required check には **しない**。失敗しても PR を blocking しない。
-# 外部 image (ghcr.io/mastodon/mastodon:latest) の更新タイミング次第で
-# 不安定になることが想定されるため。
+#   - **main 向け PR** (= develop → main の release PR)。required check 化を
+#     想定し、release 前に必ず通す。develop 向け PR では発火させない
+#     (重いビルド + 外部 image 依存 = 開発体験を損なうため)。
 #
 # 失敗時の通知は (a) この workflow ページの run 一覧、(b) GitHub の
 # Actions タブから個別 run のログ、で確認する。Discord 通知は将来 PR で
@@ -20,6 +19,12 @@ on:
   schedule:
     # UTC 19:00 = JST 04:00 (日次)。runner の混み具合が緩い時間帯。
     - cron: "0 19 * * *"
+  pull_request:
+    branches: [main]
+    # docs / 内部 markdown のみの release PR は federation 影響なし。
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
 
 permissions:
   contents: read
