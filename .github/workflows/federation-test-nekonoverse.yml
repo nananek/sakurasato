@@ -65,7 +65,9 @@ jobs:
           compose_file="compose/docker-compose.federation-nekonoverse.yml"
           for svc in sakurasato-server sakurasato-media-proxy \
                      nekonoverse-app nekonoverse-worker \
-                     sakurasato-token-issuer nekonoverse-bob-issuer; do
+                     sakurasato-token-issuer nekonoverse-bob-issuer \
+                     sakurasato-emoji-seed sakurasato-emoji-import \
+                     versitygw-sks; do
             echo "==> ${svc} logs"
             docker compose -p "$project" -f "$compose_file" \
               --profile pytest logs --no-color --tail=300 "$svc" || true

@@ -36,16 +36,47 @@ services:
     networks:
       - nekonoverse-fed
 
+  # versitygw (S3 互換オブジェクトストレージ) ── #120 PR2c で emoji import が
+  # 必須になった。本番 `docker-compose.yml` の `versitygw` を test 用に薄く
+  # 焼き直し: secret は plain env `ROOT_SECRET_ACCESS_KEY` で渡す (= 本番は
+  # `/run/secrets/s3_secret_key`、test stack は単一 host で平文 OK)。
+  #
+  # **bucket dir の事前作成**: versitygw の posix backend は bucket を
+  # サブディレクトリとして扱う。本番では運用フェーズで CreateBucket を叩く
+  # 前提 (= server 自体は bucket 作らない設計) なので、test stack でも
+  # entrypoint で `mkdir -p /data/sakurasato` してから versitygw を exec する。
+  versitygw-sks:
+    build:
+      context: ..
+      dockerfile: docker/versitygw.Dockerfile
+    image: sakurasato/versitygw:dev
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'mkdir -p /data/sakurasato && exec versitygw --port=:7070 --access=sakurasato posix /data'
+    environment:
+      ROOT_SECRET_ACCESS_KEY: testpass
+    volumes:
+      - versitygw_sks_data:/data
+    networks:
+      - nekonoverse-fed
+
   sakurasato-init:
     build:
       context: ..
       dockerfile: docker/server.Dockerfile
     image: sakurasato/server:dev
     command: ["init", "--display-name", "Sakurasato Test"]
-    environment:
+    environment: &sakurasato_env
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
+      # #120 PR2c: emoji import が versitygw に PUT するので、init / server /
+      # emoji-import の 3 サービスで storage 接続情報を共有する (= YAML anchor)。
+      SAKURASATO_STORAGE__ENDPOINT: http://versitygw-sks:7070
+      SAKURASATO_STORAGE__ACCESS_KEY_ID: sakurasato
+      SAKURASATO_STORAGE__SECRET_ACCESS_KEY: testpass
+      SAKURASATO_STORAGE__BUCKET: sakurasato
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       postgres-sks:
@@ -62,20 +93,19 @@ services:
     image: sakurasato/server:dev
     command: ["serve"]
     environment:
-      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
-      SAKURASATO_SERVER__HOST: sakurasato
-      SAKURASATO_SERVER__USER: me
+      <<: *sakurasato_env
       # PR2a (#58 PR1+PR2) で TUI が pytest コンテナから本 socket に繋がる
       # ので、Mastodon stack と同じ `/home/nonroot/local.sock` (= 共有 volume
       # `sakurasato_local_api` 経由で 65532:65532 0o700) に置く。
       SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
       SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
-      SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       sakurasato-init:
         condition: service_completed_successfully
       sakurasato-media-proxy:
         condition: service_healthy
+      versitygw-sks:
+        condition: service_started
     volumes:
       - certs:/certs:ro
       # pytest container が `/home/nonroot/local.sock` を共有 UDS として開く。
@@ -292,6 +322,62 @@ services:
     profiles: [pytest]
     restart: "no"
 
+  # Sakurasato 側にテスト用カスタム絵文字 `:sakurasato_test:` を **import** する
+  # 1-shot service (#58 / #120 PR2c)。`reaction_custom_emoji` シナリオで TUI が
+  # `:sakurasato_test:` を発火するために、import 前に local emoji 行が DB に
+  # 入っている必要がある。
+  #
+  # 2 段構え:
+  #   1. `sakurasato-emoji-seed` (alpine + zip) が Misskey 形式 zip を build し
+  #      共有 volume `sakurasato_seed_emoji` に出す。
+  #   2. `sakurasato-emoji-import` (sakurasato/server:dev) が同 zip を
+  #      `emoji import` CLI で取り込む。media-proxy → versitygw 経由で
+  #      `:sakurasato_test:` の local emoji 行 + S3 object が作られる。
+  sakurasato-emoji-seed:
+    image: alpine:3.21
+    # zip = Info-ZIP の `zip` バイナリ。coreutils = base64 -d (busybox の
+    # base64 は `-d` を読まないことがあるため確実な GNU 系を入れる)。
+    command: >
+      sh -c "apk add --no-cache zip coreutils >/dev/null &&
+             /seed-emoji.sh"
+    environment:
+      SEED_EMOJI_OUT: /seed-emoji/sakurasato_test.zip
+    volumes:
+      - ./federation-test/nekonoverse-federation/seed-emoji.sh:/seed-emoji.sh:ro
+      - sakurasato_seed_emoji:/seed-emoji
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+  sakurasato-emoji-import:
+    image: sakurasato/server:dev
+    command: ["emoji", "import", "/seed-emoji/sakurasato_test.zip"]
+    environment:
+      # `&sakurasato_env` (init / server と同じ DB + storage env) に
+      # media-proxy socket を追加。emoji import は media-proxy で sanitize →
+      # versitygw に PUT するため、`SAKURASATO_STORAGE__*` 4 件と
+      # `SAKURASATO_MEDIA_PROXY__SOCKET` の両方が必須。
+      <<: *sakurasato_env
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
+      sakurasato-emoji-seed:
+        condition: service_completed_successfully
+      versitygw-sks:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+      - sakurasato_seed_emoji:/seed-emoji:ro
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
   pytest:
     build:
       # Context = repo root so the multi-stage build can pull `crates/`,
@@ -314,6 +400,9 @@ services:
       # bob 用 OAuth Bearer (PR2b で DB 直 seed)。`nekonoverse-bob-issuer` が
       # 書き出した raw token をここで読む。
       NEKONOVERSE_TOKEN_FILE: /nkv-tokens/bob.token
+      # PR2c で seed する custom emoji の shortcode。test 側 fixture と
+      # 揃えるため env で渡しておく (= seed と test の不整合を避ける)。
+      SAKURASATO_SEED_EMOJI_SHORTCODE: sakurasato_test
       # Mastodon stack を立てていないので autouse wait を OFF にする。
       MASTODON_ENABLED: "0"
       NEKONOVERSE_ENABLED: "1"
@@ -327,6 +416,8 @@ services:
       sakurasato-server:
         condition: service_started
       sakurasato-token-issuer:
+        condition: service_completed_successfully
+      sakurasato-emoji-import:
         condition: service_completed_successfully
       nekonoverse-bob-issuer:
         condition: service_completed_successfully
@@ -356,6 +447,12 @@ volumes:
   # bob 用 OAuth Bearer (raw token) を nekonoverse-bob-issuer → pytest で共有
   # する named volume (#120 PR2b)。
   nekonoverse_tokens:
+  # `:sakurasato_test:` の seed zip を seed → import 1-shot 間で受け渡す
+  # named volume (#120 PR2c)。pytest 本体は触らない。
+  sakurasato_seed_emoji:
+  # versitygw が emoji import の S3 PUT を受け止める POSIX backend。
+  # `:sakurasato_test:` の webp はここに置かれる (#120 PR2c)。
+  versitygw_sks_data:
 
 networks:
   nekonoverse-fed:
