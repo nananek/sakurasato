@@ -282,6 +282,41 @@ impl LocalApi {
         decode_json(resp).await
     }
 
+    /// `POST /api/v1/follow` ── M13 PR2 (Issue #79)。
+    ///
+    /// `target` で `acct` / `actor_uri` / `actor_id` のいずれか 1 つを指定する
+    /// (= 排他)。`acct` と `actor_uri` は server 側で `WebFinger` host 一致検証
+    /// と remote actor fetch を経由する。`actor_id` は `GET /api/v1/actor` で
+    /// 既に取り込み済みの actor を素早く follow するための高速経路。
+    ///
+    /// 既存 `accepted` 行の再叩きは冪等 ── 200 + `already_accepted=true` で返る。
+    pub async fn follow(&self, target: &FollowTarget) -> Result<FollowResponse, ApiError> {
+        let body = serde_json::to_vec(target)?;
+        let request = self
+            .request_builder(Method::POST, "/api/v1/follow")?
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// `DELETE /api/v1/follow/{id}` ── M13 PR2 (Issue #79)。
+    ///
+    /// `follow_id` (= `follow.id`、Profile relationship エンドポイントが返す
+    /// `follow_state` を保持する行) に対して Undo Follow を送出し、ローカル
+    /// follow 行を削除する。本人 (= local actor) が follower の行のみ削除可能
+    /// (= 他人の follow を消そうとすると 403)。
+    pub async fn unfollow(&self, follow_id: i64) -> Result<UnfollowResponse, ApiError> {
+        let path = format!("/api/v1/follow/{follow_id}");
+        let request = self
+            .request_builder(Method::DELETE, &path)?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
     /// `DELETE /api/v1/reactions/{id}` ── 自分のリアクションを取り消す (M8 PR3)。
     pub async fn delete_reaction(&self, reaction_id: i64) -> Result<(), ApiError> {
         let path = format!("/api/v1/reactions/{reaction_id}");
@@ -565,6 +600,74 @@ pub struct ProfileResponse {
 pub struct CreateReactionRequest {
     pub note_id: i64,
     pub content: String,
+}
+
+/// `POST /api/v1/follow` の body。3 つの指定方式は排他 ── 1 つだけ Some に
+/// する。`#[serde(skip_serializing_if = "Option::is_none")]` で None を JSON
+/// から落とすことで「acct と `actor_id` を同時送信して 400」を踏まない設計。
+///
+/// `TUI` 内では `for_actor_id` / `for_acct` のような builder で組み立てる
+/// ことを推奨 ── 3 つ全部 None で送ると server 側で 400 になる。
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FollowTarget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acct: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<i64>,
+}
+
+impl FollowTarget {
+    /// `GET /api/v1/actor` で取り込み済みの actor を follow する経路。
+    /// remote fetch を伴わないので最速 (= TUI Profile 画面 `f` トグルの常用形)。
+    #[must_use]
+    pub fn for_actor_id(id: i64) -> Self {
+        Self {
+            actor_id: Some(id),
+            ..Self::default()
+        }
+    }
+    /// `acct` (= `user@host`) から `WebFinger` 解決 + remote fetch を経由する。
+    /// `:follow @bob@example` 等のコマンドで使う。
+    #[must_use]
+    pub fn for_acct(acct: impl Into<String>) -> Self {
+        Self {
+            acct: Some(acct.into()),
+            ..Self::default()
+        }
+    }
+    /// actor URI 直接指定 (`WebFinger` をスキップ、remote fetch は通る)。
+    /// 上級者向け / 障害切り分け用。
+    #[must_use]
+    pub fn for_actor_uri(uri: impl Into<String>) -> Self {
+        Self {
+            actor_uri: Some(uri.into()),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FollowResponse {
+    pub follow_id: i64,
+    pub ap_id: String,
+    pub state: String,
+    pub target_actor_id: i64,
+    pub target_ap_id: String,
+    #[serde(default)]
+    pub delivery_queue_id: Option<i64>,
+    #[serde(default)]
+    pub inbox_url: Option<String>,
+    pub already_accepted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnfollowResponse {
+    pub follow_id: i64,
+    pub target_ap_id: String,
+    pub delivery_queue_id: i64,
+    pub inbox_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
