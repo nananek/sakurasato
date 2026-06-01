@@ -871,14 +871,29 @@ pub enum EmojiKind {
 impl EmojiItem {
     /// AP `content` (= リアクション送信 / `:foo:` 挿入のときに使う文字列) を返す。
     /// Custom は `:shortcode:` 形式、Unicode は emoji の生 codepoint。
+    ///
+    /// **Invariant**: Unicode entry は必ず `codepoint = Some(_)` で構築される
+    /// (build.rs 経由で gemoji 由来、`EmojiSuggestState::open` 内で組み立て、
+    /// server 側は Unicode を返さない)。fallback の `shortcode.clone()` は
+    /// 「`:foo:` が AP `content` に流れて Misskey / Mastodon 非互換」になる
+    /// 経路なので、debug build では `debug_assert!` で早期検出する
+    /// ([review #122] minor 2 対応)。release build では fallback を実行して
+    /// **panic はしない** ── リアクション 1 件のために TUI を落とすより、
+    /// 相手側の reaction parser に拒否させた方が被害が小さい。
     #[must_use]
     pub fn content_token(&self) -> String {
         match self.kind {
             EmojiKind::Custom => format!(":{}:", self.shortcode),
-            EmojiKind::Unicode => self
-                .codepoint
-                .clone()
-                .unwrap_or_else(|| self.shortcode.clone()),
+            EmojiKind::Unicode => {
+                debug_assert!(
+                    self.codepoint.is_some(),
+                    "Unicode EmojiItem must have codepoint (shortcode={})",
+                    self.shortcode,
+                );
+                self.codepoint
+                    .clone()
+                    .unwrap_or_else(|| self.shortcode.clone())
+            }
         }
     }
 }
