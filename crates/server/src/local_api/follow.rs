@@ -49,14 +49,16 @@ pub struct CreateFollowResponse {
     pub state: String,
     pub target_actor_id: i64,
     pub target_ap_id: String,
-    /// 既存 `accepted` 行を再叩きしたとき (= Follow を再送しなかった) は `None`、
-    /// それ以外 (= pending 新規 / pending 再 enqueue / rejected → pending 復活)
-    /// は `Some(delivery_queue.id)`。
+    /// 既存 `accepted` または `pending` (Issue #113 で導入) を再叩きしたときは
+    /// `None` (= 何も新規 enqueue しない印)。新規 INSERT / rejected → pending
+    /// 復活でのみ `Some(delivery_queue.id)`。
     pub delivery_queue_id: Option<i64>,
     pub inbox_url: Option<String>,
-    /// `delivery_queue_id is None` と同値だが、クライアント側で読みやすい
-    /// boolean を返しておく (= TUI `f` トグルが UI 文言を分岐する用)。
+    /// 既存 `accepted` 行を再叩き ── TUI `f` トグルが UI 文言を分岐する用。
     pub already_accepted: bool,
+    /// **Issue #113**: 既存 `pending` 行を再叩き ── enqueue を抑止した印。
+    /// TUI 側で「followed」表示はせず「pending 中、retry 待ち」と出すと UX が良い。
+    pub already_pending: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,6 +143,7 @@ fn to_create_response(outcome: FollowOutcome) -> CreateFollowResponse {
         delivery_queue_id: outcome.queue_id,
         inbox_url: outcome.inbox_url,
         already_accepted: outcome.already_accepted,
+        already_pending: outcome.already_pending,
     }
 }
 
