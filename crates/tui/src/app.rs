@@ -65,6 +65,13 @@ pub enum Focus {
     /// `App::profile_stack` の末尾が描画対象。空 stack で Profile に
     /// 入ったままになることは無い (= push と focus 切替を 1 セットで行う)。
     Profile,
+    /// M13 PR5 (Issue #79): 自分の following / followers 一覧画面。
+    /// `App::follow_list` が `Some` のときのみ取りうる。タブは画面内 `t` で
+    /// 切替。Enter で Profile を push して [`Self::Profile`] に遷移する。
+    FollowList,
+    /// M13 PR5 (Issue #79): vim 風コマンドプロンプト `:` 入力中。
+    /// `App::command` が `Some` のときのみ取りうる。
+    Command,
 }
 
 #[derive(Debug)]
@@ -118,6 +125,13 @@ pub struct App {
     /// `p` で push、`Esc`/`q` で pop。空 stack + `Focus::Profile` は許されない
     /// (= `apply_action` 側で焦点を Timeline に戻す責務)。
     pub profile_stack: Vec<crate::profile::ProfileScreen>,
+    /// M13 PR5 (Issue #79): `FollowList` 画面 state。`:following` / `:followers`
+    /// で開く。`Esc` / `q` で `None` に戻し、Profile 同様 stack 風に扱える。
+    /// PR5 では following と followers が排他なので 1 件で足りる。
+    pub follow_list: Option<crate::follow_list::FollowListScreen>,
+    /// M13 PR5 (Issue #79): `:` プロンプトの入力 state。`Focus::Command` の
+    /// あいだだけ `Some`。Esc キャンセル / Enter で実行。
+    pub command: Option<crate::command::CommandPrompt>,
 }
 
 impl App {
@@ -152,6 +166,8 @@ impl App {
             alt_prompt: None,
             last_reaction_ids: HashMap::new(),
             profile_stack: Vec::new(),
+            follow_list: None,
+            command: None,
         }
     }
 

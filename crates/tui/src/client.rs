@@ -302,8 +302,8 @@ impl LocalApi {
     ///
     /// AP URI 直指定で actor を DB upsert した上で relationship を返す。
     /// `WebFinger` を経由しないため、actor URI が既知の場面 (= 別経路で取得した
-    /// JSON / Move target / debug) 向け。
-    #[allow(dead_code, reason = "PR5 / TUI command mode で利用予定")]
+    /// JSON / Move target / debug、PR5 `:me` で自分の `whoami.ap_id` を直引き)
+    /// 向け。
     pub async fn lookup_actor_by_ap_id(
         &self,
         ap_id: &str,
@@ -329,6 +329,37 @@ impl LocalApi {
     /// follow toggle 後に relationship だけを再取得して画面に反映する。
     pub async fn get_relationship(&self, actor_id: i64) -> Result<Relationship, ApiError> {
         let path = format!("/api/v1/actor/{actor_id}/relationship");
+        self.get_json(&path).await
+    }
+
+    /// `GET /api/v1/following?limit=&before_id=` ── M13 PR5 (Issue #79)。
+    ///
+    /// `FollowList` screen の "following" タブが叩く。state=accepted のみ、
+    /// `follow.id DESC` 順 (= 最近 follow 順)。
+    pub async fn list_following(
+        &self,
+        before_id: Option<i64>,
+        limit: i64,
+    ) -> Result<FollowListResponse, ApiError> {
+        use std::fmt::Write as _;
+        let mut path = format!("/api/v1/following?limit={limit}");
+        if let Some(b) = before_id {
+            write!(&mut path, "&before_id={b}").expect("write to String");
+        }
+        self.get_json(&path).await
+    }
+
+    /// `GET /api/v1/followers?limit=&before_id=` ── M13 PR5 (Issue #79)。
+    pub async fn list_followers(
+        &self,
+        before_id: Option<i64>,
+        limit: i64,
+    ) -> Result<FollowListResponse, ApiError> {
+        use std::fmt::Write as _;
+        let mut path = format!("/api/v1/followers?limit={limit}");
+        if let Some(b) = before_id {
+            write!(&mut path, "&before_id={b}").expect("write to String");
+        }
         self.get_json(&path).await
     }
 
@@ -816,6 +847,24 @@ impl Relationship {
             follow_id: None,
         }
     }
+}
+
+/// `GET /api/v1/following` / `/api/v1/followers` の 1 件分。
+/// `server::local_api::follow_list::FollowListEntry` と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct FollowListEntry {
+    pub follow_id: i64,
+    pub follow_state: String,
+    pub follow_created_at: chrono::DateTime<chrono::Utc>,
+    pub actor: ActorProfile,
+}
+
+/// `GET /api/v1/following` / `/api/v1/followers` のレスポンス body。
+#[derive(Debug, Clone, Deserialize)]
+pub struct FollowListResponse {
+    pub entries: Vec<FollowListEntry>,
+    #[serde(default)]
+    pub next_before_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
