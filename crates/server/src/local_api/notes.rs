@@ -73,6 +73,10 @@ const ATTACHMENT_MAX: usize = 4;
 /// それぞれ `WebFinger` + actor fetch を直列実行すると応答が分単位になる。
 /// Mastodon の慣習に近い 50 件を上限とする (PR #78 review #2)。
 const MENTION_MAX: usize = 50;
+/// 1 投稿あたりの local emoji shortcode 上限。content から `:foo:` を抽出した
+/// 後の dedupe 済み件数で評価。Misskey の慣習 (= 1 投稿 30 個前後) に余裕を
+/// もたせて 64 個まで許可、超えたぶんは static drop。
+const EMOJI_MAX: usize = 64;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateNoteRequest {
@@ -165,6 +169,13 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         Err(resp) => return resp,
     };
 
+    // **Issue #102**: content から `:foo:` 形式の local emoji shortcode を
+    // 抽出し、DB の `emoji` 行に解決して AP `Emoji` tag 配列を組み立てる。
+    // 解決できなかった shortcode は黙って drop (= 連合相手に絵文字を表示
+    // させる手段が無いため tag に乗せない。content の `:foo:` テキストは
+    // そのまま残るので「shortcode 風文字列」として表示される)。
+    let emoji_tags = resolve_emoji_tags(&state, &req.content).await;
+
     // **#65**: direct visibility は宛先解決が完了して初めて成立する。
     // 解決後 mention 0 件 + reply_parent も無い場合は配送先がゼロになるので
     // 400 で拒否する (= followers にも配らない = どこにも届かない post)。
@@ -184,6 +195,7 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         &attachments,
         reply_parent.as_ref(),
         &mentions,
+        emoji_tags,
         &state,
     );
 
@@ -224,7 +236,7 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         &prepared.to,
         &prepared.cc,
         &prepared.attachment_documents,
-        &prepared.mention_tags,
+        &prepared.all_tags(),
         published_at,
     );
     // **#65**: extra_inboxes は (a) 返信先 author の inbox と (b) mention で
@@ -304,11 +316,15 @@ struct PreparedNote {
     /// `build_create_activity` にも渡して `Note.attachment` に同値を載せる。
     attachment_documents: Vec<JsonValue>,
     /// **#65**: `Note.tag` に乗せる Mention エントリ。`{type, href, name}` を
-    /// 解決済み mention 1 件につき 1 つ。DB の `note.tags` 列にも同値を入れる。
+    /// 解決済み mention 1 件につき 1 つ。
     mention_tags: Vec<JsonValue>,
+    /// **#102**: `Note.tag` に乗せる Emoji エントリ。content から抽出した
+    /// `:foo:` shortcode を local emoji 行に解決して 1 件ごとに組み立てる。
+    emoji_tags: Vec<JsonValue>,
 }
 
 impl PreparedNote {
+    #[allow(clippy::too_many_arguments, reason = "post fixup を 1 関数にまとめる")]
     fn from_request(
         req: &CreateNoteRequest,
         actor: &ActorRow,
@@ -316,6 +332,7 @@ impl PreparedNote {
         attachments: &[MediaRow],
         reply_parent: Option<&ReplyParentInfo>,
         mentions: &[ResolvedMention],
+        emoji_tags: Vec<JsonValue>,
         state: &AppState,
     ) -> Self {
         let followers_url = actor
@@ -355,7 +372,17 @@ impl PreparedNote {
             cc,
             attachment_documents,
             mention_tags,
+            emoji_tags,
         }
+    }
+
+    /// `Note.tag` 用に mention + emoji を結合した配列。`build_create_activity`
+    /// にも `note.tags` JSONB にも同値を流し込む。
+    fn all_tags(&self) -> Vec<JsonValue> {
+        let mut v = Vec::with_capacity(self.mention_tags.len() + self.emoji_tags.len());
+        v.extend(self.mention_tags.iter().cloned());
+        v.extend(self.emoji_tags.iter().cloned());
+        v
     }
 }
 
@@ -462,6 +489,97 @@ struct ResolvedMention {
     actor_uri: String,
     name: String,
     inbox_for_delivery: Option<String>,
+}
+
+/// content から `:foo:` 形式の local emoji shortcode を抽出する。
+///
+/// 制約 (`repo::emoji::is_valid_shortcode` と同じ): ASCII alphanumeric +
+/// underscore + hyphen、長さ 1..=64。`:foo@host:` のリモート絵文字は本 PR
+/// では対象外で、shortcode に `@` が来た時点で抽出を打ち切る (別 issue で
+/// 対応する)。
+///
+/// 重複 shortcode は ASCII-lowercase で dedupe。上限 [`EMOJI_MAX`] を超えた
+/// ぶんは drop (= attack 防御 + 投稿サイズ抑制)。
+fn parse_emoji_shortcodes(content: &str) -> Vec<String> {
+    let bytes = content.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() && out.len() < EMOJI_MAX {
+        if bytes[i] != b':' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        // 終端 `:` が必要、空 shortcode (`::`) は無視、長さ 1..=64 制約。
+        if j == start || j >= bytes.len() || bytes[j] != b':' {
+            i += 1;
+            continue;
+        }
+        let len = j - start;
+        if !(1..=64).contains(&len) {
+            i += 1;
+            continue;
+        }
+        let shortcode = &content[start..j];
+        let lc = shortcode.to_ascii_lowercase();
+        if seen.insert(lc.clone()) {
+            out.push(lc);
+        }
+        // 終端 `:` の次から再開 ── `:a::b:` のような連続書きも拾えるように。
+        i = j + 1;
+    }
+    out
+}
+
+/// 抽出した shortcode を DB の **local emoji 行** に解決し、AP `Emoji`
+/// tag JSON 配列を返す。
+///
+/// - 解決できなかった shortcode は黙って drop (= 連合相手側で `:foo:` の
+///   テキストはそのまま見えるが画像化はされない、許容範囲)。
+/// - DB エラーも drop (= 投稿全体を 503 にする筋でもないので)。
+async fn resolve_emoji_tags(state: &AppState, content: &str) -> Vec<JsonValue> {
+    let shortcodes = parse_emoji_shortcodes(content);
+    if shortcodes.is_empty() {
+        return Vec::new();
+    }
+    let host = state.config().server.host.clone();
+    let mut out: Vec<JsonValue> = Vec::with_capacity(shortcodes.len());
+    for sc in shortcodes {
+        match repo::emoji::get_local_by_shortcode(state.pool(), &sc).await {
+            Ok(Some(row)) => {
+                let url = build_media_url(&host, &row.image_key);
+                let emoji_ap_id = format!("https://{host}/emojis/{sc}");
+                out.push(json!({
+                    "type": "Emoji",
+                    "id": emoji_ap_id,
+                    "name": format!(":{sc}:"),
+                    "updated": row.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "icon": {
+                        "type": "Image",
+                        "mediaType": row.media_type,
+                        "url": url,
+                    },
+                }));
+            }
+            Ok(None) => {
+                // shortcode が DB に無い ── テキストとしてそのまま残す。
+            }
+            Err(err) => {
+                warn!(?err, shortcode = %sc, "emoji shortcode resolution failed; dropping tag");
+            }
+        }
+    }
+    out
 }
 
 /// content から `@user@host` を抽出する。byte 単位の単純スキャナで、外部
@@ -833,7 +951,7 @@ async fn persist_note(
         to_recipients: prepared.to.clone(),
         cc_recipients: prepared.cc.clone(),
         attachments: JsonValue::Array(prepared.attachment_documents.clone()),
-        tags: JsonValue::Array(prepared.mention_tags.clone()),
+        tags: JsonValue::Array(prepared.all_tags()),
         is_local: true,
         url: None,
         published_at,
@@ -1336,6 +1454,65 @@ mod tests {
         // 前が単語 (`d`) なので mention 開始と認識しない。
         let m = parse_mentions("send email to bob@example.com please");
         assert!(m.is_empty(), "expected no mentions, got {m:?}");
+    }
+
+    // ── parse_emoji_shortcodes (Issue #102) ─────────────────────
+
+    #[test]
+    fn parse_emoji_basic() {
+        let v = parse_emoji_shortcodes("hello :sakura: world");
+        assert_eq!(v, vec!["sakura"]);
+    }
+
+    #[test]
+    fn parse_emoji_multiple_and_dedupe() {
+        let v = parse_emoji_shortcodes(":a: :b: :a: :c:");
+        assert_eq!(v, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_emoji_ignores_invalid_chars() {
+        // 内部にスペース / `@` / `.` がある shortcode は無視 (= 終端 `:` が
+        // 来ないため打ち切り)。
+        let v = parse_emoji_shortcodes(":foo bar: :baz.qux: :alice@host:");
+        assert!(v.is_empty(), "got {v:?}");
+    }
+
+    #[test]
+    fn parse_emoji_lowercase_dedupe() {
+        let v = parse_emoji_shortcodes(":Sakura: :SAKURA: :sakura:");
+        assert_eq!(v, vec!["sakura"]);
+    }
+
+    #[test]
+    fn parse_emoji_underscore_hyphen_digits_ok() {
+        let v = parse_emoji_shortcodes(":hello-1: :foo_bar: :u_2:");
+        assert_eq!(v, vec!["hello-1", "foo_bar", "u_2"]);
+    }
+
+    #[test]
+    fn parse_emoji_skips_too_long_shortcode() {
+        // 65 文字 (= 上限 64 超え) は drop。
+        let long = "a".repeat(65);
+        let v = parse_emoji_shortcodes(&format!(":{long}:"));
+        assert!(v.is_empty(), "got {v:?}");
+    }
+
+    #[test]
+    fn parse_emoji_after_japanese_works() {
+        let v = parse_emoji_shortcodes("こんにちは:sakura:");
+        assert_eq!(v, vec!["sakura"]);
+    }
+
+    #[test]
+    fn parse_emoji_respects_max_limit() {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        for n in 0..200 {
+            let _ = write!(s, ":e{n}: ");
+        }
+        let v = parse_emoji_shortcodes(&s);
+        assert_eq!(v.len(), EMOJI_MAX);
     }
 
     #[test]
