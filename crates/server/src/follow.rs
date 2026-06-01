@@ -34,6 +34,7 @@ use crate::delivery;
 use crate::media_proxy_client::MediaProxyError;
 use crate::remote_actor::{self, FetchError};
 use crate::state::AppState;
+use crate::webfinger_guard::{ensure_webfinger_host_match, extract_acct_host};
 
 pub async fn run(config: Config, args: FollowArgs) -> anyhow::Result<()> {
     let state = AppState::from_config(config).await?;
@@ -164,41 +165,6 @@ async fn resolve_target(state: &AppState, args: &FollowArgs) -> anyhow::Result<A
         })
 }
 
-/// **PR #78 review F-1**: `acct` (= `user@host` / `@user@host` / `acct:user@host`)
-/// から host 部だけを lower-case で抜き出す。形式が壊れていれば `None`。
-/// `media-proxy::webfinger::parse_acct` と同じ受理形を踏襲する。
-fn extract_acct_host(acct: &str) -> Option<String> {
-    let trimmed = acct.trim();
-    let body = trimmed
-        .strip_prefix("acct:")
-        .unwrap_or(trimmed)
-        .trim_start_matches('@');
-    let (_, host) = body.split_once('@')?;
-    if host.is_empty() {
-        return None;
-    }
-    Some(host.to_ascii_lowercase())
-}
-
-/// **PR #78 review F-1**: `WebFinger` が返した `actor_uri` のホストが、
-/// クエリした acct のホストと一致するかを検証する。不一致は cross-domain
-/// 差し替え攻撃の徴候として拒否する。
-fn ensure_webfinger_host_match(expected_host_lc: &str, actor_uri: &str) -> anyhow::Result<()> {
-    let parsed = url::Url::parse(actor_uri)
-        .with_context(|| format!("WebFinger returned invalid actor_uri {actor_uri:?}"))?;
-    let actor_host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("WebFinger actor_uri {actor_uri:?} has no host"))?
-        .to_ascii_lowercase();
-    if actor_host == expected_host_lc {
-        return Ok(());
-    }
-    bail!(
-        "WebFinger returned actor_uri on different host (expected {expected_host_lc:?}, \
-         got {actor_host:?}); possible cross-domain redirect, refusing to follow",
-    )
-}
-
 fn build_follow_activity(ap_id: &str, actor: &str, object: &str) -> JsonValue {
     json!({
         "@context": "https://www.w3.org/ns/activitystreams",
@@ -299,41 +265,5 @@ mod tests {
         assert_eq!(a["actor"], "https://x/users/me");
         assert_eq!(a["object"], "https://y/users/bob");
         assert_eq!(a["@context"], "https://www.w3.org/ns/activitystreams");
-    }
-
-    /// **PR #78 review F-1**: `extract_acct_host` は 3 形式 (acct: / @ / 素)
-    /// すべてから host を lower-case で取り出す。
-    #[test]
-    fn extract_acct_host_handles_all_three_forms() {
-        assert_eq!(
-            extract_acct_host("acct:alice@Example.com").as_deref(),
-            Some("example.com"),
-        );
-        assert_eq!(
-            extract_acct_host("@alice@example.com").as_deref(),
-            Some("example.com"),
-        );
-        assert_eq!(
-            extract_acct_host("alice@example.com").as_deref(),
-            Some("example.com"),
-        );
-        // 形式不正は None。
-        assert_eq!(extract_acct_host("no-at-sign"), None);
-        assert_eq!(extract_acct_host("alice@"), None);
-    }
-
-    #[test]
-    fn ensure_webfinger_host_match_rejects_cross_domain() {
-        ensure_webfinger_host_match("evil.example", "https://evil.example/users/bob").unwrap();
-        let err = ensure_webfinger_host_match("evil.example", "https://victim.example/users/bob")
-            .unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("different host"), "msg={msg}");
-        assert!(msg.contains("victim.example"), "msg={msg}");
-    }
-
-    #[test]
-    fn ensure_webfinger_host_match_is_case_insensitive() {
-        ensure_webfinger_host_match("evil.example", "https://EVIL.EXAMPLE/users/bob").unwrap();
     }
 }

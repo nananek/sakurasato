@@ -62,6 +62,28 @@ where
     .await
 }
 
+/// `(follower_actor_id, followed_actor_id)` ペアで follow 行を引く。
+///
+/// M13 PR1 (Issue #79) の `GET /api/v1/actor/{id}/relationship` 用。
+/// `(follower, followed)` には UNIQUE 制約があるので戻り値は 0 or 1 行。
+pub async fn get_by_pair(
+    pool: &PgPool,
+    follower_actor_id: i64,
+    followed_actor_id: i64,
+) -> sqlx::Result<Option<FollowRow>> {
+    sqlx::query_as!(
+        FollowRow,
+        r#"
+        SELECT id, ap_id, follower_actor_id, followed_actor_id, state, created_at, updated_at
+        FROM follow WHERE follower_actor_id = $1 AND followed_actor_id = $2
+        "#,
+        follower_actor_id,
+        followed_actor_id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// **Issue #66 / M12 `follow-request list`**: local actor 宛 Follow を列挙する。
 ///
 /// `state_filter`:

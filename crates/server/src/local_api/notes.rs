@@ -59,6 +59,7 @@ use crate::local_api::stream::{NoteCreatedPayload, TimelineEvent};
 use crate::media_proxy_client::MediaProxyError;
 use crate::remote_actor::{self, FetchError};
 use crate::state::AppState;
+use crate::webfinger_guard;
 
 const CONTENT_MAX: usize = 5_000;
 const SUMMARY_MAX: usize = 200;
@@ -664,38 +665,11 @@ async fn resolve_mention_actor(state: &AppState, m: &MentionAcct) -> Result<Acto
         .map_err(|err| format_webfinger_err(&m.name, &err))?;
     // F-1: WebFinger が返した actor_uri のホストが、クエリしたホストと一致するか。
     // 不一致は cross-domain 差し替え攻撃の徴候なので reject。
-    ensure_webfinger_host_match(&m.name, &host_lc, &resolved.actor_uri)?;
+    webfinger_guard::ensure_webfinger_host_match(&host_lc, &resolved.actor_uri)
+        .map_err(|err| format!("mention {} {err}", m.name))?;
     remote_actor::fetch_and_upsert(state, &resolved.actor_uri)
         .await
         .map_err(|err| format_fetch_err(&m.name, &err))
-}
-
-/// **PR #78 review F-1**: `WebFinger` レスポンスの `actor_uri` ホストが、
-/// クエリした acct のホストと一致するか確認する。一致しない場合は
-/// `Err(String)` で reject する (= 上位は 400 に倒す)。
-///
-/// `url::Host` は DNS 名を lowercase で返す。IP リテラル等は既存の
-/// `net_guard` (`fetch_and_upsert` 内) で別途遮断されるので、ここは
-/// **ドメイン文字列の一致** だけを担保する。
-fn ensure_webfinger_host_match(
-    name: &str,
-    expected_host_lc: &str,
-    actor_uri: &str,
-) -> Result<(), String> {
-    let parsed = url::Url::parse(actor_uri)
-        .map_err(|e| format!("mention {name} webfinger returned invalid actor_uri: {e}"))?;
-    let actor_host = parsed
-        .host_str()
-        .ok_or_else(|| format!("mention {name} webfinger actor_uri has no host"))?
-        .to_ascii_lowercase();
-    if actor_host == expected_host_lc {
-        return Ok(());
-    }
-    Err(format!(
-        "mention {name} webfinger returned actor_uri on different host \
-         (expected {expected_host_lc:?}, got {actor_host:?}); \
-         possible cross-domain redirect, refusing to use",
-    ))
 }
 
 fn format_webfinger_err(name: &str, err: &MediaProxyError) -> String {
@@ -1422,40 +1396,8 @@ mod tests {
         assert_eq!(m[0].name, "@alice@a.test");
     }
 
-    /// **PR #78 review F-1**: `ensure_webfinger_host_match` は host が完全一致
-    /// すれば Ok、異なる host (cross-domain redirect) なら Err。case fold あり。
-    #[test]
-    fn webfinger_host_match_accepts_exact_and_case_fold() {
-        assert!(
-            ensure_webfinger_host_match("@bob@a.test", "a.test", "https://a.test/users/bob")
-                .is_ok()
-        );
-        // expected が lower-cased で渡されることを前提に、actor_uri の host は
-        // 大文字でも `to_ascii_lowercase()` で揃う。
-        assert!(
-            ensure_webfinger_host_match("@bob@a.test", "a.test", "https://A.TEST/users/bob")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn webfinger_host_match_rejects_cross_domain() {
-        let err = ensure_webfinger_host_match(
-            "@legit@evil.example",
-            "evil.example",
-            "https://victim.example/users/legit",
-        )
-        .unwrap_err();
-        assert!(err.contains("different host"), "msg={err}");
-        assert!(err.contains("victim.example"), "msg={err}");
-    }
-
-    #[test]
-    fn webfinger_host_match_rejects_invalid_uri() {
-        let err =
-            ensure_webfinger_host_match("@x@a.test", "a.test", "not a url at all").unwrap_err();
-        assert!(err.contains("invalid actor_uri"), "msg={err}");
-    }
+    // `ensure_webfinger_host_match` の挙動テストは
+    // [`crate::webfinger_guard::tests`] に集約済 (PR1 / Issue #79 で共通化)。
 
     /// **#65 (review #2)**: 同一投稿で `MENTION_MAX` を超える mention は
     /// 配送経路の `DoS` 防止に巻き込まれ得るため、`MENTION_MAX` の値が

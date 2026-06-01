@@ -28,6 +28,7 @@ pub mod serve;
 pub(crate) mod sign;
 pub mod state;
 pub mod token;
+pub mod webfinger_guard;
 
 #[cfg(test)]
 mod inbox_signature_tests;

@@ -13,6 +13,10 @@
 //! ## ルート
 //!
 //! - `GET /api/v1/whoami` ── 認証確認 + ローカル actor サマリ (M4 PR1)
+//! - `GET /api/v1/actor?acct=|ap_id=` ── actor 解決 + ローカルとの関係を返す
+//!   (M13 PR1 / Issue #79)。`acct` 経路は `WebFinger` host 一致検証を経る。
+//! - `GET /api/v1/actor/{id}` ── DB id で actor を取得 (M13 PR1)
+//! - `GET /api/v1/actor/{id}/relationship` ── ローカル → target の follow 関係 (M13 PR1)
 //! - `GET /api/v1/timeline/home` ── home timeline 一覧 (M4 PR2)
 //! - `POST /api/v1/notes` ── Note 作成 + Create Activity 配送 (M4 PR2)
 //! - `GET /api/v1/stream` ── SSE で新規 Note を購読 (M4 PR2)
@@ -43,6 +47,7 @@ use tracing::warn;
 
 use crate::state::AppState;
 
+pub mod actor;
 pub mod actor_admin;
 pub mod auth;
 pub mod follow_request;
@@ -64,6 +69,11 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/api/v1/whoami", get(whoami::handle))
+        // M13 PR1 (Issue #79): リモート/ローカル actor の lookup + relationship。
+        // TUI の Profile 画面と `:follow` コマンドの基盤。
+        .route("/api/v1/actor", get(actor::lookup))
+        .route("/api/v1/actor/{id}", get(actor::get_by_id))
+        .route("/api/v1/actor/{id}/relationship", get(actor::relationship))
         .route("/api/v1/timeline/home", get(timeline::home))
         .route("/api/v1/notes", post(notes::create))
         .route("/api/v1/stream", get(stream::handle))
