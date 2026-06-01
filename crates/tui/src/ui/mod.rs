@@ -1182,12 +1182,16 @@ fn render_compose(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // カーソル位置 (本文行のみ)。CW 編集中は CW 行の末尾に出す。
     if app.focus == Focus::Compose {
+        use unicode_width::UnicodeWidthStr;
+
         // M13 PR6: 返信ラベル行 (= 1 行先頭固定) があれば本文行を 1 行ずらす。
         let reply_offset = usize::from(app.compose.reply_parent_label().is_some());
         let (row, col) = if app.compose.editing_cw() {
+            // **Issue #105**: char 数ではなく display width で測る ── 日本語の
+            // CW にもカーソルが揃うように。
             (
                 reply_offset,
-                "CW> ".chars().count() + app.compose.cw().chars().count(),
+                UnicodeWidthStr::width("CW> ") + UnicodeWidthStr::width(app.compose.cw()),
             )
         } else {
             let (r, c) = app.compose.cursor_row_col();

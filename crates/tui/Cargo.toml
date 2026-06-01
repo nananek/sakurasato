@@ -35,6 +35,7 @@ chrono.workspace = true
 url.workspace = true
 clap.workspace = true
 http.workspace = true
+unicode-width.workspace = true
 
 ratatui.workspace = true
 crossterm.workspace = true

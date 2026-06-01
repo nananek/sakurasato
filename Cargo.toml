@@ -48,6 +48,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 percent-encoding = "2"
 url = "2"
+# TUI compose で日本語 / 絵文字を 2 cell として扱う display-width 計算用
+# (Issue #105: マルチバイト文字でカーソル位置がズレるバグ修正)。
+unicode-width = "0.2"
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "macros", "chrono", "uuid", "json", "derive", "migrate"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
 axum = "0.8"
