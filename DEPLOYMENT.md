@@ -193,15 +193,21 @@ cloudflared の **Service** には 2 経路ある:
 
 UDS 経路にする場合は `server` 側で `SAKURASATO_SERVER__PUBLIC_LISTEN=unix:/run/sakurasato/public.sock` を入れ、cloudflared サービスにも同じ volume をマウントする。cloudflared ダッシュボードで Service を `unix:/run/sakurasato/public.sock` に登録すれば動く。
 
-### 4.1 token を compose secret として注入
+### 4.1 token を env_file で注入
 
-CLI 引数 (`--token "${TOKEN}"`) に渡すと `ps` / `docker inspect` で平文露出するので、**compose secret** で `/run/secrets/cloudflared_token` に置く:
+CLI 引数 (`--token "${TOKEN}"`) に渡すと `ps` / `docker inspect` で平文露出するので避ける。
+
+**`cloudflare/cloudflared:latest` は distroless** (`/bin/sh` を持たない) のため、従来の `entrypoint: ['/bin/sh', '-c', 'exec cloudflared --token "$(cat /run/secrets/...)" run']` パターンは「`OCI runtime exec failed: exec: "/bin/sh": stat ...`」で起動失敗する ([Issue #71](https://github.com/nananek/sakurasato/issues/71))。
+
+代わりに **`TUNNEL_TOKEN` 環境変数** (= cloudflared の公式入力経路) を `env_file` で注入する:
 
 ```bash
-# ホスト側
-echo "<YOUR_CLOUDFLARED_TOKEN>" > secrets/cloudflared_token.txt
-chmod 644 secrets/cloudflared_token.txt   # secrets/ ディレクトリは 0700 (§7.1)
+# ホスト側 ── KEY=VALUE 形式の単一行ファイル。
+printf 'TUNNEL_TOKEN=%s\n' "<YOUR_CLOUDFLARED_TOKEN>" > secrets/cloudflared.env
+chmod 644 secrets/cloudflared.env   # secrets/ ディレクトリは 0700 (§7.1)
 ```
+
+`env_file` 経由ならコンテナ内に環境変数として直接展開され、`ps` / `docker inspect` (= 引数を引く) では値が見えない。compose は `env_file` をコンテナ起動時に解釈するだけで、host process 環境にも乗らない。
 
 ### 4.2 cloudflared overlay
 
@@ -211,13 +217,15 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
-    # token は file から読む経路にする (CLI 引数は ps で見える)。
-    entrypoint:
-      - /bin/sh
-      - -c
-      - 'exec cloudflared tunnel --no-autoupdate --token "$$(cat /run/secrets/cloudflared_token)" run'
-    secrets:
-      - cloudflared_token
+    # 公式イメージの ENTRYPOINT は `cloudflared` 単体。`TUNNEL_TOKEN` env で
+    # token を渡せば `tunnel run` のサブコマンドだけ command として足せば良い
+    # (= distroless なので /bin/sh ラッパは使えない、Issue #71)。
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+    env_file:
+      - ./secrets/cloudflared.env
     networks:
       # server は internal + egress 両方に居る (CLAUDE.md §6)。
       # cloudflared は外部 (= Cloudflare edge) と server だけ届けばよいので
@@ -225,10 +233,6 @@ services:
       - egress
     depends_on:
       - server
-
-secrets:
-  cloudflared_token:
-    file: ./secrets/cloudflared_token.txt
 ```
 
 `compose -f docker-compose.yml -f docker-compose.ghcr.yml -f docker-compose.cloudflared.yml up -d` で 4 サービス + tunnel が立つ。

@@ -242,30 +242,81 @@ pub struct DatabaseConfig {
     pub password_file: Option<PathBuf>,
 }
 
+/// `sqlx::postgres` が解釈しない URL クエリパラメタ。
+/// 一致するパラメタは [`DatabaseConfig::resolved_url`] が捨てる。
+///
+/// **`channel_binding`** (Neon): TLS channel binding 強制フラグ。
+/// libpq / psycopg などは認識するが sqlx 0.9 は未対応で、起動時に
+/// `unknown URL parameter: channel_binding` の WARN を吐く (Issue #74)。
+/// channel binding は Neon 側で TLS 終端時に強制されており、クライアントの
+/// 同意フラグは advisory に過ぎないので、ここで剥がしても接続安全性に影響
+/// しない (= 結局 server 側で `SCRAM-SHA-256-PLUS` を要求される)。
+///
+/// 将来 sqlx 側がサポートしたらこの allow-list から外す。
+const SQLX_UNKNOWN_QUERY_PARAMS: &[&str] = &["channel_binding"];
+
 impl DatabaseConfig {
     /// Resolve the connection URL, substituting `{password}` from
     /// [`Self::password_file`] when present. The password is percent-encoded
     /// per RFC 3986 userinfo before insertion, so passwords containing
     /// `@`, `:`, `/`, `#`, or other reserved characters do not corrupt
     /// the URL.
+    ///
+    /// **Issue #74**: 解決後の URL から sqlx が認識しないクエリパラメタ
+    /// (= [`SQLX_UNKNOWN_QUERY_PARAMS`]) を取り除く。Neon の
+    /// `channel_binding=require` で起動毎に WARN が出るのを抑止する。
     pub fn resolved_url(&self) -> anyhow::Result<String> {
-        if !self.url.contains("{password}") {
-            return Ok(self.url.clone());
-        }
-        let path = self.password_file.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "database.url contains {{password}} placeholder but database.password_file is unset"
-            )
-        })?;
-        let raw = std::fs::read_to_string(path).map_err(|err| {
-            anyhow::anyhow!(
-                "failed to read database password_file {}: {err}",
-                path.display()
-            )
-        })?;
-        let encoded = utf8_percent_encode(raw.trim(), USERINFO_ENCODE).to_string();
-        Ok(self.url.replace("{password}", &encoded))
+        let substituted = if self.url.contains("{password}") {
+            let path = self.password_file.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "database.url contains {{password}} placeholder but database.password_file is unset",
+                )
+            })?;
+            let raw = std::fs::read_to_string(path).map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to read database password_file {}: {err}",
+                    path.display()
+                )
+            })?;
+            let encoded = utf8_percent_encode(raw.trim(), USERINFO_ENCODE).to_string();
+            self.url.replace("{password}", &encoded)
+        } else {
+            self.url.clone()
+        };
+        Ok(strip_unknown_query_params(
+            &substituted,
+            SQLX_UNKNOWN_QUERY_PARAMS,
+        ))
     }
+}
+
+/// `url` の query string から `drop_keys` に一致するペアだけを除去する。
+/// パースに失敗 (= 無効な URL) なら元の文字列を返す ── sqlx 側で
+/// 接続時に同じパース失敗が再現するので、エラー報告は connect 側に任せる。
+fn strip_unknown_query_params(url: &str, drop_keys: &[&str]) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let kept: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(k, _)| !drop_keys.contains(&k.as_ref()))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if kept.len() == parsed.query_pairs().count() {
+        return parsed.into();
+    }
+    if kept.is_empty() {
+        parsed.set_query(None);
+    } else {
+        let mut serializer = parsed.query_pairs_mut();
+        serializer.clear();
+        for (k, v) in &kept {
+            serializer.append_pair(k, v);
+        }
+        // serializer は Drop 時に書き戻すので明示 drop して parsed を return。
+        drop(serializer);
+    }
+    parsed.into()
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -456,6 +507,61 @@ max_pixels = 33554432
             assert_eq!(parsed.password(), Some("p%40ss%2Fwo%3Ard%231"));
             Ok(())
         });
+    }
+
+    /// Issue #74: Neon の `channel_binding=require` クエリパラメタは sqlx 0.9
+    /// が認識しないので `unknown URL parameter` の WARN を吐く。`resolved_url`
+    /// が剥がして返すことを確認する。
+    #[test]
+    fn resolved_url_strips_channel_binding_query_param() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env(
+                "SAKURASATO_DATABASE__URL",
+                "postgres://u:p@neon.example/dbname?sslmode=require&channel_binding=require",
+            );
+            let cfg = Config::load(&path, None).unwrap();
+            let resolved = cfg.database.resolved_url().unwrap();
+            assert!(
+                !resolved.contains("channel_binding"),
+                "channel_binding must be stripped, got {resolved}"
+            );
+            assert!(
+                resolved.contains("sslmode=require"),
+                "sslmode must be kept, got {resolved}"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolved_url_preserves_url_when_only_unknown_param() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env(
+                "SAKURASATO_DATABASE__URL",
+                "postgres://u:p@neon.example/dbname?channel_binding=require",
+            );
+            let cfg = Config::load(&path, None).unwrap();
+            let resolved = cfg.database.resolved_url().unwrap();
+            assert_eq!(resolved, "postgres://u:p@neon.example/dbname");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn strip_unknown_query_params_is_noop_when_no_match() {
+        let url = "postgres://u:p@host:5432/db?sslmode=require";
+        let cleaned = strip_unknown_query_params(url, &["channel_binding"]);
+        assert_eq!(cleaned, url);
+    }
+
+    #[test]
+    fn strip_unknown_query_params_returns_input_when_invalid_url() {
+        // sqlx 側で同じパース失敗が再現するので、ここは noop で OK。
+        let url = "not a url";
+        let cleaned = strip_unknown_query_params(url, &["channel_binding"]);
+        assert_eq!(cleaned, url);
     }
 
     #[test]
