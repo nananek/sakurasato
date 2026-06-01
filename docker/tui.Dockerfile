@@ -58,6 +58,9 @@ COPY config ./config
 # runtime stage には migrations/ を COPY しないので image サイズは増えない。
 COPY migrations ./migrations
 COPY .sqlx ./.sqlx
+# `crates/core/build.rs` が `vendor/gemoji/emoji.json` を読んで Unicode emoji
+# テーブルを生成する (PR #122 で導入)。TUI build が core を引くので必須。
+COPY vendor ./vendor
 
 # BuildKit のキャッシュマウントで registry とビルド成果物を温存。
 # SQLX_OFFLINE=true は workspace 内で sqlx を使う他クレートのコンパイル時クエリ

@@ -13,6 +13,9 @@ COPY crates ./crates
 COPY config ./config
 COPY migrations ./migrations
 COPY .sqlx ./.sqlx
+# `crates/core/build.rs` が `vendor/gemoji/emoji.json` を読んで Unicode emoji
+# テーブルを生成する (PR #122 で導入)。media-proxy build が core を引くので必須。
+COPY vendor ./vendor
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target,id=sakurasato-media-proxy-target \
