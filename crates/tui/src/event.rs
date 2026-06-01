@@ -286,6 +286,12 @@ fn translate_compose_key(k: KeyEvent) -> Action {
                 Action::InsertNewline
             }
         }
+        // **代替送信キー**: `Ctrl-Enter` は Kitty keyboard protocol (CSI u) に
+        // 対応した端末でしか modifier 付き KeyEvent として届かない。tmux 経由・
+        // xterm / GNOME Terminal / Konsole 等の通常 VT 端末では `\r` のままで
+        // 区別不可能なので、それらの環境のために `F2` を恒久的な送信キーとして
+        // 用意する (function key はほぼどの端末でも素直に通る)。
+        KeyCode::F(2) => Action::SubmitNote,
         KeyCode::Char('w') if ctrl => Action::ToggleCw,
         KeyCode::Char('s') if ctrl => Action::ToggleSensitive,
         KeyCode::Char('v') if ctrl => Action::CycleVisibility,
@@ -422,6 +428,18 @@ mod tests {
                 Focus::Compose,
             ),
             Action::InsertNewline,
+        ));
+    }
+
+    /// Kitty keyboard protocol 非対応端末向けの代替送信キー。
+    #[test]
+    fn compose_f2_submits() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::F(2), KeyModifiers::NONE)),
+                Focus::Compose,
+            ),
+            Action::SubmitNote,
         ));
     }
 
