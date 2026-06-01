@@ -99,6 +99,20 @@ pub enum Action {
     AltPromptSubmit,
     /// M13 PR6: Esc ── alt text プロンプトをキャンセル (= アップロードを破棄)。
     AltPromptCancel,
+    /// M13 PR4: Timeline で選択中の Note の author の Profile 画面を push。
+    OpenProfileFromSelected,
+    /// M13 PR4: Profile 画面でカーソル下移動 (note 一覧)。
+    ProfileSelectNext,
+    /// M13 PR4: Profile 画面でカーソル上移動。
+    ProfileSelectPrev,
+    /// M13 PR4: Profile 画面で `o` ── 古い note ページを追加取得。
+    ProfileLoadMoreNotes,
+    /// M13 PR4: Profile 画面で `f` ── follow / unfollow を toggle。
+    ProfileToggleFollow,
+    /// M13 PR4: Profile 画面で `Esc`/`q` ── stack を 1 段 pop。空になれば Timeline 復帰。
+    ProfileBack,
+    /// M13 PR4: Profile 画面で `r` ── actor + relationship + 直近 notes を再取得。
+    ProfileRefresh,
 }
 
 /// crossterm イベント → Action。
@@ -131,6 +145,20 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::ReactionPrompt => translate_reaction_prompt_key(k),
         Focus::Suppression => translate_suppression_key(k),
         Focus::AltPrompt => translate_alt_prompt_key(k),
+        Focus::Profile => translate_profile_key(k),
+    }
+}
+
+fn translate_profile_key(k: KeyEvent) -> Action {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => Action::ProfileBack,
+        (KeyCode::Char('q'), m) if m.is_empty() => Action::ProfileBack,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::ProfileSelectNext,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::ProfileSelectPrev,
+        (KeyCode::Char('o'), m) if m.is_empty() => Action::ProfileLoadMoreNotes,
+        (KeyCode::Char('f'), m) if m.is_empty() => Action::ProfileToggleFollow,
+        (KeyCode::Char('r'), m) if m.is_empty() => Action::ProfileRefresh,
+        _ => Action::Noop,
     }
 }
 
@@ -164,6 +192,8 @@ fn translate_timeline_key(k: KeyEvent) -> Action {
         (KeyCode::Char('R'), _) => Action::ReplyToSelected,
         // M13 PR6: u = 自分が直近に付けた reaction を取り消し。
         (KeyCode::Char('u'), m) if m.is_empty() => Action::UndoReactionOnSelected,
+        // M13 PR4: p = 選択中の Note の author の Profile 画面を push。
+        (KeyCode::Char('p'), m) if m.is_empty() => Action::OpenProfileFromSelected,
         _ => Action::Noop,
     }
 }
@@ -514,6 +544,70 @@ mod tests {
                 Focus::AltPrompt,
             ),
             Action::AltPromptBackspace,
+        ));
+    }
+
+    #[test]
+    fn timeline_p_opens_profile() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('p'), KeyModifiers::NONE)),
+                Focus::Timeline,
+            ),
+            Action::OpenProfileFromSelected,
+        ));
+    }
+
+    #[test]
+    fn profile_focus_keys_route_correctly() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(matches!(
+                translate(Event::Key(key(code, KeyModifiers::NONE)), Focus::Profile),
+                Action::ProfileBack,
+            ));
+        }
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)),
+                Focus::Profile,
+            ),
+            Action::ProfileSelectNext,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('k'), KeyModifiers::NONE)),
+                Focus::Profile,
+            ),
+            Action::ProfileSelectPrev,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('f'), KeyModifiers::NONE)),
+                Focus::Profile,
+            ),
+            Action::ProfileToggleFollow,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('o'), KeyModifiers::NONE)),
+                Focus::Profile,
+            ),
+            Action::ProfileLoadMoreNotes,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('r'), KeyModifiers::NONE)),
+                Focus::Profile,
+            ),
+            Action::ProfileRefresh,
+        ));
+        // Ctrl-C は Profile でも Quit が勝つ。
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Focus::Profile,
+            ),
+            Action::Quit,
         ));
     }
 

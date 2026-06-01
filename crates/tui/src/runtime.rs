@@ -24,12 +24,13 @@ use tracing::{debug, error, info, warn};
 use crate::TuiOptions;
 use crate::app::{App, Focus, StatusKind};
 use crate::client::{
-    ApiError, CreateNoteRequest, LocalApi, MediaResponse, ProfileUpdate, StreamEvent,
+    ApiError, CreateNoteRequest, FollowTarget, LocalApi, MediaResponse, ProfileUpdate, StreamEvent,
 };
 use crate::compose::{AttachmentRef, Visibility};
 use crate::event::{Action, translate};
 use crate::image_cache::ImageCache;
 use crate::picker::{Activation, FilePicker, PickerMode};
+use crate::profile::ProfileScreen;
 use crate::sse;
 use crate::theme::Theme;
 use crate::ui;
@@ -516,6 +517,253 @@ async fn apply_action(
                 );
             }
             app.focus = Focus::Compose;
+        }
+        Action::OpenProfileFromSelected => open_profile_from_selected(app, api, page_size).await,
+        Action::ProfileSelectNext => {
+            if let Some(p) = app.current_profile_mut() {
+                p.select_next_note();
+            }
+        }
+        Action::ProfileSelectPrev => {
+            if let Some(p) = app.current_profile_mut() {
+                p.select_prev_note();
+            }
+        }
+        Action::ProfileLoadMoreNotes => profile_load_more_notes(app, api, page_size).await,
+        Action::ProfileToggleFollow => profile_toggle_follow(app, api).await,
+        Action::ProfileBack => profile_back(app),
+        Action::ProfileRefresh => profile_refresh(app, api, page_size).await,
+    }
+}
+
+/// `p` で選択中の Note の author を Profile push する。
+async fn open_profile_from_selected(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(note) = app.notes.get(app.selected) else {
+        app.set_status(
+            "no note selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    };
+    let actor_id = note.actor_id;
+    push_profile_for_actor_id(app, api, actor_id, page_size).await;
+}
+
+/// `actor_id` から actor + relationship + 直近 notes を取り、Profile stack に
+/// 1 段 push する。失敗時は status だけ更新して focus は変えない。
+async fn push_profile_for_actor_id(app: &mut App, api: &LocalApi, actor_id: i64, page_size: i64) {
+    let actor = match api.get_actor(actor_id).await {
+        Ok(resp) => resp.actor,
+        Err(err) => {
+            app.set_status(
+                format!("actor lookup failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+            return;
+        }
+    };
+    let relationship = match api.get_relationship(actor_id).await {
+        Ok(r) => r,
+        Err(err) => {
+            // 自分自身の lookup 等は 200 + neutral で返る想定だが、移行時の
+            // 互換性として「relationship 不明 → neutral 扱い」を許す。
+            warn!(
+                ?err,
+                actor_id, "relationship fetch failed; neutral fallback"
+            );
+            crate::client::Relationship::neutral()
+        }
+    };
+    let notes = match api.list_actor_notes(actor_id, None, page_size).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            app.set_status(
+                format!("actor notes fetch failed: {err}"),
+                StatusKind::Warning,
+                Some(Duration::from_secs(5)),
+            );
+            crate::client::TimelineResponse {
+                notes: Vec::new(),
+                next_before_id: None,
+            }
+        }
+    };
+    let acct = format!("@{}@{}", actor.preferred_username, actor.host);
+    app.profile_stack.push(ProfileScreen::new(
+        actor,
+        relationship,
+        notes.notes,
+        notes.next_before_id,
+    ));
+    app.focus = Focus::Profile;
+    app.set_status(
+        format!("profile: {acct}"),
+        StatusKind::Info,
+        Some(Duration::from_secs(2)),
+    );
+}
+
+async fn profile_load_more_notes(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(profile) = app.current_profile() else {
+        return;
+    };
+    if profile.notes_exhausted {
+        app.set_status(
+            "no more notes",
+            StatusKind::Info,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    }
+    let actor_id = profile.actor.id;
+    let before = profile.next_before_id;
+    match api.list_actor_notes(actor_id, before, page_size).await {
+        Ok(resp) => {
+            let n = resp.notes.len();
+            if let Some(p) = app.current_profile_mut() {
+                p.append_older_notes(resp.notes, resp.next_before_id);
+            }
+            app.set_status(
+                format!("loaded {n} older"),
+                StatusKind::Info,
+                Some(Duration::from_secs(2)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("load more failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(5)),
+            );
+        }
+    }
+}
+
+async fn profile_toggle_follow(app: &mut App, api: &LocalApi) {
+    let Some(profile) = app.current_profile() else {
+        return;
+    };
+    let actor_id = profile.actor.id;
+    let acct_label = profile.acct();
+    let is_self_lookup = profile.actor.ap_id == app.whoami.ap_id;
+    if is_self_lookup {
+        app.set_status(
+            "cannot follow yourself",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    }
+    let active = profile.has_active_follow();
+
+    if active {
+        // Unfollow ── relationship に同梱された `follow_id` を使って
+        // `DELETE /api/v1/follow/{id}` を撃つ。pending / accepted のときだけ
+        // server が `follow_id` を露出する仕様 (= rejected のときは toggle 自体
+        // を出さない、has_active_follow が false なので)。
+        let Some(follow_id) = profile.relationship.follow_id else {
+            app.set_status(
+                "relationship has no follow_id; refresh and try again",
+                StatusKind::Warning,
+                Some(Duration::from_secs(4)),
+            );
+            return;
+        };
+        match api.unfollow(follow_id).await {
+            Ok(_) => {
+                if let Some(p) = app.current_profile_mut() {
+                    p.update_relationship(crate::client::Relationship {
+                        following: false,
+                        follow_state: None,
+                        followed_by: p.relationship.followed_by,
+                        follow_id: None,
+                    });
+                }
+                app.set_status(
+                    format!("unfollowed {acct_label}"),
+                    StatusKind::Success,
+                    Some(Duration::from_secs(3)),
+                );
+            }
+            Err(err) => {
+                app.set_status(
+                    format!("unfollow failed: {err}"),
+                    StatusKind::Error,
+                    Some(Duration::from_secs(6)),
+                );
+            }
+        }
+    } else {
+        match api.follow(&FollowTarget::for_actor_id(actor_id)).await {
+            Ok(resp) => {
+                let label = if resp.already_accepted {
+                    format!("{acct_label} (already following)")
+                } else {
+                    format!("follow requested → {acct_label}")
+                };
+                if let Some(p) = app.current_profile_mut() {
+                    p.update_relationship(crate::client::Relationship {
+                        following: resp.state == "accepted",
+                        follow_state: Some(resp.state.clone()),
+                        followed_by: p.relationship.followed_by,
+                        follow_id: Some(resp.follow_id),
+                    });
+                }
+                app.set_status(label, StatusKind::Success, Some(Duration::from_secs(3)));
+            }
+            Err(err) => {
+                app.set_status(
+                    format!("follow failed: {err}"),
+                    StatusKind::Error,
+                    Some(Duration::from_secs(6)),
+                );
+            }
+        }
+    }
+}
+
+fn profile_back(app: &mut App) {
+    app.profile_stack.pop();
+    if app.profile_stack.is_empty() {
+        app.focus = Focus::Timeline;
+    }
+}
+
+async fn profile_refresh(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(profile) = app.current_profile() else {
+        return;
+    };
+    let actor_id = profile.actor.id;
+    // actor 本体は再取得しない (= DB の値で十分、Update Activity を rerun したい
+    // ケースは別 issue)。relationship + notes を撃ち直す。
+    if let Ok(rel) = api.get_relationship(actor_id).await
+        && let Some(p) = app.current_profile_mut()
+    {
+        p.update_relationship(rel);
+    }
+    match api.list_actor_notes(actor_id, None, page_size).await {
+        Ok(resp) => {
+            if let Some(p) = app.current_profile_mut() {
+                p.notes = resp.notes;
+                p.next_before_id = resp.next_before_id;
+                p.notes_exhausted = p.notes.is_empty();
+                p.selected_note = 0;
+                p.note_top = 0;
+            }
+            app.set_status(
+                "profile refreshed",
+                StatusKind::Success,
+                Some(Duration::from_secs(2)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("profile refresh failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(5)),
+            );
         }
     }
 }
