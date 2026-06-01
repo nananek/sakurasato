@@ -2,3 +2,7 @@
 # patch 更新を引き取ってよい (dependabot で追従)。
 httpx>=0.28.0
 pytest>=8.0.0
+# `@pytest.mark.timeout(N)` per-test 安全網 (tui スモーク #58 / #120 PR2a)。
+# 個別 wait は `wait_until_text` / `poll_until` で 30-90s timeout だが、
+# 万一どこかで deadlock した時に pytest 全体を止めるための belt-and-suspenders。
+pytest-timeout>=2.3.0

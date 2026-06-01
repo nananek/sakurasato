@@ -65,16 +65,50 @@ services:
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
-      # 既定の /run/sakurasato は rootless container では書けない
-      # (M4 PR1 で local API が入った後の compose 漏れ)。federation-test で
-      # TUI は使わないので /tmp 配下に逃がす。
-      SAKURASATO_SERVER__LOCAL_API_SOCKET: /tmp/sakurasato-local.sock
+      # PR2a (#58 PR1+PR2) で TUI が pytest コンテナから本 socket に繋がる
+      # ので、Mastodon stack と同じ `/home/nonroot/local.sock` (= 共有 volume
+      # `sakurasato_local_api` 経由で 65532:65532 0o700) に置く。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       sakurasato-init:
         condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
     volumes:
       - certs:/certs:ro
+      # pytest container が `/home/nonroot/local.sock` を共有 UDS として開く。
+      - sakurasato_local_api:/home/nonroot
+      # follow CLI が WebFinger 解決を media-proxy 経由で行うので、socket
+      # を共有する必要がある。
+      - media_sock:/run/sakurasato
+    networks:
+      - nekonoverse-fed
+
+  # M10 PR #51 で `follow` CLI の WebFinger 解決が media-proxy 経由に移った
+  # ため、`:follow bob@nekonoverse` が成立するには media-proxy が立っている
+  # 必要がある。Mastodon stack と同じ構成。
+  sakurasato-media-proxy:
+    build:
+      context: ..
+      dockerfile: docker/media-proxy.Dockerfile
+    image: sakurasato/media-proxy:dev
+    environment:
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    healthcheck:
+      test: ["CMD", "/app/sakurasato-media-proxy", "--healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
     networks:
       - nekonoverse-fed
 
@@ -185,8 +219,115 @@ services:
         aliases:
           - nekonoverse
 
+  # ── pytest profile (#58 / #120 PR2a) ─────────────────────────
+  # `scripts/federation-test/pytest.sh nekonoverse` から発火。
+  # `up.sh nekonoverse` (= 手動 e2e) では起動しない。
+
+  # sakurasato 側のローカル API Bearer トークンを発行して共有 volume に出す。
+  # Mastodon stack と同じパターン。
+  sakurasato-token-issuer:
+    image: sakurasato/server:dev
+    command: ["token", "issue", "--name", "pytest", "--out", "/home/nonroot/pytest.token"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+  # Nekonoverse 側に bob アカウントを headless 登録する (= WebFinger で引ける
+  # 状態にする)。PR2a スコープでは user-level token は取らない ── pytest 側は
+  # public な `/api/v1/accounts/lookup` + `/api/v1/accounts/{id}/followers` で
+  # Follow + Accept round-trip を検証する。alpine + curl + jq の最小構成。
+  nekonoverse-bob-issuer:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache curl jq ca-certificates >/dev/null &&
+             cp /certs/ca.crt /usr/local/share/ca-certificates/test-ca.crt &&
+             update-ca-certificates >/dev/null &&
+             /seed-bob.sh"
+    environment:
+      NKV_BASE: https://nekonoverse
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    depends_on:
+      nekonoverse-app:
+        condition: service_healthy
+      nginx-neko:
+        condition: service_started
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - ./federation-test/nekonoverse-federation/seed-bob.sh:/seed-bob.sh:ro
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+  pytest:
+    build:
+      # Context = repo root so the multi-stage build can pull `crates/`,
+      # `vendor/`, `scripts/tmux-e2e/` for building the TUI binary and
+      # bundling the tmux harness. Compose YAML resolves `context` relative
+      # to the YAML file location (= `compose/`), so `..` lands at the
+      # repo root (mirrors `sakurasato-init` build context).
+      context: ..
+      dockerfile: tests/federation/Dockerfile.tmux
+    image: sakurasato/federation-pytest-tmux:dev
+    command: ["pytest", "-xvs", "--tb=short", "test_nekonoverse_tui.py"]
+    environment:
+      SAKURASATO_BASE_URL: https://sakurasato
+      SAKURASATO_DOMAIN: sakurasato
+      SAKURASATO_LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_TOKEN_FILE: /home/nonroot/pytest.token
+      NEKONOVERSE_BASE_URL: https://nekonoverse
+      NEKONOVERSE_DOMAIN: nekonoverse
+      NEKONOVERSE_USERNAME: bob
+      # Mastodon stack を立てていないので autouse wait を OFF にする。
+      MASTODON_ENABLED: "0"
+      NEKONOVERSE_ENABLED: "1"
+      SSL_CERT_FILE: /certs/ca.crt
+      REQUESTS_CA_BUNDLE: /certs/ca.crt
+      # tmux に与える window サイズはコンテナ TERM の影響を受けないよう
+      # lib.sh 内で `-x 200 -y 50` 固定。env 上書きの余地は残しておく。
+      TERM: xterm-256color
+    user: "65532:65532"
+    depends_on:
+      sakurasato-server:
+        condition: service_started
+      sakurasato-token-issuer:
+        condition: service_completed_successfully
+      nekonoverse-bob-issuer:
+        condition: service_completed_successfully
+      nekonoverse-worker:
+        condition: service_started
+      nginx-neko:
+        condition: service_started
+      nginx-sks:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot:ro
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
 volumes:
   certs:
+  media_sock:
+  # sakurasato local API UDS + token を pytest と共有する。Mastodon stack と
+  # 名前を揃えてあるので、CI から見たときに同じ意味合いで覗ける。
+  sakurasato_local_api:
 
 networks:
   nekonoverse-fed:

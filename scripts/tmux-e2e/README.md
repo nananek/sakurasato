@@ -126,8 +126,27 @@ pytest 経路で挙動がズレる。`subprocess.run` で `lib.sh` を毎回 sou
 Python 側 `_unique_session_name`)。並列 pytest 実行 (`pytest-xdist`) でも
 session 名は worker pid で区別されるので衝突しない。
 
+## 別 image から `lib.sh` を呼ぶ場合 (= tests/federation の Dockerfile.tmux)
+
+`scripts/tmux-e2e/conftest.py` を別 path (例えば `/tests/tmux_driver.py`) に
+copy して使う Docker image では、`conftest.py` 中の
+`LIB_SH = Path(__file__).parent / "lib.sh"` が成立しなくなる。代わりに
+**`TMUX_E2E_LIB_PATH`** 環境変数で `lib.sh` への絶対パスを渡せば、
+`conftest.py` 側はそれを優先して使う。
+
+```
+# Dockerfile.tmux 抜粋
+COPY scripts/tmux-e2e/lib.sh /tests/tmux_lib.sh
+COPY scripts/tmux-e2e/conftest.py /tests/tmux_driver.py
+ENV TMUX_E2E_LIB_PATH=/tests/tmux_lib.sh
+```
+
+これで `tests/federation/conftest.py` から `from tmux_driver import TmuxSession`
+できる ── PR2a (#58 / #120) で Nekonoverse 連合テストが使う経路。
+
 ## 関連
 
 - 親: #58 (E2E 連合テスト umbrella)
-- 後続: #NEW2 = compose + Nekonoverse + 実シナリオ + `.github/workflows/`
+- PR1 (本ファイル): #119 (driver harness 完成、PR #121)
+- PR2a: #120 (= compose + Nekonoverse smoke 1 本 + `federation-test-nekonoverse.yml`)
 - 関連バグ例: #118 (この harness で検出可能な「キー入力が届かない」型)

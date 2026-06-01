@@ -36,8 +36,16 @@ from typing import Iterator
 
 import pytest
 
-# `lib.sh` までの絶対 path。conftest.py と同じディレクトリに置く前提。
-LIB_SH = Path(__file__).resolve().parent / "lib.sh"
+# `lib.sh` までの絶対 path。conftest.py と同じディレクトリに置く前提を
+# default にしつつ、別の場所にコピーした (= tests/federation 用 docker image
+# のように `scripts/tmux-e2e/conftest.py` を別 path に移したい) ケースは
+# `TMUX_E2E_LIB_PATH` 環境変数で上書きできる。
+LIB_SH = Path(
+    os.environ.get(
+        "TMUX_E2E_LIB_PATH",
+        str(Path(__file__).resolve().parent / "lib.sh"),
+    )
+)
 
 # テスト session 名の prefix。Python 側で生成して `tmux_start` に直接渡す。
 # (lib.sh の `tmux_unique_session_name` を呼ぶよりも、Python 側で生成した方が
@@ -180,32 +188,49 @@ def tmux_session() -> Iterator:
 def tmux_tui() -> Iterator:
     """sakurasato-tui を tmux 内で起動するファクトリ fixture。
 
-    PR2 以降の実シナリオで使う想定。PR1 (= 本 PR) では実 TUI 連携が
-    無いので、テストでは `tmux_session("cat")` 等を直接使う。
-
     Usage::
 
         def test_yyy(tmux_tui):
-            tui = tmux_tui(socket_path, token)
+            tui = tmux_tui(socket_path="/run/local.sock",
+                           token_file="/tokens/pytest.token")
             tui.send_keys(":quit", "Enter")
 
-    `SAKURASATO_TUI_BIN` 環境変数でバイナリ path を上書き可能。
+    引数:
+
+    - ``socket_path``: server の UDS パス (= ``--socket`` の env 形
+      ``SAKURASATO_SOCKET`` に渡す)。
+    - ``token_file``: Bearer トークンを格納したファイル (= ``--token-file``
+      引数で渡す)。raw トークンを env / argv に乗せると ``/proc/<pid>/environ``
+      / ``/proc/<pid>/cmdline`` で同 uid プロセスから覗かれ得るため、ファイル
+      経由を強制する。
+    - ``*extra_args``: TUI バイナリへの追加引数 (例: ``--no-images`` で CI
+      の Kitty / Sixel 検出を抑止)。
+    - ``label``: tmux session 名のヒント。複数 TUI を上げるシナリオで識別子
+      にする。
+
+    ``SAKURASATO_TUI_BIN`` 環境変数でバイナリ path を上書き可能 (default
+    ``sakurasato-tui``)。
     """
     started: list[TmuxSession] = []
 
-    def factory(socket_path: str, token: str, *extra_args: str,
-                label: str = "tui") -> TmuxSession:
+    def factory(
+        socket_path: str,
+        token_file: str,
+        *extra_args: str,
+        label: str = "tui",
+    ) -> TmuxSession:
         bin_path = os.environ.get("SAKURASATO_TUI_BIN", "sakurasato-tui")
         name = _unique_session_name(label)
-        # lib.sh の `tmux_start_tui` を経由せず Python 側で env + tmux_start に
-        # 展開する ── tmux_start_tui は env 経由で渡す仕組みだが、Python から
-        # 環境変数を bash 経由でリレーすると subprocess 境界で消えるため。
-        # 代わりに sakurasato-tui を `env KEY=VALUE bin` 形式で起動する。
+        # Python 側で env + tmux_start に展開する ── lib.sh の
+        # tmux_start_tui を bash subprocess 経由で呼ぶと env が境界で
+        # 落ちるため、`env KEY=VALUE bin --token-file <path>` 形式を
+        # 直接構築する。
         cmd = (
             "env",
-            f"SAKURASATO_LOCAL_API_SOCKET={socket_path}",
-            f"SAKURASATO_LOCAL_API_TOKEN={token}",
+            f"SAKURASATO_SOCKET={socket_path}",
             bin_path,
+            "--token-file",
+            token_file,
             *extra_args,
         )
         _run_lib("tmux_start", name, *cmd)
