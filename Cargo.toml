@@ -151,6 +151,16 @@ lru = "0.16"
 #     (axum 0.8 は `serve` API で listener を受け取れる)
 #   - reqwest で外部 GET (workspace 既定の rustls-tls-native-roots)
 #   - image で decode / resize / WebP 再エンコード
+#   - webp (libwebp 経由) で **animated WebP** 再エンコード (#129)
+#     `image` crate の WebP encoder は still 限定で、animated GIF / APNG /
+#     animated WebP を first-frame に潰す。`webp` crate は libwebp-sys を
+#     vendored で内包し AnimEncoder API を提供 ── unsafe は dep 内に閉じ、
+#     本 crate の `#![forbid(unsafe_code)]` は維持される。default の `img`
+#     feature で `image::DynamicImage` ↔ AnimFrame 変換が使える。
+#     libwebp-sys (transitive) は `parallel` 既定 = libwebp の pthread 並列化を
+#     musl 静的リンクで取り込む ── alpine builder の musl-dev に pthread が
+#     同梱されており追加依存なし。
+webp = "0.3"
 
 # ── M8 emoji zip インポート ────────────────────────────────────────
 # Misskey 形式 zip (meta.json + 画像群) を server CLI で取り込むために使う。

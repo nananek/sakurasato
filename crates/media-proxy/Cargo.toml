@@ -38,7 +38,16 @@ reqwest = { workspace = true, features = ["stream"] }
 # WebP encode 用に `webp` を明示 enable (default-features=false にすると
 # encoder が落ちるので features 列に明示)。
 image = { workspace = true, features = ["png", "jpeg", "webp", "gif"] }
+# animated GIF / APNG / animated WebP の再エンコードに使う (#129)。
+# `image` crate の WebP encoder は still 限定なので libwebp 経由の
+# `AnimEncoder` でフレームを保持したまま animated WebP に焼き直す。
+webp = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+# APNG (animated PNG) fixture を tests で組み立てるため。`image` crate には
+# APNG encoder が無いので `png` crate 直叩きで 2 frame APNG を作る。
+# `image` の transitive dep として既に Cargo.lock には乗っているので追加
+# コストは無い。
+png = "0.18"
