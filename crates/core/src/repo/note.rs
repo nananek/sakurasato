@@ -307,10 +307,9 @@ pub async fn count_local(pool: &PgPool) -> sqlx::Result<i64> {
     // ビルドで検出できるようにする (CLAUDE.md §10 規約)。`count(*)` は
     // PostgreSQL の慣習で常に非 NULL だが、sqlx の型は `Option<i64>` で
     // 来るので `unwrap_or(0)` で剥がす。
-    let count: Option<i64> =
-        sqlx::query_scalar!("SELECT count(*) FROM note WHERE is_local = TRUE")
-            .fetch_one(pool)
-            .await?;
+    let count: Option<i64> = sqlx::query_scalar!("SELECT count(*) FROM note WHERE is_local = TRUE")
+        .fetch_one(pool)
+        .await?;
     Ok(count.unwrap_or(0))
 }
 
