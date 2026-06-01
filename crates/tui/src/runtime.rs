@@ -152,7 +152,7 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
     // 十分 (= 同時アップロードは picker UX 的に 1 件 / 時々 2 件)。
     let (upload_tx, mut upload_rx) = mpsc::channel::<UploadOutcome>(8);
 
-    let mut terminal = init_terminal()?;
+    let (mut terminal, enhancement_active) = init_terminal()?;
     let mut event_stream = EventStream::new();
     let mut last_rects = ui::PanelRects::default();
 
@@ -169,7 +169,7 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
     )
     .await;
 
-    restore_terminal(&mut terminal)?;
+    restore_terminal(&mut terminal, enhancement_active)?;
     drop(sse_rx); // receiver drop → SSE task が次ループで終了。
     sse_task.abort();
     let _ = sse_task.await;
@@ -1735,17 +1735,56 @@ fn next_theme(current: &Theme) -> &'static str {
     names[(cur + 1) % names.len()]
 }
 
-fn init_terminal() -> anyhow::Result<TuiTerminal> {
+/// 端末の初期化。戻り値の bool は **Kitty keyboard protocol を有効化できたか**
+/// (= [`PushKeyboardEnhancementFlags`] が通ったか)。`restore_terminal` で対称的に
+/// [`PopKeyboardEnhancementFlags`] を呼ぶか判断するため呼び出し側に渡す。
+///
+/// この拡張プロトコルが効くと `Ctrl-Enter` / `Ctrl-J` 等の修飾キーが modifier
+/// 付きの [`KeyEvent`] として届くようになる。**無効化のままだと普通の VT 端末
+/// (xterm / `GNOME` Terminal / tmux 等) では Ctrl-Enter が単なる `\r` として
+/// 来てしまい、modifier も立たないので compose 送信ができない**。Kitty /
+/// `WezTerm` / Alacritty (CSI u) / foot 等は対応する。
+///
+/// tmux 中継経由や非対応端末では `supports_keyboard_enhancement` が false /
+/// Err を返すので push しない (= 従来挙動)。その場合の救済は代替送信キー
+/// (`F2`) に倒す ── 詳細は [`crate::event::translate_compose_key`]。
+fn init_terminal() -> anyhow::Result<(TuiTerminal, bool)> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .context("enter alternate screen + mouse capture")?;
+    let mut enhancement_active = false;
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        // 最小フラグ: DISAMBIGUATE_ESCAPE_CODES のみ。REPORT_EVENT_TYPES (=
+        // Release/Repeat 配信) は既存 event loop が Release を捨てる前提なので
+        // 入れない (= 動作変化を最小化)。
+        if execute!(
+            stdout,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            )
+        )
+        .is_ok()
+        {
+            enhancement_active = true;
+        }
+    }
     let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).context("create ratatui Terminal")
+    let terminal = Terminal::new(backend).context("create ratatui Terminal")?;
+    Ok((terminal, enhancement_active))
 }
 
-fn restore_terminal(terminal: &mut TuiTerminal) -> anyhow::Result<()> {
+fn restore_terminal(terminal: &mut TuiTerminal, enhancement_active: bool) -> anyhow::Result<()> {
     disable_raw_mode().context("disable raw mode")?;
+    // 対称的に Pop ── push していない端末で Pop だけ呼ぶと端末によっては
+    // 不明シーケンスとして表示される事故が報告されているので、push の成否を
+    // bool で持ち回す設計にしている。
+    if enhancement_active {
+        let _ = execute!(
+            terminal.backend_mut(),
+            crossterm::event::PopKeyboardEnhancementFlags,
+        );
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
