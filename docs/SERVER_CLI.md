@@ -1,0 +1,389 @@
+# Sakurasato サーバ CLI ガイド 🌸
+
+> `sakurasato-server` バイナリのサブコマンド一覧と、それぞれの典型的な使い方。
+
+Sakurasato は **Web の認証 UI を持たない** ため、ユーザ作成・トークン発行・絵文字インポート・鍵アカ管理・引っ越しといった管理操作は **サーバ側 CLI** で完結します。本ドキュメントは [`crates/server/src/cli.rs`](../crates/server/src/cli.rs) で定義される全コマンドのリファレンスです。
+
+TUI 側の操作方法は [docs/TUI.md](TUI.md)、デプロイ手順は [DEPLOYMENT.md](../DEPLOYMENT.md) を参照してください。
+
+---
+
+## 0. 共通の前提
+
+### 0.1 起動の形
+
+実運用ではコンテナ内で `sakurasato-server` を呼び出します。docker compose 環境では:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server <subcommand> [args]
+```
+
+開発時にローカルビルドで叩く場合:
+
+```bash
+cargo run -p sakurasato-server -- <subcommand> [args]
+```
+
+### 0.2 グローバル引数
+
+| 引数 | 用途 |
+|---|---|
+| `--config <path>` | 追加 TOML overlay。`config/default.toml` の上に重ねる (DEPLOYMENT.md §3.3 参照) |
+
+### 0.3 環境変数
+
+設定はすべて `SAKURASATO_<セクション>__<キー>` 形式の env で上書き可能 (`__` がネスト区切り)。詳細は [DEPLOYMENT.md §3.3](../DEPLOYMENT.md) と [`crates/core/src/config.rs`](../crates/core/src/config.rs)。
+
+---
+
+## 1. サブコマンド一覧
+
+| コマンド | 役割 | セクション |
+|---|---|---|
+| `serve` | AP 連合デーモンを起動 | [§2](#2-serve) |
+| `init` | 初回 actor + 鍵生成 (DB マイグレーション込み) | [§3](#3-init) |
+| `deliver` | キューにある特定の配送を 1 回手動で flush | [§4](#4-deliver) |
+| `token` | ローカル API Bearer トークンの管理 | [§5](#5-token) |
+| `emoji` | カスタム絵文字の管理 (Misskey 形式 zip インポート) | [§6](#6-emoji) |
+| `alias` | `alsoKnownAs` の管理 (引っ越し受け入れ準備) | [§7](#7-alias) |
+| `move-out` | フォロワー連れて他鯖へ引っ越し (Move 送出) | [§8](#8-move-out) |
+| `follow` | acct で指定した相手に Follow を投入 | [§9](#9-follow) |
+| `move-accept` | 受領済み Move 本文を CLI から再処理 | [§10](#10-move-accept) |
+| `actor lock` / `unlock` | 鍵アカ運用切替 (M12 / #66) | [§11](#11-actor) |
+| `follow-request` | 鍵アカ時の承認待ち follow の管理 | [§12](#12-follow-request) |
+
+---
+
+## 2. `serve`
+
+AP 連合デーモンを起動します。本番では compose 起動 (`docker compose up -d`) 経由で常駐させるのが普通で、CLI から直接叩く場面は少ないです (= ローカル開発で手動起動するとき用)。
+
+```bash
+sakurasato-server serve
+```
+
+---
+
+## 3. `init`
+
+DB マイグレーション + 単一ユーザ actor + 署名鍵 (RSA 2048 + Ed25519) の生成を行います。新規セットアップで **必ず一度** 走らせるコマンド。
+
+```bash
+sakurasato-server init
+```
+
+### 3.1 オプション
+
+| 引数 | 既定値 | 用途 |
+|---|---|---|
+| `--username <name>` | `config.server.user` | 上書き用 (高度な用途のみ) |
+| `--display-name <text>` | username と同じ | actor の表示名 |
+| `--force` | `false` | 既存 actor を上書きして再 init (**フェデレーション破壊**) |
+| `--locked` | `false` | 鍵アカ (`manuallyApprovesFollowers = true`) として初期化 |
+
+### 3.2 `--force` の意味
+
+`--force` は **鍵を再生成** します。これは:
+
+- 既存フォロワーの inbox に送る配送が全て署名検証失敗で弾かれる
+- ロールバック手段は postgres dump 復元のみ
+- 緊急時 (= 鍵漏洩) のみ使う
+
+詳細は [DEPLOYMENT.md §7.3 鍵ローテーション](../DEPLOYMENT.md)。
+
+### 3.3 `--locked` と既存 lock 状態
+
+- 新規 `init`: `--locked` あり → lock 状態で初期化 / 無し → unlock
+- `init --force`: `--locked` あり → lock 維持/有効化 / 無し → **既存 lock は保たれる** (= unlock したい時は `actor unlock` を明示的に叩く)
+
+これは「lock を片方向に倒すミス」(unlock 解除事故) を防ぐ設計です。
+
+---
+
+## 4. `deliver`
+
+`delivery_queue` から 1 行を手動 flush します。配送ワーカが正常運用中であれば不要で、開発 / トラブルシュート時のデバッグ用。
+
+```bash
+sakurasato-server deliver --queue-id <id>
+```
+
+`queue_id` を一覧する CLI は意図的に用意していません (= 攻撃面を増やさない方針)。`psql` で `SELECT id, target_inbox, status FROM delivery_queue WHERE status != 'delivered';` を叩く想定。
+
+---
+
+## 5. `token`
+
+TUI / pytest など Bearer 認証でローカル API を叩くクライアント用のトークン管理。
+
+### 5.1 `token issue`
+
+新規発行。**生 token は stdout に一度きり** 表示されます (DB にはハッシュのみ保管)。
+
+```bash
+sakurasato-server token issue --name "tui-laptop"
+```
+
+ファイル出力 (= compose の named volume で TUI / pytest に共有する用途):
+
+```bash
+sakurasato-server token issue --name "ci" --out /run/sakurasato-secrets/ci-token
+```
+
+`--out` 指定時、**既存ファイルが存在すると失敗** します (= 古いトークンが意図せず奪われるのを防ぐ)。
+
+### 5.2 `token list`
+
+発行済みトークンの一覧 (id / name / created / last_used)。**生 token は再表示できません** ── 失念したら `revoke` + `issue` で作り直し。
+
+```bash
+sakurasato-server token list
+```
+
+### 5.3 `token revoke`
+
+指定 id を hard-delete。
+
+```bash
+sakurasato-server token revoke --id 3
+```
+
+---
+
+## 6. `emoji`
+
+カスタム絵文字管理。M8 で Misskey 形式 zip インポートのみ実装。
+
+### 6.1 `emoji import`
+
+Misskey の export 形式 zip (`meta.json` + 画像ファイル) を取り込みます。
+
+```bash
+sakurasato-server emoji import /path/to/misskey-emoji.zip
+```
+
+- 既存 shortcode は **上書き** されます (CLAUDE.md §5.4)
+- 画像バイト列は **server 本体ではデコードしない** ── media-proxy の `/v1/image/sanitize` 経由で再エンコードしてから versitygw に格納 (CLAUDE.md §7 隔離方針)
+- `downloaded == true` の絵文字のみ取り込み (Misskey の元仕様準拠)
+
+---
+
+## 7. `alias`
+
+`alsoKnownAs` の管理。他鯖から **引っ越し受け入れ** をするとき、こちら側の actor に「自分が以前居た場所」を宣言する必要があります (Mastodon の双方向同意検査用)。
+
+### 7.1 `alias list`
+
+```bash
+sakurasato-server alias list
+```
+
+### 7.2 `alias add`
+
+URI を追加 (冪等)。actor `Update` を全フォロワーに配信します。
+
+```bash
+sakurasato-server alias add https://old.example.com/users/me
+```
+
+### 7.3 `alias remove`
+
+URI を削除 (無い場合は no-op)。同じく `Update` 配信。
+
+```bash
+sakurasato-server alias remove https://old.example.com/users/me
+```
+
+### 7.4 `alias clear`
+
+全エントリクリア + `Update` 配信。
+
+```bash
+sakurasato-server alias clear
+```
+
+---
+
+## 8. `move-out`
+
+フォロワーを連れて別 actor へ **引っ越し送出**。Mastodon / Misskey と同じ作法で、Move activity を全フォロワーに送り、相手側に follow を引き継いでもらいます。
+
+```bash
+sakurasato-server move-out https://new.example.com/users/me
+```
+
+### 8.1 双方向同意検査
+
+**移動先 actor の `alsoKnownAs` に自分の `ap_id` が先に登録されていない** と CLI は拒否します。これは「勝手に他人の actor に引っ越し偽装する」のを防ぐためで、Mastodon も同じ作法です。
+
+移動先で先に登録してもらった上で `move-out` を実行する流れ:
+
+1. 移動先 actor の側で `alsoKnownAs` に Sakurasato の actor URI を追加
+2. Sakurasato 側で `move-out <移動先 URI>` を実行
+
+### 8.2 `--force` (緊急時のみ)
+
+双方向検査をスキップします。同意が無い状態で Move を投げると相手側で偽装と扱われる可能性が高いので、**通常は使わない**。
+
+```bash
+sakurasato-server move-out https://new.example.com/users/me --force
+```
+
+---
+
+## 9. `follow`
+
+acct で指定した相手に Follow を投入します。WebFinger 解決 (media-proxy 経由) → actor URI 取得 → `delivery_queue` に Follow を 1 行積みます。常駐ワーカが拾って送出。
+
+```bash
+sakurasato-server follow acct:alice@misskey.example
+# または
+sakurasato-server follow @alice@misskey.example
+sakurasato-server follow alice@misskey.example
+```
+
+### 9.1 WebFinger をスキップ (actor URI 直指定)
+
+```bash
+sakurasato-server follow --actor-uri https://misskey.example/users/abcd1234
+```
+
+`acct` 引数があっても **`--actor-uri` が優先** されます。
+
+### 9.2 冪等
+
+同じ相手に何度叩いても `(follower, followed)` UNIQUE 制約 + 決定論的 activity id で冪等。既存 row が:
+
+- `accepted` → no-op
+- `rejected` → 明示拒否
+- `pending` → 再 enqueue (= retry)
+
+---
+
+## 10. `move-accept`
+
+**初回受領時に DB / network エラーで 503 を返した** inbound Move を CLI から手動再処理するための薄いラッパ。HTTP 署名検証はスキップされるため、**自分が控えておいた activity 本文 (= 通常経路で受領したものを保存しておいた JSON)** にのみ使ってください。
+
+```bash
+sakurasato-server move-accept --from /path/to/saved-move-activity.json
+```
+
+### 10.1 signer 上書き
+
+通常は activity 本文の `actor` を信用しますが、改竄を疑うときに上書き可能:
+
+```bash
+sakurasato-server move-accept --from /path/to/saved.json --signer https://x.example/users/alice
+```
+
+### 10.2 安全側のガード
+
+`type == "Move"` のみ受け付けます (それ以外は拒否)。さらに `handle_move` 内で:
+
+- `alsoKnownAs` 双方向同意検査
+- target actor の fresh fetch
+
+を行うので、第三者から渡された JSON を流しても勝手に follow が向こう側に倒れることは無い設計です。それでも **未検証 JSON を流すのは推奨しません**。
+
+---
+
+## 11. `actor`
+
+鍵アカ運用 (`manuallyApprovesFollowers = true`) の切替。M12 / Issue #66。
+
+### 11.1 `actor lock`
+
+鍵アカ化。
+
+```bash
+sakurasato-server actor lock
+```
+
+- actor JSON が `manuallyApprovesFollowers: true` を emit するようになる
+- フォロワー全員に actor `Update` を配信 (= 相手側のキャッシュを更新)
+- 新規 Follow は `pending` に据え置かれ、`follow-request approve/reject` で明示的に処理する必要がある
+- **既存 `accepted` フォロワーが Mastodon 側で Follow を retry してきた** ケースは引き続き Accept が自動で返る (= `:lock` した瞬間に従来フォロワーを切るのではなく、新規 Follow だけ承認制に切替える設計)
+
+### 11.2 `actor unlock`
+
+鍵アカ解除。
+
+```bash
+sakurasato-server actor unlock
+```
+
+- 同様に actor `Update` を配信
+- **lock 中に溜まった pending Follow は auto-Accept されません** ── 明示的に `follow-request approve/reject` する必要があります (Mastodon と同じ作法 / unlock 事故防止)
+
+### 11.3 TUI から触る
+
+M12 (PR #95) で TUI command mode にも同等コマンドが入っています:
+
+| TUI command | サーバ CLI 同等 |
+|---|---|
+| `:lock` | `actor lock` |
+| `:unlock` | `actor unlock` |
+| `:requests` | `follow-request list` (+ 画面内で `a` / `x` で approve / reject) |
+
+詳細は [docs/TUI.md §4 Command mode](TUI.md)。
+
+---
+
+## 12. `follow-request`
+
+鍵アカ中の承認待ち follow を CLI から処理。
+
+### 12.1 `follow-request list`
+
+`follow.state = 'pending'` かつ followed が local actor の行を列挙。`id` / `follower (ap_id)` / `received_at` を出します。
+
+```bash
+sakurasato-server follow-request list
+```
+
+### 12.2 `follow-request approve`
+
+指定 id を承認 → Accept activity を `delivery_queue` に積み + `follow.state = 'accepted'` に遷移。
+
+```bash
+sakurasato-server follow-request approve --id 42
+```
+
+### 12.3 `follow-request reject`
+
+指定 id を拒否 → Reject activity を積み + `follow.state = 'rejected'` に遷移。
+
+```bash
+sakurasato-server follow-request reject --id 42
+```
+
+---
+
+## トラブルシューティング
+
+### TUI から `:lock` を叩いたが反映されない
+
+サーバ CLI と同じ local API (`POST /api/v1/actor/lock`) を叩いているので、原理上挙動は同じです。`server` のログ (`docker compose logs -f server`) で `actor_admin` の error を確認してください。
+
+### `init --force` で間違って鍵を再生成してしまった
+
+postgres の dump 復元しかありません ([DEPLOYMENT.md §7.2 バックアップ](../DEPLOYMENT.md))。バックアップが無い場合、**全フォロワー関係は失われます**。新規鍵で再フォローしてもらうしかありません。
+
+### `follow` が pending のまま遷移しない
+
+- 相手側が鍵アカ (= `manuallyApprovesFollowers = true`) で承認待ち状態
+- 相手の管理者に承認依頼するか、`follow-request approve` 待ち
+- `delivery_queue` のステータスを `psql` で確認
+
+### `move-out` が拒否される (双方向同意検査)
+
+移動先 actor の `alsoKnownAs` に **先に** 自分の ap_id を入れてもらう必要があります。例: Mastodon → Sakurasato の引っ越しなら、まず Mastodon 側 `tootctl accounts merge` か Web UI で alsoKnownAs を設定。詳細は §8.1。
+
+---
+
+## 関連ドキュメント
+
+- [docs/TUI.md](TUI.md) ── TUI クライアント操作ガイド
+- [DEPLOYMENT.md](../DEPLOYMENT.md) ── サーバ本番デプロイ手順
+- [CLAUDE.md](../CLAUDE.md) ── アーキテクチャ・設計方針
+- [`crates/server/src/cli.rs`](../crates/server/src/cli.rs) ── CLI 定義 (本ドキュメントの ground truth)
