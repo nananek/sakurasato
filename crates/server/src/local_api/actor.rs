@@ -7,6 +7,11 @@
 //!   profile + ローカル actor との関係を返す。
 //! - `GET /api/v1/actor/{id}` ── DB id で actor を取得 (= 既知 actor の再 fetch)。
 //! - `GET /api/v1/actor/{id}/relationship` ── ローカル actor からの関係のみ。
+//! - `GET /api/v1/actor/{id}/notes?limit=&before_id=` ── 当該 actor が author の
+//!   Note を `note.id DESC` 順で列挙 (M13 PR3)。visibility filter:
+//!   `public` / `unlisted` は常に見える、`followers` は viewer が accepted で
+//!   follow しているとき、`direct` は viewer が `to_recipients` /
+//!   `cc_recipients` に乗っているとき。author 自身を viewer にすると全件返る。
 //!
 //! ## 関係の意味
 //!
@@ -25,6 +30,8 @@
 //! `ap_id` 直接指定は `remote_actor::fetch_and_upsert` 内の `id == ap_id`
 //! 自己整合性チェックと `net_guard` (SSRF 防御) に委ねる。
 
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -32,8 +39,11 @@ use axum::response::{IntoResponse, Response};
 use sakurasato_core::model::{ActorRow, FollowState};
 use sakurasato_core::repo;
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{error, warn};
 
+use crate::local_api::timeline::{
+    self as timeline_api, ReactionSummaryDto, TimelineNote, TimelineResponse,
+};
 use crate::media_proxy_client::MediaProxyError;
 use crate::remote_actor::{self, FetchError};
 use crate::state::AppState;
@@ -154,6 +164,96 @@ pub async fn relationship(State(state): State<AppState>, Path(id): Path<i64>) ->
         }
     };
     Json(rel).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NotesQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub before_id: Option<i64>,
+}
+
+/// `GET /api/v1/actor/{id}/notes?limit=&before_id=`
+///
+/// 当該 actor が author の Note を visibility filter 経由で列挙する。
+/// - `id` が存在しなければ 404。
+/// - ローカル actor が未 init なら 503。
+/// - リアクション集計は **集計に失敗してもタイムライン本体は返す**
+///   (= `home` と同じ動き、`warn!` だけ残す)。
+pub async fn list_notes(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<NotesQuery>,
+) -> Response {
+    let target = match repo::actor::get_by_id(state.pool(), id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return not_found(),
+        Err(err) => {
+            error!(?err, id, "list_notes: target actor lookup failed");
+            return internal_error();
+        }
+    };
+    let viewer = match resolve_local_actor(&state).await {
+        Ok(a) => a,
+        Err(err) => return err.into_response(),
+    };
+
+    let limit = timeline_api::clamp_limit(q.limit);
+    let entries = match repo::note::list_by_author(
+        state.pool(),
+        target.id,
+        viewer.id,
+        &viewer.ap_id,
+        q.before_id,
+        limit,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            error!(?err, target_id = target.id, "list_notes: query failed");
+            return internal_error();
+        }
+    };
+
+    let host = &state.config().server.host;
+    let next_before_id = entries.last().map(|e| e.id);
+
+    // M8 PR3 と同じくリアクション集計を 1 クエリで取り、失敗時は warn だけ。
+    let note_ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
+    let mut by_note: HashMap<i64, Vec<ReactionSummaryDto>> = HashMap::new();
+    match repo::reaction::counts_for_notes(state.pool(), &note_ids).await {
+        Ok(rows) => {
+            for row in rows {
+                by_note
+                    .entry(row.note_id)
+                    .or_default()
+                    .push(timeline_api::row_to_dto(host, row));
+            }
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                target_id = target.id,
+                "list_notes: reaction counts_for_notes failed"
+            );
+        }
+    }
+
+    let notes: Vec<TimelineNote> = entries
+        .into_iter()
+        .map(|e| {
+            let reactions = by_note.remove(&e.id).unwrap_or_default();
+            TimelineNote::from_entry_with_reactions(e, reactions)
+        })
+        .collect();
+
+    Json(TimelineResponse {
+        notes,
+        next_before_id,
+    })
+    .into_response()
 }
 
 async fn resolve_by_ap_id(state: &AppState, ap_id: &str) -> Result<ActorRow, ResolveError> {

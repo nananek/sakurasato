@@ -1714,3 +1714,598 @@ async fn follow_requires_auth(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ============================================================
+// M13 PR3 (Issue #79) — `GET /api/v1/following` / `/followers` /
+// `GET /api/v1/actor/{id}/notes`
+// ============================================================
+
+#[allow(clippy::too_many_arguments)] // テストヘルパ; 引数は逐一意味があり束ねづらい。
+async fn insert_note_with_visibility(
+    pool: &PgPool,
+    actor_id: i64,
+    host: &str,
+    suffix: &str,
+    content: &str,
+    visibility: sakurasato_core::model::Visibility,
+    to_recipients: Vec<String>,
+    cc_recipients: Vec<String>,
+) -> i64 {
+    let ap_id = format!("https://{host}/notes/{suffix}");
+    let row = repo::note::insert(
+        pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id,
+            actor_id,
+            content: content.into(),
+            language: Some("ja".into()),
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility,
+            sensitive: false,
+            to_recipients,
+            cc_recipients,
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: false,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    row.id
+}
+
+/// `GET /api/v1/following` ── accepted のみ返る。pending / rejected は除外。
+/// `next_before_id` は `entries` 末尾の `follow.id`。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_returns_only_accepted(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let carol = repo::actor::insert(&pool, sample_remote_actor("carol", "other.test"))
+        .await
+        .unwrap();
+    let dave = repo::actor::insert(&pool, sample_remote_actor("dave", "rej.test"))
+        .await
+        .unwrap();
+    let _f_bob = insert_follow(
+        &pool,
+        me.id,
+        bob.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+    let _f_carol = insert_follow(
+        &pool,
+        me.id,
+        carol.id,
+        sakurasato_core::model::FollowState::Pending,
+    )
+    .await;
+    let _f_dave = insert_follow(
+        &pool,
+        me.id,
+        dave.id,
+        sakurasato_core::model::FollowState::Rejected,
+    )
+    .await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/following")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "only accepted should return: {entries:?}");
+    assert_eq!(entries[0]["actor"]["ap_id"], bob.ap_id);
+    assert_eq!(entries[0]["follow_state"], "accepted");
+    assert!(entries[0]["follow_id"].is_i64());
+    // 秘密鍵は出ない (二重防御の確認)。
+    let body = serde_json::to_string(&json).unwrap();
+    assert!(!body.contains("private_key"), "private_key leaked: {body}");
+    // next_before_id = 末尾 (= 唯一) の follow_id と一致。
+    assert_eq!(json["next_before_id"], entries[0]["follow_id"]);
+}
+
+/// `GET /api/v1/followers` も対称。bob → alice (accepted) のみ返る。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn followers_returns_only_accepted(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let carol = repo::actor::insert(&pool, sample_remote_actor("carol", "other.test"))
+        .await
+        .unwrap();
+    // bob → alice accepted、carol → alice pending。
+    let _ = insert_follow(
+        &pool,
+        bob.id,
+        me.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+    let _ = insert_follow(
+        &pool,
+        carol.id,
+        me.id,
+        sakurasato_core::model::FollowState::Pending,
+    )
+    .await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/followers")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "only accepted should return: {entries:?}");
+    assert_eq!(entries[0]["actor"]["ap_id"], bob.ap_id);
+}
+
+/// `GET /api/v1/following?limit=&before_id=` のページネーション。
+/// 3 件登録 → limit=2 で 2 件 → `next_before_id` で次ページに 1 件残る。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_pagination_uses_follow_id_cursor(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "b.test"))
+        .await
+        .unwrap();
+    let carol = repo::actor::insert(&pool, sample_remote_actor("carol", "c.test"))
+        .await
+        .unwrap();
+    let dave = repo::actor::insert(&pool, sample_remote_actor("dave", "d.test"))
+        .await
+        .unwrap();
+    // 順序: bob → carol → dave (= follow.id 昇順)。
+    let _ = insert_follow(
+        &pool,
+        me.id,
+        bob.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+    let _ = insert_follow(
+        &pool,
+        me.id,
+        carol.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+    let _ = insert_follow(
+        &pool,
+        me.id,
+        dave.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state.clone());
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/following?limit=2")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    // 並び順は follow.id DESC ── 最後に follow した dave が先頭、その次が carol。
+    assert_eq!(entries[0]["actor"]["ap_id"], dave.ap_id);
+    assert_eq!(entries[1]["actor"]["ap_id"], carol.ap_id);
+    let next = json["next_before_id"].as_i64().unwrap();
+
+    // 次ページ: before_id=next で残り 1 件 (bob)。
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/following?limit=2&before_id={next}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["actor"]["ap_id"], bob.ap_id);
+}
+
+/// `GET /api/v1/following` ローカル actor 未 init → 503。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_503_when_local_actor_missing(pool: PgPool) {
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/following")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// `GET /api/v1/following` 認証無しは 401。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requires_auth(pool: PgPool) {
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/following")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `GET /api/v1/actor/{id}/notes` ── public / unlisted は誰でも (= 自分も)
+/// 見える、followers は accepted フォロワーだけ、direct は宛先のみ。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_notes_applies_visibility_filter(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+
+    // alice が bob を未フォロー (= follow 行なし) の状態でテスト開始。
+    // bob の投稿:
+    //   - public  → 見える
+    //   - unlisted → 見える
+    //   - followers → 見えない (フォロー未確立)
+    //   - direct (to me)  → 見える
+    //   - direct (to 別人) → 見えない
+    let public_id = insert_note_with_visibility(
+        &pool,
+        bob.id,
+        "remote.test",
+        "p",
+        "public note",
+        sakurasato_core::model::Visibility::Public,
+        vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+        vec![],
+    )
+    .await;
+    let unlisted_id = insert_note_with_visibility(
+        &pool,
+        bob.id,
+        "remote.test",
+        "u",
+        "unlisted note",
+        sakurasato_core::model::Visibility::Unlisted,
+        vec![],
+        vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+    )
+    .await;
+    let followers_id = insert_note_with_visibility(
+        &pool,
+        bob.id,
+        "remote.test",
+        "f",
+        "followers note",
+        sakurasato_core::model::Visibility::Followers,
+        vec![format!("{}/followers", bob.ap_id)],
+        vec![],
+    )
+    .await;
+    let direct_to_me_id = insert_note_with_visibility(
+        &pool,
+        bob.id,
+        "remote.test",
+        "d-me",
+        "direct to alice",
+        sakurasato_core::model::Visibility::Direct,
+        vec![me.ap_id.clone()],
+        vec![],
+    )
+    .await;
+    let direct_other_id = insert_note_with_visibility(
+        &pool,
+        bob.id,
+        "remote.test",
+        "d-other",
+        "direct to someone else",
+        sakurasato_core::model::Visibility::Direct,
+        vec!["https://other.test/users/eve".into()],
+        vec![],
+    )
+    .await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state.clone());
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/actor/{}/notes", bob.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let ids: Vec<i64> = json["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_i64().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&public_id),
+        "public should be visible: {ids:?}"
+    );
+    assert!(
+        ids.contains(&unlisted_id),
+        "unlisted should be visible: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&followers_id),
+        "followers should be hidden (no follow): {ids:?}",
+    );
+    assert!(
+        ids.contains(&direct_to_me_id),
+        "direct to me should be visible: {ids:?}",
+    );
+    assert!(
+        !ids.contains(&direct_other_id),
+        "direct to someone else must be hidden: {ids:?}",
+    );
+
+    // 次に alice が bob を accepted で follow する → followers が見えるようになる。
+    let _ = insert_follow(
+        &pool,
+        me.id,
+        bob.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await;
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/actor/{}/notes", bob.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let ids: Vec<i64> = json["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_i64().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&followers_id),
+        "followers should be visible after follow: {ids:?}",
+    );
+}
+
+/// `GET /api/v1/actor/{id}/notes` author == viewer (= 自分自身) のとき、
+/// direct も含めた全件返る。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_notes_author_sees_all_own(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let direct_id = insert_note_with_visibility(
+        &pool,
+        me.id,
+        "example.test",
+        "self-direct",
+        "secret",
+        sakurasato_core::model::Visibility::Direct,
+        vec!["https://other.test/users/eve".into()], // 自分宛ではないが author なので見える
+        vec![],
+    )
+    .await;
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/actor/{}/notes", me.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let ids: Vec<i64> = json["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_i64().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&direct_id),
+        "author should see all own notes incl. direct: {ids:?}",
+    );
+}
+
+/// `GET /api/v1/actor/{id}/notes` 存在しない actor → 404。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_notes_404_when_target_missing(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/actor/99999/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `GET /api/v1/actor/{id}/notes` ローカル actor 未 init → 503。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_notes_503_when_local_actor_missing(pool: PgPool) {
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/actor/{}/notes", bob.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// `GET /api/v1/actor/{id}/notes?limit=&before_id=` のページネーション。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_notes_pagination(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let id = insert_note_with_visibility(
+            &pool,
+            bob.id,
+            "remote.test",
+            &format!("p{i}"),
+            "x",
+            sakurasato_core::model::Visibility::Public,
+            vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+            vec![],
+        )
+        .await;
+        ids.push(id);
+    }
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let _ = me;
+    let app = sakurasato_server::local_api::router(state.clone());
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/actor/{}/notes?limit=2", bob.id))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let notes = json["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 2);
+    // note.id DESC 並び (= 最新が先頭)。
+    assert_eq!(notes[0]["id"].as_i64().unwrap(), ids[2]);
+    assert_eq!(notes[1]["id"].as_i64().unwrap(), ids[1]);
+    let next = json["next_before_id"].as_i64().unwrap();
+    assert_eq!(next, ids[1]);
+
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/actor/{}/notes?limit=2&before_id={next}",
+                bob.id,
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let notes = json["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["id"].as_i64().unwrap(), ids[0]);
+}
+
+/// `GET /api/v1/actor/{id}/notes` 認証無しは 401。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn actor_notes_requires_auth(pool: PgPool) {
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/actor/1/notes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
