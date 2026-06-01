@@ -50,7 +50,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 ```
 
-**本番運用** (Cloudflare Tunnel 越しの公開 + Tailscale 経由の TUI アクセス) は [DEPLOYMENT.md](DEPLOYMENT.md) を参照。
+**本番運用** (Cloudflare Tunnel 越しの公開 + Tailscale 経由の TUI アクセス) は [DEPLOYMENT.md](DEPLOYMENT.md) を参照。**TUI の操作方法** (起動 / キー操作 / コマンド一覧 / トラブルシュート) は [docs/TUI.md](docs/TUI.md) を参照。
 
 ## ローカル開発
 
