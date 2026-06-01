@@ -1,5 +1,5 @@
-//! `GET /api/v1/emojis?prefix=...&limit=N` ── ローカル絵文字の shortcode
-//! prefix 検索 (Issue #101)。
+//! `GET /api/v1/emojis?prefix=...&q=...&limit=N` ── ローカル絵文字の検索
+//! (Issue #101 + Issue #130)。
 //!
 //! TUI が compose / reaction prompt 入力中に `:foo` まで打った段階で叩き、
 //! popup overlay で候補を表示する。本 PR ではローカル絵文字のみを返し、
@@ -8,6 +8,20 @@
 //! 認証は他 `/api/v1/*` と同じ Bearer (UDS 上で middleware が処理)。
 //! 結果は **画像 URL + `media_type`** を返すので、TUI 側は `:foo:` 挿入時に
 //! 表示用 URL を別途取得し直す必要がない。
+//!
+//! ## 検索モード
+//!
+//! - `q=foo` を渡すと **`shortcode` / `aliases` の部分一致** (Issue #130)。
+//!   将来 keystroke fetch (server 問い合わせ) を入れたときの布石。
+//! - `prefix=foo` または無指定なら従来どおり **shortcode 前方一致**。
+//! - 両方与えられた場合は `q` が優先。
+//!
+//! ## limit と帯域
+//!
+//! お一人様サーバの UDS 経由なので帯域コストは無視できる。`MAX_LIMIT = 10000`
+//! 件を一気に返しても client 側 substring マッチはサブ ms。`DEFAULT_LIMIT = 20`
+//! は明示的に多件取りに来ない経路 (= 旧版クライアントや CLI など) を意識した
+//! 保守的な既定。
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -21,15 +35,22 @@ use crate::local_api::media::build_media_url;
 use crate::state::AppState;
 
 const DEFAULT_LIMIT: i64 = 20;
-const MAX_LIMIT: i64 = 100;
+/// 明示要求の上限。お一人様 + UDS 前提なので 10000 件返しても帯域問題は出ず、
+/// TUI 側で全件キャッシュ → client-side substring 検索する設計と整合する
+/// (Issue #130)。
+const MAX_LIMIT: i64 = 10000;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListQuery {
     /// 前方一致検索キー (ASCII-lowercase 比較)。空文字 / 未指定なら全件
-    /// (= `limit` まで)。
+    /// (= `limit` まで)。`q` が指定されたときは無視される。
     #[serde(default)]
     pub prefix: Option<String>,
-    /// 1..=100 にクランプ。未指定なら 20。
+    /// 部分一致検索キー (Issue #130, `shortcode` / `aliases` を `ILIKE` で
+    /// 検索)。空文字 / 未指定なら従来挙動 (= `prefix` 経路) を使う。
+    #[serde(default)]
+    pub q: Option<String>,
+    /// `1..=MAX_LIMIT` にクランプ。未指定なら `DEFAULT_LIMIT`。
     #[serde(default)]
     pub limit: Option<i64>,
 }
@@ -60,11 +81,17 @@ pub struct ListResponse {
     pub items: Vec<EmojiItem>,
 }
 
-pub async fn list(State(state): State<AppState>, Query(q): Query<ListQuery>) -> Response {
-    let prefix = q.prefix.as_deref().unwrap_or("").trim();
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+pub async fn list(State(state): State<AppState>, Query(params): Query<ListQuery>) -> Response {
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let substring_q = params.q.as_deref().map_or("", str::trim);
 
-    let rows = match repo::emoji::list_local_by_prefix(state.pool(), prefix, limit).await {
+    let rows = if substring_q.is_empty() {
+        let prefix = params.prefix.as_deref().unwrap_or("").trim();
+        repo::emoji::list_local_by_prefix(state.pool(), prefix, limit).await
+    } else {
+        repo::emoji::search_local_by_substring(state.pool(), substring_q, limit).await
+    };
+    let rows = match rows {
         Ok(rows) => rows,
         Err(err) => {
             error!(?err, "list emojis failed");

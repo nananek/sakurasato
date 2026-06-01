@@ -321,22 +321,16 @@ fn render_emoji_list(
         } else {
             Style::default().fg(palette.muted)
         };
-        // Unicode entry は `:shortcode: 👍` で codepoint を行頭近くに併記。
-        // ratatui の Line は単一フォントなので画像サムネは入れず、文字表示で
-        // 代用する (= プレビュー枠が大きい絵を担当する)。
-        let codepoint_hint = item.codepoint.as_deref().unwrap_or("").to_string();
-        let mut spans = vec![Span::styled(marker.to_string(), marker_style)];
-        if !codepoint_hint.is_empty() {
-            spans.push(Span::styled(
-                codepoint_hint,
+        // Unicode / custom とも `:shortcode:` のみで揃える。Unicode の
+        // codepoint を行頭に併記する旧仕様は列ズレを生むだけで意味が薄い
+        // ため撤去 (= 実際の絵姿は preview 枠が担当する)。
+        let mut spans = vec![
+            Span::styled(marker.to_string(), marker_style),
+            Span::styled(
+                format!(":{}:", item.shortcode),
                 Style::default().fg(palette.foreground),
-            ));
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled(
-            format!(":{}:", item.shortcode),
-            Style::default().fg(palette.foreground),
-        ));
+            ),
+        ];
         if let Some(cat) = item.category.as_deref()
             && !cat.is_empty()
         {

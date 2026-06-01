@@ -31,8 +31,11 @@ use crate::client::{EmojiItem, EmojiKind};
 
 /// 候補表示の最大件数 (viewport から溢れる ぶんはスクロール)。
 pub const VISIBLE_MAX: usize = 8;
-/// 初回 fetch で取得する件数。server 側 `MAX_LIMIT = 100` と揃える。
-pub const FETCH_LIMIT: i64 = 100;
+/// 初回 fetch で取得する件数。server 側 `MAX_LIMIT = 10000` と揃える
+/// (Issue #130) ── ローカルに大量にインポート済みでも 101 件目以降の絵文字を
+/// 取りこぼさず、client-side substring 検索の母集団に乗せる。
+/// お一人様 + UDS 経由なので帯域コストは無視できる。
+pub const FETCH_LIMIT: i64 = 10000;
 
 /// モーダルを「何のために」開いたかを覚えるための discriminator。
 ///
