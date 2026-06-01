@@ -198,6 +198,13 @@ async fn main_loop(
         // (ensure_visible は二段スクロール禁止のための保険)。
         let approx_items = timeline_capacity.max(1) / 4;
         app.ensure_visible(approx_items.max(1));
+        // M12 (#66): Follow Requests 一覧画面のスクロール追従。1 行 = 1 件
+        // (アバター無し)。`last_rects.follow_requests` は直前フレームで
+        // 確定した一覧領域の Rect。
+        if let Some(fr) = app.follow_requests.as_mut() {
+            let viewport = last_rects.follow_requests.height as usize;
+            fr.ensure_visible(viewport);
+        }
 
         tokio::select! {
             biased;
@@ -563,6 +570,23 @@ async fn apply_action(
         Action::FollowListLoadMore => follow_list_load_more(app, api, page_size).await,
         Action::FollowListRefresh => follow_list_refresh(app, api, page_size).await,
         Action::FollowListClose => follow_list_close(app),
+        Action::ActorLock => command_actor_lock(app, api, true).await,
+        Action::ActorUnlock => command_actor_lock(app, api, false).await,
+        Action::OpenFollowRequests => command_open_requests(app, api).await,
+        Action::RequestsSelectNext => {
+            if let Some(s) = app.follow_requests.as_mut() {
+                s.select_next();
+            }
+        }
+        Action::RequestsSelectPrev => {
+            if let Some(s) = app.follow_requests.as_mut() {
+                s.select_prev();
+            }
+        }
+        Action::RequestsApproveSelected => requests_mutate_selected(app, api, true).await,
+        Action::RequestsRejectSelected => requests_mutate_selected(app, api, false).await,
+        Action::RequestsRefresh => requests_refresh(app, api).await,
+        Action::RequestsClose => requests_close(app),
     }
 }
 
@@ -1399,6 +1423,9 @@ async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
         Command::Unfollow(target) => {
             command_follow_target(app, api, &target, true).await;
         }
+        Command::Lock => command_actor_lock(app, api, true).await,
+        Command::Unlock => command_actor_lock(app, api, false).await,
+        Command::OpenRequests => command_open_requests(app, api).await,
         Command::Invalid { reason } => {
             app.set_status(
                 format!(":: {reason}"),
@@ -1563,6 +1590,158 @@ async fn command_follow_target(
             }
         }
     }
+}
+
+/// M12 (#66): `:lock` / `:unlock` 実行ハンドラ。
+///
+/// 成功時は `LockResponse` を見て (a) 既に同じ状態 → `no-op`、(b) 切替成功 +
+/// queued 配送本数を status に出す。`enqueue_failures > 0` のときは warn 扱い
+/// で個別 follower への配送失敗があったことを示す ── 配送自体は state 切替の
+/// 副作用 (= 相手側 UI のキャッシュ更新) なので、失敗していても切替は完了して
+/// いる。
+async fn command_actor_lock(app: &mut App, api: &LocalApi, lock: bool) {
+    let verb = if lock { "lock" } else { "unlock" };
+    let result = if lock {
+        api.actor_lock().await
+    } else {
+        api.actor_unlock().await
+    };
+    match result {
+        Ok(resp) => {
+            let prefix = if resp.changed {
+                format!(":{verb} ok ({} Update queued)", resp.queued_deliveries)
+            } else {
+                format!(":{verb} no-op (already in target state)")
+            };
+            let kind = if resp.enqueue_failures > 0 {
+                StatusKind::Warning
+            } else {
+                StatusKind::Info
+            };
+            let body = if resp.enqueue_failures > 0 {
+                format!(
+                    "{prefix}; {} follower(s) failed to enqueue",
+                    resp.enqueue_failures
+                )
+            } else {
+                prefix
+            };
+            app.set_status(body, kind, Some(Duration::from_secs(6)));
+        }
+        Err(err) => {
+            app.set_status(
+                format!(":{verb} failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// M12 (#66): `:requests` 実行 ── 一覧画面を開く + 初回 fetch。失敗しても
+/// 画面は開く (= 空表示でユーザに通知)。
+///
+/// **PR #95 review fix**: `app.follow_requests = Some(...)` + `focus` 切替
+/// を `await` の **前** に行う。これにより fetch 中も `"loading…"` が描画
+/// され、`requests_refresh` と挙動が揃う。
+async fn command_open_requests(app: &mut App, api: &LocalApi) {
+    let mut screen = crate::follow_requests::FollowRequestsScreen::new();
+    screen.fetching = true;
+    app.follow_requests = Some(screen);
+    app.focus = Focus::Requests;
+    let result = api.list_follow_requests().await;
+    match result {
+        Ok(resp) => {
+            if let Some(s) = app.follow_requests.as_mut() {
+                s.replace(resp.items);
+            }
+        }
+        Err(err) => {
+            if let Some(s) = app.follow_requests.as_mut() {
+                s.fetching = false;
+            }
+            app.set_status(
+                format!(":requests fetch failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `a` / `x` ── 選択中の row を approve / reject 配信し、成功すれば list から
+/// 除去する。失敗時は除去せず status に出す (= ユーザが再試行可能)。
+async fn requests_mutate_selected(app: &mut App, api: &LocalApi, approve: bool) {
+    let Some(screen) = app.follow_requests.as_ref() else {
+        return;
+    };
+    let Some(target) = screen.current() else {
+        app.set_status(
+            "no pending request selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(4)),
+        );
+        return;
+    };
+    let id = target.id;
+    let follower = target.follower_ap_id.clone();
+    let verb = if approve { "approve" } else { "reject" };
+    let result = if approve {
+        api.approve_follow_request(id).await
+    } else {
+        api.reject_follow_request(id).await
+    };
+    match result {
+        Ok(resp) => {
+            if let Some(s) = app.follow_requests.as_mut() {
+                s.remove_id(resp.id);
+            }
+            app.set_status(
+                format!("{verb}d follow from {follower}"),
+                StatusKind::Info,
+                Some(Duration::from_secs(5)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("{verb} failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `r` ── 再取得。
+async fn requests_refresh(app: &mut App, api: &LocalApi) {
+    let Some(screen) = app.follow_requests.as_mut() else {
+        return;
+    };
+    screen.fetching = true;
+    match api.list_follow_requests().await {
+        Ok(resp) => {
+            if let Some(s) = app.follow_requests.as_mut() {
+                s.replace(resp.items);
+            }
+        }
+        Err(err) => {
+            if let Some(s) = app.follow_requests.as_mut() {
+                s.fetching = false;
+            }
+            app.set_status(
+                format!("refresh failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `Esc` / `q` ── 画面を閉じて Timeline へ戻る。state は破棄する (= 再 fetch
+/// 込みで `:requests` を再実行する流れ)。
+fn requests_close(app: &mut App) {
+    app.follow_requests = None;
+    app.focus = Focus::Timeline;
 }
 
 async fn open_follow_list(

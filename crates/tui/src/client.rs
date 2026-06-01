@@ -416,6 +416,40 @@ impl LocalApi {
         decode_json(resp).await
     }
 
+    /// `POST /api/v1/actor/lock` ── 鍵アカ運用に切替 (Issue #66 / M12)。
+    pub async fn actor_lock(&self) -> Result<LockResponse, ApiError> {
+        self.post_json_no_body("/api/v1/actor/lock").await
+    }
+
+    /// `POST /api/v1/actor/unlock` ── 鍵アカ運用を解除。**pending follow は
+    /// auto-accept されない** ── 明示的に approve/reject する必要がある。
+    pub async fn actor_unlock(&self) -> Result<LockResponse, ApiError> {
+        self.post_json_no_body("/api/v1/actor/unlock").await
+    }
+
+    /// `GET /api/v1/follow-requests` ── pending 一覧 (Issue #66 / M12)。
+    pub async fn list_follow_requests(&self) -> Result<FollowRequestList, ApiError> {
+        self.get_json("/api/v1/follow-requests").await
+    }
+
+    /// `POST /api/v1/follow-requests/{id}/approve` ── Accept 配送 + state 遷移。
+    pub async fn approve_follow_request(
+        &self,
+        id: i64,
+    ) -> Result<FollowRequestMutateResponse, ApiError> {
+        self.post_json_no_body(&format!("/api/v1/follow-requests/{id}/approve"))
+            .await
+    }
+
+    /// `POST /api/v1/follow-requests/{id}/reject` ── Reject 配送 + state 遷移。
+    pub async fn reject_follow_request(
+        &self,
+        id: i64,
+    ) -> Result<FollowRequestMutateResponse, ApiError> {
+        self.post_json_no_body(&format!("/api/v1/follow-requests/{id}/reject"))
+            .await
+    }
+
     /// `DELETE /api/v1/reactions/{id}` ── 自分のリアクションを取り消す (M8 PR3)。
     pub async fn delete_reaction(&self, reaction_id: i64) -> Result<(), ApiError> {
         let path = format!("/api/v1/reactions/{reaction_id}");
@@ -456,6 +490,20 @@ impl LocalApi {
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, ApiError> {
         let request = self
             .request_builder(Method::GET, path)?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// body 不要の POST → JSON。M12 の鍵アカ管理系 (`actor/lock` /
+    /// `follow-requests/{id}/approve` 等) で共通利用する。
+    async fn post_json_no_body<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+    ) -> Result<T, ApiError> {
+        let request = self
+            .request_builder(Method::POST, path)?
             .body(Full::default())
             .map_err(|e| ApiError::Transport(e.to_string()))?;
         let resp = self.send(request).await?;
@@ -767,6 +815,41 @@ pub struct UnfollowResponse {
     pub target_ap_id: String,
     pub delivery_queue_id: i64,
     pub inbox_url: String,
+}
+
+/// `POST /api/v1/actor/{lock,unlock}` のレスポンス。
+/// `server::local_api::actor_admin::LockResponse` と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct LockResponse {
+    pub ap_id: String,
+    pub manually_approves_followers: bool,
+    pub queued_deliveries: usize,
+    pub changed: bool,
+    pub enqueue_failures: usize,
+}
+
+/// `GET /api/v1/follow-requests` の各要素。
+/// `server::local_api::follow_request::PendingFollow` と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PendingFollow {
+    pub id: i64,
+    pub ap_id: String,
+    pub follower_ap_id: String,
+    pub received_at: String,
+    pub state: String,
+}
+
+/// `GET /api/v1/follow-requests` のレスポンス全体。
+#[derive(Debug, Clone, Deserialize)]
+pub struct FollowRequestList {
+    pub items: Vec<PendingFollow>,
+}
+
+/// `POST /api/v1/follow-requests/{id}/{approve,reject}` のレスポンス。
+#[derive(Debug, Clone, Deserialize)]
+pub struct FollowRequestMutateResponse {
+    pub id: i64,
+    pub new_state: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
