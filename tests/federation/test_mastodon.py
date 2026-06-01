@@ -269,21 +269,22 @@ class TestLockedFollow:
             assert actor.get("manuallyApprovesFollowers") is True
 
             # 2) Mastodon に actor JSON を再 fetch させる (= 鍵アカ判定を更新)。
-            #    search_accounts(resolve=True) が actor を取り直すので、続く
-            #    follow() で Mastodon 側は新しい locked 判定で動く。
+            #    ただし **Issue #97 で判明**: Mastodon の Account.locked カラム
+            #    は一度作られると `accounts/search?resolve=true` で actor を
+            #    再 fetch しても更新されない (= Mastodon 側 cache 仕様、
+            #    180s poll でも false のまま)。`sakurasato-prefollow-bob` で
+            #    sakurasato → bob を follow した時点で Mastodon に me Account
+            #    row が `locked=false` で作られ、後で sakurasato が lock しても
+            #    Mastodon 側はそれを反映しない。
+            #
+            #    そのため Mastodon は `POST /accounts/:id/follow` で
+            #    `following=true` を即座に返してしまうが、これは **Mastodon
+            #    の relationship cache** であって、Sakurasato 側で lock を
+            #    respect しているかどうかとは独立。本テストは Mastodon の
+            #    cache 表示ではなく Sakurasato 側 `follow_requests` に pending
+            #    行が立つかどうかで lock 機構の有効性を検証する。
             mastodon.search_accounts(f"me@{SAKURASATO_DOMAIN}", resolve=True)
-            follow_resp = mastodon.follow(sks_id)
-
-            # 3) **#7 strict assert**: Mastodon は locked actor へ follow した
-            #    瞬間 requested=True / following=False を返さなければならない。
-            #    `requested OR following` の OR 形は「既に Bob が follow 済み
-            #    だった場合」を素通りさせ、locked path を検証しないので不可。
-            assert follow_resp["requested"] is True, (
-                f"Mastodon must observe requested=True on locked actor: {follow_resp}"
-            )
-            assert follow_resp["following"] is False, (
-                f"Mastodon must NOT observe following=True yet: {follow_resp}"
-            )
+            mastodon.follow(sks_id)
 
             # 4) Sakurasato の pending リストに Bob 行が出現するまで待つ
             #    (delivery / inbox 処理が非同期)。
