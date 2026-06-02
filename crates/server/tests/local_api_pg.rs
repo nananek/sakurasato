@@ -660,6 +660,177 @@ async fn create_note_direct_delivers_only_to_mentioned_inbox(pool: PgPool) {
     assert_eq!(arr[0]["type"], "Mention");
 }
 
+/// **#98**: direct visibility で `in_reply_to_ap_id` だけ指定 (= mention 無し)
+/// の場合、activity の `to` は **親 author の actor URI 1 件のみ**、`cc` は
+/// 空でなければならない。
+///
+/// 連合テストで Mastodon 側が `visibility=private` (followers-only) と
+/// 認識する事故が報告されていた。Mastodon の `StatusParser#visibility` は
+/// `audience_to.include?(@account.followers_url)` で `:private` 判定するので、
+/// `to` に followers URL が混入していると private 扱いされる。本テストで
+/// followers URL や Public URI が混入しないことを assert する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_direct_reply_to_remote_actor_has_only_parent_in_to(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    // Bob: 返信先の remote actor。事前に seed note を 1 つ仕込んでおく。
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    bob.shared_inbox_url = Some("https://remote.test/inbox".into());
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+
+    let bob_seed_ap_id = "https://remote.test/notes/seed-1";
+    repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: bob_seed_ap_id.into(),
+            actor_id: bob.id,
+            content: "seed".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: false,
+            url: Some(bob_seed_ap_id.into()),
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    // content には `@bob@remote.test` mention を入れない (= reply parent 経路で
+    // direct を成立させる scenario)。federation test の direct visibility と同形。
+    let body = serde_json::json!({
+        "content": "direct reply to bob",
+        "visibility": "direct",
+        "in_reply_to_ap_id": bob_seed_ap_id,
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = read_json(resp).await;
+    assert_eq!(json["visibility"], "direct");
+    // Bob (parent author) 1 件のみ。followers は direct なので配送しない。
+    assert_eq!(json["queued_deliveries"], 1);
+
+    let row = sqlx::query!(r#"SELECT activity FROM delivery_queue LIMIT 1"#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let me_followers = format!("{}/followers", me.ap_id);
+    let public_uri = "https://www.w3.org/ns/activitystreams#Public";
+
+    // object.to は bob URI 1 件のみ。followers URL / Public 混入なし。
+    let to: Vec<&str> = row.activity["object"]["to"]
+        .as_array()
+        .expect("object.to array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        to,
+        vec![bob.ap_id.as_str()],
+        "direct reply: object.to must be exactly [bob], got {to:?}",
+    );
+    assert!(
+        !to.contains(&me_followers.as_str()),
+        "direct reply must NOT include {me_followers} in object.to (would be parsed as private by Mastodon)",
+    );
+    assert!(
+        !to.contains(&public_uri),
+        "direct reply must NOT include Public URI in object.to",
+    );
+
+    let cc = row.activity["object"]["cc"]
+        .as_array()
+        .expect("object.cc array");
+    assert!(
+        cc.is_empty(),
+        "direct reply: object.cc must be empty, got {cc:?}",
+    );
+
+    // outer Create envelope も同値。
+    let outer_to: Vec<&str> = row.activity["to"]
+        .as_array()
+        .expect("Create.to array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        outer_to,
+        vec![bob.ap_id.as_str()],
+        "direct reply: Create.to must equal object.to",
+    );
+    let outer_cc = row.activity["cc"].as_array().expect("Create.cc array");
+    assert!(
+        outer_cc.is_empty(),
+        "direct reply: Create.cc must be empty, got {outer_cc:?}",
+    );
+
+    // **#98**: tag.Mention に親 author (bob) が乗っていること。Mastodon は
+    // tag.Mention に無い audience を silent mention として扱い、direct を
+    // `:limited` に降格 (API では `private` 表示) する。
+    let tags = row.activity["object"]["tag"]
+        .as_array()
+        .expect("object.tag array");
+    assert_eq!(
+        tags.len(),
+        1,
+        "expected 1 Mention tag (parent author), got {tags:?}"
+    );
+    assert_eq!(tags[0]["type"], "Mention");
+    assert_eq!(tags[0]["href"], bob.ap_id);
+    assert_eq!(
+        tags[0]["name"],
+        format!("@{}@{}", bob.preferred_username, bob.host)
+    );
+
+    // 永続化された note 行の to_recipients / cc_recipients も同値であること
+    // (= permalink の AP JSON も同じ値を返す)。
+    let note_row = sqlx::query!(
+        r#"SELECT to_recipients, cc_recipients FROM note WHERE actor_id = $1"#,
+        me.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let stored_to: Vec<&str> = note_row
+        .to_recipients
+        .as_array()
+        .expect("to_recipients array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(stored_to, vec![bob.ap_id.as_str()]);
+    let stored_cc = note_row
+        .cc_recipients
+        .as_array()
+        .expect("cc_recipients array");
+    assert!(stored_cc.is_empty());
+}
+
 /// **#65**: 公開投稿でも `@user@host` mention は `cc` に乗り、mention 先
 /// inbox にも `delivery_queue` 行が積まれる (= followers 配送と並列)。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

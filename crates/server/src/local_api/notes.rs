@@ -351,7 +351,7 @@ impl PreparedNote {
             .iter()
             .map(|m| attachment_document(host, m))
             .collect();
-        let mention_tags = mentions
+        let mut mention_tags: Vec<JsonValue> = mentions
             .iter()
             .map(|m| {
                 json!({
@@ -361,6 +361,28 @@ impl PreparedNote {
                 })
             })
             .collect();
+        // **#98**: reply_parent author を `tag.Mention` に自動追加する。
+        // Mastodon の `process_audience` は audience に居て `tag.Mention` に
+        // 無い account を silent mention として扱い、直前で `direct` 判定
+        // していた visibility を `:limited` に降格する (API では `private` 表示)。
+        // 親 author を明示 Mention として乗せることで、direct reply が正しく
+        // direct のまま伝わり、非 direct でも親 author が「explicit mention」
+        // として通知される (Mastodon / Misskey の慣習どおり)。
+        //
+        // 自己 reply (= `is_local_self`) と、content `@user@host` で既に
+        // 解決済みの actor (= mentions と URI が同じ) はスキップ。
+        if let Some(p) = reply_parent
+            && !p.is_local_self
+            && !mention_tags
+                .iter()
+                .any(|t| t.get("href").and_then(JsonValue::as_str) == Some(p.actor_uri.as_str()))
+        {
+            mention_tags.push(json!({
+                "type": "Mention",
+                "href": p.actor_uri,
+                "name": p.mention_name,
+            }));
+        }
         Self {
             summary: req
                 .summary
@@ -409,6 +431,15 @@ impl PreparedNote {
 struct ReplyParentInfo {
     note_id: i64,
     actor_uri: String,
+    /// **#98**: 親 author を `tag.Mention` に積むときの `@user@host` 表現。
+    /// Mastodon の `process_audience` は audience に居て `tag.Mention` に無い
+    /// account を **silent mention** として扱い、direct を `:limited` に降格
+    /// する (= API では `private` 表示)。reply 経路でこれが起きないよう、
+    /// 親 author 行から構築した `@user@host` を Mention.name に乗せる。
+    mention_name: String,
+    /// 親 author == ローカル actor (= 自己 reply) のとき `true`。`tag.Mention`
+    /// 自動追加対象から外す ── 自分宛の Mention は受信側に不要なノイズ。
+    is_local_self: bool,
     inbox_for_delivery: Option<String>,
 }
 
@@ -460,9 +491,13 @@ async fn resolve_reply_parent(
                 .unwrap_or_else(|| parent_actor.inbox_url.clone()),
         )
     };
+    let mention_name = format!("@{}@{}", parent_actor.preferred_username, parent_actor.host);
+    let is_local_self = parent_actor.id == local_actor.id;
     Some(ReplyParentInfo {
         note_id: parent_note.id,
         actor_uri: parent_actor.ap_id,
+        mention_name,
+        is_local_self,
         inbox_for_delivery,
     })
 }

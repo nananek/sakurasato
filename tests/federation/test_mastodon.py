@@ -591,13 +591,6 @@ class TestVisibilityMatrix:
             for s in mastodon.public_timeline(limit=40)
         ), f"followers-only note {marker} unexpectedly appeared on Mastodon public TL"
 
-    @pytest.mark.skip(
-        reason=(
-            "Issue #98: SK→MA direct reply が Mastodon 側で `private` "
-            "(followers-only) と認識される。原因 (recipients_for 出力か "
-            "build_create_activity か Mastodon 側仕様か) は別 issue で調査。"
-        )
-    )
     def test_sakurasato_direct_visibility_observed_on_mastodon(
         self, mastodon: MastodonClient, sakurasato: SakurasatoClient
     ):
