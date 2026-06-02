@@ -54,6 +54,39 @@ mod common {
         }
     }
 
+    /// renote 対象 (= ローカル user 以外の note 作者) 用のリモート actor。
+    /// PR #155 review Finding 1 で自己 renote が 422 になったので、各テストの
+    /// 「renote 可能な note」は本 actor が author になる構成にする。
+    pub(super) fn sample_remote_actor(username: &str, host: &str) -> NewActor {
+        let ap_id = format!("https://{host}/users/{username}");
+        NewActor {
+            ap_id: ap_id.clone(),
+            preferred_username: username.into(),
+            host: host.into(),
+            display_name: Some("Bob".into()),
+            summary: None,
+            icon_url: None,
+            image_url: None,
+            inbox_url: format!("{ap_id}/inbox"),
+            shared_inbox_url: Some(format!("https://{host}/inbox")),
+            outbox_url: Some(format!("{ap_id}/outbox")),
+            followers_url: Some(format!("{ap_id}/followers")),
+            following_url: Some(format!("{ap_id}/following")),
+            public_key_id: format!("{ap_id}#main-key"),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----".into(),
+            // remote actor は private_key を持たない。
+            private_key_pem: None,
+            ed25519_public_key_id: None,
+            ed25519_public_key_pem: None,
+            ed25519_private_key_pem: None,
+            also_known_as: vec![],
+            moved_to_ap_id: None,
+            is_local: false,
+            actor_type: "Person".into(),
+            manually_approves_followers: false,
+        }
+    }
+
     fn sample_ed25519_public_pem() -> String {
         let signing = SigningKey::generate(&mut OsRng);
         signing
@@ -115,6 +148,7 @@ async fn seed_note_with_visibility(
     actor_id: i64,
     host: &str,
     visibility: Visibility,
+    is_local: bool,
 ) -> i64 {
     let ap_id = format!(
         "https://{host}/notes/{seq}",
@@ -136,7 +170,7 @@ async fn seed_note_with_visibility(
             cc_recipients: vec![],
             attachments: serde_json::json!([]),
             tags: serde_json::json!([]),
-            is_local: true,
+            is_local,
             url: Some(ap_id),
             published_at: chrono::Utc::now(),
         },
@@ -146,6 +180,20 @@ async fn seed_note_with_visibility(
     inserted.id
 }
 
+/// 各テストの定番セットアップ: alice (local) と bob (remote) を作り、bob の
+/// 指定 visibility note を 1 件 seed する。renote 経路は「他人の note を boost」
+/// が前提なので bob.id を author に使う。
+async fn seed_alice_and_bob_note(pool: &PgPool, visibility: Visibility) -> (i64, i64) {
+    let alice = repo::actor::insert(pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(pool, common::sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let note_id = seed_note_with_visibility(pool, bob.id, "remote.test", visibility, false).await;
+    (alice.id, note_id)
+}
+
 async fn read_json(resp: axum::response::Response) -> serde_json::Value {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&body).unwrap()
@@ -153,11 +201,7 @@ async fn read_json(resp: axum::response::Response) -> serde_json::Value {
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn create_renote_inserts_announce_row(pool: PgPool) {
-    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
-        .await
-        .unwrap();
-    let note_id =
-        seed_note_with_visibility(&pool, actor.id, "example.test", Visibility::Public).await;
+    let (alice_id, note_id) = seed_alice_and_bob_note(&pool, Visibility::Public).await;
     let raw = issue_token(&pool, "tui").await;
     let state =
         sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
@@ -180,11 +224,11 @@ async fn create_renote_inserts_announce_row(pool: PgPool) {
         ap_id.starts_with("https://example.test/users/alice/activities/announce-"),
         "ap_id {ap_id} should start with announce- pattern",
     );
-    // followers が 0 件なので enqueue は 0、ローカル author なので note 作者 inbox も追加されない。
-    assert_eq!(json["queued_deliveries"], 0);
+    // followers 0 件、bob (remote) の shared_inbox に 1 件 enqueue される。
+    assert_eq!(json["queued_deliveries"], 1);
 
     // DB 確認。
-    let row = repo::announce::get_by_pair(&pool, note_id, actor.id)
+    let row = repo::announce::get_by_pair(&pool, note_id, alice_id)
         .await
         .unwrap();
     assert!(row.is_some());
@@ -192,11 +236,7 @@ async fn create_renote_inserts_announce_row(pool: PgPool) {
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn create_renote_unlisted_is_allowed(pool: PgPool) {
-    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
-        .await
-        .unwrap();
-    let note_id =
-        seed_note_with_visibility(&pool, actor.id, "example.test", Visibility::Unlisted).await;
+    let (_alice_id, note_id) = seed_alice_and_bob_note(&pool, Visibility::Unlisted).await;
     let raw = issue_token(&pool, "tui").await;
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
@@ -215,11 +255,7 @@ async fn create_renote_unlisted_is_allowed(pool: PgPool) {
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn create_renote_rejects_followers_visibility(pool: PgPool) {
-    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
-        .await
-        .unwrap();
-    let note_id =
-        seed_note_with_visibility(&pool, actor.id, "example.test", Visibility::Followers).await;
+    let (_alice_id, note_id) = seed_alice_and_bob_note(&pool, Visibility::Followers).await;
     let raw = issue_token(&pool, "tui").await;
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
@@ -238,11 +274,7 @@ async fn create_renote_rejects_followers_visibility(pool: PgPool) {
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn create_renote_rejects_direct_visibility(pool: PgPool) {
-    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
-        .await
-        .unwrap();
-    let note_id =
-        seed_note_with_visibility(&pool, actor.id, "example.test", Visibility::Direct).await;
+    let (_alice_id, note_id) = seed_alice_and_bob_note(&pool, Visibility::Direct).await;
     let raw = issue_token(&pool, "tui").await;
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
@@ -259,13 +291,41 @@ async fn create_renote_rejects_direct_visibility(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// PR #155 review Finding 1: 自己 renote (= local actor が自分の note を
+/// renote) は 422 で拒否される。Mastodon / Misskey 互換。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn create_renote_duplicate_is_idempotent(pool: PgPool) {
-    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+async fn create_renote_rejects_self_renote(pool: PgPool) {
+    let alice = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
         .await
         .unwrap();
+    // alice 自身の public note を seed。
     let note_id =
-        seed_note_with_visibility(&pool, actor.id, "example.test", Visibility::Public).await;
+        seed_note_with_visibility(&pool, alice.id, "example.test", Visibility::Public, true).await;
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::post(format!("/api/v1/notes/{note_id}/renote"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // DB に announce 行を残してはいけない。
+    let row = repo::announce::get_by_pair(&pool, note_id, alice.id)
+        .await
+        .unwrap();
+    assert!(row.is_none(), "self-renote must not insert announce row");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_renote_duplicate_is_idempotent(pool: PgPool) {
+    let (_alice_id, note_id) = seed_alice_and_bob_note(&pool, Visibility::Public).await;
     let raw = issue_token(&pool, "tui").await;
     let state =
         sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
@@ -301,11 +361,7 @@ async fn create_renote_duplicate_is_idempotent(pool: PgPool) {
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn delete_renote_removes_announce_row(pool: PgPool) {
-    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
-        .await
-        .unwrap();
-    let note_id =
-        seed_note_with_visibility(&pool, actor.id, "example.test", Visibility::Public).await;
+    let (alice_id, note_id) = seed_alice_and_bob_note(&pool, Visibility::Public).await;
     let raw = issue_token(&pool, "tui").await;
     let state =
         sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
@@ -335,7 +391,7 @@ async fn delete_renote_removes_announce_row(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // 行が消えている。
-    let gone = repo::announce::get_by_pair(&pool, note_id, actor.id)
+    let gone = repo::announce::get_by_pair(&pool, note_id, alice_id)
         .await
         .unwrap();
     assert!(gone.is_none(), "announce row must be deleted");
@@ -343,11 +399,7 @@ async fn delete_renote_removes_announce_row(pool: PgPool) {
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn delete_renote_not_found_returns_404(pool: PgPool) {
-    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
-        .await
-        .unwrap();
-    let note_id =
-        seed_note_with_visibility(&pool, actor.id, "example.test", Visibility::Public).await;
+    let (_alice_id, note_id) = seed_alice_and_bob_note(&pool, Visibility::Public).await;
     let raw = issue_token(&pool, "tui").await;
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
@@ -366,11 +418,31 @@ async fn delete_renote_not_found_returns_404(pool: PgPool) {
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn home_timeline_reflects_viewer_renoted(pool: PgPool) {
-    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+    // alice (local) と bob (remote) を作り、alice が bob を follow している
+    // 状態にする (= bob の public note が alice の home TL に乗る前提)。
+    let alice = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
         .await
         .unwrap();
+    let bob = repo::actor::insert(&pool, common::sample_remote_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    let follow = repo::follow::insert_pending(
+        &pool,
+        "https://example.test/users/alice/follows/bob",
+        alice.id,
+        bob.id,
+    )
+    .await
+    .unwrap();
+    repo::follow::set_state(
+        &pool,
+        follow.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await
+    .unwrap();
     let note_id =
-        seed_note_with_visibility(&pool, actor.id, "example.test", Visibility::Public).await;
+        seed_note_with_visibility(&pool, bob.id, "remote.test", Visibility::Public, false).await;
     let raw = issue_token(&pool, "tui").await;
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);

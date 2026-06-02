@@ -79,6 +79,17 @@ pub async fn create(State(state): State<AppState>, Path(note_id): Path<i64>) -> 
         );
     }
 
+    // PR #155 review Finding 1: 自己 renote ガード ── Mastodon は自己 boost を
+    // 422 で拒否する。許可するとフォロワーに無意味な Announce が配送され、
+    // 受信側で `MAX_ATTEMPTS` 回リトライ後に dead に終わる (= ローカル
+    // `announce` 行と remote の表示が乖離)。Misskey も同様。
+    if note.actor_id == local_actor.id {
+        return error_with_body(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cannot renote your own note",
+        );
+    }
+
     // `announce.ap_id` は決定論的に組み立てたい (= Undo の object 再構築や
     // ログ追跡が容易) ので、insert 前に sequence の nextval を引いて id を
     // 確保する。BIGSERIAL は cycle しないので衝突は起きない。
@@ -195,15 +206,24 @@ async fn build_and_dispatch_undo(
         "actor": local_actor.ap_id,
         "object": original,
     });
-    let queued = enqueue_announce_delivery(state, local_actor, note.actor_id, &activity).await;
 
+    // PR #155 review Finding 2: DB 削除を **先** に実行し、失敗時は 503 を
+    // 返して enqueue しない ── reactions.rs と異なる方針。順序を逆にすると、
+    // delete_by_ap_id 失敗時に Undo がキューに残ったまま `announce` 行が
+    // 残存し、TUI の `viewer_renoted` が永続的に true 表示になる乖離が
+    // 起きる。「先に消して enqueue は best-effort で warn」が write-ahead
+    // セマンティクスとして安全。enqueue 自体は内部で warn 集約するので、
+    // 1 件でも `delivery_queue` insert が成功すれば配送 worker が再試行する。
     if let Err(err) = repo::announce::delete_by_ap_id(state.pool(), &row.ap_id).await {
-        warn!(
+        error!(
             ?err,
             announce_id = row.id,
-            "DELETE renote: row delete failed (Undo already queued)"
+            "DELETE renote: row delete failed"
         );
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    let queued = enqueue_announce_delivery(state, local_actor, note.actor_id, &activity).await;
+
     (
         StatusCode::OK,
         Json(json!({
@@ -235,15 +255,17 @@ async fn finalize_undo_with_uri_object(
         "actor": local_actor.ap_id,
         "object": row.ap_id,
     });
-    // note が消えていれば note 作者 inbox の解決もできない。followers だけに送る。
-    let queued = enqueue_announce_delivery(state, local_actor, local_actor.id, &activity).await;
+    // PR #155 review Finding 2: 主経路と同じく DB 削除を先に。
     if let Err(err) = repo::announce::delete_by_ap_id(state.pool(), &row.ap_id).await {
-        warn!(
+        error!(
             ?err,
             announce_id = row.id,
-            "DELETE renote: row delete failed"
+            "DELETE renote (fallback): row delete failed"
         );
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    // note が消えていれば note 作者 inbox の解決もできない。followers だけに送る。
+    let queued = enqueue_announce_delivery(state, local_actor, local_actor.id, &activity).await;
     (
         StatusCode::OK,
         Json(json!({
