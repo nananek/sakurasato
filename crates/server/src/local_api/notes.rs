@@ -491,7 +491,7 @@ async fn resolve_reply_parent(
                 .unwrap_or_else(|| parent_actor.inbox_url.clone()),
         )
     };
-    let mention_name = format!("@{}@{}", parent_actor.preferred_username, parent_actor.host,);
+    let mention_name = format!("@{}@{}", parent_actor.preferred_username, parent_actor.host);
     let is_local_self = parent_actor.id == local_actor.id;
     Some(ReplyParentInfo {
         note_id: parent_note.id,
