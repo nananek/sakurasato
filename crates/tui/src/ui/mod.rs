@@ -1421,7 +1421,10 @@ fn append_folded_body(
             let indicator = format!(" [+{truncated} 行]");
             // 行末 indicator は `truncate_for_width` の対象外にしたいので、本文側を
             // 先に狭めて切る。indicator の文字幅 (= char count 近似) を引いた残りで
-            // 本文を truncate する。
+            // 本文を truncate する。`行` は East Asian Wide で実セル幅 2 だが、
+            // `truncate_for_width` 自身も 1 char = 1 cell の素朴近似を採用しており
+            // (= `unicode-width` 未導入)、本実装もそれに揃えてある。揃って改修する
+            // 時は両方を同時に切り替える。
             let indicator_width = u16::try_from(indicator.chars().count()).unwrap_or(u16::MAX);
             let line_width = body_width.saturating_sub(indicator_width);
             out.push(Line::from(vec![
