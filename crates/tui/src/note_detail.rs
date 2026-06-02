@@ -25,13 +25,17 @@ pub struct NoteDetailScreen {
     pub revealed: Vec<bool>,
     /// プレビュー対象の添付 index ── 上下キーで切替。範囲外は無視。
     pub selected_attachment: usize,
+    /// 開いた時点での起動元 Focus。`Esc` で閉じたとき復帰先を決める。
+    /// 現状は Timeline からしか開けないので実用上常に `Timeline` だが、
+    /// 将来 Profile などから開いたときの戻り先誤りを防ぐため記録しておく。
+    pub origin: crate::app::Focus,
 }
 
 impl NoteDetailScreen {
     /// `note` の snapshot を取って開く。`sensitive == true` の Note は添付
     /// 全件 blur 状態で開き、`s` で個別 reveal させる。
     #[must_use]
-    pub fn new(note: TimelineNote) -> Self {
+    pub fn new(note: TimelineNote, origin: crate::app::Focus) -> Self {
         let initial_reveal = !note.sensitive;
         let n = note.attachments.len();
         Self {
@@ -39,15 +43,54 @@ impl NoteDetailScreen {
             scroll: 0,
             revealed: vec![initial_reveal; n],
             selected_attachment: 0,
+            origin,
         }
     }
 
+    /// 1 行スクロール下。`scroll` がコンテンツ末尾を超えると空白画面に
+    /// なるため、Note の構成要素から見積もった行数で上限を掛ける ──
+    /// wrap 後の正確な行数は描画前に分からないが、推定値より深く潜る
+    /// ことは無いはず。
     pub fn scroll_down(&mut self) {
-        self.scroll = self.scroll.saturating_add(1);
+        let max = self.estimated_max_scroll();
+        self.scroll = self.scroll.saturating_add(1).min(max);
     }
 
     pub fn scroll_up(&mut self) {
         self.scroll = self.scroll.saturating_sub(1);
+    }
+
+    /// `scroll` の上限見積もり。Note の構成要素 (時刻 / permalink / CW /
+    /// 本文行 / リアクション行 / 絵文字行 / 添付一覧) を unwrap した素の
+    /// 行数で算出 ── 実描画では terminal 幅で wrap が増えるが、wrap を
+    /// 過剰に多く見積もると無効スクロールが発生するので「下界」側の
+    /// 見積もりに留める。
+    fn estimated_max_scroll(&self) -> usize {
+        // 時刻 1 + permalink 0/1
+        let mut n: usize = 1 + usize::from(self.note.url.is_some());
+        // CW 行 + 区切り 1
+        if self.note.summary.as_deref().is_some_and(|s| !s.is_empty()) {
+            n += 2;
+        }
+        // 本文 (HTML strip 済み行数)
+        let body = crate::content::to_plain_text(&self.note.content)
+            .lines()
+            .count()
+            .max(1); // 空文でも `(empty)` 1 行
+        n += body;
+        // リアクション行 (区切り + 本体)
+        if !self.note.reactions.is_empty() {
+            n += 2;
+        }
+        // 絵文字行
+        if !self.note.emojis.is_empty() {
+            n += 2;
+        }
+        // 添付ヘッダ + 各 1 行
+        if !self.note.attachments.is_empty() {
+            n += 2 + self.note.attachments.len();
+        }
+        n.saturating_sub(1)
     }
 
     /// 現在カーソルにある添付の reveal を toggle する。
@@ -77,6 +120,8 @@ mod tests {
     use super::*;
     use crate::client::{Attachment, TimelineNote};
     use chrono::TimeZone;
+
+    use crate::app::Focus;
 
     fn make_note(sensitive: bool, n_attach: usize) -> TimelineNote {
         TimelineNote {
@@ -113,19 +158,19 @@ mod tests {
 
     #[test]
     fn new_sensitive_starts_blurred() {
-        let s = NoteDetailScreen::new(make_note(true, 2));
+        let s = NoteDetailScreen::new(make_note(true, 2), Focus::Timeline);
         assert_eq!(s.revealed, vec![false, false]);
     }
 
     #[test]
     fn new_non_sensitive_starts_revealed() {
-        let s = NoteDetailScreen::new(make_note(false, 3));
+        let s = NoteDetailScreen::new(make_note(false, 3), Focus::Timeline);
         assert_eq!(s.revealed, vec![true, true, true]);
     }
 
     #[test]
     fn toggle_flips_current_only() {
-        let mut s = NoteDetailScreen::new(make_note(true, 3));
+        let mut s = NoteDetailScreen::new(make_note(true, 3), Focus::Timeline);
         s.selected_attachment = 1;
         s.toggle_reveal();
         assert_eq!(s.revealed, vec![false, true, false]);
@@ -135,7 +180,7 @@ mod tests {
 
     #[test]
     fn select_next_wraps() {
-        let mut s = NoteDetailScreen::new(make_note(false, 3));
+        let mut s = NoteDetailScreen::new(make_note(false, 3), Focus::Timeline);
         s.select_next_attachment();
         s.select_next_attachment();
         s.select_next_attachment();
@@ -144,14 +189,14 @@ mod tests {
 
     #[test]
     fn select_prev_wraps_backward() {
-        let mut s = NoteDetailScreen::new(make_note(false, 3));
+        let mut s = NoteDetailScreen::new(make_note(false, 3), Focus::Timeline);
         s.select_prev_attachment();
         assert_eq!(s.selected_attachment, 2); // wrapped to last
     }
 
     #[test]
     fn empty_attachments_select_is_noop() {
-        let mut s = NoteDetailScreen::new(make_note(false, 0));
+        let mut s = NoteDetailScreen::new(make_note(false, 0), Focus::Timeline);
         s.select_next_attachment();
         s.select_prev_attachment();
         s.toggle_reveal();
@@ -161,12 +206,36 @@ mod tests {
 
     #[test]
     fn scroll_saturates_at_zero() {
-        let mut s = NoteDetailScreen::new(make_note(false, 0));
+        let mut s = NoteDetailScreen::new(make_note(false, 0), Focus::Timeline);
         s.scroll_up();
         assert_eq!(s.scroll, 0);
         s.scroll_down();
+        // 短い note (body 1 行) では max_scroll=1。さらに down しても capped。
         s.scroll_down();
+        s.scroll_down();
+        assert!(s.scroll <= s.estimated_max_scroll());
+    }
+
+    #[test]
+    fn scroll_down_caps_at_estimated_max() {
+        // round-1 review Finding 2: 末尾を超えても空白画面にならないよう
+        // `scroll_down` で見積もり上限にクランプする。
+        let note = make_note(false, 0);
+        let mut s = NoteDetailScreen::new(note, Focus::Timeline);
+        // 1000 回押しても見積もり上限を超えない。
+        for _ in 0..1000 {
+            s.scroll_down();
+        }
+        assert_eq!(s.scroll, s.estimated_max_scroll());
+        // scroll_up は素直に減る。
         s.scroll_up();
-        assert_eq!(s.scroll, 1);
+        assert_eq!(s.scroll, s.estimated_max_scroll().saturating_sub(1));
+    }
+
+    #[test]
+    fn estimated_max_scroll_grows_with_content() {
+        let small = NoteDetailScreen::new(make_note(false, 0), Focus::Timeline);
+        let big = NoteDetailScreen::new(make_note(false, 4), Focus::Timeline);
+        assert!(big.estimated_max_scroll() > small.estimated_max_scroll());
     }
 }

@@ -1725,7 +1725,10 @@ fn render_note_detail_preview(
         );
         return;
     }
-    app.images.ensure(&att.url, area);
+    // 添付プレビューは `preview` variant (1280×1280) を要求 ── アバター用の
+    // 256×256 では Note 詳細モーダルで粗くなる。
+    app.images
+        .ensure_with_variant(&att.url, area, crate::image_cache::VARIANT_PREVIEW);
     if let Some(proto) = app.images.get(&att.url) {
         let widget = Image::new(proto.as_ref());
         frame.render_widget(widget, area);

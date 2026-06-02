@@ -667,14 +667,26 @@ fn open_note_detail(app: &mut App) {
         );
         return;
     };
-    app.note_detail = Some(crate::note_detail::NoteDetailScreen::new(note.clone()));
+    let origin = app.focus;
+    app.note_detail = Some(crate::note_detail::NoteDetailScreen::new(
+        note.clone(),
+        origin,
+    ));
     app.focus = Focus::NoteDetail;
 }
 
-/// Issue #133 (3): `Esc` / `q` でモーダルを閉じる。Timeline に focus 復帰。
+/// Issue #133 (3): `Esc` / `q` でモーダルを閉じる。`origin` に記録した
+/// 起動元 Focus に戻す ── 現状は Timeline からしか開けないが、将来
+/// Profile 経路を増やしたときに「閉じると Timeline に飛ばされる」事故を
+/// 起こさない。Note: `note_detail` を `take()` してから focus 操作に進む
+/// (= 順序逆だと state を持ったまま Timeline focus に戻りバグの温床)。
 fn close_note_detail(app: &mut App) {
+    let origin = app
+        .note_detail
+        .as_ref()
+        .map_or(Focus::Timeline, |s| s.origin);
     app.note_detail = None;
-    app.focus = Focus::Timeline;
+    app.focus = origin;
 }
 
 /// `p` で選択中の Note の author を Profile push する。

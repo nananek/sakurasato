@@ -218,16 +218,24 @@ pub(crate) fn parse_attachments(raw: &JsonValue) -> Vec<AttachmentDto> {
         .collect()
 }
 
+/// shortcode (= AP `Emoji.name`) のバイト長上限。AP には明示の規約が無いが
+/// Mastodon は 50 文字未満、Misskey は 100 文字程度を想定している ── 連合
+/// 先が極端に長い文字列を送り込むと TUI レンダリングで Line span が膨らみ
+/// レイアウト計算に響くため、防御的に 128 で切る。
+const SHORTCODE_MAX_LEN: usize = 128;
+
 /// `note.tags` JSONB を走査し `type == "Emoji"` の要素だけ [`EmojiDto`] に
 /// 変換する。AP `Emoji` は `name` (shortcode) と `icon.url` を持つ。
 ///
 /// `is_local` は `image_url` の host を `local_host` (= 自インスタンス) と
 /// 比較して決める。AP の `Emoji` 自体には `is_local` フィールドが無いため
-/// host 比較が現状唯一の信号。
+/// host 比較が現状唯一の信号。`local_host` に port が混じっていても合致
+/// するよう、両辺をパースして `host_str()` 同士で比較する。
 pub(crate) fn parse_emojis(raw: &JsonValue, local_host: &str) -> Vec<EmojiDto> {
     let JsonValue::Array(arr) = raw else {
         return Vec::new();
     };
+    let local_normalized = normalize_host_for_compare(local_host);
     arr.iter()
         .filter_map(|v| {
             if v.get("type").and_then(JsonValue::as_str) != Some("Emoji") {
@@ -236,7 +244,8 @@ pub(crate) fn parse_emojis(raw: &JsonValue, local_host: &str) -> Vec<EmojiDto> {
             let shortcode = v
                 .get("name")
                 .and_then(JsonValue::as_str)
-                .filter(|s| !s.is_empty())?
+                .filter(|s| !s.is_empty())
+                .filter(|s| s.len() <= SHORTCODE_MAX_LEN)?
                 .to_string();
             let icon = v.get("icon");
             let image_url = icon
@@ -251,7 +260,7 @@ pub(crate) fn parse_emojis(raw: &JsonValue, local_host: &str) -> Vec<EmojiDto> {
                 .as_deref()
                 .and_then(|u| url::Url::parse(u).ok())
                 .and_then(|p| p.host_str().map(str::to_ascii_lowercase))
-                .map(|h| h == local_host.to_ascii_lowercase());
+                .map(|h| h == local_normalized);
             Some(EmojiDto {
                 shortcode,
                 image_url,
@@ -260,6 +269,21 @@ pub(crate) fn parse_emojis(raw: &JsonValue, local_host: &str) -> Vec<EmojiDto> {
             })
         })
         .collect()
+}
+
+/// `local_host` 設定値を `host_str` 比較用に正規化する。`config.server.host`
+/// は通常 `"example.com"` だが、開発環境で `"example.com:8443"` のように
+/// port が付くことがある ── [`url::Url`] パースを試み、`host_str()` のみを
+/// 取り出して lowercase 化する。パース失敗時 (= スキームなし純粋ホスト名)
+/// は素のままを lowercase 化する。
+fn normalize_host_for_compare(s: &str) -> String {
+    if let Some(host) = url::Url::parse(&format!("https://{s}"))
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+    {
+        return host;
+    }
+    s.to_ascii_lowercase()
 }
 
 /// `ReactionSummaryRow` (DB) → `ReactionSummaryDto` (API)。
@@ -496,5 +520,45 @@ mod tests {
     fn parse_emojis_non_array_returns_empty() {
         assert!(parse_emojis(&JsonValue::Null, "local.test").is_empty());
         assert!(parse_emojis(&json!({"x": 1}), "local.test").is_empty());
+    }
+
+    #[test]
+    fn parse_emojis_drops_overly_long_shortcode() {
+        // round-1 review ⚠️ 1: shortcode に長さ上限を設ける (128 byte)。
+        let long_name = ":".to_string() + &"a".repeat(200) + ":";
+        let raw = json!([{ "type": "Emoji", "name": long_name }]);
+        let out = parse_emojis(&raw, "local.test");
+        assert!(out.is_empty(), "200-byte shortcode should be dropped");
+    }
+
+    #[test]
+    fn parse_emojis_keeps_exactly_max_len_shortcode() {
+        // 境界: 128 byte ちょうどは通す (上限は inclusive)。
+        let name = ":".to_string() + &"a".repeat(126) + ":"; // 128 bytes total
+        assert_eq!(name.len(), 128);
+        let raw = json!([{ "type": "Emoji", "name": name.clone() }]);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].shortcode, name);
+    }
+
+    #[test]
+    fn parse_emojis_is_local_handles_port_in_local_host() {
+        // round-1 review ⚠️ 2: `local_host` に port が混じっていても、
+        // パースして `host_str()` 同士の比較で一致させる。
+        let raw = json!([
+            {
+                "type": "Emoji",
+                "name": ":foo:",
+                "icon": {"url": "https://example.com/media/emoji/local/foo.webp"}
+            }
+        ]);
+        // 通常パターン (port なし)。
+        let no_port = parse_emojis(&raw, "example.com");
+        assert_eq!(no_port[0].is_local, Some(true));
+        // port が混じったパターン (= dev 環境)。同じ host_str に正規化されて
+        // local 判定される。
+        let with_port = parse_emojis(&raw, "example.com:8443");
+        assert_eq!(with_port[0].is_local, Some(true));
     }
 }
