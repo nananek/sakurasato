@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, name, url, format, enabled,\n            notify_mention, notify_direct, notify_quote, notify_reaction,\n            notify_renote, notify_follow, notify_follow_request,\n            created_at, updated_at\n        FROM notification_channel\n        ORDER BY id ASC\n        ",
+  "query": "\n        SELECT\n            id, name, url, format,\n            notify_mention, notify_direct, notify_quote, notify_reaction,\n            notify_renote, notify_follow, notify_follow_request,\n            created_at, updated_at\n        FROM notification_channel\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -49,17 +49,6 @@
       },
       {
         "ordinal": 4,
-        "name": "enabled",
-        "type_info": "Bool",
-        "origin": {
-          "Table": {
-            "table": "notification_channel",
-            "name": "enabled"
-          }
-        }
-      },
-      {
-        "ordinal": 5,
         "name": "notify_mention",
         "type_info": "Bool",
         "origin": {
@@ -70,7 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "notify_direct",
         "type_info": "Bool",
         "origin": {
@@ -81,7 +70,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "notify_quote",
         "type_info": "Bool",
         "origin": {
@@ -92,7 +81,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "notify_reaction",
         "type_info": "Bool",
         "origin": {
@@ -103,7 +92,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "notify_renote",
         "type_info": "Bool",
         "origin": {
@@ -114,7 +103,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "notify_follow",
         "type_info": "Bool",
         "origin": {
@@ -125,7 +114,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "notify_follow_request",
         "type_info": "Bool",
         "origin": {
@@ -136,7 +125,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -147,7 +136,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -159,10 +148,11 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Int8"
+      ]
     },
     "nullable": [
-      false,
       false,
       false,
       false,
@@ -178,5 +168,5 @@
       false
     ]
   },
-  "hash": "e94998af5d43ea3531236ab62dbd521ac4ab4870f8f02c3be0b7a3aa838bc98e"
+  "hash": "465141299ea1d9acaf1d3a2dec7947f329c92dfd9c592f5e0ed8fada0a66d4d9"
 }

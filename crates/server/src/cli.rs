@@ -306,16 +306,18 @@ pub enum NotificationChannelCommand {
     /// ([`crate::net_guard::host_blocked`]) で検査するが、配送時にも再検査する
     /// (DNS 再解決後の TOCTOU 防御)。`name` は CLI / 表示用ラベルで UNIQUE。
     Add(NotificationChannelAddArgs),
-    /// 登録チャンネルを `id`/`name`/`enabled`/`format`/`url ホスト`/`on の event`
-    /// の 1 行で列挙する。**URL 全体は表示しない** (URL が漏れれば第三者が同じ
-    /// チャンネルに任意メッセージを撃てるため)。
+    /// 登録チャンネルを `id`/`name`/`format`/`url ホスト`/`on の event`
+    /// の 1 行で列挙する。**URL 全体は表示しない** (URL が漏れれば第三者が
+    /// 同じチャンネルに任意メッセージを撃てるため)。
     List,
     /// `--id N` でハード削除する。
     Remove(NotificationChannelIdArgs),
-    /// チャンネルの master `enabled` または個別 `notify_<event>` を反転する。
-    /// `--event all` は `enabled` 列を反転、それ以外は対応する `notify_*` を
-    /// 反転する。
-    Toggle(NotificationChannelToggleArgs),
+    /// `notify_<event>` を **ON** に設定する (idempotent)。`--event all` は
+    /// 7 個の `notify_*` を一斉 TRUE にする (= チャンネル全 event 有効化)。
+    Enable(NotificationChannelEventArgs),
+    /// `notify_<event>` を **OFF** に設定する (idempotent)。`--event all` は
+    /// 7 個の `notify_*` を一斉 FALSE にする (= チャンネル全停止)。
+    Disable(NotificationChannelEventArgs),
     /// テスト通知 (固定文言の embed/plain) を 1 件 `delivery_queue` に enqueue
     /// する。worker が拾って実 POST する (即時送出は worker のティック次第)。
     Test(NotificationChannelIdArgs),
@@ -342,12 +344,14 @@ pub struct NotificationChannelIdArgs {
     pub id: i64,
 }
 
+/// `enable` / `disable` の共通引数。`--id` でチャンネル、`--event` で対象。
 #[derive(Debug, Args)]
-pub struct NotificationChannelToggleArgs {
+pub struct NotificationChannelEventArgs {
     #[arg(long)]
     pub id: i64,
     /// `all` / `mention` / `direct` / `quote` / `reaction` / `renote` /
-    /// `follow` / `follow-request` のいずれか。
+    /// `follow` / `follow-request` のいずれか。`all` は 7 個の `notify_*`
+    /// を一斉セット (= チャンネル全 event 有効化 / 全停止)。
     #[arg(long)]
     pub event: String,
 }

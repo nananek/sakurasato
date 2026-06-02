@@ -318,6 +318,11 @@ impl FollowState {
 // のは不適切 (= 1 channel が複数 event を独立に on/off できる必要があり、
 // `HashSet<NotificationEvent>` 形式に倒すと正規化が壊れる)。本構造体は repo
 // 層の型として閉じているのでフィールドアクセスが分散しない。
+//
+// **master `enabled` 列は migration 0014 で撤去された** (元は 2 段スイッチに
+// していたが `--event all` の直感とぶつかり、`toggle` が冪等にならなかった)。
+// チャンネル全停止は `disable --event all` で 7 個 `notify_*` を一斉 FALSE に
+// する運用に統一されている。
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct NotificationChannelRow {
@@ -327,8 +332,6 @@ pub struct NotificationChannelRow {
     /// `embed` (Discord embed JSON) または `plain` (`{"content": "..."}` の
     /// Slack / Misskey fallback)。`CHECK` 制約付きなので不正値は入らない。
     pub format: String,
-    /// master switch (`false` で全 event を黙らせる)。個別 `notify_*` と AND。
-    pub enabled: bool,
     pub notify_mention: bool,
     pub notify_direct: bool,
     pub notify_quote: bool,

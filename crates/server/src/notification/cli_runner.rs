@@ -24,7 +24,7 @@ use tracing::info;
 
 use crate::cli::{
     NotificationChannelAddArgs, NotificationChannelArgs, NotificationChannelCommand,
-    NotificationChannelIdArgs, NotificationChannelToggleArgs,
+    NotificationChannelEventArgs, NotificationChannelIdArgs,
 };
 use crate::delivery;
 use crate::net_guard;
@@ -38,7 +38,8 @@ pub async fn run(config: Config, args: NotificationChannelArgs) -> anyhow::Resul
         NotificationChannelCommand::Add(add) => run_add(&state, add).await,
         NotificationChannelCommand::List => run_list(&state).await,
         NotificationChannelCommand::Remove(rm) => run_remove(&state, rm).await,
-        NotificationChannelCommand::Toggle(toggle) => run_toggle(&state, toggle).await,
+        NotificationChannelCommand::Enable(args) => run_set(&state, args, true).await,
+        NotificationChannelCommand::Disable(args) => run_set(&state, args, false).await,
         NotificationChannelCommand::Test(test) => run_test(&state, test).await,
     }
 }
@@ -123,8 +124,8 @@ async fn run_list(state: &AppState) -> anyhow::Result<()> {
             events
         };
         println!(
-            "id={} name={:?} enabled={} format={} host={} events={}",
-            row.id, row.name, row.enabled, row.format, host, events,
+            "id={} name={:?} format={} host={} events={}",
+            row.id, row.name, row.format, host, events,
         );
     }
     Ok(())
@@ -167,18 +168,25 @@ async fn run_remove(state: &AppState, args: NotificationChannelIdArgs) -> anyhow
     Ok(())
 }
 
-async fn run_toggle(state: &AppState, args: NotificationChannelToggleArgs) -> anyhow::Result<()> {
+/// `enable` (value = true) / `disable` (value = false) を共通化したハンドラ。
+/// `--event all` は `set_all_events` で 7 列を一斉セットし、それ以外の event は
+/// `set_event` で 1 列だけセット (両方とも idempotent)。
+async fn run_set(
+    state: &AppState,
+    args: NotificationChannelEventArgs,
+    value: bool,
+) -> anyhow::Result<()> {
     let updated = if args.event.eq_ignore_ascii_case("all") {
-        repo::notification_channel::toggle_enabled(state.pool(), args.id)
+        repo::notification_channel::set_all_events(state.pool(), args.id, value)
             .await
-            .with_context(|| format!("toggle enabled for id={}", args.id))?
+            .with_context(|| format!("set all events for id={}", args.id))?
     } else {
         let event = NotificationEvent::from_str(&args.event).map_err(|e| anyhow!(e))?;
-        repo::notification_channel::toggle_event(state.pool(), args.id, event)
+        repo::notification_channel::set_event(state.pool(), args.id, event, value)
             .await
             .with_context(|| {
                 format!(
-                    "toggle event {event} for id={id}",
+                    "set event {event} for id={id}",
                     event = event.as_str(),
                     id = args.id,
                 )
@@ -187,7 +195,12 @@ async fn run_toggle(state: &AppState, args: NotificationChannelToggleArgs) -> an
     if !updated {
         bail!("no notification channel with id={}", args.id);
     }
-    println!("toggled channel id={} event={}", args.id, args.event);
+    let verb = if value { "enabled" } else { "disabled" };
+    println!(
+        "{verb} channel id={id} event={event}",
+        id = args.id,
+        event = args.event,
+    );
     Ok(())
 }
 
