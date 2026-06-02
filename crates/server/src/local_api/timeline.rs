@@ -258,9 +258,14 @@ pub(crate) fn parse_emojis(raw: &JsonValue, local_host: &str) -> Vec<EmojiDto> {
                 .filter(|s| s.chars().count() <= SHORTCODE_MAX_CHARS)?
                 .to_string();
             let icon = v.get("icon");
+            // round-3 review Finding 2: `parse_attachments` と同じく
+            // server 側で URL スキームを `http(s)://` に絞る。TUI 側
+            // `vet_url` も落とすが、API レスポンス JSON に乗ること自体を
+            // 防ぐ多層防御 (= 一貫性ある方針)。
             let image_url = icon
                 .and_then(|i| i.get("url"))
                 .and_then(JsonValue::as_str)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
                 .map(str::to_string);
             let media_type = icon
                 .and_then(|i| i.get("mediaType"))
@@ -566,6 +571,38 @@ mod tests {
         let out = parse_emojis(&raw, "local.test");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].shortcode, name);
+    }
+
+    #[test]
+    fn parse_emojis_rejects_non_http_icon_url() {
+        // round-3 review Finding 2: `parse_attachments` と一貫して URL
+        // スキームを `http(s)://` に絞る。落とした場合は `image_url` が
+        // None だが、shortcode 自体は通過する (= 画像なしの emoji)。
+        let raw = json!([
+            {
+                "type": "Emoji",
+                "name": ":bad:",
+                "icon": {"url": "file:///etc/passwd"}
+            },
+            {
+                "type": "Emoji",
+                "name": ":js:",
+                "icon": {"url": "javascript:alert(1)"}
+            },
+            {
+                "type": "Emoji",
+                "name": ":ok:",
+                "icon": {"url": "https://e.example/ok.webp"}
+            },
+        ]);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), 3, "shortcode 自体は drop しない");
+        assert!(out[0].image_url.is_none());
+        assert!(out[1].image_url.is_none());
+        assert_eq!(
+            out[2].image_url.as_deref(),
+            Some("https://e.example/ok.webp")
+        );
     }
 
     #[test]

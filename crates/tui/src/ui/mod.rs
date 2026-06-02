@@ -1692,17 +1692,10 @@ fn render_note_detail_preview(
         .get(state.selected_attachment)
         .copied()
         .unwrap_or(false);
-    if !is_image {
-        let msg = format!("  [non-image attachment: {}]", att.url);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                msg,
-                Style::default().fg(palette.muted),
-            ))),
-            area,
-        );
-        return;
-    }
+    // round-3 review Finding 1: **画像か否かに関わらず** blur チェックを先に
+    // 行う ── 非画像 (動画 / 音声) の URL も sensitive Note では `s` で
+    // 解除するまで隠す。`!is_image` を先に置くと、非画像添付の URL が常時
+    // 平文表示されて sensitive 保護をバイパスする。
     if !revealed {
         let msg = "  [sensitive — press s to reveal]";
         frame.render_widget(
@@ -1711,6 +1704,17 @@ fn render_note_detail_preview(
                 Style::default()
                     .fg(palette.warning)
                     .add_modifier(Modifier::BOLD),
+            ))),
+            area,
+        );
+        return;
+    }
+    if !is_image {
+        let msg = format!("  [non-image attachment: {}]", att.url);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(palette.muted),
             ))),
             area,
         );
