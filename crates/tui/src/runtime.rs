@@ -894,8 +894,11 @@ fn start_reply(app: &mut App) {
     };
     // 親 note のラベルは「@user@host: 抜粋 (60 文字)」。author host が無い
     // ローカル post も `@user` だけは出るので識別子として使える。
-    let mut excerpt: String = note.content.chars().take(60).collect();
-    if note.content.chars().count() > 60 {
+    // AP HTML はプレーン化してから切り詰める ── Timeline 表示と同じ
+    // 形にして compose 画面で `<p>...</p>` 等を生で見せない。
+    let plain = crate::content::to_plain_text(&note.content);
+    let mut excerpt: String = plain.chars().take(60).collect();
+    if plain.chars().count() > 60 {
         excerpt.push('…');
     }
     excerpt = excerpt.replace('\n', " ");

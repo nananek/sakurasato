@@ -657,9 +657,14 @@ fn render_profile_screen(
 
     // ヘッダ部の高さは bio の行数で可変。最低 4 行 (名前 / acct / 状態 / counts)、
     // bio で +N。残りを notes 一覧に渡す。
-    let summary_lines: Vec<String> = profile
+    // 連合先 (Mastodon 等) からの bio は `<p>...</p>` 等の HTML 形式で
+    // 届くため、本文と同じく `to_plain_text` でプレーン化する。
+    let summary_plain = profile
         .actor
         .summary
+        .as_deref()
+        .map(crate::content::to_plain_text);
+    let summary_lines: Vec<String> = summary_plain
         .as_deref()
         .map(|s| s.lines().map(ToOwned::to_owned).collect())
         .unwrap_or_default();
@@ -899,7 +904,9 @@ fn profile_note_lines(
         ]));
     }
     let body_width = width.saturating_sub(2);
-    for body_line in note.content.lines() {
+    // Timeline と同じく AP HTML をプレーンテキストにしてから描画する。
+    let body_text = crate::content::to_plain_text(&note.content);
+    for body_line in body_text.lines() {
         out.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -908,7 +915,7 @@ fn profile_note_lines(
             ),
         ]));
     }
-    if note.content.is_empty() {
+    if body_text.is_empty() {
         out.push(Line::from(vec![
             Span::raw("  "),
             Span::styled("(empty)", Style::default().fg(palette.muted)),
@@ -1286,7 +1293,11 @@ fn note_lines(
 
     let total_indent = avatar_indent + 2;
     let body_width = width.saturating_sub(total_indent);
-    for body_line in note.content.lines() {
+    // AP `Note.content` は HTML (`<p>`, `<br>`, `<a>`) 形式で配信されるため
+    // TUI 描画前にプレーン化する。DB / 配送 / permalink に保存する文字列は
+    // 連合互換のため触らない (`content` フィールドは読み取りのみ)。
+    let body_text = crate::content::to_plain_text(&note.content);
+    for body_line in body_text.lines() {
         out.push(Line::from(vec![
             Span::raw(format!("{pad}  ")),
             Span::styled(
@@ -1295,7 +1306,7 @@ fn note_lines(
             ),
         ]));
     }
-    if note.content.is_empty() {
+    if body_text.is_empty() {
         out.push(Line::from(vec![
             Span::raw(pad.clone()),
             Span::styled("  (empty)", Style::default().fg(palette.muted)),
