@@ -899,7 +899,7 @@ fn profile_note_lines(
         ]));
     }
     let body_width = width.saturating_sub(2);
-    // Issue #133 (1): Profile 内 notes 一覧も Timeline と同じく HTML を剥がす。
+    // Timeline と同じく AP HTML をプレーンテキストにしてから描画する。
     let body_text = crate::content::to_plain_text(&note.content);
     for body_line in body_text.lines() {
         out.push(Line::from(vec![
@@ -1288,9 +1288,9 @@ fn note_lines(
 
     let total_indent = avatar_indent + 2;
     let body_width = width.saturating_sub(total_indent);
-    // Issue #133 (1): Mastodon / Misskey が `<p>...</p>` / `<br>` 等の
-    // HTML として送ってくる本文を、TUI 表示用にだけ剥がす。DB / 配送 /
-    // permalink に保存する文字列は連合互換のため元のままで触らない。
+    // AP `Note.content` は HTML (`<p>`, `<br>`, `<a>`) 形式で配信されるため
+    // TUI 描画前にプレーン化する。DB / 配送 / permalink に保存する文字列は
+    // 連合互換のため触らない (`content` フィールドは読み取りのみ)。
     let body_text = crate::content::to_plain_text(&note.content);
     for body_line in body_text.lines() {
         out.push(Line::from(vec![

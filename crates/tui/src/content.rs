@@ -135,11 +135,11 @@ fn handle_entity(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut
 fn decode_entity(name: &str) -> Option<char> {
     if let Some(rest) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
         let code = u32::from_str_radix(rest, 16).ok()?;
-        return char::from_u32(code);
+        return safe_char_from_u32(code);
     }
     if let Some(rest) = name.strip_prefix('#') {
         let code: u32 = rest.parse().ok()?;
-        return char::from_u32(code);
+        return safe_char_from_u32(code);
     }
     match name {
         "amp" => Some('&'),
@@ -150,6 +150,22 @@ fn decode_entity(name: &str) -> Option<char> {
         "nbsp" => Some(' '),
         _ => None,
     }
+}
+
+/// 数値文字参照 (`&#NN;` / `&#xHH;`) を `char` に変換する。NUL (`U+0000`)
+/// と Unicode 制御コード (TAB / LF / CR は除外) は `ratatui` / `crossterm`
+/// 上で予期せぬ描画を起こすため None を返し、呼び出し側でリテラルに
+/// フォールバックさせる ── 悪意ある連合先が `&#0;` などを送り込んで
+/// 端末状態を壊すのを防ぐ防御層。
+fn safe_char_from_u32(code: u32) -> Option<char> {
+    let ch = char::from_u32(code)?;
+    if ch == '\t' || ch == '\n' || ch == '\r' {
+        return Some(ch);
+    }
+    if ch.is_control() {
+        return None;
+    }
+    Some(ch)
 }
 
 /// 段落区切りを 1 つだけ挿入する。末尾に空白があれば落とし、既に空行で
@@ -170,13 +186,11 @@ fn ensure_paragraph_break(out: &mut String) {
 
 /// 末尾の空白 / 改行 / blank line を 1 まとめに落とす。
 fn trim_trailing_blank(out: &mut String) {
-    while let Some(c) = out.chars().last() {
-        if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-            out.pop();
-        } else {
-            break;
-        }
-    }
+    // `chars().last()` を回すと毎回先頭からスキャンが入って O(n²) になる。
+    // `trim_end_matches` は一度だけ末尾から走査して残り長さの &str を返すので、
+    // 戻り値の `len()` を `truncate` に渡せば O(n) で末尾だけ落とせる。
+    let keep = out.trim_end_matches([' ', '\t', '\n', '\r']).len();
+    out.truncate(keep);
 }
 
 #[cfg(test)]
@@ -263,6 +277,18 @@ mod tests {
     fn unknown_entity_preserved() {
         // 未知 entity は生のままにする (= データ消失しない)。
         assert_eq!(to_plain_text("&unknownent;"), "&unknownent;");
+    }
+
+    #[test]
+    fn control_characters_rejected() {
+        // `&#0;` は NUL ── 端末描画を壊しうるのでリテラルにフォールバック。
+        assert_eq!(to_plain_text("&#0;"), "&#0;");
+        // `&#x07;` (BEL) も同様。
+        assert_eq!(to_plain_text("&#x07;"), "&#x07;");
+        // TAB / LF / CR は通常の空白として通す (末尾でないこと保証のため
+        // `a` を後置)。`\n` 単独だと `trim_trailing_blank` で除去されるため。
+        assert_eq!(to_plain_text("&#9;a"), "\ta");
+        assert_eq!(to_plain_text("&#10;a"), "\na");
     }
 
     #[test]
