@@ -496,25 +496,25 @@ fn render_alt_prompt(
     frame.render_widget(p, area);
 }
 
-/// `Paragraph::wrap` 後にこの `Line` が消費する行数を概算する。
+/// `Paragraph::wrap` 後にこの `Line` が消費する行数を `ratatui` の
+/// `WordWrapper` と完全一致で算出する。
 ///
-/// **Issue #104**: 旧実装は各 `Line` を 1 行と仮定して `row_cursor` を進め、
-/// 長文 note の content が折り返されると次 note のアバター画像位置がズレた。
-/// `Line::width()` (= span 合計 display width) を viewport 幅で割って `ceil`
-/// する。`Wrap { trim: false }` の word boundary とは完全一致しないが、
-/// note 表示用途では 1 行誤差程度に収まる。
+/// **Issue #104** で旧実装は各 `Line` を 1 行扱いし、`Issue #144` の修正で
+/// `div_ceil(line.width(), viewport_width)` の近似に置き換えていたが、これは
+/// ASCII の空白を挟む長文 (`HTTP GETにも署名 ...`) で `WordWrapper` が空白優
+/// 先折返しを行うと近似値より 1 行多くなり、アバター位置が縦ズレする症状を
+/// 生んだ。`ratatui` 0.30 の unstable feature `unstable-rendered-line-info`
+/// (`Paragraph::line_count`) は実描画と同じ `WordWrapper` を回して行数を返す
+/// ため、描画と高さ計算の食い違いをゼロにできる。
 ///
-/// `viewport_width = 0` のときは安全に 1 を返す (= 行が消えないように)。
-/// 空 Line も 1 行扱い (ratatui の挙動と一致)。
+/// `viewport_width = 0` / 空 Line は安全に 1 を返す (= 行が消えないように)。
 fn wrapped_line_height(line: &Line<'_>, viewport_width: u16) -> u16 {
-    if viewport_width == 0 {
+    if viewport_width == 0 || line.width() == 0 {
         return 1;
     }
-    let w = u16::try_from(line.width()).unwrap_or(u16::MAX);
-    if w == 0 {
-        return 1;
-    }
-    w.div_ceil(viewport_width)
+    let para = Paragraph::new(line.clone()).wrap(Wrap { trim: false });
+    let count = para.line_count(viewport_width);
+    u16::try_from(count.max(1)).unwrap_or(u16::MAX)
 }
 
 fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
@@ -574,17 +574,18 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
         let is_selected = idx == app.selected;
         let block_lines = note_lines(note, palette, is_selected, inner.width, header_indent);
 
-        // **Issue #104**: 各 Line の **wrap 後の高さ** を計算して row_cursor を
-        // 進める。`note_lines` が組む Line は 1 行扱いだが、Paragraph::wrap で
-        // 折り返されると実際は複数行になる ── content が長い note の次行に
-        // 次 note のアバターが乗ってしまうバグの原因だった。
-        // `Line::width()` (= span 合計 display width) を viewport 幅で割って
-        // ceil する。`Wrap { trim: false }` は word boundary 優先だが、
-        // word 境界の有無で多少ズレることがあるのは許容 (= 1 行ズレ程度)。
-        let consumed_total: u16 = block_lines
+        // **Issue #104 / #144**: 各 Line の **wrap 後の高さ** を計算して
+        // row_cursor を進める。`note_lines` が組む Line は 1 行扱いだが、
+        // Paragraph::wrap で折り返されると実際は複数行になる ── content が
+        // 長い note の次行に次 note のアバターが乗ってしまうバグの原因。
+        // ratatui の `Paragraph::line_count` で実描画と同じ WordWrapper を
+        // 回すので、`Wrap { trim: false }` の空白優先折返しでも食い違わない。
+        // 1 Line につき WordWrapper を 2 回走らせないよう先にまとめて算出する。
+        let line_heights: Vec<u16> = block_lines
             .iter()
             .map(|l| wrapped_line_height(l, inner.width))
-            .fold(0u16, u16::saturating_add);
+            .collect();
+        let consumed_total: u16 = line_heights.iter().copied().fold(0u16, u16::saturating_add);
         let visible_top = inner.y + row_cursor;
         let visible_height = consumed_total.min(inner.height - row_cursor);
         hits.push(idx, visible_top, visible_height);
@@ -596,11 +597,10 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
             avatar_overlays.push((visible_top, url));
         }
 
-        for l in block_lines {
+        for (l, h) in block_lines.into_iter().zip(line_heights) {
             if row_cursor >= inner.height {
                 break;
             }
-            let h = wrapped_line_height(&l, inner.width);
             lines.push(l);
             row_cursor = row_cursor.saturating_add(h);
         }
@@ -2006,6 +2006,54 @@ mod tests {
             Some("example.test".into()),
         );
         assert_eq!(extract_host("not a url"), None);
+    }
+
+    /// **Issue #144 回帰**: ASCII の空白を含む CJK 長文で `WordWrapper` が
+    /// 空白優先折返しを行うと、旧 `div_ceil(line.width(), width)` 近似は実
+    /// 描画より 1 行少ない値を返していた。`Paragraph::line_count` 経由で
+    /// 実描画と完全一致することを確認する。
+    #[test]
+    fn wrapped_line_height_matches_word_wrapper_with_cjk_and_space() {
+        // 「HTTP GET にも署名を実装してみたい今日この頃ですが ──」
+        // ASCII の "HTTP GET" の直後に空白があり、WordWrapper はそこで折り
+        // 返すため、近似 ceil(width / cols) よりも 1 行多く必要になる幅を
+        // 選ぶ。viewport_width = 12 cells のとき:
+        //   span 全体の display width = 8 (HTTP GET) + 1 (space) + ...
+        //   先頭 word "HTTP" は 4 cells、続く word "GET" は 3 cells で 12
+        //   セルに収まるが、次の word "にも署名" の直前で折り返される。
+        let line =
+            Line::from("HTTP GETにも署名を実装してみたい今日この頃ですが ── そう簡単じゃない");
+        let h = wrapped_line_height(&line, 12);
+
+        // Paragraph::line_count と一致 (= 同じ実装に委譲しているので自明)。
+        // ここでは「div_ceil 近似より大きい」ことだけ確認する: 旧実装の
+        // バグはこの差で発生していた。
+        let display_width = u16::try_from(line.width()).unwrap();
+        let approx = display_width.div_ceil(12);
+        assert!(
+            h > approx,
+            "WordWrapper の実行数 {h} は div_ceil 近似 {approx} より大きいはず (空白優先折返しで 1 行多くなる)"
+        );
+    }
+
+    /// 空 Line / `viewport_width = 0` は 1 行扱い ── 行が消えてアバター
+    /// 位置が縮退しないように維持する不変条件。
+    #[test]
+    fn wrapped_line_height_handles_empty_and_zero_width() {
+        assert_eq!(wrapped_line_height(&Line::from(""), 80), 1);
+        assert_eq!(wrapped_line_height(&Line::from("hello"), 0), 1);
+    }
+
+    /// ASCII のみで wrap が発生しないケース ── `div_ceil` 近似と
+    /// `Paragraph::line_count` が一致するため、回帰しても気付きにくいので
+    /// 1 行で済む短文と確実に折り返す長文の双方で確認しておく。
+    #[test]
+    fn wrapped_line_height_ascii_basic() {
+        let short = Line::from("hello world");
+        assert_eq!(wrapped_line_height(&short, 80), 1);
+
+        let long = Line::from("abcdefghijklmnopqrstuvwxyz0123456789");
+        assert_eq!(wrapped_line_height(&long, 10), 4); // 36 / 10 → 4
     }
 
     #[test]
