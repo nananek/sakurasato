@@ -63,12 +63,14 @@ mod tests {
     }
 
     #[test]
-    fn guard_drop_underflow_saturates_at_zero_via_atomic_wraparound_is_avoided() {
-        // 万一 new と drop の対が崩れても (= 想定外) panic にはしない。
-        // Relaxed fetch_sub は 0 → usize::MAX に wrap するため、運用上は
-        // 「常に new と drop が 1:1 で対応している」前提を呼び出し側 (=
-        // async fn の冒頭で必ず let _g = ... を書く) が守ることで担保。
-        // 本テストは「guard が複数あっても 1 つずつ正確に dec する」を確認。
+    fn guard_multiple_drops_decrement_correctly() {
+        // 複数の guard を任意順で drop しても 1 つずつ正確に dec され、
+        // 全部 drop で 0 に戻る。3 件並列の async (= 起動時 timeline +
+        // 数本の reaction 等) を想定したスモーク。
+        //
+        // 注: Relaxed fetch_sub は 0 → usize::MAX に wrap する仕様で、
+        // panic は出ない。「new と drop が 1:1 で対応する」前提は呼び出し
+        // 側 (= 各 async fn 冒頭で必ず `let _g = ...` を書く) が守る。
         let counter = Arc::new(AtomicUsize::new(0));
         let g1 = InFlightGuard::new(counter.clone());
         let g2 = InFlightGuard::new(counter.clone());

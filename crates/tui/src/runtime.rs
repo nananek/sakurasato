@@ -1008,7 +1008,9 @@ async fn open_emoji_search(app: &mut App, api: &LocalApi) {
 /// `Mode::InsertIntoCompose` の場合は `EmojiItem::content_token()` を compose
 /// 本文に挿入し、Compose focus に戻る。
 async fn emoji_search_confirm(app: &mut App, api: &LocalApi, page_size: i64) {
-    let _g = InFlightGuard::new(app.in_flight.clone());
+    // `ReactToNote` 経路は `send_reaction` が `InFlightGuard` を持ち、
+    // `InsertIntoCompose` 経路はネットワーク呼び出しを伴わないため、
+    // 本関数自身では guard を作らない (PR #149 review 二重 inc 修正)。
     let Some(state) = app.emoji_suggest.as_ref() else {
         return;
     };
@@ -1561,13 +1563,18 @@ async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
 }
 
 async fn command_open_self(app: &mut App, api: &LocalApi, page_size: i64) {
-    let _g = InFlightGuard::new(app.in_flight.clone());
+    let lookup_guard = InFlightGuard::new(app.in_flight.clone());
     let ap_id = app.whoami.ap_id.clone();
     match api.lookup_actor_by_ap_id(&ap_id).await {
         Ok(resp) => {
+            // `lookup_actor_by_ap_id` 完了済み。続く `push_profile_from_lookup`
+            // も guard を持つので、ここで明示 drop して二重 inc を避ける
+            // (PR #149 review)。
+            drop(lookup_guard);
             push_profile_from_lookup(app, api, page_size, resp).await;
         }
         Err(err) => {
+            // Err 経路は後続 API 呼び出しなしなのでスコープ末尾で自然 drop。
             app.set_status(
                 format!(":me failed: {err}"),
                 StatusKind::Error,
@@ -1583,13 +1590,18 @@ async fn command_open_target(
     page_size: i64,
     target: &crate::command::LookupTarget,
 ) {
-    let _g = InFlightGuard::new(app.in_flight.clone());
+    let lookup_guard = InFlightGuard::new(app.in_flight.clone());
     let resp = match target {
         crate::command::LookupTarget::Acct(acct) => api.lookup_actor_by_acct(acct).await,
         crate::command::LookupTarget::ApId(uri) => api.lookup_actor_by_ap_id(uri).await,
     };
     match resp {
-        Ok(r) => push_profile_from_lookup(app, api, page_size, r).await,
+        Ok(r) => {
+            // lookup 完了。続く `push_profile_from_lookup` も guard を持つ
+            // ので明示 drop して二重 inc を避ける (PR #149 review)。
+            drop(lookup_guard);
+            push_profile_from_lookup(app, api, page_size, r).await;
+        }
         Err(err) => {
             app.set_status(
                 format!(":open failed: {err}"),
