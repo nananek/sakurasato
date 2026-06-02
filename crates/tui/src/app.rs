@@ -128,6 +128,13 @@ pub struct App {
     /// TUI 再起動で消える ── 永続性は不要 (= サーバが真実、TUI はキャッシュ
     /// に過ぎない)。
     pub last_reaction_ids: HashMap<i64, i64>,
+    /// #151: 自分が直近に renote した announce の id を `note_id` 別に覚える。
+    /// `B` (undo renote) は server 側 `(note_id, local_actor.id)` で引けるので
+    /// この map 自体は必須ではないが、status bar に「renote 済み」を一目で
+    /// 出す UI hint として保持する (= `last_reaction_ids` と同パターン)。
+    /// `TimelineNote.viewer_renoted` が真実源で、起動直後はサーバ応答が反映
+    /// されるまで空。
+    pub last_renote_ids: HashMap<i64, i64>,
     /// M13 PR4 (Issue #79): Profile 画面 stack。末尾が現在描画中の Profile。
     /// `p` で push、`Esc`/`q` で pop。空 stack + `Focus::Profile` は許されない
     /// (= `apply_action` 側で焦点を Timeline に戻す責務)。
@@ -191,6 +198,7 @@ impl App {
             suppression_cursor: 0,
             alt_prompt: None,
             last_reaction_ids: HashMap::new(),
+            last_renote_ids: HashMap::new(),
             profile_stack: Vec::new(),
             follow_list: None,
             command: None,
@@ -360,6 +368,8 @@ mod tests {
             reactions: Vec::new(),
             attachments: Vec::new(),
             emojis: Vec::new(),
+            announce_count: 0,
+            viewer_renoted: false,
         }
     }
 

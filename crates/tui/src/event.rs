@@ -80,6 +80,11 @@ pub enum Action {
     ReplyToSelected,
     /// M13 PR6: 選択中の Note への自分の直近リアクションを取り消す。
     UndoReactionOnSelected,
+    /// #151: 選択中の Note を renote / boost する。`b` キー / `:renote` コマンド。
+    RenoteSelected,
+    /// #151: 選択中の Note への自分の renote を取り消す。`B` (Shift-B) /
+    /// `:unrenote` コマンド。
+    UndoRenoteOnSelected,
     /// M13 PR6: alt text 入力中の文字入力。
     AltPromptInsertChar(char),
     /// M13 PR6: alt text プロンプトの Backspace。
@@ -344,6 +349,10 @@ fn translate_timeline_key(k: KeyEvent) -> Action {
         (KeyCode::Char('R'), _) => Action::ReplyToSelected,
         // M13 PR6: u = 自分が直近に付けた reaction を取り消し。
         (KeyCode::Char('u'), m) if m.is_empty() => Action::UndoReactionOnSelected,
+        // #151: b = renote (boost / 引用なし), B = undo renote。
+        // reaction の `e` / `u` と並ぶキー設計。`B` は Shift 必須で誤爆を抑える。
+        (KeyCode::Char('b'), m) if m.is_empty() => Action::RenoteSelected,
+        (KeyCode::Char('B'), _) => Action::UndoRenoteOnSelected,
         // M13 PR4: p = 選択中の Note の author の Profile 画面を push。
         (KeyCode::Char('p'), m) if m.is_empty() => Action::OpenProfileFromSelected,
         // M13 PR5: `:` でコマンドプロンプトを開く (vim 風)。
@@ -639,6 +648,28 @@ mod tests {
                 Focus::Timeline,
             ),
             Action::UndoReactionOnSelected,
+        ));
+    }
+
+    #[test]
+    fn timeline_b_renotes_selected() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('b'), KeyModifiers::NONE)),
+                Focus::Timeline,
+            ),
+            Action::RenoteSelected,
+        ));
+    }
+
+    #[test]
+    fn timeline_capital_b_undoes_renote() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('B'), KeyModifiers::SHIFT)),
+                Focus::Timeline,
+            ),
+            Action::UndoRenoteOnSelected,
         ));
     }
 

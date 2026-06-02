@@ -947,6 +947,9 @@ fn profile_note_lines(
     if !note.reactions.is_empty() {
         out.push(reaction_line(note, palette, ""));
     }
+    if note.announce_count > 0 {
+        out.push(renote_line(note, palette, ""));
+    }
     out.push(Line::from(""));
     out
 }
@@ -1359,6 +1362,9 @@ fn note_lines(
     if !note.reactions.is_empty() {
         out.push(reaction_line(note, palette, &pad));
     }
+    if note.announce_count > 0 {
+        out.push(renote_line(note, palette, &pad));
+    }
     out.push(Line::from(""));
     out
 }
@@ -1385,6 +1391,31 @@ fn reaction_line(note: &TimelineNote, palette: &Palette, pad: &str) -> Line<'sta
         ));
         spans.push(Span::styled(
             format!(" ×{}", r.count),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// #151: 1 件の Note の renote (Announce) 集計を 1 行にまとめる。
+///
+/// 表示例: ` ↻ 3 (you renoted) `。`viewer_renoted` が true のとき accent 色 +
+/// BOLD で強調 (= 自分が boost 済みであることを一目で示す)。
+/// `announce_count == 0` のときは行を作らず、呼び出し側で push を抑制する。
+fn renote_line(note: &TimelineNote, palette: &Palette, pad: &str) -> Line<'static> {
+    let style = if note.viewer_renoted {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    let mut spans = Vec::with_capacity(3);
+    spans.push(Span::raw(format!("{pad}  ")));
+    spans.push(Span::styled(format!("↻ {}", note.announce_count), style));
+    if note.viewer_renoted {
+        spans.push(Span::styled(
+            "  (you renoted)",
             Style::default().fg(palette.muted),
         ));
     }
@@ -1604,6 +1635,10 @@ fn render_note_detail(
     if !note.reactions.is_empty() {
         lines.push(Line::from(""));
         lines.push(reaction_line(note, palette, ""));
+    }
+    if note.announce_count > 0 {
+        lines.push(Line::from(""));
+        lines.push(renote_line(note, palette, ""));
     }
     // round-4 review Finding 1: 視覚刺激抑制 `suppression.emoji` が off の
     // ときは emoji セクションを丸ごとスキップする (= CLAUDE.md §5.2

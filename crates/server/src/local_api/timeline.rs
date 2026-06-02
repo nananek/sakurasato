@@ -78,6 +78,14 @@ pub struct TimelineNote {
     /// shortcode と画像のギャラリー表示に使う。空 Vec は省略しない。
     #[serde(default)]
     pub emojis: Vec<EmojiDto>,
+    /// #151: この Note が何回 boost / renote されたか (受信 + 送出側の合計)。
+    /// `announce` テーブル `count(*)` 由来。
+    #[serde(default)]
+    pub announce_count: i64,
+    /// #151: viewer (= ローカル actor) 自身が renote 済みか。TUI の「↻ you
+    /// renoted」マーカー表示に使う。
+    #[serde(default)]
+    pub viewer_renoted: bool,
 }
 
 /// Note 添付の TUI 向け正規化形式。AP `Document` / `Image` のフィールドの
@@ -142,13 +150,20 @@ pub struct ReactionSummaryDto {
 }
 
 impl TimelineNote {
-    pub(crate) fn from_entry_with_reactions(
+    /// `TimelineEntry` + 集約データ (reactions / announce) を 1 個の DTO に
+    /// 組み立てる。`announce` が `None` のときは「集計取得に失敗」 or
+    /// 「該当 row 無し」のどちらでも安全側に `count = 0, viewer_renoted = false`
+    /// で返す ── タイムライン本体は表示し続けたい。
+    pub(crate) fn from_entry_with_aggregates(
         e: TimelineEntry,
         reactions: Vec<ReactionSummaryDto>,
+        announce: Option<&sakurasato_core::repo::announce::AnnounceSummaryRow>,
         host: &str,
     ) -> Self {
         let attachments = parse_attachments(&e.attachments);
         let emojis = parse_emojis(&e.tags, host);
+        let (announce_count, viewer_renoted) =
+            announce.map_or((0, false), |a| (a.count, a.viewer_renoted));
         Self {
             id: e.id,
             ap_id: e.ap_id,
@@ -170,6 +185,8 @@ impl TimelineNote {
             reactions,
             attachments,
             emojis,
+            announce_count,
+            viewer_renoted,
         }
     }
 }
@@ -391,7 +408,7 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
 
     // M8 PR3: 当ページの note 全件のリアクションを 1 クエリで集計する。
     // failure は warn でログに残し、空の集計で続行 ── タイムライン本体を
-    // 失敗させたくない。
+    // 失敗させたくない。#151 で announce 集計も同じ要領で追加。
     let note_ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
     let mut by_note: HashMap<i64, Vec<ReactionSummaryDto>> = HashMap::new();
     match repo::reaction::counts_for_notes(state.pool(), &note_ids).await {
@@ -407,12 +424,25 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
             warn!(?err, "timeline/home: reaction counts_for_notes failed");
         }
     }
+    let mut announce_by_note: HashMap<i64, sakurasato_core::repo::announce::AnnounceSummaryRow> =
+        HashMap::new();
+    match repo::announce::counts_for_notes(state.pool(), &note_ids, actor.id).await {
+        Ok(rows) => {
+            for row in rows {
+                announce_by_note.insert(row.note_id, row);
+            }
+        }
+        Err(err) => {
+            warn!(?err, "timeline/home: announce counts_for_notes failed");
+        }
+    }
 
     let notes: Vec<TimelineNote> = entries
         .into_iter()
         .map(|e| {
             let reactions = by_note.remove(&e.id).unwrap_or_default();
-            TimelineNote::from_entry_with_reactions(e, reactions, host)
+            let announce = announce_by_note.get(&e.id);
+            TimelineNote::from_entry_with_aggregates(e, reactions, announce, host)
         })
         .collect();
 

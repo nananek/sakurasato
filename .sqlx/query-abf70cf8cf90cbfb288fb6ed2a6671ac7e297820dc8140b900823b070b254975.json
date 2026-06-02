@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            note_id as \"note_id!\",\n            COUNT(*) as \"count!\",\n            BOOL_OR(actor_id = $2) as \"viewer_renoted!\"\n        FROM announce\n        WHERE note_id = ANY($1)\n        GROUP BY note_id\n        ORDER BY note_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "note_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "announce",
+            "name": "note_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "viewer_renoted!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "abf70cf8cf90cbfb288fb6ed2a6671ac7e297820dc8140b900823b070b254975"
+}

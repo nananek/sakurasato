@@ -65,6 +65,7 @@ pub mod media_proxy;
 pub mod notes;
 pub mod profile;
 pub mod reactions;
+pub mod renotes;
 pub mod stream;
 pub mod timeline;
 pub mod whoami;
@@ -113,6 +114,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/reactions/{id}",
             axum::routing::delete(reactions::delete),
+        )
+        // #151: Announce (boost / renote) 送出。POST = boost、DELETE = Undo。
+        // path の `id` は **元 Note の id** (受信側 announce 行の id ではない)。
+        // 1 user 1 target 制約は announce テーブルの UNIQUE で担保される。
+        .route(
+            "/api/v1/notes/{id}/renote",
+            post(renotes::create).delete(renotes::delete),
         )
         // M12 / Issue #66: 鍵アカ運用の lock/unlock + 承認待ち管理。
         // CLI と同じロジックを呼ぶだけ。pytest 連合テストと TUI 共通のフロント。

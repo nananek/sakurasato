@@ -558,6 +558,8 @@ async fn apply_action(
         }
         Action::ReplyToSelected => start_reply(app),
         Action::UndoReactionOnSelected => undo_reaction(app, api, page_size).await,
+        Action::RenoteSelected => send_renote(app, api, page_size).await,
+        Action::UndoRenoteOnSelected => undo_renote(app, api, page_size).await,
         Action::AltPromptInsertChar(c) => {
             if let Some(p) = app.alt_prompt.as_mut() {
                 p.insert_char(c);
@@ -1145,6 +1147,80 @@ fn emoji_search_cancel(app: &mut App) {
     };
 }
 
+/// `POST /api/v1/notes/{id}/renote` ── 選択中 Note を renote する (#151)。
+/// 成功時は timeline を再取得して `announce_count` / `viewer_renoted` を反映。
+/// visibility が public / unlisted 以外なら server 側 400 で弾かれ、status に
+/// エラー表示する。
+async fn send_renote(app: &mut App, api: &LocalApi, page_size: i64) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(note) = app.notes.get(app.selected) else {
+        app.set_status(
+            "no note selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    };
+    let note_id = note.id;
+    match api.create_renote(note_id).await {
+        Ok(resp) => {
+            app.last_renote_ids.insert(note_id, resp.id);
+            app.set_status(
+                format!("renoted #{note_id} ({} queued)", resp.queued_deliveries),
+                StatusKind::Success,
+                Some(Duration::from_secs(3)),
+            );
+            if let Ok(resp) = api.timeline_home(None, page_size).await {
+                app.replace_timeline(resp.notes, resp.next_before_id);
+            }
+        }
+        Err(err) => {
+            app.set_status(
+                format!("renote failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `DELETE /api/v1/notes/{id}/renote` ── 自分の renote を取り消し (#151)。
+/// path には選択中 Note の id を渡す ── サーバが `(note_id, local_actor.id)`
+/// で announce row を引いて Undo を配送する。`last_renote_ids` 経由のヒント
+/// が無くても動くが、UI 整合のために taken して削除する。
+async fn undo_renote(app: &mut App, api: &LocalApi, page_size: i64) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(note) = app.notes.get(app.selected) else {
+        app.set_status(
+            "no note selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    };
+    let note_id = note.id;
+    match api.delete_renote(note_id).await {
+        Ok(()) => {
+            app.last_renote_ids.remove(&note_id);
+            app.set_status(
+                "renote removed",
+                StatusKind::Success,
+                Some(Duration::from_secs(3)),
+            );
+            if let Ok(resp) = api.timeline_home(None, page_size).await {
+                app.replace_timeline(resp.notes, resp.next_before_id);
+            }
+        }
+        Err(err) => {
+            app.set_status(
+                format!("undo renote failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
 /// `POST /api/v1/reactions` 本体。Timeline `e` 経路で確定した `content` を
 /// 送る。成功時は timeline を再取得して reaction count を反映する。
 async fn send_reaction(app: &mut App, api: &LocalApi, note_id: i64, content: &str, page_size: i64) {
@@ -1651,6 +1727,8 @@ async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
         Command::Lock => command_actor_lock(app, api, true).await,
         Command::Unlock => command_actor_lock(app, api, false).await,
         Command::OpenRequests => command_open_requests(app, api).await,
+        Command::Renote => send_renote(app, api, page_size).await,
+        Command::Unrenote => undo_renote(app, api, page_size).await,
         Command::Invalid { reason } => {
             app.set_status(
                 format!(":: {reason}"),
