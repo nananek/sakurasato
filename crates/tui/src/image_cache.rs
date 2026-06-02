@@ -57,8 +57,18 @@ const CACHE_CAP: usize = 64;
 /// 掛ける ── server 経路を経ない攻撃 (= 別経路でキャッシュに突っ込まれる
 /// 可能性) は無いが、image crate の Limits は常時オンが正しい運用。
 const MAX_IMAGE_DIMENSION: u32 = 4096;
-/// media-proxy に頼むバリアント (アバター用)。
-const AVATAR_VARIANT: &str = "avatar";
+/// media-proxy に頼むバリアント。呼び出し側が用途に応じて選ぶ:
+///
+/// - `avatar` (256×256, 既定) ── アイコン / 絵文字 (= 小サイズ用途で十分)
+/// - `thumbnail` (320×320) ── リスト中のサムネイル
+/// - `preview` (1280×1280) ── Note 詳細モーダルの添付プレビュー (Issue #133)
+/// - `header` (1500×500) ── プロフィール画像
+///
+/// media-proxy 側で同じ名前の variant に解決される ([`crate::client::LocalApi::fetch_proxy_image`])。
+/// 未知の variant が渡ったときは server 側で 400 が返るため、呼び出し側で
+/// 文字列をハードコードせず本モジュールの定数を使う。
+pub const VARIANT_AVATAR: &str = "avatar";
+pub const VARIANT_PREVIEW: &str = "preview";
 
 /// キャッシュ entry の状態。
 ///
@@ -138,10 +148,25 @@ impl ImageCache {
         }
     }
 
-    /// `url` が未取得 / 期限切れ failed なら fetch task を spawn する。
-    /// `size` はターゲット領域 (= avatar セル数)。Picker は `font_size` を
-    /// 使って実ピクセル換算する。
+    /// `url` が未取得 / 期限切れ failed なら fetch task を spawn する
+    /// (= `variant = "avatar"` で 256×256 上限)。アバター / 絵文字経路で使う。
     pub fn ensure(&self, url: &str, size: Rect) {
+        self.ensure_with_variant(url, size, VARIANT_AVATAR);
+    }
+
+    /// `ensure` のバリアント可変版。Issue #133 (4) 添付プレビューで
+    /// `preview` (1280×1280) を渡すために生やした。`variant` は
+    /// [`VARIANT_AVATAR`] / [`VARIANT_PREVIEW`] などの定数を渡す。
+    ///
+    /// キャッシュキーは `url` のみで、同じ URL を異なる variant で要求すると
+    /// **最初の variant の結果が再利用される**。お一人様 TUI ではアバター・
+    /// 絵文字・添付で URL が重複する場面は想定されない (= 添付は AP `Document`
+    /// 由来、絵文字は `Emoji.icon.url` 由来、actor icon は `actor.icon_url`
+    /// 由来で名前空間が衝突しない)。リモート actor が icon と Note 添付に
+    /// 同じ URL を使った場合は、先に取得された側の variant が再利用されて
+    /// しまう ── PR #154 round-2 review P2 で指摘。将来衝突を許す場合は
+    /// cache key を `(url, variant)` に拡張する (= TODO、別 issue)。
+    pub fn ensure_with_variant(&self, url: &str, size: Rect, variant: &'static str) {
         let (Some(picker), Some(api)) = (self.picker.clone(), self.api.clone()) else {
             return;
         };
@@ -167,7 +192,7 @@ impl ImageCache {
         let inner = self.inner.clone();
         let url_owned = url.to_string();
         tokio::spawn(async move {
-            let outcome = fetch_and_decode(&api, &url_owned, &picker, size).await;
+            let outcome = fetch_and_decode(&api, &url_owned, &picker, size, variant).await;
             let Ok(mut cache) = inner.lock() else {
                 return;
             };
@@ -176,7 +201,7 @@ impl ImageCache {
                     cache.put(url_owned, ImageState::Ready(Arc::new(proto)));
                 }
                 Err(err) => {
-                    warn!(%url_owned, error = %err, "avatar fetch failed");
+                    warn!(%url_owned, variant, error = %err, "media fetch failed");
                     cache.put(
                         url_owned,
                         ImageState::Failed {
@@ -216,13 +241,14 @@ async fn fetch_and_decode(
     url: &str,
     picker: &Picker,
     size: Rect,
+    variant: &str,
 ) -> Result<Protocol, String> {
     let target = Size::new(size.width, size.height);
     let parsed = vet_url(url).ok_or_else(|| "blocked URL".to_string())?;
-    debug!(url = %parsed, "fetch avatar via local API");
+    debug!(url = %parsed, variant, "fetch media via local API");
 
     let bytes = api
-        .fetch_proxy_image(parsed.as_str(), AVATAR_VARIANT)
+        .fetch_proxy_image(parsed.as_str(), variant)
         .await
         .map_err(|e| format!("media-proxy: {e}"))?;
 

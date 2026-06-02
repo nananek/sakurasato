@@ -394,13 +394,45 @@ async fn apply_action(
             submit_note(app, api).await;
         }
         Action::Scroll(delta) => {
-            if delta > 0 {
-                for _ in 0..delta {
-                    app.select_next();
+            // round-4 review Finding 2: モーダル / overlay focus 中はマウス
+            // ホイールが背後 Timeline に抜けないようガード。Note 詳細では
+            // ホイールを `NoteDetailScrollDown/Up` に振り向ける ── UX 改善
+            // も兼ねる。他 overlay (Suppression / Picker / EmojiSearch /
+            // AltPrompt / Command) はホイール無視で十分。
+            match app.focus {
+                Focus::NoteDetail => {
+                    if let Some(s) = app.note_detail.as_mut() {
+                        if delta > 0 {
+                            for _ in 0..delta {
+                                s.scroll_down();
+                            }
+                        } else {
+                            for _ in 0..(-delta) {
+                                s.scroll_up();
+                            }
+                        }
+                    }
                 }
-            } else {
-                for _ in 0..(-delta) {
-                    app.select_prev();
+                Focus::Suppression
+                | Focus::Picker
+                | Focus::EmojiSearch
+                | Focus::AltPrompt
+                | Focus::Command
+                | Focus::Requests => {
+                    // overlay 中は背後 Timeline を動かさない。`Requests`
+                    // (= follow request 承認画面) も同じく overlay 風だが
+                    // round-4 で漏れていた (= round-6 review F7)。
+                }
+                _ => {
+                    if delta > 0 {
+                        for _ in 0..delta {
+                            app.select_next();
+                        }
+                    } else {
+                        for _ in 0..(-delta) {
+                            app.select_prev();
+                        }
+                    }
                 }
             }
         }
@@ -625,7 +657,70 @@ async fn apply_action(
         Action::RequestsRejectSelected => requests_mutate_selected(app, api, false).await,
         Action::RequestsRefresh => requests_refresh(app, api).await,
         Action::RequestsClose => requests_close(app),
+        Action::OpenNoteDetail => open_note_detail(app),
+        Action::NoteDetailClose => close_note_detail(app),
+        Action::NoteDetailScrollDown => {
+            if let Some(s) = app.note_detail.as_mut() {
+                s.scroll_down();
+            }
+        }
+        Action::NoteDetailScrollUp => {
+            if let Some(s) = app.note_detail.as_mut() {
+                s.scroll_up();
+            }
+        }
+        Action::NoteDetailNextAttachment => {
+            if let Some(s) = app.note_detail.as_mut() {
+                s.select_next_attachment();
+            }
+        }
+        Action::NoteDetailPrevAttachment => {
+            if let Some(s) = app.note_detail.as_mut() {
+                s.select_prev_attachment();
+            }
+        }
+        Action::NoteDetailToggleReveal => {
+            if let Some(s) = app.note_detail.as_mut() {
+                s.toggle_reveal();
+            }
+        }
     }
+}
+
+/// Issue #133 (3): Timeline で `Enter` ── 選択中 Note の snapshot を取って
+/// 詳細モーダルを開く。空 timeline / 範囲外なら status だけ更新して focus
+/// は移さない (= UI 状態を壊さない)。
+fn open_note_detail(app: &mut App) {
+    let Some(note) = app.notes.get(app.selected) else {
+        app.set_status(
+            "no note selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    };
+    let origin = app.focus;
+    let emoji_visible = app.suppression.emoji;
+    app.note_detail = Some(crate::note_detail::NoteDetailScreen::new(
+        note.clone(),
+        origin,
+        emoji_visible,
+    ));
+    app.focus = Focus::NoteDetail;
+}
+
+/// Issue #133 (3): `Esc` / `q` でモーダルを閉じる。`origin` に記録した
+/// 起動元 Focus に戻す ── 現状は Timeline からしか開けないが、将来
+/// Profile 経路を増やしたときに「閉じると Timeline に飛ばされる」事故を
+/// 起こさない。Note: `note_detail` を `take()` してから focus 操作に進む
+/// (= 順序逆だと state を持ったまま Timeline focus に戻りバグの温床)。
+fn close_note_detail(app: &mut App) {
+    let origin = app
+        .note_detail
+        .as_ref()
+        .map_or(Focus::Timeline, |s| s.origin);
+    app.note_detail = None;
+    app.focus = origin;
 }
 
 /// `p` で選択中の Note の author を Profile push する。
@@ -1358,14 +1453,22 @@ fn handle_upload_outcome(app: &mut App, outcome: UploadOutcome) {
 }
 
 fn handle_click(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
-    // [[m9-pr2-review]] Finding 1: overlay 系 focus (Suppression / Picker /
-    // EmojiSearch / AltPrompt / Command) の最中は背後パネルへの hit test を
-    // 抜けさせない ── クリックでサイレントに overlay が閉じてしまい、背後の
-    // ノートが選択されたり compose にフォーカスが奪われるのを防ぐ。Help は
-    // overlay 中のクリックで明示的に閉じる従来挙動を維持 (既存テストの依存)。
+    // [[m9-pr2-review]] Finding 1 + #133 PR3 round-2 C1: overlay 系 focus
+    // (Suppression / Picker / EmojiSearch / AltPrompt / Command / NoteDetail)
+    // の最中は背後パネルへの hit test を抜けさせない ── クリックでサイレント
+    // に overlay が閉じてしまい、背後のノートが選択されたり compose に
+    // フォーカスが奪われるのを防ぐ。`NoteDetail` を入れずに置くと、モーダル
+    // 外クリックで focus だけが Timeline に書き換わり `app.note_detail` は
+    // ゴミデータとして残る split state を起こす。Help は overlay 中の
+    // クリックで明示的に閉じる従来挙動を維持 (既存テストの依存)。
     if matches!(
         app.focus,
-        Focus::Suppression | Focus::Picker | Focus::EmojiSearch | Focus::AltPrompt | Focus::Command,
+        Focus::Suppression
+            | Focus::Picker
+            | Focus::EmojiSearch
+            | Focus::AltPrompt
+            | Focus::Command
+            | Focus::NoteDetail,
     ) {
         return;
     }

@@ -167,6 +167,20 @@ pub enum Action {
     RequestsRefresh,
     /// M12 (#66): 一覧画面で `Esc` / `q` ── 画面を閉じる。
     RequestsClose,
+    /// Issue #133 (3): Timeline で選択中の Note の詳細モーダルを開く。
+    OpenNoteDetail,
+    /// Issue #133 (3): 詳細モーダルを閉じる (Esc / q)。
+    NoteDetailClose,
+    /// Issue #133 (3): モーダル本文を 1 行下スクロール (j / Down)。
+    NoteDetailScrollDown,
+    /// Issue #133 (3): モーダル本文を 1 行上スクロール (k / Up)。
+    NoteDetailScrollUp,
+    /// Issue #133 (4): モーダル内で次の添付プレビューに切替 (n / Right)。
+    NoteDetailNextAttachment,
+    /// Issue #133 (4): モーダル内で前の添付プレビューに切替 (p / Left)。
+    NoteDetailPrevAttachment,
+    /// Issue #133 (4): モーダル内で現在の添付の sensitive blur を toggle (s)。
+    NoteDetailToggleReveal,
 }
 
 /// crossterm イベント → Action。
@@ -203,6 +217,26 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::Command => translate_command_key(k),
         Focus::Requests => translate_requests_key(k),
         Focus::EmojiSearch => translate_emoji_search_key(k),
+        Focus::NoteDetail => translate_note_detail_key(k),
+    }
+}
+
+/// Issue #133 (3): Note 詳細モーダル中のキー操作。
+fn translate_note_detail_key(k: KeyEvent) -> Action {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => Action::NoteDetailClose,
+        (KeyCode::Char('q'), m) if m.is_empty() => Action::NoteDetailClose,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::NoteDetailScrollDown,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::NoteDetailScrollUp,
+        // 添付プレビュー切替: n / p は添付が無い note では noop。Right / Left
+        // も同義に割り当てる ── 矢印キーだけで一通り操作できる。
+        (KeyCode::Char('n') | KeyCode::Right, m) if m.is_empty() => {
+            Action::NoteDetailNextAttachment
+        }
+        (KeyCode::Char('p') | KeyCode::Left, m) if m.is_empty() => Action::NoteDetailPrevAttachment,
+        // sensitive blur 解除 toggle。
+        (KeyCode::Char('s'), m) if m.is_empty() => Action::NoteDetailToggleReveal,
+        _ => Action::Noop,
     }
 }
 
@@ -314,6 +348,8 @@ fn translate_timeline_key(k: KeyEvent) -> Action {
         (KeyCode::Char('p'), m) if m.is_empty() => Action::OpenProfileFromSelected,
         // M13 PR5: `:` でコマンドプロンプトを開く (vim 風)。
         (KeyCode::Char(':'), m) if m.is_empty() => Action::OpenCommand,
+        // Issue #133 (3): Enter で選択中 Note の詳細モーダルを開く。
+        (KeyCode::Enter, m) if m.is_empty() => Action::OpenNoteDetail,
         _ => Action::Noop,
     }
 }

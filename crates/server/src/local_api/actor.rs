@@ -252,7 +252,7 @@ pub async fn list_notes(
         .into_iter()
         .map(|e| {
             let reactions = by_note.remove(&e.id).unwrap_or_default();
-            TimelineNote::from_entry_with_reactions(e, reactions)
+            TimelineNote::from_entry_with_reactions(e, reactions, host)
         })
         .collect();
 

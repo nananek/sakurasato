@@ -25,7 +25,7 @@ use sakurasato_core::repo;
 use sakurasato_core::repo::note::TimelineEntry;
 use sakurasato_core::repo::reaction::ReactionSummaryRow;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value as JsonValue, json};
 use tracing::{error, warn};
 
 use crate::local_api::media::build_media_url;
@@ -68,6 +68,58 @@ pub struct TimelineNote {
     /// `Vec::new()` で安全。
     #[serde(default)]
     pub reactions: Vec<ReactionSummaryDto>,
+    /// Issue #133 (4): 添付メディア。AP `Document` を扱いやすい形に正規化
+    /// した一覧。Timeline の `📎 N` バッジ件数と、Note 詳細モーダルの
+    /// プレビューに使う。空 Vec は省略しない (= 必ず `attachments: []`)。
+    #[serde(default)]
+    pub attachments: Vec<AttachmentDto>,
+    /// Issue #133 (5): 本文の `:shortcode:` に対応する Emoji tag 一覧
+    /// (AP `tag` のうち `type == "Emoji"` だけ抜き出した形)。詳細モーダルで
+    /// shortcode と画像のギャラリー表示に使う。空 Vec は省略しない。
+    #[serde(default)]
+    pub emojis: Vec<EmojiDto>,
+}
+
+/// Note 添付の TUI 向け正規化形式。AP `Document` / `Image` のフィールドの
+/// うち TUI が実描画に使う部分だけを引き出す。
+///
+/// - `url`: 表示用 URL (= `/media/proxy?url=...` 経由で fetch する元 URL)。
+///   ローカル添付は `https://<host>/media/<key>`、リモートは送られてきた URL。
+/// - `media_type`: `image/webp` 等。`image/` で始まらない (= 動画など) なら
+///   TUI は preview をスキップしてリンクだけ出す。
+/// - `alt`: AP `name` 由来の代替テキスト。なければ `None`。
+/// - `width` / `height`: 元 Document の寸法 (= AP では任意)。preview のアスペクト比に。
+#[derive(Debug, Serialize)]
+pub struct AttachmentDto {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+/// Note 本文中で参照される custom emoji の最小情報。`shortcode` は AP
+/// `name` で `:foo:` (ローカル) または `:foo@host:` (リモート) の形を維持。
+///
+/// `image_url` は媒体取得用 ── ローカル emoji は `/media/emoji/local/...`、
+/// リモートは AP `icon.url` を素のまま渡す (= TUI 側は `media/proxy?url=`
+/// 経由で fetch)。
+#[derive(Debug, Serialize)]
+pub struct EmojiDto {
+    pub shortcode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    /// `Some(true)` = ローカル絵文字 (= `/media/proxy?url=` 経由で OK)、
+    /// `Some(false)` = リモート、`None` = 由来不明 (= `image_url` の host を
+    /// 自インスタンスと比較する)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_local: Option<bool>,
 }
 
 /// `TimelineNote.reactions` の 1 要素。`content` は AP のまま (`:foo:` /
@@ -93,7 +145,10 @@ impl TimelineNote {
     pub(crate) fn from_entry_with_reactions(
         e: TimelineEntry,
         reactions: Vec<ReactionSummaryDto>,
+        host: &str,
     ) -> Self {
+        let attachments = parse_attachments(&e.attachments);
+        let emojis = parse_emojis(&e.tags, host);
         Self {
             id: e.id,
             ap_id: e.ap_id,
@@ -113,8 +168,166 @@ impl TimelineNote {
             published_at: e.published_at,
             is_local: e.is_local,
             reactions,
+            attachments,
+            emojis,
         }
     }
+}
+
+/// `note.attachments` JSONB を [`AttachmentDto`] の Vec に正規化する。AP
+/// `Document` / `Image` / `Audio` / `Video` を `url` / `mediaType` / `name`
+/// / `width` / `height` だけ抜く。`url` を持たない要素は無視する。
+pub(crate) fn parse_attachments(raw: &JsonValue) -> Vec<AttachmentDto> {
+    let JsonValue::Array(arr) = raw else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| {
+            // server 側で URL のスキームを `http(s)://` に絞る ── TUI 側
+            // `image_cache::vet_url` でも同様のチェックがあるが、ここで
+            // 落とすことで `file://` / `javascript:` / `data:` 等が API
+            // レスポンス JSON に乗ること自体を防ぐ (= 多層防御)。
+            let url = v
+                .get("url")
+                .and_then(JsonValue::as_str)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .filter(|u| u.len() <= URL_MAX_BYTES)?
+                .to_string();
+            let media_type = v
+                .get("mediaType")
+                .and_then(JsonValue::as_str)
+                .filter(|s| s.len() <= MEDIA_TYPE_MAX_BYTES)
+                .map(str::to_string);
+            let alt = v
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= ATTACHMENT_ALT_MAX_BYTES)
+                .map(str::to_string);
+            let width = v.get("width").and_then(JsonValue::as_u64).and_then(|w| {
+                if w > u64::from(u32::MAX) {
+                    None
+                } else {
+                    u32::try_from(w).ok()
+                }
+            });
+            let height = v.get("height").and_then(JsonValue::as_u64).and_then(|h| {
+                if h > u64::from(u32::MAX) {
+                    None
+                } else {
+                    u32::try_from(h).ok()
+                }
+            });
+            Some(AttachmentDto {
+                url,
+                media_type,
+                alt,
+                width,
+                height,
+            })
+        })
+        .take(ATTACHMENTS_PER_NOTE_MAX)
+        .collect()
+}
+
+/// shortcode (= AP `Emoji.name`) の**文字数**上限。AP には明示の規約が無いが
+/// Mastodon は 50 文字未満、Misskey は 100 文字程度を想定している ── 連合
+/// 先が極端に長い文字列を送り込むと TUI レンダリングで Line span が膨らみ
+/// レイアウト計算に響くため、防御的に 128 で切る。`str::len()` (= byte) では
+/// なく `chars().count()` で測ることで、CJK 文字 (1 文字 3 byte) でも文字数
+/// として 128 まで通る (= 識別子としての意味で 128 文字、UTF-8 byte で 384)。
+const SHORTCODE_MAX_CHARS: usize = 128;
+
+/// 1 Note あたりの添付件数上限。Mastodon は 4 件、Misskey も 16 件程度が
+/// 通常で、これを超える Note は実用上ない。連合先が 10,000 件の添付を
+/// 送り込んで TUI メモリ / Line span を肥大化させるのを防ぐ防御層。
+const ATTACHMENTS_PER_NOTE_MAX: usize = 32;
+
+/// 1 Note あたりの emoji 件数上限。連合先からの `DoS` 風入力を弾く防御層。
+/// Mastodon / Misskey の通常 Note では 数〜十数件が上限なので余裕を持たせて 128。
+const EMOJIS_PER_NOTE_MAX: usize = 128;
+
+/// 添付 alt text のバイト長上限。AP `name` は本来サイズ制約が無いため、
+/// 連合先が極端に長い文字列を送ってきても TUI Span が爆発しないよう截る。
+/// 識別子ではなく説明文なので chars ではなく byte で十分 (= UTF-8 boundary は
+/// 別途、保存時に保証されている前提)。
+const ATTACHMENT_ALT_MAX_BYTES: usize = 1500;
+
+/// `mediaType` 文字列の上限。実用的な MIME type は 100 byte 以内に収まる。
+const MEDIA_TYPE_MAX_BYTES: usize = 100;
+
+/// 添付 / 絵文字 `url` のバイト長上限。実用 URL は数百 byte で十分で、AP
+/// 仕様上の URI 制約も同程度。連合先が ~900 KB の URL 文字列を送り込んで
+/// API レスポンスと TUI heap を肥大化させる `DoS` 入力を弾く。
+const URL_MAX_BYTES: usize = 2048;
+
+/// `note.tags` JSONB を走査し `type == "Emoji"` の要素だけ [`EmojiDto`] に
+/// 変換する。AP `Emoji` は `name` (shortcode) と `icon.url` を持つ。
+///
+/// `is_local` は `image_url` の host を `local_host` (= 自インスタンス) と
+/// 比較して決める。AP の `Emoji` 自体には `is_local` フィールドが無いため
+/// host 比較が現状唯一の信号。`local_host` に port が混じっていても合致
+/// するよう、両辺をパースして `host_str()` 同士で比較する。
+pub(crate) fn parse_emojis(raw: &JsonValue, local_host: &str) -> Vec<EmojiDto> {
+    let JsonValue::Array(arr) = raw else {
+        return Vec::new();
+    };
+    let local_normalized = normalize_host_for_compare(local_host);
+    arr.iter()
+        .filter_map(|v| {
+            if v.get("type").and_then(JsonValue::as_str) != Some("Emoji") {
+                return None;
+            }
+            let shortcode = v
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .filter(|s| !s.is_empty())
+                .filter(|s| s.chars().count() <= SHORTCODE_MAX_CHARS)?
+                .to_string();
+            let icon = v.get("icon");
+            // round-3 review Finding 2: `parse_attachments` と同じく
+            // server 側で URL スキームを `http(s)://` に絞る。TUI 側
+            // `vet_url` も落とすが、API レスポンス JSON に乗ること自体を
+            // 防ぐ多層防御 (= 一貫性ある方針)。
+            let image_url = icon
+                .and_then(|i| i.get("url"))
+                .and_then(JsonValue::as_str)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .filter(|u| u.len() <= URL_MAX_BYTES)
+                .map(str::to_string);
+            let media_type = icon
+                .and_then(|i| i.get("mediaType"))
+                .and_then(JsonValue::as_str)
+                .filter(|s| s.len() <= MEDIA_TYPE_MAX_BYTES)
+                .map(str::to_string);
+            let is_local = image_url
+                .as_deref()
+                .and_then(|u| url::Url::parse(u).ok())
+                .and_then(|p| p.host_str().map(str::to_ascii_lowercase))
+                .map(|h| h == local_normalized);
+            Some(EmojiDto {
+                shortcode,
+                image_url,
+                media_type,
+                is_local,
+            })
+        })
+        .take(EMOJIS_PER_NOTE_MAX)
+        .collect()
+}
+
+/// `local_host` 設定値を `host_str` 比較用に正規化する。`config.server.host`
+/// は通常 `"example.com"` だが、開発環境で `"example.com:8443"` のように
+/// port が付くことがある ── [`url::Url`] パースを試み、`host_str()` のみを
+/// 取り出して lowercase 化する。パース失敗時 (= スキームなし純粋ホスト名)
+/// は素のままを lowercase 化する。
+fn normalize_host_for_compare(s: &str) -> String {
+    if let Some(host) = url::Url::parse(&format!("https://{s}"))
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+    {
+        return host;
+    }
+    s.to_ascii_lowercase()
 }
 
 /// `ReactionSummaryRow` (DB) → `ReactionSummaryDto` (API)。
@@ -199,7 +412,7 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
         .into_iter()
         .map(|e| {
             let reactions = by_note.remove(&e.id).unwrap_or_default();
-            TimelineNote::from_entry_with_reactions(e, reactions)
+            TimelineNote::from_entry_with_reactions(e, reactions, host)
         })
         .collect();
 
@@ -222,6 +435,7 @@ fn error_with_body(status: StatusCode, reason: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn clamp_limit_uses_default_when_missing() {
@@ -237,5 +451,312 @@ mod tests {
     fn clamp_limit_floors_at_one() {
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(-5)), 1);
+    }
+
+    #[test]
+    fn parse_attachments_extracts_fields() {
+        let raw = json!([
+            {
+                "type": "Document",
+                "mediaType": "image/webp",
+                "url": "https://e.example/m/1.webp",
+                "name": "alt text",
+                "width": 800,
+                "height": 600,
+            },
+            {
+                "type": "Image",
+                "mediaType": "image/jpeg",
+                "url": "https://e.example/m/2.jpg",
+            },
+        ]);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].url, "https://e.example/m/1.webp");
+        assert_eq!(out[0].media_type.as_deref(), Some("image/webp"));
+        assert_eq!(out[0].alt.as_deref(), Some("alt text"));
+        assert_eq!(out[0].width, Some(800));
+        assert_eq!(out[0].height, Some(600));
+        assert_eq!(out[1].url, "https://e.example/m/2.jpg");
+        assert!(out[1].alt.is_none());
+        assert!(out[1].width.is_none());
+    }
+
+    #[test]
+    fn parse_attachments_skips_no_url() {
+        // `url` 無しの entry は drop ── 表示できないため。
+        let raw = json!([
+            { "type": "Document", "mediaType": "image/webp" },
+            { "type": "Document", "url": "https://e.example/ok.webp" },
+        ]);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].url, "https://e.example/ok.webp");
+    }
+
+    #[test]
+    fn parse_attachments_empty_alt_dropped() {
+        let raw = json!([{ "type": "Document", "url": "https://e.example/x.webp", "name": "" }]);
+        let out = parse_attachments(&raw);
+        assert!(out[0].alt.is_none());
+    }
+
+    #[test]
+    fn parse_attachments_non_array_returns_empty() {
+        assert!(parse_attachments(&JsonValue::Null).is_empty());
+        assert!(parse_attachments(&json!({"key": "val"})).is_empty());
+    }
+
+    #[test]
+    fn parse_attachments_rejects_non_http_schemes() {
+        // round-2 review P3: `file://` / `javascript:` / `data:` などを
+        // server 側で落とす (多層防御)。
+        let raw = json!([
+            { "url": "file:///etc/passwd" },
+            { "url": "javascript:alert(1)" },
+            { "url": "data:text/html,<script>" },
+            { "url": "ftp://e.example/file" },
+            { "url": "https://e.example/ok.webp" },
+        ]);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].url, "https://e.example/ok.webp");
+    }
+
+    #[test]
+    fn parse_emojis_filters_type_emoji_only() {
+        let raw = json!([
+            {
+                "type": "Emoji",
+                "name": ":blob:",
+                "icon": {"url": "https://local.test/media/emoji/local/blob.webp", "mediaType": "image/webp"}
+            },
+            {
+                "type": "Mention",
+                "name": "@alice@e.example",
+                "href": "https://e.example/users/alice"
+            },
+            {
+                "type": "Hashtag",
+                "name": "#tag",
+                "href": "https://e.example/tags/tag"
+            },
+            {
+                "type": "Emoji",
+                "name": ":remote@misskey.io:",
+                "icon": {"url": "https://misskey.io/files/x.webp", "mediaType": "image/webp"}
+            },
+        ]);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].shortcode, ":blob:");
+        assert_eq!(out[0].is_local, Some(true));
+        assert_eq!(out[1].shortcode, ":remote@misskey.io:");
+        assert_eq!(out[1].is_local, Some(false));
+    }
+
+    #[test]
+    fn parse_emojis_missing_icon_url_drops_image() {
+        let raw = json!([
+            { "type": "Emoji", "name": ":foo:" },
+            { "type": "Emoji", "name": ":bar:", "icon": {} },
+        ]);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), 2);
+        assert!(out[0].image_url.is_none());
+        assert!(out[1].image_url.is_none());
+        // `image_url` が無いので `is_local` 判定不能 → `None`。
+        assert!(out[0].is_local.is_none());
+    }
+
+    #[test]
+    fn parse_emojis_empty_name_dropped() {
+        let raw = json!([{ "type": "Emoji", "name": "" }]);
+        let out = parse_emojis(&raw, "local.test");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_emojis_non_array_returns_empty() {
+        assert!(parse_emojis(&JsonValue::Null, "local.test").is_empty());
+        assert!(parse_emojis(&json!({"x": 1}), "local.test").is_empty());
+    }
+
+    #[test]
+    fn parse_emojis_drops_overly_long_shortcode() {
+        // round-1 review ⚠️ 1: shortcode に長さ上限を設ける。
+        let long_name = ":".to_string() + &"a".repeat(200) + ":";
+        let raw = json!([{ "type": "Emoji", "name": long_name }]);
+        let out = parse_emojis(&raw, "local.test");
+        assert!(out.is_empty(), "200-char shortcode should be dropped");
+    }
+
+    #[test]
+    fn parse_emojis_keeps_exactly_max_len_shortcode() {
+        // 境界: 128 文字ちょうどは通す (上限は inclusive)。
+        let name = ":".to_string() + &"a".repeat(126) + ":"; // 128 chars total
+        assert_eq!(name.chars().count(), 128);
+        let raw = json!([{ "type": "Emoji", "name": name.clone() }]);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].shortcode, name);
+    }
+
+    #[test]
+    fn parse_attachments_caps_count() {
+        // round-4 review F3: 1 Note あたり 32 件で truncate (悪意ある DoS 入力)。
+        let mut arr = Vec::new();
+        for i in 0..200 {
+            arr.push(json!({ "url": format!("https://e.example/{i}.webp") }));
+        }
+        let raw = JsonValue::Array(arr);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), ATTACHMENTS_PER_NOTE_MAX);
+    }
+
+    #[test]
+    fn parse_emojis_caps_count() {
+        let mut arr = Vec::new();
+        for i in 0..500 {
+            arr.push(json!({ "type": "Emoji", "name": format!(":e{i}:") }));
+        }
+        let raw = JsonValue::Array(arr);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), EMOJIS_PER_NOTE_MAX);
+    }
+
+    #[test]
+    fn parse_attachments_caps_alt_length() {
+        // 1500 byte ちょうどは通し、1501 byte は drop。
+        let alt_ok = "a".repeat(ATTACHMENT_ALT_MAX_BYTES);
+        let alt_too_long = "a".repeat(ATTACHMENT_ALT_MAX_BYTES + 1);
+        let raw = json!([
+            {"url": "https://e.example/a.webp", "name": alt_ok.clone()},
+            {"url": "https://e.example/b.webp", "name": alt_too_long},
+        ]);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].alt.as_deref(), Some(alt_ok.as_str()));
+        assert!(out[1].alt.is_none(), "overly long alt should be dropped");
+    }
+
+    #[test]
+    fn parse_attachments_caps_url_length() {
+        // round-6 review F1: URL に 2048 byte 上限を入れて DoS 入力を弾く。
+        let long_url = "https://e.example/".to_string() + &"a".repeat(URL_MAX_BYTES);
+        assert!(long_url.len() > URL_MAX_BYTES);
+        let raw = json!([
+            {"url": long_url},
+            {"url": "https://e.example/ok.webp"},
+        ]);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].url, "https://e.example/ok.webp");
+    }
+
+    #[test]
+    fn parse_emojis_caps_icon_url_length() {
+        // round-6 review F2: emoji `icon.url` も 2048 byte 上限。
+        let long_url = "https://e.example/".to_string() + &"a".repeat(URL_MAX_BYTES);
+        let raw = json!([
+            {
+                "type": "Emoji",
+                "name": ":big:",
+                "icon": {"url": long_url}
+            },
+            {
+                "type": "Emoji",
+                "name": ":ok:",
+                "icon": {"url": "https://e.example/ok.webp"}
+            },
+        ]);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), 2);
+        assert!(out[0].image_url.is_none(), "long url should be dropped");
+        assert!(out[1].image_url.is_some());
+    }
+
+    #[test]
+    fn parse_attachments_caps_media_type_length() {
+        let mt_too_long = "image/".to_string() + &"x".repeat(200);
+        let raw = json!([
+            {"url": "https://e.example/x.webp", "mediaType": mt_too_long}
+        ]);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].media_type.is_none(),
+            "overly long mediaType should be dropped"
+        );
+    }
+
+    #[test]
+    fn parse_emojis_rejects_non_http_icon_url() {
+        // round-3 review Finding 2: `parse_attachments` と一貫して URL
+        // スキームを `http(s)://` に絞る。落とした場合は `image_url` が
+        // None だが、shortcode 自体は通過する (= 画像なしの emoji)。
+        let raw = json!([
+            {
+                "type": "Emoji",
+                "name": ":bad:",
+                "icon": {"url": "file:///etc/passwd"}
+            },
+            {
+                "type": "Emoji",
+                "name": ":js:",
+                "icon": {"url": "javascript:alert(1)"}
+            },
+            {
+                "type": "Emoji",
+                "name": ":ok:",
+                "icon": {"url": "https://e.example/ok.webp"}
+            },
+        ]);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), 3, "shortcode 自体は drop しない");
+        assert!(out[0].image_url.is_none());
+        assert!(out[1].image_url.is_none());
+        assert_eq!(
+            out[2].image_url.as_deref(),
+            Some("https://e.example/ok.webp")
+        );
+    }
+
+    #[test]
+    fn parse_emojis_shortcode_cap_counts_chars_not_bytes() {
+        // round-2 review C2: 上限は **文字数** であって byte 数ではない。
+        // CJK (1 文字 = 3 byte) でも 128 文字までは通す。byte 比較だと 43
+        // 文字 (= 129 byte) で落ちるが、char 比較なら通る。
+        let cjk_43 = "あ".repeat(43);
+        assert!(cjk_43.len() > 128, "CJK 43 chars exceeds 128 bytes");
+        assert!(cjk_43.chars().count() <= 128);
+        let raw = json!([{ "type": "Emoji", "name": cjk_43.clone() }]);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), 1);
+        // 逆に 129 文字 (= 387 byte) は char 上限超で drop。
+        let cjk_129 = "あ".repeat(129);
+        let raw2 = json!([{ "type": "Emoji", "name": cjk_129 }]);
+        let out2 = parse_emojis(&raw2, "local.test");
+        assert!(out2.is_empty());
+    }
+
+    #[test]
+    fn parse_emojis_is_local_handles_port_in_local_host() {
+        // round-1 review ⚠️ 2: `local_host` に port が混じっていても、
+        // パースして `host_str()` 同士の比較で一致させる。
+        let raw = json!([
+            {
+                "type": "Emoji",
+                "name": ":foo:",
+                "icon": {"url": "https://example.com/media/emoji/local/foo.webp"}
+            }
+        ]);
+        // 通常パターン (port なし)。
+        let no_port = parse_emojis(&raw, "example.com");
+        assert_eq!(no_port[0].is_local, Some(true));
+        // port が混じったパターン (= dev 環境)。同じ host_str に正規化されて
+        // local 判定される。
+        let with_port = parse_emojis(&raw, "example.com:8443");
+        assert_eq!(with_port[0].is_local, Some(true));
     }
 }
