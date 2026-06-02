@@ -252,10 +252,10 @@ fn parse_events(tokens: &[String]) -> anyhow::Result<Vec<NotificationEvent>> {
     let has_all = tokens.iter().any(|t| t.eq_ignore_ascii_case("all"));
     if has_all {
         if tokens.len() > 1 {
-            bail!(
-                "event 'all' cannot be combined with other events; \
-                 use either 'all' alone or list events explicitly (got {tokens:?})"
-            );
+            // `all,all` のような重複指定でも len > 1 で発火する。「他 event と
+            // 組み合わせ禁止」だけだと不自然 (= 'all' 二重指定なのに「他と」)
+            // なので、より汎用的なメッセージにしておく。
+            bail!("'all' must appear alone; got {tokens:?}");
         }
         return Ok(NotificationEvent::all().to_vec());
     }
@@ -396,16 +396,22 @@ mod tests {
     }
 
     /// `all` + 他 event の混在は **拒否** する (「全部 + α」は意味が無く誤入力
-    /// の可能性が高いので寛容に倒さない設計)。
+    /// の可能性が高いので寛容に倒さない設計)。`all,all` の重複指定も同じ
+    /// メッセージで弾く (= round-3 review F-3 minor 対応)。
     #[test]
     fn parse_events_all_with_other_rejected() {
-        let err = parse_events(&["all".to_string(), "mention".to_string()]).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("'all'"), "error should mention 'all': {msg}");
-        assert!(
-            msg.contains("cannot be combined"),
-            "error should explain rejection: {msg}",
-        );
+        for tokens in [
+            vec!["all".to_string(), "mention".to_string()],
+            vec!["all".to_string(), "all".to_string()],
+        ] {
+            let err = parse_events(&tokens).unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("'all'"), "error should mention 'all': {msg}");
+            assert!(
+                msg.contains("must appear alone"),
+                "error should explain rejection: {msg}",
+            );
+        }
     }
 
     /// 不正な event 名は早期 bail (= DB を一切触らない)。

@@ -412,7 +412,7 @@ Discord (および Slack / Misskey 互換) webhook で push 通知する宛先�
 
 ### 通知発火イベント (7 種)
 
-| `--event` 値 | 発火元 |
+| event 名 | 発火元 |
 |---|---|
 | `mention` | 自分が `tag.Mention` に乗った Note を受信 |
 | `direct` | `to` に自分の actor URI のみが指定された Note (= 自分宛 DM) |
@@ -440,7 +440,7 @@ sakurasato-server notification-channel add \
 - `--url` は登録時に SSRF ガード ([`net_guard::host_blocked`](../crates/server/src/net_guard.rs)) で検査します。private / loopback / link-local / reserved の宛先は弾かれます。配送時にも DNS 再解決後の TOCTOU 防御で再検査されます。
 - `--format`: `embed` (Discord embed JSON) / `plain` (`{"content": "..."}` で Slack の `text` フィールドや Misskey 互換 fallback と相互運用)。
 
-登録後の初期状態は **7 イベントすべて ON**。「フォローだけ通知したい」場合は登録後に `disable --event all` で一旦すべて OFF にしてから `enable --event follow` で必要な分だけ ON に戻す運用です。
+登録後の初期状態は **7 イベントすべて ON**。「フォローだけ通知したい」場合は `enable --id N --only follow` の一発で完全宣言できます。あるいは `disable --id N all` で一旦すべて OFF にしてから `enable --id N follow` で必要な分だけ ON に戻す運用も可。
 
 ### 13.2 `notification-channel list`
 
@@ -507,8 +507,8 @@ sakurasato-server notification-channel test --id 1
 embed なら `title: "テスト通知"` + 説明文、plain なら `[テスト通知] ...` の `content`。Follow event のペイロード形を流用しているので、表示は「フォロー通知」ではなく明示的に「テスト通知」になります。届かない場合は:
 
 - `delivery_queue` の該当行の `last_error` を `psql` で確認
-- `--event follow` で本物のフォローを 1 件発火させて切り分け
-- channel の `notify_*` がすべて FALSE になっていないか `list` で確認
+- channel の `notify_*` がすべて FALSE になっていないか `list` で確認 (= 全 OFF だと dispatch 側で `WHERE notify_<event> = TRUE` に引っかからず通知が出ない)
+- 通知経路自体は届くか別 event で切り分け: 例えばテスト用に手元から自分の actor へ Follow を投げてみて (= 別端末 / 別アカウント経由) `follow` event が発火するか観察。`enable --id N follow` で対象 event が ON である前提
 
 ### 13.5 `notification-channel remove`
 
@@ -544,7 +544,10 @@ postgres の dump 復元しかありません ([DEPLOYMENT.md §7.2 バックア
 
 順に確認:
 
-1. `notification-channel list` で `events` 列に対象 event が含まれているか (= `notify_<event> = TRUE` か)。0 件チャンネルなら `enable --event all` で復帰。
+1. `notification-channel list` で対象チャンネルが存在し、`events` 列に対象 event が含まれているか確認 (= `notify_<event> = TRUE` か):
+   - そもそも `list` に出ないなら未登録 → `notification-channel add` で先に作る
+   - 出るが `events=(none)` なら全 event が OFF → `notification-channel enable --id N all` で復帰
+   - 出るが対象 event だけ抜けているなら → `notification-channel enable --id N <event>` で個別 ON
 2. Webhook URL の host が SSRF ガードで遮断されていないか (登録時に弾かれていれば `add` で失敗していますが、運用中に DNS が private IP に倒れたケースは配送時 TOCTOU で弾かれます)。`delivery_queue.last_error` を `psql` で確認。
 3. `delivery_queue.state = 'dead'` で停止していないか。`sakurasato-server deliver --queue-id N` で手動 flush して挙動を確認。
 4. `notification-channel test --id N` でテスト通知を 1 件撃って、worker tick のタイミングと配送経路だけ切り分け。
