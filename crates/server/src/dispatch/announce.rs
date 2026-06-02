@@ -26,6 +26,7 @@ use serde_json::Value as JsonValue;
 use tracing::{debug, info, warn};
 
 use super::DispatchError;
+use crate::notification;
 use crate::state::AppState;
 
 pub(crate) async fn handle_announce(
@@ -83,6 +84,13 @@ pub(crate) async fn handle_announce(
         signer = %signer.ap_id,
         "boost recorded",
     );
+
+    // 通知発火 (fire-and-forget)。Note は既知のもの (= 我々 local もしくは
+    // 我々が引き込んだ remote note) なので、boost が自分の note でなくても
+    // 「フォロー先が誰かの何かを boost した」が webhook に流れる。煩ければ
+    // `notify_renote` 列で off にする運用。
+    notification::dispatch::notify_renote(state, signer, &note).await;
+
     Ok(())
 }
 

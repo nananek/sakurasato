@@ -1,0 +1,184 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            id, name, url, format, enabled,\n            notify_mention, notify_direct, notify_quote, notify_reaction,\n            notify_renote, notify_follow, notify_follow_request,\n            created_at, updated_at\n        FROM notification_channel\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "url"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "format",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "format"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "notify_mention",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "notify_mention"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "notify_direct",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "notify_direct"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "notify_quote",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "notify_quote"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "notify_reaction",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "notify_reaction"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "notify_renote",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "notify_renote"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "notify_follow",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "notify_follow"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "notify_follow_request",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "notify_follow_request"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "notification_channel",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f7b2e3e3267321d90cbec1d255769d756a53a465682798621f4e945b342f8613"
+}

@@ -147,10 +147,15 @@ pub async fn try_deliver_one(state: &AppState, queue_id: i64) -> anyhow::Result<
 
     match attempt_post(state, &row, &sender).await {
         Ok(status) if status.is_success() => {
+            // Webhook 行は `inbox_url` に Discord の secret token を含む完全 URL が
+            // 入っているので、ログ集約先 (Loki / CloudWatch) に流れないよう host
+            // までに刈り込む。`list` CLI が URL を host だけ表示する設計と整合させる。
+            // (round-1 review F1)
+            let inbox_display = redact_inbox_for_log(&row.inbox_url, &row.activity.0);
             info!(
                 queue_id,
                 status = status.as_u16(),
-                inbox = %row.inbox_url,
+                inbox = %inbox_display,
                 "delivery succeeded",
             );
             repo::delivery_queue::mark_delivered(state.pool(), queue_id)
@@ -212,8 +217,8 @@ pub async fn try_deliver_one(state: &AppState, queue_id: i64) -> anyhow::Result<
 }
 
 /// `attempt_post` のエラー分類。永続エラー (`Sign` / `InvalidUrl` /
-/// `BlockedAddress` / `Serialize`) と一時エラー (`Transport`) を呼び出し側で
-/// 区別するため。
+/// `BlockedAddress` / `Serialize` / `MissingPayload` / `WebhookRejected`) と
+/// 一時エラー (`Transport`) を呼び出し側で区別するため。
 #[derive(Debug, Error)]
 enum AttemptError {
     #[error("signing failed: {0}")]
@@ -227,6 +232,19 @@ enum AttemptError {
     /// プロセスを落とすリスクが顕在化する。permanent 扱いで `dead` に倒す。
     #[error("activity JSON serialization failed: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// Webhook 行で `activity.payload` キーが欠落している。dispatch 側の契約違反
+    /// または DB 直挿入の人為ミスなので retry しても直らない。
+    /// (round-3 review F3: `expect_err` で `serde_json::Error` を偽造する代わりに
+    /// 専用 variant を持って panic リスクを除去する)
+    #[error("activity JSON missing 'payload' key")]
+    MissingPayload,
+    /// Webhook 配送で Discord / Slack から永続失敗扱いのステータス (401 / 403 /
+    /// 404 / 410) が返った。トークン無効 / channel 削除 / 権限剥奪は retry しても
+    /// 回復しないので即 `dead` に倒す。AP 配送の 4xx は Mastodon の retry 慣習に
+    /// 合わせて一時失敗扱いだが、webhook ではここで分岐する。
+    /// (round-3 review F2)
+    #[error("webhook rejected with HTTP {status} (permanent)")]
+    WebhookRejected { status: u16 },
     #[error("transport: {0}")]
     Transport(#[from] reqwest::Error),
 }
@@ -237,7 +255,12 @@ impl AttemptError {
     fn is_permanent(&self) -> bool {
         matches!(
             self,
-            Self::Sign(_) | Self::InvalidUrl(_) | Self::BlockedAddress { .. } | Self::Serialize(_)
+            Self::Sign(_)
+                | Self::InvalidUrl(_)
+                | Self::BlockedAddress { .. }
+                | Self::Serialize(_)
+                | Self::MissingPayload
+                | Self::WebhookRejected { .. }
         )
     }
 }
@@ -286,6 +309,24 @@ async fn attempt_post(
         });
     }
 
+    // **Webhook 通知の分岐**: `activity.type` が `"Webhook:"` prefix なら、
+    // ActivityPub の HTTP 署名は付けず、`payload` サブツリーを
+    // `application/json` で POST する ── Discord / Slack / Misskey 互換 webhook
+    // への通知配送 (`crate::notification::dispatch`)。
+    //
+    // net_guard / self-host 検査は上で通常経路と同じく適用済み。`sender` の鍵は
+    // 触らないが、`sender_actor_id` 列は NOT NULL 制約で埋まっている前提
+    // (notification dispatch 側で local actor の id を入れている)。
+    let activity_type = row
+        .activity
+        .0
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if activity_type.starts_with("Webhook:") {
+        return attempt_post_webhook(state, &row.activity.0, url).await;
+    }
+
     // `serde_json::Value` のシリアライズは実質失敗しないが、`expect` だと
     // 常駐 worker ループ化後にプロセス落ちのリスクが残る。`Serialize` variant
     // で permanent 扱い (`dead` に倒す) に伝播する (#22)。
@@ -304,6 +345,80 @@ async fn attempt_post(
 
     let response = state.http_client().execute(req).await?;
     Ok(response.status())
+}
+
+/// Webhook 通知 (`activity.type` が `Webhook:Discord` / `Webhook:Plain`) の
+/// 配送本体。`activity.payload` だけを `application/json` で POST する。署名
+/// は一切付けない。
+///
+/// `activity.payload` が無い行は **permanent error** (`MissingPayload` で
+/// `dead` に倒す) ── notification dispatch 側が必ず `payload` を埋める契約
+/// なので、欠如は DB 直挿入の人為ミス。retry しても直らない。
+///
+/// 受信ステータスのうち **401 / 403 / 404 / 410** は Discord / Slack いずれの
+/// webhook でも「トークン失効・channel 削除・権限剥奪」を意味し retry で
+/// 回復しない。AP 配送と違って Mastodon 流の retry 慣習が無いので
+/// [`AttemptError::WebhookRejected`] で即 dead に倒す。それ以外の非 2xx
+/// (5xx / 408 / 429 等) は `Ok(status)` のまま返して上位の指数バックオフに
+/// 任せる。
+async fn attempt_post_webhook(
+    state: &AppState,
+    activity: &JsonValue,
+    url: reqwest::Url,
+) -> Result<StatusCode, AttemptError> {
+    let payload = activity
+        .get("payload")
+        .ok_or(AttemptError::MissingPayload)?;
+    let body = serde_json::to_vec(payload)?;
+    let req = state
+        .http_client()
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body)
+        .build()?;
+    let response = state.http_client().execute(req).await?;
+    let status = response.status();
+    if is_webhook_permanent_status(status) {
+        return Err(AttemptError::WebhookRejected {
+            status: status.as_u16(),
+        });
+    }
+    Ok(status)
+}
+
+/// 4xx のうち webhook では永続失敗とみなすもの。`401` / `403` / `404` / `410`。
+/// Discord / Slack ともに「トークン無効 / channel 削除 / 権限なし」がここに
+/// マップされる。それ以外の 4xx (`400` 等) も理屈上は retry 無意味だが、payload
+/// 構築のバグ起因 = 修正 deploy で直る可能性があるので safe side で retry させる。
+fn is_webhook_permanent_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE
+    )
+}
+
+/// `info!` / `warn!` 用に inbox URL をマスクする。
+///
+/// Webhook 行 (`activity.type` が `Webhook:` prefix) は `inbox_url` が Discord
+/// webhook の full URL = secret token を含むので、`<scheme>://<host>/<redacted>`
+/// に刈り込む。AP 配送行は素の URL をそのまま返す (連合配送 inbox は public
+/// path なので秘匿不要、デバッグ可読性を優先)。
+/// (round-1 review F1)
+fn redact_inbox_for_log(raw: &str, activity: &JsonValue) -> String {
+    let activity_type = activity
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    if !activity_type.starts_with("Webhook:") {
+        return raw.to_string();
+    }
+    reqwest::Url::parse(raw)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| format!("{scheme}://{h}/<redacted>", scheme = u.scheme()))
+        })
+        .unwrap_or_else(|| "<invalid-webhook-url>".to_string())
 }
 
 /// `mark_failed` を呼び、`Retry` か `Dead` を返す。
@@ -361,6 +476,75 @@ mod tests {
         let serde_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
         let ser = AttemptError::Serialize(serde_err);
         assert!(ser.is_permanent());
+        // round-3 review F2/F3: webhook 永続失敗系も permanent。
+        assert!(AttemptError::MissingPayload.is_permanent());
+        assert!(AttemptError::WebhookRejected { status: 401 }.is_permanent());
+        assert!(AttemptError::WebhookRejected { status: 404 }.is_permanent());
+    }
+
+    /// `is_webhook_permanent_status` の境界。401/403/404/410 が permanent。
+    /// 5xx / 429 / 408 等は retry させたいので false。
+    #[test]
+    fn webhook_permanent_status_boundaries() {
+        assert!(is_webhook_permanent_status(StatusCode::UNAUTHORIZED));
+        assert!(is_webhook_permanent_status(StatusCode::FORBIDDEN));
+        assert!(is_webhook_permanent_status(StatusCode::NOT_FOUND));
+        assert!(is_webhook_permanent_status(StatusCode::GONE));
+        // retry させたい群
+        assert!(!is_webhook_permanent_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_webhook_permanent_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(!is_webhook_permanent_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_webhook_permanent_status(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!is_webhook_permanent_status(StatusCode::GATEWAY_TIMEOUT));
+        // 400 はバグ起因の可能性があるので一旦 retry 扱い
+        assert!(!is_webhook_permanent_status(StatusCode::BAD_REQUEST));
+        // 2xx は当然 permanent ではない
+        assert!(!is_webhook_permanent_status(StatusCode::OK));
+    }
+
+    /// round-1 review F1: Webhook 行は secret token を含む URL を host 止まり
+    /// にマスクする。AP 配送行はそのまま (連合 inbox は public path)。
+    #[test]
+    fn redact_inbox_for_log_masks_webhook_only() {
+        let webhook_activity = serde_json::json!({
+            "type": "Webhook:Discord",
+            "channel_id": 1,
+            "event": "mention",
+            "payload": {},
+        });
+        let redacted = redact_inbox_for_log(
+            "https://discord.com/api/webhooks/123456789/SUPER_SECRET_TOKEN",
+            &webhook_activity,
+        );
+        assert_eq!(redacted, "https://discord.com/<redacted>");
+        // path / query / token は完全に消える
+        assert!(!redacted.contains("SUPER_SECRET_TOKEN"));
+        assert!(!redacted.contains("webhooks"));
+
+        // AP 配送行は素のまま
+        let ap_activity = serde_json::json!({ "type": "Create" });
+        let raw = "https://mastodon.example/users/alice/inbox";
+        assert_eq!(redact_inbox_for_log(raw, &ap_activity), raw);
+
+        // 不正 URL でも panic しない
+        let bad = redact_inbox_for_log("not a url", &webhook_activity);
+        assert_eq!(bad, "<invalid-webhook-url>");
+    }
+
+    /// `Webhook:Plain` prefix も同様にマスクされる。
+    #[test]
+    fn redact_inbox_for_log_handles_webhook_plain() {
+        let webhook_activity = serde_json::json!({
+            "type": "Webhook:Plain",
+            "payload": {},
+        });
+        let redacted = redact_inbox_for_log(
+            "https://example.slack.com/services/T000/B000/SECRET",
+            &webhook_activity,
+        );
+        assert_eq!(redacted, "https://example.slack.com/<redacted>");
     }
 
     #[test]

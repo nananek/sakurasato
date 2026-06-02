@@ -27,6 +27,7 @@ use tracing::{info, warn};
 use url::Url;
 
 use super::DispatchError;
+use crate::notification;
 use crate::state::AppState;
 
 /// 受領 `Like` の処理。
@@ -184,6 +185,11 @@ async fn process_inbound_reaction(
         emoji_id = ?emoji_id,
         "reaction recorded",
     );
+
+    // 通知発火 (fire-and-forget)。reaction target は local note のみここに来る
+    // (上で `is_local` チェック済み)。
+    notification::dispatch::notify_reaction(state, signer, &note, &content).await;
+
     Ok(())
 }
 

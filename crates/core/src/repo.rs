@@ -16,4 +16,5 @@ pub mod emoji;
 pub mod follow;
 pub mod media;
 pub mod note;
+pub mod notification_channel;
 pub mod reaction;

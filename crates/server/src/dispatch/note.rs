@@ -22,13 +22,14 @@
 
 use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
-use sakurasato_core::model::{ActorRow, Visibility};
+use sakurasato_core::model::{ActorRow, NoteRow, Visibility};
 use sakurasato_core::repo;
 use serde_json::Value as JsonValue;
 use tracing::{debug, info};
 use url::Url;
 
 use super::DispatchError;
+use crate::notification;
 use crate::state::AppState;
 
 /// AS2 の "public" 配送先 magic URI。
@@ -116,6 +117,8 @@ pub(crate) async fn handle_create(
         .with_context(|| format!("insert remote note {note_ap_id}"))
         .map_err(DispatchError::Internal)?;
 
+    let (quote_target, is_local_quote) = resolve_quote_target(state, obj).await;
+
     info!(
         note_id = inserted.id,
         note_ap_id = %note_ap_id,
@@ -123,9 +126,91 @@ pub(crate) async fn handle_create(
         visibility = %inserted.visibility,
         addresses_us,
         followed,
+        has_quote = quote_target.is_some(),
+        is_local_quote,
         "remote note stored",
     );
+
+    // Webhook 通知発火 (fire-and-forget)。失敗は内部 warn! のみで本筋に
+    // 伝播しない。`is_local_quote` のときだけ quote target を渡す ── 第三者
+    // の note を引用しているケースで誤って通知を撃たないため。
+    let quote_for_notify = if is_local_quote {
+        quote_target.as_ref()
+    } else {
+        None
+    };
+    notification::dispatch::notify_inbound_note(
+        state,
+        signer,
+        &inserted,
+        addresses_us,
+        quote_for_notify,
+    )
+    .await;
+
     Ok(())
+}
+
+/// 引用先 note を解決し、それが我々 local actor の local note を指しているか
+/// (= `is_local_quote`) を判定して返す。DB エラーは debug ログだけ残して
+/// `None` 扱いで進む ── quote 通知は本筋の Create 受領を巻き込まない。
+async fn resolve_quote_target(
+    state: &AppState,
+    obj: &serde_json::Map<String, JsonValue>,
+) -> (Option<NoteRow>, bool) {
+    let quote_target = match extract_quote_target(state, obj).await {
+        Ok(q) => q,
+        Err(err) => {
+            debug!(
+                ?err,
+                "Create: quote target lookup failed; continuing without quote notification"
+            );
+            None
+        }
+    };
+    let is_local_quote = match quote_target.as_ref() {
+        Some(q) if q.is_local => local_actor_id_opt(state).await == Some(q.actor_id),
+        _ => false,
+    };
+    (quote_target, is_local_quote)
+}
+
+/// `quoteUrl` / `quoteUri` / `_misskey_quote` のうち最初に見つかった URI で
+/// `note` テーブルを検索する。これら全ては「もう一つの note を引用している」
+/// AP 拡張で、Mastodon の最新 draft / FEP-e232 / FEP-044f / Misskey 慣習を
+/// カバーする。
+///
+/// 永続化 (= note テーブルに `quote_target_note_id` 列追加) は別 issue 扱い。
+/// 本関数は「引用先 note を引き当てる」だけ。
+async fn extract_quote_target(
+    state: &AppState,
+    obj: &serde_json::Map<String, JsonValue>,
+) -> Result<Option<NoteRow>, anyhow::Error> {
+    let uri = obj
+        .get("quoteUrl")
+        .or_else(|| obj.get("quoteUri"))
+        .or_else(|| obj.get("_misskey_quote"))
+        .and_then(JsonValue::as_str);
+    let Some(uri) = uri else {
+        return Ok(None);
+    };
+    let row = repo::note::get_by_ap_id(state.pool(), uri)
+        .await
+        .with_context(|| format!("lookup quote target {uri}"))?;
+    Ok(row)
+}
+
+/// `is_local_quote` 判定用に local actor の id を引く best-effort lookup。
+/// 失敗は `None` → 全 note 一致しないので quote 通知が発火しない安全側挙動。
+async fn local_actor_id_opt(state: &AppState) -> Option<i64> {
+    let host = &state.config().server.host;
+    let user = &state.config().server.user;
+    repo::actor::get_by_username_host(state.pool(), user, host)
+        .await
+        .ok()
+        .flatten()
+        .filter(|a| a.is_local)
+        .map(|a| a.id)
 }
 
 /// `to` / `cc` の集合。activity 階層と object 階層の両方を保持して、

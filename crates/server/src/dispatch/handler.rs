@@ -182,6 +182,8 @@ pub(crate) async fn handle_follow(
                 followed = %followed.ap_id,
                 "follow-request received (manually_approves_followers); awaiting CLI approval",
             );
+            // 鍵アカ pending: 承認待ち通知を webhook に流す (fire-and-forget)。
+            crate::notification::dispatch::notify_follow_request(state, signer).await;
             return Ok(());
         }
     }
@@ -219,6 +221,21 @@ pub(crate) async fn handle_follow(
         followed = %followed.ap_id,
         "Follow accepted; Accept queued for delivery",
     );
+
+    // 新規 Accept のみ通知する。`row.state` が **upsert 前** に既に `Accepted`
+    // だった = Mastodon の Follow retry 経路では webhook を発火しない ── 相手側
+    // で Accept が届かない状況だと数時間おきに「新しいフォロワーです」通知が連投
+    // される問題を避ける (round-1 review F2)。
+    if row.state == FollowState::Accepted.as_str() {
+        tracing::debug!(
+            follow_id = row.id,
+            follower = %signer.ap_id,
+            "duplicate Follow retry; skipping notify_follow webhook fan-out",
+        );
+    } else {
+        crate::notification::dispatch::notify_follow(state, signer).await;
+    }
+
     Ok(())
 }
 
