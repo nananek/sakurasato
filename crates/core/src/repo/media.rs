@@ -107,6 +107,29 @@ pub async fn list_by_ids(pool: &PgPool, ids: &[i64]) -> sqlx::Result<Vec<MediaRo
     .await
 }
 
+/// 指定 `note_id` に紐付いた `media` 行を全件返す。`id ASC` 順 ──
+/// `attach_to_note` は同一 tx で複数 attachment を一括 UPDATE するので、
+/// `id ASC` が事実上「TUI で選択した順」とほぼ一致する。
+/// (TUI は upload → `attachment_ids` 配列で順序を渡すが、現行 schema には
+/// 添付順カラムが無いので id 昇順で代用する。)
+///
+/// permalink AP JSON refetch で `attachment` を出すために導入 (M13 後段)。
+pub async fn list_by_note(pool: &PgPool, note_id: i64) -> sqlx::Result<Vec<MediaRow>> {
+    sqlx::query_as!(
+        MediaRow,
+        r#"
+        SELECT id, storage_key, media_type, width, height, byte_size,
+               kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+        FROM media
+        WHERE note_id = $1
+        ORDER BY id ASC
+        "#,
+        note_id,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// 添付として `note_id` に紐付ける。POST /api/v1/notes が note 挿入直後の
 /// 同一 tx 内で呼ぶ。`ids` の各行が `owner_actor_id == actor_id` かつ
 /// `note_id IS NULL` であることをここで保証する (= 横取り防止)。

@@ -63,10 +63,21 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
         tracing::warn!(key = %key, "media GET: rejected unsafe key");
         return StatusCode::BAD_REQUEST.into_response();
     }
-    // **SECURITY (IDOR fix)**: 任意 key で versitygw から fetch & 配信していた
-    // ため、attachment が followers/direct な note に紐付いていても URL を
-    // 知っていれば取れていた。`media` table を引いて kind / 紐付き note の
-    // visibility を見て、漏らしてよい key かを判定する。
+    // **設計判断**: 紐付き Note の visibility を見て followers/direct を 404 に
+    // 落とす過去版 (PR #108 "IDOR fix") を撤回する。AP の `attachment.url` は
+    // signed delivery で audience に配送される時点ですでに「URL を知っている
+    // 人=見ていい人」の前提が立っており、Mastodon / Misskey とも media 配信
+    // URL は HTTP 層では認証せず *URL obscurity* (= SHA-256 hex の推測困難性)
+    // で防衛する。受信側 Mastodon の media proxy は post-delivery で media URL
+    // を非認証で GET するので、ここで visibility 判定を入れると followers /
+    // direct 投稿の画像が「壊れた添付」として表示される (= 本ハンドラ修正の
+    // 直接動機)。
+    //
+    // 引き続き残すガード:
+    //   * `kind = attachment` で `note_id IS NULL` (= 未投稿 draft / 孤児) は
+    //     連合に出ていないので 404
+    //   * `media` table に無い key は 404
+    //   * 不明 kind は 404 (フェイルセーフ)
     if !authorized_for_public(&state, &key).await {
         tracing::debug!(key = %key, "media GET: refusing non-public key");
         return StatusCode::NOT_FOUND.into_response();
@@ -137,10 +148,15 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
 /// - `media` table に対応 row あり:
 ///   - `kind = avatar | header` → actor の icon/image として連合配信される
 ///     ので public 許可。
-///   - `kind = attachment` + `note_id` あり + note が `public` / `unlisted`
-///     → permalink と同じく公開許可。
-///   - `kind = attachment` + (note 未紐付け or note が `followers` / `direct`)
-///     → 拒否 (404 で漏らさない)。
+///   - `kind = attachment` + `note_id IS NOT NULL` → visibility に関係なく
+///     公開許可。Note 自体が followers / direct でも、AP 配送で audience に
+///     URL が渡っており、Mastodon の media proxy は post-delivery で URL を
+///     非認証 GET する。ここで visibility ガードすると「リモートで画像が
+///     壊れて見える」(PR #108 の過剰補正、本コミットで撤回)。Fediverse の
+///     慣行は *URL obscurity* (= SHA-256 hex の推測困難性) で防衛する。
+///   - `kind = attachment` + `note_id IS NULL` (孤児 = 未投稿 draft の残骸 /
+///     アップロード後に投稿に紐付かなかった) → 拒否。連合に出ていないので
+///     公開する筋がない。
 /// - `media` table に row 無し → 不明な key、拒否。
 ///
 /// **失敗時の方針**: DB エラー / lookup 失敗は安全側 = 拒否。許可漏れは
@@ -160,24 +176,9 @@ async fn authorized_for_public(state: &AppState, key: &str) -> bool {
     match media.kind.as_str() {
         "avatar" | "header" => true,
         "attachment" => {
-            let Some(note_id) = media.note_id else {
-                // 孤児 attachment (アップロード後に投稿に紐付かなかった) は
-                // 連合にも出ていないので公開する筋がない。
-                return false;
-            };
-            match repo::note::get_by_id(state.pool(), note_id).await {
-                Ok(Some(n)) => matches!(n.visibility.as_str(), "public" | "unlisted"),
-                Ok(None) => false,
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        key = %key,
-                        note_id,
-                        "media GET: parent note lookup failed",
-                    );
-                    false
-                }
-            }
+            // 紐付き note があれば visibility 問わず公開 (= URL obscurity)。
+            // 孤児だけ 404 で漏らさない。
+            media.note_id.is_some()
         }
         other => {
             // schema CHECK で 3 種に絞っているが、将来種別が増えたとき
