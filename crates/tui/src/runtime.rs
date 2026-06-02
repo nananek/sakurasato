@@ -205,6 +205,17 @@ async fn main_loop(
             let viewport = last_rects.follow_requests.height as usize;
             fr.ensure_visible(viewport);
         }
+        // Issue #115: FollowList 画面のスクロール追従。avatar 表示時は 1 件 2 行、
+        // 抑制時は 1 件 1 行 (= render_follow_list_screen と同じ row_step 計算)。
+        // `last_rects.follow_list` は直前フレームで確定した一覧領域の Rect。
+        {
+            let avatar_enabled = app.images.enabled() && app.suppression.avatar;
+            let row_step: u16 = if avatar_enabled { 2 } else { 1 };
+            let viewport = (last_rects.follow_list.height / row_step.max(1)) as usize;
+            if let Some(fl) = app.follow_list.as_mut() {
+                fl.ensure_visible(viewport);
+            }
+        }
 
         tokio::select! {
             biased;
@@ -567,6 +578,22 @@ async fn apply_action(
         Action::FollowListSelectPrev => {
             if let Some(fl) = app.follow_list.as_mut() {
                 fl.select_prev();
+            }
+        }
+        Action::FollowListPageDown => {
+            let avatar_enabled = app.images.enabled() && app.suppression.avatar;
+            let row_step: u16 = if avatar_enabled { 2 } else { 1 };
+            let viewport = (rects.follow_list.height / row_step.max(1)) as usize;
+            if let Some(fl) = app.follow_list.as_mut() {
+                fl.select_page_down(viewport.max(1));
+            }
+        }
+        Action::FollowListPageUp => {
+            let avatar_enabled = app.images.enabled() && app.suppression.avatar;
+            let row_step: u16 = if avatar_enabled { 2 } else { 1 };
+            let viewport = (rects.follow_list.height / row_step.max(1)) as usize;
+            if let Some(fl) = app.follow_list.as_mut() {
+                fl.select_page_up(viewport.max(1));
             }
         }
         Action::FollowListToggleMode => follow_list_toggle_mode(app, api, page_size).await,

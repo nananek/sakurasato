@@ -55,6 +55,9 @@ pub struct PanelRects {
     /// M12 (#66): Follow Requests 画面の一覧領域 (= `ensure_visible` 用)。
     /// 非表示時は zero rect。
     pub follow_requests: Rect,
+    /// Issue #115: `FollowList` 画面の一覧領域 (= `ensure_visible` / `PageDown` 用)。
+    /// 非表示時は zero rect。
+    pub follow_list: Rect,
 }
 
 /// タイムラインのスクロール可能領域内に並んだ note の行位置をビット圧縮せず
@@ -84,6 +87,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     // 占有する画面として描く。
     let mut profile_notes_rect = Rect::default();
     let mut follow_requests_rect = Rect::default();
+    let mut follow_list_rect = Rect::default();
     let rows = if matches!(app.focus, Focus::Profile)
         && let Some(profile) = app.current_profile()
     {
@@ -92,7 +96,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     } else if matches!(app.focus, Focus::FollowList)
         && let Some(fl) = app.follow_list.as_ref()
     {
-        render_follow_list_screen(frame, timeline_area, app, fl);
+        follow_list_rect = render_follow_list_screen(frame, timeline_area, app, fl);
         ScrollHits::default()
     } else if matches!(app.focus, Focus::Requests)
         && let Some(fr) = app.follow_requests.as_ref()
@@ -155,6 +159,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         picker_list,
         profile_notes: profile_notes_rect,
         follow_requests: follow_requests_rect,
+        follow_list: follow_list_rect,
     }
 }
 
@@ -920,8 +925,17 @@ fn profile_note_lines(
 ///
 /// 1 行目: タブ ([following] / [followers]) + 件数。
 /// 2 行目以降: 各エントリ (アバター / display name / acct / state)。
+/// Issue #115: 戻り値は `list_rect` ── main loop が次フレームの
+/// [`crate::follow_list::FollowListScreen::ensure_visible`] /
+/// [`crate::follow_list::FollowListScreen::select_page_down`] に
+/// この高さを渡すために使う。非表示時は zero rect (= main loop で件数 0 扱い)。
 #[allow(clippy::too_many_lines, reason = "FollowList 1 画面分の宣言的描画")]
-fn render_follow_list_screen(frame: &mut Frame<'_>, area: Rect, app: &App, fl: &FollowListScreen) {
+fn render_follow_list_screen(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    fl: &FollowListScreen,
+) -> Rect {
     let palette = &app.theme.palette;
     let block = Block::default()
         .title(Span::styled(
@@ -963,7 +977,7 @@ fn render_follow_list_screen(frame: &mut Frame<'_>, area: Rect, app: &App, fl: &
             tab_style(palette, fl.mode == FollowListMode::Followers),
         ),
         Span::styled(
-            "    [t=toggle  Enter=open profile  r=refresh  o=load more  Esc=back]",
+            "    [j/k/PgUp/PgDn=move  t=toggle  Enter=open  r=refresh  o=more  Esc=back]",
             Style::default().fg(palette.muted),
         ),
     ]);
@@ -975,7 +989,7 @@ fn render_follow_list_screen(frame: &mut Frame<'_>, area: Rect, app: &App, fl: &
     let list_height = inner.height.saturating_sub(header_rect.height);
     let list_rect = Rect::new(inner.x, list_top, inner.width, list_height);
     if list_rect.height == 0 {
-        return;
+        return list_rect;
     }
 
     let page = fl.current();
@@ -990,7 +1004,7 @@ fn render_follow_list_screen(frame: &mut Frame<'_>, area: Rect, app: &App, fl: &
             Style::default().fg(palette.muted),
         )));
         frame.render_widget(para, list_rect);
-        return;
+        return list_rect;
     }
 
     let avatar_enabled = app.images.enabled() && app.suppression.avatar;
@@ -1070,6 +1084,7 @@ fn render_follow_list_screen(frame: &mut Frame<'_>, area: Rect, app: &App, fl: &
             render_avatar(frame, app, list_rect.x, y, url);
         }
     }
+    list_rect
 }
 
 /// M12 (#66): 鍵アカ承認待ち follow 一覧画面。
