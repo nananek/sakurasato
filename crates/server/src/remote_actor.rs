@@ -396,14 +396,25 @@ fn parse_ed25519_assertion(ap_id: &str, json: &JsonValue) -> Option<(String, Str
 
 fn extract_media_url(v: Option<&JsonValue>) -> Option<String> {
     let v = v?;
-    match v {
-        JsonValue::String(s) => Some(s.clone()),
+    let raw = match v {
+        JsonValue::String(s) => s.clone(),
         JsonValue::Object(map) => map
             .get("url")
             .and_then(JsonValue::as_str)
-            .map(str::to_string),
-        _ => None,
+            .map(str::to_string)?,
+        _ => return None,
+    };
+    // **スキーム制限**: 悪意ある remote actor が `"icon": {"url": "javascript:..."}`
+    // のような URL を advertise し、それが webhook payload (Discord embed の
+    // `icon_url` 等) や Web UI に流れるとリスクが残る。Discord は embed.icon_url で
+    // JS を実行しないが、Slack / Misskey 互換 webhook や将来の表示先で危険なので
+    // 入口で `http`/`https` のみ許可する。`url::Url::parse` で書式不正も同時に弾く。
+    // (round-1 review F3)
+    let parsed = url::Url::parse(&raw).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
     }
+    Some(raw)
 }
 
 async fn upsert(state: &AppState, parsed: ParsedRemoteActor) -> Result<ActorRow, FetchError> {
@@ -649,11 +660,37 @@ mod tests {
     #[test]
     fn extract_media_url_handles_object_and_string() {
         assert_eq!(
-            extract_media_url(Some(&json!({"type": "Image", "url": "x"}))),
-            Some("x".into())
+            extract_media_url(Some(
+                &json!({"type": "Image", "url": "https://cdn.x.test/a.png"})
+            )),
+            Some("https://cdn.x.test/a.png".into())
         );
-        assert_eq!(extract_media_url(Some(&json!("x"))), Some("x".into()));
+        assert_eq!(
+            extract_media_url(Some(&json!("https://cdn.x.test/a.png"))),
+            Some("https://cdn.x.test/a.png".into())
+        );
         assert_eq!(extract_media_url(None), None);
         assert_eq!(extract_media_url(Some(&JsonValue::Null)), None);
+    }
+
+    /// `http`/`https` 以外の scheme (javascript: / data: / file: / 書式不正) は弾く。
+    /// (round-1 review F3)
+    #[test]
+    fn extract_media_url_rejects_non_http_schemes() {
+        assert_eq!(extract_media_url(Some(&json!("javascript:alert(1)"))), None);
+        assert_eq!(
+            extract_media_url(Some(&json!("data:image/png;base64,AAAA"))),
+            None
+        );
+        assert_eq!(extract_media_url(Some(&json!("file:///etc/passwd"))), None);
+        // 書式不正 (scheme なし) も Url::parse で落ちる
+        assert_eq!(extract_media_url(Some(&json!("not-a-url"))), None);
+        // object 形式でも scheme 検査が効く
+        assert_eq!(
+            extract_media_url(Some(
+                &json!({"type": "Image", "url": "javascript:alert(1)"})
+            )),
+            None
+        );
     }
 }

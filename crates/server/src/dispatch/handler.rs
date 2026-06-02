@@ -222,11 +222,19 @@ pub(crate) async fn handle_follow(
         "Follow accepted; Accept queued for delivery",
     );
 
-    // Auto-accept 経路の通知。retry / mutual で `row.state` が既に `Accepted`
-    // の場合も通知する ── 相手側 UI で「pending のまま」になっていた状態が
-    // 再 Accept されたことを記録しておきたいので。煩ければ `notify_follow` 列
-    // を off にする運用。
-    crate::notification::dispatch::notify_follow(state, signer).await;
+    // 新規 Accept のみ通知する。`row.state` が **upsert 前** に既に `Accepted`
+    // だった = Mastodon の Follow retry 経路では webhook を発火しない ── 相手側
+    // で Accept が届かない状況だと数時間おきに「新しいフォロワーです」通知が連投
+    // される問題を避ける (round-1 review F2)。
+    if row.state == FollowState::Accepted.as_str() {
+        tracing::debug!(
+            follow_id = row.id,
+            follower = %signer.ap_id,
+            "duplicate Follow retry; skipping notify_follow webhook fan-out",
+        );
+    } else {
+        crate::notification::dispatch::notify_follow(state, signer).await;
+    }
 
     Ok(())
 }

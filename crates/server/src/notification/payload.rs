@@ -146,7 +146,16 @@ fn build_plain(event: NotificationEvent, ctx: &NotificationContext<'_>) -> JsonV
     } else {
         format!("[{tag}] {actor_label}: {body}", tag = title_for(event))
     };
-    json!({ "content": line })
+    // **`allowed_mentions: { parse: [] }`**: Discord 互換 webhook では
+    // top-level `content` 内の `@everyone` / `@here` / `<@user_id>` がデフォルトで
+    // メンションとして処理される。remote actor が `content: "@everyone ..."` の
+    // Note を送ってきた場合に全員 ping が飛ぶのを防ぐため、ping 対象を空集合に
+    // 明示する。Slack / Misskey 互換 webhook は本フィールドを無視するので副作用
+    // なし。(round-1 review F4)
+    json!({
+        "content": line,
+        "allowed_mentions": { "parse": [] },
+    })
 }
 
 fn make_author(actor: &ActorRow) -> JsonValue {
@@ -408,6 +417,34 @@ mod tests {
             "[メンション] @alice@example.com: おはよう"
         );
         assert!(payload.get("embeds").is_none());
+        // `allowed_mentions.parse = []` (= ping 対象なし) が常に付くこと。
+        // Discord 以外の webhook は無視するので副作用なし。
+        assert_eq!(payload["allowed_mentions"]["parse"], json!([]));
+    }
+
+    /// remote が `@everyone` を含む Note を送ってきても Discord 全員 ping が
+    /// 発火しないこと (round-1 review F4)。`content` には文字列としてそのまま
+    /// 入るが、`allowed_mentions.parse: []` で実 ping は無効化される。
+    #[test]
+    fn plain_format_suppresses_everyone_ping() {
+        let actor = sample_actor();
+        let note = sample_note("@everyone @here urgent");
+        let ctx = NotificationContext {
+            actor: &actor,
+            instance_host: "sakurasato.example",
+            note: Some(&note),
+            reaction_content: None,
+            quote_target: None,
+            occurred_at: fixed_time(),
+        };
+        let payload = build_payload(NotificationEvent::Mention, WebhookFormat::Plain, &ctx);
+        assert!(
+            payload["content"]
+                .as_str()
+                .unwrap()
+                .contains("@everyone @here urgent")
+        );
+        assert_eq!(payload["allowed_mentions"], json!({ "parse": [] }));
     }
 
     #[test]

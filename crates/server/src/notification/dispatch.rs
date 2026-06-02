@@ -144,11 +144,18 @@ pub(crate) async fn notify_inbound_note(
 
     // Mention: 我々宛 (`to`/`cc` に local_ap_id を含む) かつ visibility が
     // public / unlisted / followers。Direct は別 event なので除外。
+    //
+    // Direct: 我々宛 かつ visibility が direct。`addresses_us` ガードを掛ける
+    // のは「followee の第三者宛 DM が我々の inbox に届いた」ケースで誤通知し
+    // ないため (`handle_create` は followee 投稿を `addresses_us = false` でも
+    // 取り込むので、ここでフィルタしないと第三者 DM で Direct webhook が飛ぶ)。
+    // Mention と完全対称化する。
+    // (round-3 review F1)
     let visibility = note.visibility.as_str();
     if addresses_us && visibility != "direct" {
         notify(state, NotificationEvent::Mention, &ctx).await;
     }
-    if visibility == "direct" {
+    if addresses_us && visibility == "direct" {
         notify(state, NotificationEvent::Direct, &ctx).await;
     }
     if quote_target.is_some() {
