@@ -359,7 +359,9 @@ pub enum NotificationEvent {
 }
 
 impl NotificationEvent {
-    /// `delivery_queue.activity.event` で使う wire 表現。
+    /// `delivery_queue.activity.event` で使う **wire 表現** (`snake_case`)。
+    /// 永続化されたペイロードと互換を取る必要があるため変更不可。
+    /// CLI ユーザ向けの表示 (kebab) は [`Self::display_label`] を使う。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Mention => "mention",
@@ -369,6 +371,23 @@ impl NotificationEvent {
             Self::Renote => "renote",
             Self::Follow => "follow",
             Self::FollowRequest => "follow_request",
+        }
+    }
+
+    /// CLI 出力用の表示ラベル (kebab-case)。`from_str` が受ける CLI 入力
+    /// (`follow-request`) と一致するので、スクリプトで CLI 出力を読み取って
+    /// 再入力するときに一貫する。`list` / `enable` / `disable` の成功
+    /// メッセージで共通利用。
+    /// wire / log には [`Self::as_str`] (`snake_case`) を使うこと。
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::Direct => "direct",
+            Self::Quote => "quote",
+            Self::Reaction => "reaction",
+            Self::Renote => "renote",
+            Self::Follow => "follow",
+            Self::FollowRequest => "follow-request",
         }
     }
 
@@ -388,7 +407,9 @@ impl NotificationEvent {
         }
     }
 
-    /// 7 全 variant の配列 (CLI の `toggle --event all` 経路で iterate する用)。
+    /// 7 全 variant の配列。CLI の `enable --event all` / `disable --event all`
+    /// で `set_events` / `set_exact_state` に渡すフル集合、および
+    /// `parse_events` で `all` token を 7 要素に展開するために使う。
     pub fn all() -> &'static [Self] {
         &[
             Self::Mention,

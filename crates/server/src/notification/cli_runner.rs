@@ -131,28 +131,31 @@ async fn run_list(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `list` 出力で「ON になっている event」を CLI 表示ラベル (kebab) で返す。
+/// 列名と event の対応は [`NotificationEvent::display_label`] に集約する
+/// (= `enable` / `disable` の成功メッセージと同じ表記揺れを起こさない)。
 fn enabled_events(row: &NotificationChannelRow) -> Vec<&'static str> {
     let mut out = Vec::new();
     if row.notify_mention {
-        out.push("mention");
+        out.push(NotificationEvent::Mention.display_label());
     }
     if row.notify_direct {
-        out.push("direct");
+        out.push(NotificationEvent::Direct.display_label());
     }
     if row.notify_quote {
-        out.push("quote");
+        out.push(NotificationEvent::Quote.display_label());
     }
     if row.notify_reaction {
-        out.push("reaction");
+        out.push(NotificationEvent::Reaction.display_label());
     }
     if row.notify_renote {
-        out.push("renote");
+        out.push(NotificationEvent::Renote.display_label());
     }
     if row.notify_follow {
-        out.push("follow");
+        out.push(NotificationEvent::Follow.display_label());
     }
     if row.notify_follow_request {
-        out.push("follow-request");
+        out.push(NotificationEvent::FollowRequest.display_label());
     }
     out
 }
@@ -175,13 +178,19 @@ async fn run_remove(state: &AppState, args: NotificationChannelIdArgs) -> anyhow
 ///   `--only all` は意味が無いので拒否する (= `all` は単独で「全 ON」を
 ///   表すため、`--only` を付けると「他は OFF」 と矛盾する解釈になる)。
 async fn run_enable(state: &AppState, args: NotificationChannelEnableArgs) -> anyhow::Result<()> {
-    let events = parse_events(&args.events)?;
-    if args.only && events.len() == NotificationEvent::all().len() {
+    // PR #147 round-2 F-1: `--only` ガードは **`all` token を入力したか** で
+    // 判定する。`events.len() == 7` で判定すると、全 7 event を明示列挙した
+    // 正当なケース (= `--only mention,direct,quote,reaction,renote,follow,follow-request`)
+    // も誤って弾いてしまう (parse_events は両者とも 7 要素 Vec を返すため
+    // 長さでは区別不能)。
+    let used_all_token = args.events.iter().any(|t| t.eq_ignore_ascii_case("all"));
+    if args.only && used_all_token {
         bail!(
             "`--only all` is meaningless (all events already covered); \
              use `enable --id N all` without `--only` for a full-on state"
         );
     }
+    let events = parse_events(&args.events)?;
     let updated = if args.only {
         repo::notification_channel::set_exact_state(state.pool(), args.id, &events)
             .await
@@ -194,9 +203,12 @@ async fn run_enable(state: &AppState, args: NotificationChannelEnableArgs) -> an
     if !updated {
         bail!("no notification channel with id={}", args.id);
     }
+    // PR #147 round-2 F-3: CLI display は kebab に統一 (= `list` 出力と一致)。
+    // `as_str()` は wire 表現 (`delivery_queue.activity.event` JSONB / log) で
+    // snake のまま保つ ── 永続化されたペイロードと互換を取るため。
     let event_list = events
         .iter()
-        .map(|e| e.as_str())
+        .map(|e| e.display_label())
         .collect::<Vec<_>>()
         .join(",");
     let mode = if args.only { " (--only)" } else { "" };
@@ -217,7 +229,7 @@ async fn run_disable(state: &AppState, args: NotificationChannelEventArgs) -> an
     }
     let event_list = events
         .iter()
-        .map(|e| e.as_str())
+        .map(|e| e.display_label())
         .collect::<Vec<_>>()
         .join(",");
     let id = args.id;
@@ -425,5 +437,55 @@ mod tests {
             vec![NotificationEvent::Mention, NotificationEvent::Mention],
         );
         // repo::set_events の dedup ロジックで最終 SQL は単一列 SET に倒れる。
+    }
+
+    /// **PR #147 round-2 F-1 回帰テスト**: 全 7 event を明示列挙する
+    /// `--only mention,direct,quote,reaction,renote,follow,follow-request`
+    /// は `parse_events` で 7 要素 Vec に展開されるが、これは `--only all`
+    /// とは別経路 (= ガードに引っかかってはならない)。`run_enable` の判定
+    /// ロジックを直接呼べないので、ガード式を同じ条件で組み立てて検証する。
+    #[test]
+    fn run_enable_only_with_seven_explicit_events_is_allowed() {
+        let tokens = vec![
+            "mention".to_string(),
+            "direct".to_string(),
+            "quote".to_string(),
+            "reaction".to_string(),
+            "renote".to_string(),
+            "follow".to_string(),
+            "follow-request".to_string(),
+        ];
+        // F-1 修正のガード式と一致させる: `all` トークンが含まれているかで判定。
+        let used_all_token = tokens.iter().any(|t| t.eq_ignore_ascii_case("all"));
+        assert!(
+            !used_all_token,
+            "7 個明示列挙は `all` トークン未使用なので `--only` ガードに引っかからない",
+        );
+        let parsed = parse_events(&tokens).unwrap();
+        assert_eq!(
+            parsed.len(),
+            7,
+            "全 7 event が NotificationEvent に解決される"
+        );
+    }
+
+    /// 対比: `--only all` の側はちゃんとガードに引っかかる。
+    #[test]
+    fn run_enable_only_all_token_is_rejected_by_guard() {
+        let tokens = ["all".to_string()];
+        let used_all_token = tokens.iter().any(|t| t.eq_ignore_ascii_case("all"));
+        assert!(used_all_token, "`all` トークンはガードを発火させる");
+    }
+
+    /// F-3: `display_label()` は CLI 入力 (kebab) と完全一致するので、出力を
+    /// scripting で再入力したときに往復する。
+    #[test]
+    fn display_label_is_kebab_case() {
+        assert_eq!(
+            NotificationEvent::FollowRequest.display_label(),
+            "follow-request"
+        );
+        // wire 表現 (as_str) は snake_case のまま (= delivery_queue.activity.event 互換)。
+        assert_eq!(NotificationEvent::FollowRequest.as_str(), "follow_request");
     }
 }

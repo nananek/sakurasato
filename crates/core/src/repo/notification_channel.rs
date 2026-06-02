@@ -168,9 +168,17 @@ pub async fn set_events(
     events: &[NotificationEvent],
     value: bool,
 ) -> sqlx::Result<bool> {
+    // PR #147 round-2 F-4: 空集合の UPDATE は `Ok(false)` と "id not found"
+    // の戻り値が衝突して呼び出し側を誤誘導する。clap の `required = true`
+    // で上位は防いでいるが、内部 invariant 違反を明示するため debug ビルドで
+    // `debug_assert!` を発火させる。release では従来通り `Ok(false)` で
+    // 早期 return (= プログラマブル経路で空 Vec が混入しても production が
+    // クラッシュしない安全側に倒す)。
+    debug_assert!(
+        !events.is_empty(),
+        "set_events must be called with at least one event"
+    );
     if events.is_empty() {
-        // 上位で防いでいるはずだが念のため: 空集合の UPDATE は何もせず not-found
-        // と区別がつかなくなるので呼ばないこと。
         return Ok(false);
     }
     // 重複除去 (順序保持)。NotificationEvent は Copy + Eq。
