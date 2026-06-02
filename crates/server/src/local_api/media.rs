@@ -42,7 +42,7 @@ use base16ct::lower as base16;
 use sakurasato_core::model::{ActorRow, MediaRow};
 use sakurasato_core::repo;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value as JsonValue, json};
 use tracing::{error, warn};
 
 use crate::media_proxy_client::MediaProxyError;
@@ -99,6 +99,30 @@ impl MediaResponse {
 /// 我々が生成する ASCII (`<hex>.webp`) で encode 不要。
 pub(crate) fn build_media_url(host: &str, storage_key: &str) -> String {
     format!("https://{host}/media/{storage_key}")
+}
+
+/// 1 件の `media` 行を AP の `Document` JSON にする。
+///
+/// AS2 `Document` で `mediaType` + `url` + `name` (alt) を載せる。`width` /
+/// `height` は Mastodon 拡張だが幅広く受け入れられている (Misskey も読む)。
+///
+/// 配置: 元々 `notes.rs` の private fn だったが、`permalink.rs` で Note の AP
+/// JSON 再 fetch にも `attachment` を出すために共通化して `media.rs` に移した
+/// (= `build_media_url` と同居する方が依存関係が綺麗)。
+pub(crate) fn attachment_document(host: &str, m: &MediaRow) -> JsonValue {
+    let mut obj = json!({
+        "type": "Document",
+        "mediaType": m.media_type,
+        "url": build_media_url(host, &m.storage_key),
+        "width": m.width,
+        "height": m.height,
+    });
+    if let Some(alt) = m.alt_text.as_ref()
+        && !alt.is_empty()
+    {
+        obj["name"] = JsonValue::String(alt.clone());
+    }
+    obj
 }
 
 /// `kind` を media-proxy の variant 文字列にマップする。

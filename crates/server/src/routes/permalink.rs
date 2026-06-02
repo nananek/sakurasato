@@ -31,6 +31,7 @@ use sakurasato_core::model::{ActorRow, NoteRow};
 use sakurasato_core::repo;
 use serde_json::{Value as JsonValue, json};
 
+use crate::local_api::media::attachment_document;
 use crate::state::AppState;
 
 pub async fn handle(
@@ -88,7 +89,7 @@ pub async fn handle(
     };
 
     if wants_activity_json(&headers) {
-        let body = render_ap_note(&note, &actor);
+        let body = render_ap_note(&state, &note, &actor).await;
         let mut response = (StatusCode::OK, axum::Json(body)).into_response();
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -141,7 +142,12 @@ fn wants_activity_json(headers: &HeaderMap) -> bool {
 /// `to` / `cc` は DB に永続化済みの `to_recipients` / `cc_recipients` を
 /// そのまま使う ── POST `/api/v1/notes` で組み立てた値と完全に同じ。
 /// 受信した remote note の場合も DB の to/cc がそのまま流れる。
-fn render_ap_note(note: &NoteRow, actor: &ActorRow) -> JsonValue {
+///
+/// `attachment` は `media` 表から本 note 紐付きの行を `id ASC` で引いて
+/// AS2 `Document` 配列にする。元の `Create` activity は同じレイアウトを
+/// 載せて配送している ── canonical URL からの refetch でも attachment が
+/// 落ちないよう、permalink AP JSON でも同じ集合を返す。
+async fn render_ap_note(state: &AppState, note: &NoteRow, actor: &ActorRow) -> JsonValue {
     let published = note
         .published_at
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -169,6 +175,24 @@ fn render_ap_note(note: &NoteRow, actor: &ActorRow) -> JsonValue {
     }
     if let Some(reply) = note.in_reply_to_ap_id.as_deref() {
         body["inReplyTo"] = JsonValue::String(reply.into());
+    }
+    match repo::media::list_by_note(state.pool(), note.id).await {
+        Ok(rows) if !rows.is_empty() => {
+            let host = &state.config().server.host;
+            let docs: Vec<JsonValue> = rows.iter().map(|m| attachment_document(host, m)).collect();
+            body["attachment"] = JsonValue::Array(docs);
+        }
+        Ok(_) => {}
+        Err(err) => {
+            // attachment lookup が落ちても Note 本体は返したい (= 連合相手の
+            // 再 fetch ループを抑止)。`attachment` 欠落は cosmetic な不整合
+            // (元の Create には attachment が居る) で済む。
+            tracing::warn!(
+                ?err,
+                note_id = note.id,
+                "permalink: attachment lookup failed"
+            );
+        }
     }
     body
 }

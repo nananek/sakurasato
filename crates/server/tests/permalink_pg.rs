@@ -311,6 +311,130 @@ async fn permalink_renders_local_note_with_escaped_content(pool: PgPool) {
     );
 }
 
+/// permalink AP JSON は `attachment` フィールドを Note `Document` 配列として
+/// 出す ── 元の `Create` activity と同じレイアウトを返すことで、リモートが
+/// canonical URL から refetch しても添付が落ちないようにする。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn permalink_ap_json_includes_attachment(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let note_id = insert_note(
+        &pool,
+        actor.id,
+        "example.test",
+        "with-attach",
+        "look at this",
+        true,
+    )
+    .await;
+    // 添付 media を 2 件 insert → attach_to_note。`list_by_note` は id ASC で
+    // 返るので a, b の順で並ぶ。
+    let m_a = repo::media::insert(
+        &pool,
+        repo::media::NewMedia {
+            storage_key: "att-a.webp".into(),
+            media_type: "image/webp".into(),
+            width: 800,
+            height: 600,
+            byte_size: 1234,
+            kind: "attachment".into(),
+            alt_text: Some("first".into()),
+            owner_actor_id: actor.id,
+        },
+    )
+    .await
+    .unwrap();
+    let m_b = repo::media::insert(
+        &pool,
+        repo::media::NewMedia {
+            storage_key: "att-b.webp".into(),
+            media_type: "image/webp".into(),
+            width: 400,
+            height: 400,
+            byte_size: 5678,
+            kind: "attachment".into(),
+            alt_text: None,
+            owner_actor_id: actor.id,
+        },
+    )
+    .await
+    .unwrap();
+    repo::media::attach_to_note(&pool, &[m_a.id, m_b.id], actor.id, note_id)
+        .await
+        .unwrap();
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/notes/{note_id}"))
+                .header(header::ACCEPT, "application/activity+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let attachments = json["attachment"]
+        .as_array()
+        .expect("attachment field must be present and array");
+    assert_eq!(attachments.len(), 2, "expected 2 attachments: {json}");
+    assert_eq!(attachments[0]["type"], "Document");
+    assert_eq!(attachments[0]["mediaType"], "image/webp");
+    assert_eq!(
+        attachments[0]["url"],
+        "https://example.test/media/att-a.webp"
+    );
+    assert_eq!(attachments[0]["width"], 800);
+    assert_eq!(attachments[0]["height"], 600);
+    // alt_text あり → name フィールドあり
+    assert_eq!(attachments[0]["name"], "first");
+    // alt_text 無し → name 欠落 (= AS2 として valid)
+    assert!(
+        attachments[1].get("name").is_none(),
+        "no-alt attachment must not carry 'name': {:?}",
+        attachments[1]
+    );
+    assert_eq!(
+        attachments[1]["url"],
+        "https://example.test/media/att-b.webp"
+    );
+}
+
+/// 添付が無い Note は `attachment` フィールドを **持たない** (= 空配列でなく
+/// 欠落)。AS2 の慣習に合わせる ── 空配列を出すパーサ実装もあれば、欠落で
+/// 表現する実装もあるが、元の `Create` activity も `attachments.is_empty()`
+/// 時はフィールド自体を出さないのでそれに合わせる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn permalink_ap_json_omits_attachment_when_none(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let id = insert_note(&pool, actor.id, "example.test", "n1", "no media", true).await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(
+            Request::get(format!("/notes/{id}"))
+                .header(header::ACCEPT, "application/activity+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json.get("attachment").is_none(),
+        "attachment field must be absent for empty: {json}"
+    );
+}
+
 /// **SECURITY (緊急 fix)**: `followers` 可視性の note は URL 直アクセスで漏れない。
 /// permalink は unauthenticated な公開 endpoint なので、AS2 audience に Public が
 /// 含まれない note は 404 で返して存在自体を秘匿する (Mastodon 同様)。

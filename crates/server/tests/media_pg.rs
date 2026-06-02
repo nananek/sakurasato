@@ -102,12 +102,26 @@ async fn media_rejects_double_slash(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-// ── IDOR fix: authorization layer のテスト ───────────────────────────
+// ── authorization layer のテスト ─────────────────────────────────────
 //
 // 本テスト群は S3 が居ない環境を前提に、authorization が通過すると S3 接続
 // 失敗で **500** に倒れ、authorization が拒否すると **404** に倒れる差で
 // 「authorization 層が効いている」ことを確認する。S3 まで届かない (= 早期
 // reject) は 404、S3 まで届いた (= 許可) は 500 という対比。
+//
+// 通過 (S3 fetch まで進む) ケース:
+//   - `kind = avatar` (= 常に public)
+//   - `kind = attachment` + `note_id IS NOT NULL` (visibility 不問)
+//   - `emoji/local/...` prefix
+// 拒否 (= 404) ケース:
+//   - 未知 key (= media table に row 無し)
+//   - `kind = attachment` + `note_id IS NULL` (孤児 / 未投稿 draft)
+//
+// `attachment` の visibility ガード (`followers` / `direct` → 404) は
+// PR #108 で導入したが、Fediverse 標準は media URL を *URL obscurity* で
+// 防衛する慣行 (= Mastodon / Misskey も非認証で配信) で、private 投稿の
+// 画像がリモートで壊れて見える致命的副作用があったため撤回した。詳細は
+// `crates/server/src/routes/media.rs::authorized_for_public` の doc を見る。
 
 fn seed_local_actor(username: &str, host: &str) -> NewActor {
     let ap_id = format!("https://{host}/users/{username}");
@@ -215,8 +229,13 @@ async fn media_orphan_attachment_returns_404(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn media_attachment_on_followers_note_returns_404(pool: PgPool) {
-    // followers-only note に紐付いた attachment は永遠に漏らさない。
+async fn media_attachment_on_followers_note_reaches_s3(pool: PgPool) {
+    // followers-only note に紐付いた attachment は AP 配送で audience に
+    // URL が渡っており、Mastodon の media proxy は post-delivery で URL を
+    // 非認証 GET する。ここで 404 を返すと「リモートで画像が壊れる」状態
+    // (= 元 PR #108 が踏んだ過剰補正) なので、Fediverse 標準どおり
+    // visibility に関わらず通す。S3 が居ないテスト環境では fetch が失敗し
+    // て 500 まで進むことで「authorization 通過」を確認する。
     let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
         .await
         .unwrap();
@@ -240,11 +259,13 @@ async fn media_attachment_on_followers_note_returns_404(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn media_attachment_on_direct_note_returns_404(pool: PgPool) {
+async fn media_attachment_on_direct_note_reaches_s3(pool: PgPool) {
+    // direct (DM) note の attachment も followers と同じ理由で通す
+    // (= `media_attachment_on_followers_note_reaches_s3` 参照)。
     let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
         .await
         .unwrap();
@@ -264,7 +285,7 @@ async fn media_attachment_on_direct_note_returns_404(pool: PgPool) {
         .oneshot(Request::get("/media/dm.webp").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

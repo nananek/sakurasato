@@ -54,7 +54,7 @@ use serde_json::{Value as JsonValue, json};
 use tracing::{error, warn};
 
 use crate::delivery;
-use crate::local_api::media::build_media_url;
+use crate::local_api::media::{attachment_document, build_media_url};
 use crate::local_api::stream::{NoteCreatedPayload, TimelineEvent};
 use crate::media_proxy_client::MediaProxyError;
 use crate::remote_actor::{self, FetchError};
@@ -846,26 +846,6 @@ fn format_fetch_err(name: &str, err: &FetchError) -> String {
         FetchError::Malformed(msg) => format!("mention {name} actor malformed: {msg}"),
         other => format!("mention {name} actor fetch failed: {other}"),
     }
-}
-
-/// 1 件の `media` 行を AP の `Document` JSON にする。
-///
-/// AS2 `Document` で `mediaType` + `url` + `name` (alt) を載せる。`width` /
-/// `height` は Mastodon 拡張だが幅広く受け入れられている (Misskey も読む)。
-fn attachment_document(host: &str, m: &MediaRow) -> JsonValue {
-    let mut obj = json!({
-        "type": "Document",
-        "mediaType": m.media_type,
-        "url": build_media_url(host, &m.storage_key),
-        "width": m.width,
-        "height": m.height,
-    });
-    if let Some(alt) = m.alt_text.as_ref()
-        && !alt.is_empty()
-    {
-        obj["name"] = JsonValue::String(alt.clone());
-    }
-    obj
 }
 
 /// 添付メディア id を順序保ったまま `MediaRow` 配列に解決する。
