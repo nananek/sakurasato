@@ -77,10 +77,12 @@ fn needs_processing(input: &str) -> bool {
 }
 
 /// `<` の直後の文字がタグ名の始まり (= ASCII alpha) または閉じタグ印
-/// (`/`) のときだけ「タグかもしれない」と判断する。それ以外 (空白 / 数字 /
-/// 記号 / EOF) は平文の `<` として書き戻す。
+/// (`/`)、HTML コメント / processing instruction (`!` / `?`) のときだけ
+/// 「タグかもしれない」と判断する。それ以外 (空白 / 数字 / 記号 / EOF)
+/// は平文の `<` として書き戻す。`<!--...-->` は属性スキャンが `>` まで
+/// 食って捨ててくれるので明示的なコメント処理は要らない。
 fn looks_like_tag(next: Option<char>) -> bool {
-    matches!(next, Some(c) if c == '/' || c.is_ascii_alphabetic())
+    matches!(next, Some(c) if c == '/' || c == '!' || c == '?' || c.is_ascii_alphabetic())
 }
 
 /// 端末描画に安全な文字かどうか。
@@ -89,6 +91,9 @@ fn looks_like_tag(next: Option<char>) -> bool {
 /// - その他の Unicode 制御コード (Cc) は端末状態を壊しうるので drop
 /// - Unicode 非文字 (Cn の予約領域: `U+FDD0`–`U+FDEF` / 各 plane 末尾の
 ///   `0xFFFE` / `0xFFFF`) も一部端末で描画が不定なので drop
+/// - Line Separator (U+2028) / Paragraph Separator (U+2029) は Rust の
+///   `.lines()` が改行と認識しないため TUI レイアウトが乱れる。改行を
+///   入れたければ `<br>` / `<p>` を使う前提とし、これらは drop する
 fn is_safe_char(c: char) -> bool {
     if c == '\t' || c == '\n' || c == '\r' {
         return true;
@@ -97,6 +102,9 @@ fn is_safe_char(c: char) -> bool {
         return false;
     }
     let cp = u32::from(c);
+    if cp == 0x2028 || cp == 0x2029 {
+        return false;
+    }
     if (0xFDD0..=0xFDEF).contains(&cp) {
         return false;
     }
@@ -135,15 +143,10 @@ fn handle_tag(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut St
     }
 
     match name.as_str() {
-        "p" => {
-            if closing {
-                ensure_paragraph_break(out);
-            } else if !out.is_empty() {
-                // `<p>` 開始時点で前段に内容があれば段落区切りを入れる。
-                // `</p><p>` の連続でも空行は 1 つに正規化される。
-                ensure_paragraph_break(out);
-            }
-        }
+        // `<p>` / `</p>` のいずれも段落境界。前段が空ならスキップして
+        // 先頭に空行が漏れないようにする (= `<p></p><p>x</p>` で `\n\nx`
+        // にならない)。
+        "p" if !out.is_empty() => ensure_paragraph_break(out),
         "br" => out.push('\n'),
         // ブロック要素は前後で改行 (= リスト / 引用ブロック / 見出し)。
         // 直前が既に改行終わりなら何もしない (= 連続ブロックで空行が増えない)。
@@ -217,19 +220,24 @@ fn safe_char_from_u32(code: u32) -> Option<char> {
     if is_safe_char(ch) { Some(ch) } else { None }
 }
 
-/// 段落区切りを 1 つだけ挿入する。末尾に空白があれば落とし、既に空行で
-/// 終わっていれば追加しない (= `<p>X</p><p>Y</p>` で `\n\n` が 1 個分だけ)。
+/// 段落区切りを 1 つだけ挿入する。末尾に空白があれば落とし、改行が複数
+/// 連続している場合は 2 つに正規化する (= `<p>X</p>\n<p>Y</p>` のような
+/// タグ間リテラル `\n` でトリプル改行が生じない)。
 fn ensure_paragraph_break(out: &mut String) {
-    while out.ends_with(' ') || out.ends_with('\t') {
-        out.pop();
-    }
-    if out.ends_with("\n\n") {
-        return;
-    }
-    if out.ends_with('\n') {
-        out.push('\n');
+    // 末尾の半角空白 / タブを先に落とす ── 段落終端の不可視ゴミ。
+    let trimmed = out.trim_end_matches([' ', '\t']).len();
+    out.truncate(trimmed);
+
+    // 末尾の `\n` をすべて数え、`\n` が 2 個ちょうどになるよう正規化する。
+    // 3 個以上 → 末尾から削る / 1 個 → もう 1 個足す / 0 個 → 2 個足す。
+    let trailing_nl = out.chars().rev().take_while(|c| *c == '\n').count();
+    if trailing_nl > 2 {
+        let excess = trailing_nl - 2;
+        out.truncate(out.len() - excess);
     } else {
-        out.push_str("\n\n");
+        for _ in trailing_nl..2 {
+            out.push('\n');
+        }
     }
 }
 
@@ -362,6 +370,40 @@ mod tests {
         assert_eq!(to_plain_text("a\u{FFFF}b"), "ab");
         assert_eq!(to_plain_text("a\u{1FFFE}b"), "ab");
         assert_eq!(to_plain_text("&#xFFFE;"), "&#xFFFE;");
+    }
+
+    #[test]
+    fn closing_p_on_empty_output_no_leading_blank() {
+        // 先頭 `</p>` で出力先頭に `\n\n` が漏れない (round-3 Finding 1)。
+        assert_eq!(to_plain_text("<p></p><p>text</p>"), "text");
+        // 単独 `</p>` も同じく leading blank を生まない。
+        assert_eq!(to_plain_text("</p>"), "");
+    }
+
+    #[test]
+    fn literal_newline_between_paragraphs_not_triple() {
+        // `</p>\n<p>` のようにタグ間にリテラル `\n` が来てもトリプル改行に
+        // 落ちず段落間は `\n\n` で正規化される (round-3 Finding 2)。
+        assert_eq!(to_plain_text("<p>a</p>\n<p>b</p>"), "a\n\nb");
+        // タグ間に複数 `\n` が来る場合も同様。
+        assert_eq!(to_plain_text("<p>a</p>\n\n\n<p>b</p>"), "a\n\nb");
+    }
+
+    #[test]
+    fn unicode_line_paragraph_separators_filtered() {
+        // U+2028 (LS) / U+2029 (PS) は `.lines()` が分割しないため drop する
+        // (round-3 Finding 3)。
+        assert_eq!(to_plain_text("a\u{2028}b"), "ab");
+        assert_eq!(to_plain_text("a\u{2029}b"), "ab");
+    }
+
+    #[test]
+    fn html_comment_is_dropped() {
+        // `<!-- ... -->` がプレーンテキストとして見えない (round-3 Finding 4)。
+        assert_eq!(to_plain_text("a<!-- hidden -->b"), "ab");
+        assert_eq!(to_plain_text("<!-- only comment -->"), "");
+        // 未終端コメントは attribute スキャンで EOF まで食って落とす。
+        assert_eq!(to_plain_text("a<!-- never closed"), "a");
     }
 
     #[test]
