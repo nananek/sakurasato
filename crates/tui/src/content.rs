@@ -31,24 +31,79 @@
 /// - 数値文字参照 (`&#NN;` / `&#xHH;`) と主要な named entity
 ///   (`&amp;` / `&lt;` / `&gt;` / `&quot;` / `&apos;` / `&nbsp;`) を decode
 ///
-/// fast-path: `<` も `&` も含まない入力はそのままコピーを返す (= local の
-/// plaintext 投稿)。
+/// セキュリティ:
+/// - 端末描画を壊しうる制御コード (ESC / BEL / NUL など) は必ず除去する。
+///   entity デコード後だけでなく、生の入力に混ざっている分も同様に落とす
+///   ── 連合先が `\x1b[31m` のような ANSI エスケープを送り込んでも端末が
+///   色変更しないことを保証する。TAB / LF / CR は通常空白として通す。
+/// - Unicode 非文字 (`U+FDD0`–`U+FDEF` / `U+xxFFFE` / `U+xxFFFF`) も同じ
+///   理由で落とす。
+///
+/// 入力に「危険文字 / `<` / `&`」が一切無い場合は即コピーを返す
+/// fast-path に乗る (= local の plaintext 投稿でゼロオーバーヘッド)。
 #[must_use]
 pub fn to_plain_text(input: &str) -> String {
-    if !input.contains('<') && !input.contains('&') {
+    if !needs_processing(input) {
         return input.to_string();
     }
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '<' => handle_tag(&mut chars, &mut out),
+            '<' if looks_like_tag(chars.peek().copied()) => {
+                handle_tag(&mut chars, &mut out);
+            }
+            // `<` の直後が空白 / 数字 / 記号などタグ名にならない文字なら
+            // 平文の `<` として扱う (`a < b` や `<3` の取り違えを防ぐ ──
+            // 連合 HTML では本来 `&lt;` にエスケープされる前提だが、
+            // ローカル投稿は plaintext のまま流れてくる)。
+            '<' => out.push('<'),
             '&' => handle_entity(&mut chars, &mut out),
-            _ => out.push(c),
+            c if is_safe_char(c) => out.push(c),
+            // 危険な制御コード / Unicode 非文字は静かに drop。
+            _ => {}
         }
     }
     trim_trailing_blank(&mut out);
     out
+}
+
+/// fast-path 判定: 入力が「タグ / entity / 危険文字」を一切含まなければ
+/// 変換無しでコピーを返してよい。
+fn needs_processing(input: &str) -> bool {
+    input
+        .chars()
+        .any(|c| c == '<' || c == '&' || !is_safe_char(c))
+}
+
+/// `<` の直後の文字がタグ名の始まり (= ASCII alpha) または閉じタグ印
+/// (`/`) のときだけ「タグかもしれない」と判断する。それ以外 (空白 / 数字 /
+/// 記号 / EOF) は平文の `<` として書き戻す。
+fn looks_like_tag(next: Option<char>) -> bool {
+    matches!(next, Some(c) if c == '/' || c.is_ascii_alphabetic())
+}
+
+/// 端末描画に安全な文字かどうか。
+///
+/// - TAB (`\t`) / LF (`\n`) / CR (`\r`) は通常の空白扱いで通す
+/// - その他の Unicode 制御コード (Cc) は端末状態を壊しうるので drop
+/// - Unicode 非文字 (Cn の予約領域: `U+FDD0`–`U+FDEF` / 各 plane 末尾の
+///   `0xFFFE` / `0xFFFF`) も一部端末で描画が不定なので drop
+fn is_safe_char(c: char) -> bool {
+    if c == '\t' || c == '\n' || c == '\r' {
+        return true;
+    }
+    if c.is_control() {
+        return false;
+    }
+    let cp = u32::from(c);
+    if (0xFDD0..=0xFDEF).contains(&cp) {
+        return false;
+    }
+    if cp & 0xFFFE == 0xFFFE {
+        return false;
+    }
+    true
 }
 
 /// `<` を 1 つ消費した直後から呼ばれ、対応する `>` (or EOF) までを消費する。
@@ -153,19 +208,13 @@ fn decode_entity(name: &str) -> Option<char> {
 }
 
 /// 数値文字参照 (`&#NN;` / `&#xHH;`) を `char` に変換する。NUL (`U+0000`)
-/// と Unicode 制御コード (TAB / LF / CR は除外) は `ratatui` / `crossterm`
+/// と Unicode 制御コード、および Unicode 非文字は `ratatui` / `crossterm`
 /// 上で予期せぬ描画を起こすため None を返し、呼び出し側でリテラルに
-/// フォールバックさせる ── 悪意ある連合先が `&#0;` などを送り込んで
-/// 端末状態を壊すのを防ぐ防御層。
+/// フォールバックさせる ── 悪意ある連合先が `&#0;` / `&#xFFFE;` などを
+/// 送り込んで端末状態を壊すのを防ぐ防御層。判定は `is_safe_char` と共通。
 fn safe_char_from_u32(code: u32) -> Option<char> {
     let ch = char::from_u32(code)?;
-    if ch == '\t' || ch == '\n' || ch == '\r' {
-        return Some(ch);
-    }
-    if ch.is_control() {
-        return None;
-    }
-    Some(ch)
+    if is_safe_char(ch) { Some(ch) } else { None }
 }
 
 /// 段落区切りを 1 つだけ挿入する。末尾に空白があれば落とし、既に空行で
@@ -289,6 +338,45 @@ mod tests {
         // `a` を後置)。`\n` 単独だと `trim_trailing_blank` で除去されるため。
         assert_eq!(to_plain_text("&#9;a"), "\ta");
         assert_eq!(to_plain_text("&#10;a"), "\na");
+    }
+
+    #[test]
+    fn raw_control_chars_filtered_from_input() {
+        // 連合先が `Note.content` に生の ESC や BEL を埋め込んできても、
+        // ANSI シーケンスを TUI に流して端末状態を壊されないようにする。
+        // ESC バイトだけ落とし、後続の `[31m` 等の可視文字はそのまま残す
+        // (= 端末は ANSI として解釈しない、ただの文字列として見える)。
+        assert_eq!(to_plain_text("a\x1b[31mb\x1b[0mok"), "a[31mb[0mok"); // ESC が drop
+        assert_eq!(to_plain_text("a\x07b"), "ab"); // BEL drop
+        assert_eq!(to_plain_text("a\x00b"), "ab"); // NUL drop
+        // fast-path も同様に守られる (= `<` / `&` を含まなくても drop)。
+        assert_eq!(to_plain_text("hi\x1bx"), "hix");
+    }
+
+    #[test]
+    fn unicode_noncharacters_filtered() {
+        // U+FDD0..U+FDEF と各 plane の `0xFFFE`/`0xFFFF` は描画不定なので
+        // 落とす。`&#xFFFE;` も decode 後に同じ理由で None → リテラル。
+        assert_eq!(to_plain_text("\u{FDD0}a"), "a");
+        assert_eq!(to_plain_text("a\u{FFFE}b"), "ab");
+        assert_eq!(to_plain_text("a\u{FFFF}b"), "ab");
+        assert_eq!(to_plain_text("a\u{1FFFE}b"), "ab");
+        assert_eq!(to_plain_text("&#xFFFE;"), "&#xFFFE;");
+    }
+
+    #[test]
+    fn bare_lt_followed_by_non_alpha_is_literal() {
+        // `a < b` のような数式や `<3` のような emoticon が壊れない。
+        // 連合 HTML では本来 `&lt;` にエスケープされる前提だが、ローカル
+        // 投稿は plaintext のまま入ってくるため。
+        assert_eq!(to_plain_text("a < b"), "a < b");
+        assert_eq!(to_plain_text("<3 you"), "<3 you");
+        assert_eq!(to_plain_text("if a<2 then"), "if a<2 then");
+        // 一方で `<p>` などの本物のタグはこれまでどおり剥がす。
+        assert_eq!(to_plain_text("<p>hi</p>"), "hi");
+        // 閉じタグ印 `/` も tag 扱い (= `<a></a>` の `</a>` でラベルが
+        // 壊れない、`</span>` 内も同様)。
+        assert_eq!(to_plain_text("<span>hi</span>"), "hi");
     }
 
     #[test]

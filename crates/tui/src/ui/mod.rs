@@ -657,9 +657,14 @@ fn render_profile_screen(
 
     // ヘッダ部の高さは bio の行数で可変。最低 4 行 (名前 / acct / 状態 / counts)、
     // bio で +N。残りを notes 一覧に渡す。
-    let summary_lines: Vec<String> = profile
+    // 連合先 (Mastodon 等) からの bio は `<p>...</p>` 等の HTML 形式で
+    // 届くため、本文と同じく `to_plain_text` でプレーン化する。
+    let summary_plain = profile
         .actor
         .summary
+        .as_deref()
+        .map(crate::content::to_plain_text);
+    let summary_lines: Vec<String> = summary_plain
         .as_deref()
         .map(|s| s.lines().map(ToOwned::to_owned).collect())
         .unwrap_or_default();
