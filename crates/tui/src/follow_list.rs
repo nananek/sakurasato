@@ -143,6 +143,23 @@ impl FollowListScreen {
         }
     }
 
+    /// `PageDown` ── `viewport_items` 件分だけ下へ。末尾で clamp。
+    /// `runtime` から viewport 件数を渡す ([`crate::app::App::page_down`] と同設計)。
+    pub fn select_page_down(&mut self, viewport_items: usize) {
+        let len = self.current().entries.len();
+        if len == 0 {
+            return;
+        }
+        let step = viewport_items.max(1);
+        self.selected = (self.selected + step).min(len - 1);
+    }
+
+    /// `PageUp` ── `viewport_items` 件分だけ上へ。0 で clamp。
+    pub fn select_page_up(&mut self, viewport_items: usize) {
+        let step = viewport_items.max(1);
+        self.selected = self.selected.saturating_sub(step);
+    }
+
     pub fn ensure_visible(&mut self, viewport_items: usize) {
         let v = viewport_items.max(1);
         if self.selected < self.top {
@@ -221,5 +238,88 @@ mod tests {
         s.following.append(vec![], None);
         assert!(s.following.exhausted);
         assert_eq!(s.following.entries.len(), 1);
+    }
+
+    fn screen_with(n: i64) -> FollowListScreen {
+        let mut s = FollowListScreen::new(FollowListMode::Following);
+        let entries: Vec<_> = (1..=n)
+            .map(|i| entry(i, i + 100, &format!("u{i}")))
+            .collect();
+        s.following.replace(entries, None);
+        s
+    }
+
+    #[test]
+    fn ensure_visible_scrolls_top_when_cursor_below_window() {
+        let mut s = screen_with(20);
+        s.selected = 7;
+        // viewport=3, cursor=7 → top = 7+1-3 = 5.
+        s.ensure_visible(3);
+        assert_eq!(s.top, 5);
+    }
+
+    #[test]
+    fn ensure_visible_scrolls_top_up_when_cursor_above_window() {
+        let mut s = screen_with(20);
+        s.top = 10;
+        s.selected = 2;
+        s.ensure_visible(3);
+        assert_eq!(s.top, 2);
+    }
+
+    #[test]
+    fn ensure_visible_no_op_when_cursor_inside_window() {
+        let mut s = screen_with(20);
+        s.top = 4;
+        s.selected = 5;
+        s.ensure_visible(3);
+        assert_eq!(s.top, 4);
+    }
+
+    #[test]
+    fn ensure_visible_treats_zero_viewport_as_one() {
+        let mut s = screen_with(20);
+        s.selected = 5;
+        s.ensure_visible(0);
+        // viewport=0 → 1 として扱い、selected=5 が見える top=5。
+        assert_eq!(s.top, 5);
+    }
+
+    #[test]
+    fn ensure_visible_on_empty_list_does_nothing() {
+        let mut s = FollowListScreen::new(FollowListMode::Following);
+        // entries 空 / cursor=0 / top=0 で no-op、特に panic しないこと。
+        s.ensure_visible(10);
+        assert_eq!(s.top, 0);
+    }
+
+    #[test]
+    fn select_page_down_clamps_at_end() {
+        let mut s = screen_with(10);
+        s.select_page_down(4);
+        assert_eq!(s.selected, 4);
+        s.select_page_down(4);
+        assert_eq!(s.selected, 8);
+        s.select_page_down(4);
+        // 末尾 (= len - 1 = 9) で clamp。
+        assert_eq!(s.selected, 9);
+    }
+
+    #[test]
+    fn select_page_up_clamps_at_zero() {
+        let mut s = screen_with(10);
+        s.selected = 7;
+        s.select_page_up(3);
+        assert_eq!(s.selected, 4);
+        s.select_page_up(10);
+        // 0 で clamp (saturating_sub)。
+        assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn select_page_down_on_empty_list_does_nothing() {
+        let mut s = FollowListScreen::new(FollowListMode::Following);
+        s.select_page_down(5);
+        assert_eq!(s.selected, 0);
     }
 }

@@ -126,6 +126,10 @@ pub enum Action {
     FollowListRefresh,
     /// M13 PR5: `FollowList` で `Esc` / `q` ── 画面を閉じる。
     FollowListClose,
+    /// Issue #115: `FollowList` で `PageDown` (or `Ctrl-D`) ── viewport 件数分下へ。
+    FollowListPageDown,
+    /// Issue #115: `FollowList` で `PageUp` (or `Ctrl-U`) ── viewport 件数分上へ。
+    FollowListPageUp,
     /// Issue #118 (Issue #101 後継): 絵文字検索モーダルを開く。
     /// Timeline `e` (= 選択中 Note に即リアクション送信) と Compose `Ctrl-E`
     /// (= 本文 buffer に `:shortcode:` / Unicode 1 字を挿入) の両起動経路で
@@ -239,6 +243,10 @@ fn translate_follow_list_key(k: KeyEvent) -> Action {
         (KeyCode::Char('q'), m) if m.is_empty() => Action::FollowListClose,
         (KeyCode::Char('j') | KeyCode::Down, _) => Action::FollowListSelectNext,
         (KeyCode::Char('k') | KeyCode::Up, _) => Action::FollowListSelectPrev,
+        (KeyCode::PageDown, _) => Action::FollowListPageDown,
+        (KeyCode::PageUp, _) => Action::FollowListPageUp,
+        (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => Action::FollowListPageDown,
+        (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => Action::FollowListPageUp,
         (KeyCode::Char('t'), m) if m.is_empty() => Action::FollowListToggleMode,
         (KeyCode::Enter, _) => Action::FollowListOpenSelected,
         (KeyCode::Char('o'), m) if m.is_empty() => Action::FollowListLoadMore,
@@ -786,6 +794,35 @@ mod tests {
                 Focus::FollowList,
             ),
             Action::FollowListRefresh,
+        ));
+        // Issue #115: PageDown / PageUp + Ctrl-D / Ctrl-U で page 単位ジャンプ。
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::PageDown, KeyModifiers::NONE)),
+                Focus::FollowList,
+            ),
+            Action::FollowListPageDown,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::PageUp, KeyModifiers::NONE)),
+                Focus::FollowList,
+            ),
+            Action::FollowListPageUp,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+                Focus::FollowList,
+            ),
+            Action::FollowListPageDown,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+                Focus::FollowList,
+            ),
+            Action::FollowListPageUp,
         ));
     }
 
