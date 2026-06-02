@@ -417,8 +417,11 @@ async fn apply_action(
                 | Focus::Picker
                 | Focus::EmojiSearch
                 | Focus::AltPrompt
-                | Focus::Command => {
-                    // overlay 中は背後 Timeline を動かさない。
+                | Focus::Command
+                | Focus::Requests => {
+                    // overlay 中は背後 Timeline を動かさない。`Requests`
+                    // (= follow request 承認画面) も同じく overlay 風だが
+                    // round-4 で漏れていた (= round-6 review F7)。
                 }
                 _ => {
                     if delta > 0 {

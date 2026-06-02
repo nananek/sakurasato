@@ -190,7 +190,8 @@ pub(crate) fn parse_attachments(raw: &JsonValue) -> Vec<AttachmentDto> {
             let url = v
                 .get("url")
                 .and_then(JsonValue::as_str)
-                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))?
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .filter(|u| u.len() <= URL_MAX_BYTES)?
                 .to_string();
             let media_type = v
                 .get("mediaType")
@@ -254,6 +255,11 @@ const ATTACHMENT_ALT_MAX_BYTES: usize = 1500;
 /// `mediaType` 文字列の上限。実用的な MIME type は 100 byte 以内に収まる。
 const MEDIA_TYPE_MAX_BYTES: usize = 100;
 
+/// 添付 / 絵文字 `url` のバイト長上限。実用 URL は数百 byte で十分で、AP
+/// 仕様上の URI 制約も同程度。連合先が ~900 KB の URL 文字列を送り込んで
+/// API レスポンスと TUI heap を肥大化させる `DoS` 入力を弾く。
+const URL_MAX_BYTES: usize = 2048;
+
 /// `note.tags` JSONB を走査し `type == "Emoji"` の要素だけ [`EmojiDto`] に
 /// 変換する。AP `Emoji` は `name` (shortcode) と `icon.url` を持つ。
 ///
@@ -286,6 +292,7 @@ pub(crate) fn parse_emojis(raw: &JsonValue, local_host: &str) -> Vec<EmojiDto> {
                 .and_then(|i| i.get("url"))
                 .and_then(JsonValue::as_str)
                 .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .filter(|u| u.len() <= URL_MAX_BYTES)
                 .map(str::to_string);
             let media_type = icon
                 .and_then(|i| i.get("mediaType"))
@@ -631,6 +638,42 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].alt.as_deref(), Some(alt_ok.as_str()));
         assert!(out[1].alt.is_none(), "overly long alt should be dropped");
+    }
+
+    #[test]
+    fn parse_attachments_caps_url_length() {
+        // round-6 review F1: URL に 2048 byte 上限を入れて DoS 入力を弾く。
+        let long_url = "https://e.example/".to_string() + &"a".repeat(URL_MAX_BYTES);
+        assert!(long_url.len() > URL_MAX_BYTES);
+        let raw = json!([
+            {"url": long_url},
+            {"url": "https://e.example/ok.webp"},
+        ]);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].url, "https://e.example/ok.webp");
+    }
+
+    #[test]
+    fn parse_emojis_caps_icon_url_length() {
+        // round-6 review F2: emoji `icon.url` も 2048 byte 上限。
+        let long_url = "https://e.example/".to_string() + &"a".repeat(URL_MAX_BYTES);
+        let raw = json!([
+            {
+                "type": "Emoji",
+                "name": ":big:",
+                "icon": {"url": long_url}
+            },
+            {
+                "type": "Emoji",
+                "name": ":ok:",
+                "icon": {"url": "https://e.example/ok.webp"}
+            },
+        ]);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), 2);
+        assert!(out[0].image_url.is_none(), "long url should be dropped");
+        assert!(out[1].image_url.is_some());
     }
 
     #[test]

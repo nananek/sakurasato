@@ -905,10 +905,14 @@ fn profile_note_lines(
         ),
     ];
     if !note.attachments.is_empty() {
-        header_spans.push(Span::styled(
-            format!("  📎 {}", note.attachments.len()),
-            Style::default().fg(palette.muted),
-        ));
+        // round-6 review F4: sensitive Note では件数を露出させない (= 添付の
+        // 規模ヒントを隠す)。Profile も Timeline と同方針。
+        let badge = if note.sensitive {
+            "  📎".to_string()
+        } else {
+            format!("  📎 {}", note.attachments.len())
+        };
+        header_spans.push(Span::styled(badge, Style::default().fg(palette.muted)));
     }
     out.push(Line::from(header_spans));
     if let Some(cw) = &note.summary
@@ -1294,12 +1298,17 @@ fn note_lines(
         ),
     ];
     if !note.attachments.is_empty() {
-        // 添付があれば `📎 N` badge を visibility の隣に出す。Timeline では
+        // 添付があれば badge を visibility の隣に出す。Timeline では
         // 添付実体は出さず、Enter で詳細モーダルに遷移してプレビューする運用。
-        header_spans.push(Span::styled(
-            format!("  📎 {}", note.attachments.len()),
-            Style::default().fg(palette.muted),
-        ));
+        // round-6 review F4: sensitive Note では件数を露出させない (= 添付の
+        // 規模ヒントを隠す)。アイコンだけ出して「何かある」とだけ示し、
+        // 詳細は reveal してから見せる。
+        let badge = if note.sensitive {
+            "  📎".to_string()
+        } else {
+            format!("  📎 {}", note.attachments.len())
+        };
+        header_spans.push(Span::styled(badge, Style::default().fg(palette.muted)));
     }
     out.push(Line::from(header_spans));
 
@@ -1618,23 +1627,37 @@ fn render_note_detail(
             } else {
                 "  "
             };
-            let mt = att.media_type.as_deref().unwrap_or("?");
-            let dims = match (att.width, att.height) {
-                (Some(w), Some(h)) => format!(" {w}×{h}"),
-                _ => String::new(),
-            };
-            let alt = att.alt.as_deref().unwrap_or("");
-            let alt_part = if alt.is_empty() {
-                String::new()
-            } else {
-                format!(" — {alt}")
-            };
-            lines.push(Line::from(vec![Span::styled(
+            // round-6 review F3: blur 中 (= 個別 `revealed[i] == false`) の
+            // 添付はメタ情報 (mediaType / 寸法 / alt) も隠す。alt を見せると
+            // sensitive コンテンツのヒントになりうるため fail-closed で
+            // プレースホルダだけ出す。
+            let revealed = state.revealed.get(i).copied().unwrap_or(false);
+            let label = if revealed {
+                let mt = att.media_type.as_deref().unwrap_or("?");
+                let dims = match (att.width, att.height) {
+                    (Some(w), Some(h)) => format!(" {w}×{h}"),
+                    _ => String::new(),
+                };
+                let alt = att.alt.as_deref().unwrap_or("");
+                let alt_part = if alt.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {alt}")
+                };
                 format!(
                     "{cursor}[{}/{}] {mt}{dims}{alt_part}",
                     i + 1,
                     note.attachments.len()
-                ),
+                )
+            } else {
+                format!(
+                    "{cursor}[{}/{}] [hidden — press s to reveal]",
+                    i + 1,
+                    note.attachments.len()
+                )
+            };
+            lines.push(Line::from(vec![Span::styled(
+                label,
                 Style::default().fg(if i == state.selected_attachment {
                     palette.accent
                 } else {
@@ -1701,7 +1724,14 @@ fn render_note_detail_preview(
     // 解除するまで隠す。`!is_image` を先に置くと、非画像添付の URL が常時
     // 平文表示されて sensitive 保護をバイパスする。
     if !revealed {
-        let msg = "  [sensitive — press s to reveal]";
+        // round-6 review F8: 非 sensitive Note でも `s` で再ブラー可能なので
+        // メッセージは Note の `sensitive` フラグを参照して切り替える ──
+        // sensitive=false で「sensitive」と出すのは誤誘導。
+        let msg = if state.note.sensitive {
+            "  [sensitive — press s to reveal]"
+        } else {
+            "  [hidden — press s to reveal]"
+        };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 msg,
