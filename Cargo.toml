@@ -103,7 +103,13 @@ aws-credential-types = "1"
 # ratatui 0.30 は内部で crossterm 0.29 を引く。crossterm を direct dependency
 # にしているのは event 型 (KeyEvent / MouseEvent) を TUI 本体で扱うため。
 # 必ず ratatui と版を合わせること (cargo tree -i crossterm で検査)。
-ratatui = "0.30"
+# `unstable-rendered-line-info` で `Paragraph::line_count(width)` を解禁する
+# (= 内部 WordWrapper による実描画と完全一致する行数を返す)。Issue #144 で
+# `div_ceil(line.width(), viewport_width)` の近似がワード境界折返しと食い違い、
+# 長文 note の次行アバター位置がズレる症状を踏んだため切替えた。
+# unstable API なので 0.31 で API 変更があり得る ── tracking issue:
+# https://github.com/ratatui/ratatui/issues/293
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 # `event-stream` feature で `EventStream` (tokio から poll する非同期版) を有効化。
 # 既定の `events` / `bracketed-paste` / `windows` / `derive-more` も維持する。
 crossterm = { version = "0.29", features = ["event-stream"] }
