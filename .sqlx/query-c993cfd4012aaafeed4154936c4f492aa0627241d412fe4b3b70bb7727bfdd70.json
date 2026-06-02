@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE notification_channel\n        SET\n            notify_mention = $2,\n            notify_direct = $3,\n            notify_quote = $4,\n            notify_reaction = $5,\n            notify_renote = $6,\n            notify_follow = $7,\n            notify_follow_request = $8,\n            updated_at = now()\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c993cfd4012aaafeed4154936c4f492aa0627241d412fe4b3b70bb7727bfdd70"
+}

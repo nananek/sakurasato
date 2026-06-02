@@ -51,6 +51,7 @@ cargo run -p sakurasato-server -- <subcommand> [args]
 | `move-accept` | 受領済み Move 本文を CLI から再処理 | [§10](#10-move-accept) |
 | `actor lock` / `unlock` | 鍵アカ運用切替 (M12 / #66) | [§11](#11-actor) |
 | `follow-request` | 鍵アカ時の承認待ち follow の管理 | [§12](#12-follow-request) |
+| `notification-channel` | Discord 互換 webhook 通知の宛先管理 | [§13](#13-notification-channel) |
 
 ---
 
@@ -405,6 +406,120 @@ sakurasato-server follow-request reject --id 42
 
 ---
 
+## 13. `notification-channel`
+
+Discord (および Slack / Misskey 互換) webhook で push 通知する宛先を管理します。お一人様サーバには Web UI が無いので、外出中に「自分宛の何かが来た」ことを Discord 等で気付くための経路。**配送経路は既存 `delivery_queue` を流用** ── retry / backoff / dead 状態機械を AP 配送と共有します。`activity.type` が `Webhook:` prefix の行は worker が HTTP 署名を skip して `application/json` で POST します。
+
+### 通知発火イベント (7 種)
+
+| event 名 | 発火元 |
+|---|---|
+| `mention` | 自分が `tag.Mention` に乗った Note を受信 |
+| `direct` | `to` に自分の actor URI のみが指定された Note (= 自分宛 DM) |
+| `quote` | 自分の Note を `quote` した Note を受信 |
+| `reaction` | 自分の Note への `Like` / `EmojiReact` |
+| `renote` | 自分の Note への `Announce` (= boost / renote) |
+| `follow` | 自分への `Follow` が `accepted` 状態で着地 |
+| `follow-request` | 鍵アカ運用時に自分への `Follow` が `pending` 状態で着地 |
+| `all` | 上記 7 種の一斉セット (`enable` / `disable` 時のみ意味を持つ) |
+
+### 13.1 `notification-channel add`
+
+Webhook URL を登録します。`--format` は省略時 `embed` (= Discord 互換)。
+
+```bash
+# 1) Discord のチャンネル設定 → 連携サービス → Webhook で URL を取得
+# 2) 登録 (--format 省略時は embed)
+sakurasato-server notification-channel add \
+  --name discord-personal \
+  --url 'https://discord.com/api/webhooks/123.../abc...' \
+  --format embed
+```
+
+- `--name` は表示・CLI 識別用ラベル (DB UNIQUE)。同名再登録は拒否される。
+- `--url` は登録時に SSRF ガード ([`net_guard::host_blocked`](../crates/server/src/net_guard.rs)) で検査します。private / loopback / link-local / reserved の宛先は弾かれます。配送時にも DNS 再解決後の TOCTOU 防御で再検査されます。
+- `--format`: `embed` (Discord embed JSON) / `plain` (`{"content": "..."}` で Slack の `text` フィールドや Misskey 互換 fallback と相互運用)。
+
+登録後の初期状態は **7 イベントすべて ON**。「フォローだけ通知したい」場合は `enable --id N --only follow` の一発で完全宣言できます。あるいは `disable --id N all` で一旦すべて OFF にしてから `enable --id N follow` で必要な分だけ ON に戻す運用も可。
+
+### 13.2 `notification-channel list`
+
+登録チャンネルを 1 行ずつ列挙します。**URL は host だけ表示** ── URL 全体が capability であり、screenshot や paste で漏らされるのを避けるため。
+
+```bash
+sakurasato-server notification-channel list
+# 例:
+# id=1 name="discord-personal" format=embed host=discord.com events=mention,direct,quote,reaction,renote,follow,follow-request
+```
+
+`events` 列がそのチャンネルで通知発火する event の一覧 (= `notify_<event> = TRUE` な列を抽出)。完全な URL が必要な場合は `psql` で `SELECT url FROM notification_channel WHERE id = N;` を叩いてください。
+
+### 13.3 `notification-channel enable` / `disable`
+
+`notify_<event>` を **ON** / **OFF** に設定します (idempotent ── 同じコマンドを再実行しても結果は変わらず DB 状態は等しい)。event は **positional 引数で 1 個以上**、空白区切りでも `,` 区切りでも、混在でも可。
+
+```bash
+# 個別 event の有効化 (= partial update / 他列据え置き)
+sakurasato-server notification-channel enable  --id 1 mention
+sakurasato-server notification-channel disable --id 1 reaction
+
+# 複数 event の一括有効化 / 停止 (1 UPDATE 文で atomic)
+sakurasato-server notification-channel enable  --id 1 mention,quote
+sakurasato-server notification-channel disable --id 1 mention reaction renote
+sakurasato-server notification-channel enable  --id 1 mention,quote follow
+
+# チャンネル全停止 (= 7 個の notify_* を一斉 FALSE)
+sakurasato-server notification-channel disable --id 1 all
+# チャンネル全有効化 (= 7 個の notify_* を一斉 TRUE)
+sakurasato-server notification-channel enable  --id 1 all
+```
+
+#### `--only`: フル状態宣言モード (enable のみ)
+
+`enable --only A,B` は「A と B だけ ON、他は OFF」── 希望状態を 1 コマンドで言い切ります。スクリプトや ansible で「現状を問わず状態 X に揃える」用途。完全冪等。
+
+```bash
+# mention と quote だけ ON、他 5 列は OFF
+sakurasato-server notification-channel enable --id 1 --only mention,quote
+
+# follow だけ ON、他 6 列は OFF (= 「フォロー通知だけ欲しい」)
+sakurasato-server notification-channel enable --id 1 --only follow
+```
+
+- `--only` は **`enable` 限定** (= `disable --only` は提供しない。「X だけ OFF」は `enable --only (complement)` 経由で書ける + 「全部 OFF」は `disable all` で済むため)。
+- `--only all` は意味が無いので拒否 (`enable --id N all` を使ってください)。
+- `all` を `--only` 無しで指定するのと `--only` 付きで指定するのは結果が同じ ── 後者は CLI で reject する設計。
+
+#### 設計メモ
+
+- 旧バージョンには `toggle` サブコマンドと `enabled` master 列がありましたが、`--event all` が「7 個一斉反転」ではなく「master 反転」を意味し直感に反していたこと、`toggle` が冪等にならないこと (= スクリプトから安全に呼べない) から、migration 0014 で master 撤去 + `enable` / `disable` への置換が行われました。
+- 通知 fan-out は `WHERE notify_<event> = TRUE` の単純フィルタです (master の AND 条件は無くなりました)。
+- 不明な event 名 (typo 等) は CLI で早期 `bail!` ── DB を一切触らずに失敗します。受理する token: `mention` / `direct` / `quote` / `reaction` / `renote` / `follow` / `follow-request` / `all`。
+
+### 13.4 `notification-channel test`
+
+固定文言のテスト通知を 1 件 `delivery_queue` に enqueue します。実 POST は worker のティック次第 (即時ではない)。
+
+```bash
+sakurasato-server notification-channel test --id 1
+```
+
+embed なら `title: "テスト通知"` + 説明文、plain なら `[テスト通知] ...` の `content`。Follow event のペイロード形を流用しているので、表示は「フォロー通知」ではなく明示的に「テスト通知」になります。届かない場合は:
+
+- `delivery_queue` の該当行の `last_error` を `psql` で確認
+- channel の `notify_*` がすべて FALSE になっていないか `list` で確認 (= 全 OFF だと dispatch 側で `WHERE notify_<event> = TRUE` に引っかからず通知が出ない)
+- 通知経路自体は届くか別 event で切り分け: 例えばテスト用に手元から自分の actor へ Follow を投げてみて (= 別端末 / 別アカウント経由) `follow` event が発火するか観察。`enable --id N follow` で対象 event が ON である前提
+
+### 13.5 `notification-channel remove`
+
+`--id` 指定のハード削除。配送中の `delivery_queue` 行には影響しません (= 既に enqueue 済みの通知は worker が撃ち切る)。
+
+```bash
+sakurasato-server notification-channel remove --id 1
+```
+
+---
+
 ## トラブルシューティング
 
 ### TUI から `:lock` を叩いたが反映されない
@@ -424,6 +539,18 @@ postgres の dump 復元しかありません ([DEPLOYMENT.md §7.2 バックア
 ### `move-out` が拒否される (双方向同意検査)
 
 移動先 actor の `alsoKnownAs` に **先に** 自分の ap_id を入れてもらう必要があります。例: Mastodon → Sakurasato の引っ越しなら、まず Mastodon 側 `tootctl accounts merge` か Web UI で alsoKnownAs を設定。詳細は §8.1。
+
+### Discord 通知が届かない
+
+順に確認:
+
+1. `notification-channel list` で対象チャンネルが存在し、`events` 列に対象 event が含まれているか確認 (= `notify_<event> = TRUE` か):
+   - そもそも `list` に出ないなら未登録 → `notification-channel add` で先に作る
+   - 出るが `events=(none)` なら全 event が OFF → `notification-channel enable --id N all` で復帰
+   - 出るが対象 event だけ抜けているなら → `notification-channel enable --id N <event>` で個別 ON
+2. Webhook URL の host が SSRF ガードで遮断されていないか (登録時に弾かれていれば `add` で失敗していますが、運用中に DNS が private IP に倒れたケースは配送時 TOCTOU で弾かれます)。`delivery_queue.last_error` を `psql` で確認。
+3. `delivery_queue.state = 'dead'` で停止していないか。`sakurasato-server deliver --queue-id N` で手動 flush して挙動を確認。
+4. `notification-channel test --id N` でテスト通知を 1 件撃って、worker tick のタイミングと配送経路だけ切り分け。
 
 ---
 

@@ -318,6 +318,11 @@ impl FollowState {
 // のは不適切 (= 1 channel が複数 event を独立に on/off できる必要があり、
 // `HashSet<NotificationEvent>` 形式に倒すと正規化が壊れる)。本構造体は repo
 // 層の型として閉じているのでフィールドアクセスが分散しない。
+//
+// **master `enabled` 列は migration 0014 で撤去された** (元は 2 段スイッチに
+// していたが `--event all` の直感とぶつかり、`toggle` が冪等にならなかった)。
+// チャンネル全停止は `disable --event all` で 7 個 `notify_*` を一斉 FALSE に
+// する運用に統一されている。
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct NotificationChannelRow {
@@ -327,8 +332,6 @@ pub struct NotificationChannelRow {
     /// `embed` (Discord embed JSON) または `plain` (`{"content": "..."}` の
     /// Slack / Misskey fallback)。`CHECK` 制約付きなので不正値は入らない。
     pub format: String,
-    /// master switch (`false` で全 event を黙らせる)。個別 `notify_*` と AND。
-    pub enabled: bool,
     pub notify_mention: bool,
     pub notify_direct: bool,
     pub notify_quote: bool,
@@ -356,7 +359,9 @@ pub enum NotificationEvent {
 }
 
 impl NotificationEvent {
-    /// `delivery_queue.activity.event` で使う wire 表現。
+    /// `delivery_queue.activity.event` で使う **wire 表現** (`snake_case`)。
+    /// 永続化されたペイロードと互換を取る必要があるため変更不可。
+    /// CLI ユーザ向けの表示 (kebab) は [`Self::display_label`] を使う。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Mention => "mention",
@@ -366,6 +371,23 @@ impl NotificationEvent {
             Self::Renote => "renote",
             Self::Follow => "follow",
             Self::FollowRequest => "follow_request",
+        }
+    }
+
+    /// CLI 出力用の表示ラベル (kebab-case)。`from_str` が受ける CLI 入力
+    /// (`follow-request`) と一致するので、スクリプトで CLI 出力を読み取って
+    /// 再入力するときに一貫する。`list` / `enable` / `disable` の成功
+    /// メッセージで共通利用。
+    /// wire / log には [`Self::as_str`] (`snake_case`) を使うこと。
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::Direct => "direct",
+            Self::Quote => "quote",
+            Self::Reaction => "reaction",
+            Self::Renote => "renote",
+            Self::Follow => "follow",
+            Self::FollowRequest => "follow-request",
         }
     }
 
@@ -385,7 +407,9 @@ impl NotificationEvent {
         }
     }
 
-    /// 7 全 variant の配列 (CLI の `toggle --event all` 経路で iterate する用)。
+    /// 7 全 variant の配列。CLI の `enable --event all` / `disable --event all`
+    /// で `set_events` / `set_exact_state` に渡すフル集合、および
+    /// `parse_events` で `all` token を 7 要素に展開するために使う。
     pub fn all() -> &'static [Self] {
         &[
             Self::Mention,

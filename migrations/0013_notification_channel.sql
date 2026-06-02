@@ -23,7 +23,8 @@
 --   footer)。`format = 'plain'` は `{"content": "..."}` のみで Slack の `text`
 --   フィールドとも互換に倒せる fallback。
 -- - 個別 `notify_*` は default TRUE で「とりあえず全イベント通知」をベースに
---   する。個別 off は `notification-channel toggle --event ...` で。
+--   する。個別 off は `notification-channel disable --id N <event>` で
+--   (0014 で master 撤去 + toggle → enable/disable 化)。
 
 CREATE TABLE notification_channel (
     id                       BIGSERIAL    PRIMARY KEY,

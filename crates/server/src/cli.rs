@@ -306,16 +306,28 @@ pub enum NotificationChannelCommand {
     /// ([`crate::net_guard::host_blocked`]) で検査するが、配送時にも再検査する
     /// (DNS 再解決後の TOCTOU 防御)。`name` は CLI / 表示用ラベルで UNIQUE。
     Add(NotificationChannelAddArgs),
-    /// 登録チャンネルを `id`/`name`/`enabled`/`format`/`url ホスト`/`on の event`
-    /// の 1 行で列挙する。**URL 全体は表示しない** (URL が漏れれば第三者が同じ
-    /// チャンネルに任意メッセージを撃てるため)。
+    /// 登録チャンネルを `id`/`name`/`format`/`url ホスト`/`on の event`
+    /// の 1 行で列挙する。**URL 全体は表示しない** (URL が漏れれば第三者が
+    /// 同じチャンネルに任意メッセージを撃てるため)。
     List,
     /// `--id N` でハード削除する。
     Remove(NotificationChannelIdArgs),
-    /// チャンネルの master `enabled` または個別 `notify_<event>` を反転する。
-    /// `--event all` は `enabled` 列を反転、それ以外は対応する `notify_*` を
-    /// 反転する。
-    Toggle(NotificationChannelToggleArgs),
+    /// 指定した event を **ON** に設定する (idempotent / 複数指定可)。
+    ///
+    /// 既定は **部分更新** ── 指定した event だけ TRUE、他列は据え置き。
+    /// `--only` を付けると **完全宣言** ── 指定した event だけ TRUE、
+    /// 他列はすべて FALSE に倒す (= 「希望状態を 1 コマンドで言い切る」)。
+    ///
+    /// 例:
+    /// - `enable --id 1 mention,quote` → mention/quote を ON、他は不変
+    /// - `enable --id 1 --only mention,quote` → mention/quote だけ ON、他は OFF
+    /// - `enable --id 1 all` → 全 7 列 ON
+    Enable(NotificationChannelEnableArgs),
+    /// 指定した event を **OFF** に設定する (idempotent / 複数指定可)。
+    /// 部分更新のみ (= 「全部 OFF にして特定だけ ON」は `enable --only` 側で
+    /// 表現するため、`disable --only` は提供しない)。
+    /// 例: `disable --id 1 reaction` / `disable --id 1 all`。
+    Disable(NotificationChannelEventArgs),
     /// テスト通知 (固定文言の embed/plain) を 1 件 `delivery_queue` に enqueue
     /// する。worker が拾って実 POST する (即時送出は worker のティック次第)。
     Test(NotificationChannelIdArgs),
@@ -342,12 +354,45 @@ pub struct NotificationChannelIdArgs {
     pub id: i64,
 }
 
+/// `disable` の引数。`--id` でチャンネル、positional で event 1 個以上 (部分更新)。
+///
+/// **冪等性**: `disable mention,quote` の 1 呼び出しで `notify_mention` と
+/// `notify_quote` が両方 FALSE になる (= 旧 `toggle` を 2 回叩く運用ではなく、
+/// 「目的状態を 1 回で宣言する」スタイル)。同じ呼び出しを再実行しても結果
+/// は変わらず。
 #[derive(Debug, Args)]
-pub struct NotificationChannelToggleArgs {
+pub struct NotificationChannelEventArgs {
     #[arg(long)]
     pub id: i64,
-    /// `all` / `mention` / `direct` / `quote` / `reaction` / `renote` /
-    /// `follow` / `follow-request` のいずれか。
+    /// 1 個以上の event 名。空白区切りでも `,` 区切りでも、混在でも可。
+    /// 例:
+    /// - `mention`
+    /// - `mention,quote`
+    /// - `mention quote follow`
+    /// - `mention,quote follow,reaction`
+    /// - `all` (= 7 個の `notify_*` を一斉セット。他 event token と併用すると拒否)
+    ///
+    /// 受理する token:
+    /// `mention` / `direct` / `quote` / `reaction` / `renote` / `follow` /
+    /// `follow-request` / `all`。重複は dedup される。
+    #[arg(required = true, num_args = 1.., value_delimiter = ',')]
+    pub events: Vec<String>,
+}
+
+/// `enable` の引数。`disable` と同じ positional events に加え、`--only` で
+/// 「指定 event 以外は OFF に倒す」フル状態宣言モードに切り替えられる。
+#[derive(Debug, Args)]
+pub struct NotificationChannelEnableArgs {
     #[arg(long)]
-    pub event: String,
+    pub id: i64,
+    /// 1 個以上の event 名。`disable` と同じ token (`mention` / `direct` /
+    /// `quote` / `reaction` / `renote` / `follow` / `follow-request` / `all`)
+    /// を受ける。
+    #[arg(required = true, num_args = 1.., value_delimiter = ',')]
+    pub events: Vec<String>,
+    /// **完全宣言モード**。指定した event は TRUE、他列はすべて FALSE に倒す。
+    /// 1 コマンドで希望状態を言い切るとき用 (= 完全冪等 / 完全宣言的)。
+    /// `--only all` は意味が無いので拒否。
+    #[arg(long, default_value_t = false)]
+    pub only: bool,
 }
