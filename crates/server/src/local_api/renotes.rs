@@ -124,8 +124,12 @@ pub async fn create(State(state): State<AppState>, Path(note_id): Path<i64>) -> 
     };
 
     // 既存 row (= 同じ `(note_id, actor_id)` で前回 renote 済み) が返った
-    // ケースは連合通知を再送しない。冪等性。
-    let queued = if row.ap_id == ap_id {
+    // ケースは連合通知を再送しない。冪等性。PR #155 round-2 F4 / round-3 F2:
+    // 既存返却時は RFC 9110 に従って `200 OK` (= 「resource already existed」)、
+    // 新規 insert のときだけ `201 Created` を返す。Location ヘッダはどちらも
+    // 同じパスで OK ── 元 Note の id は変わらない。
+    let is_new = row.ap_id == ap_id;
+    let queued = if is_new {
         let activity =
             build_announce_activity(&local_actor, &note.ap_id, &row.ap_id, row.published_at);
         enqueue_announce_delivery(&state, &local_actor, note.actor_id, &activity).await
@@ -139,8 +143,13 @@ pub async fn create(State(state): State<AppState>, Path(note_id): Path<i64>) -> 
         note_id: row.note_id,
         queued_deliveries: queued,
     };
+    let status = if is_new {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
     let location = format!("/api/v1/notes/{}/renote", row.note_id);
-    let mut response = (StatusCode::CREATED, Json(body)).into_response();
+    let mut response = (status, Json(body)).into_response();
     if let Ok(hv) = HeaderValue::from_str(&location) {
         response
             .headers_mut()
@@ -199,13 +208,20 @@ async fn build_and_dispatch_undo(
         user = local_actor.preferred_username,
         id = row.id,
     );
-    let activity = json!({
+    // PR #155 round-2 F2: Undo wrapper 自体にも audience を載せる ── 一部
+    // 受信実装 (古い Misskey 系 / Pleroma の一部) は外側 to/cc でルーティング
+    // するため、inner Announce にだけ付けても取りこぼされる。
+    let mut activity = json!({
         "@context": "https://www.w3.org/ns/activitystreams",
         "id": undo_id,
         "type": "Undo",
         "actor": local_actor.ap_id,
+        "to": [PUBLIC_AUDIENCE],
         "object": original,
     });
+    if let Some(followers) = local_actor.followers_url.as_ref() {
+        activity["cc"] = json!([followers]);
+    }
 
     // PR #155 review Finding 2: DB 削除を **先** に実行し、失敗時は 503 を
     // 返して enqueue しない ── reactions.rs と異なる方針。順序を逆にすると、
@@ -214,13 +230,31 @@ async fn build_and_dispatch_undo(
     // 起きる。「先に消して enqueue は best-effort で warn」が write-ahead
     // セマンティクスとして安全。enqueue 自体は内部で warn 集約するので、
     // 1 件でも `delivery_queue` insert が成功すれば配送 worker が再試行する。
-    if let Err(err) = repo::announce::delete_by_ap_id(state.pool(), &row.ap_id).await {
-        error!(
-            ?err,
-            announce_id = row.id,
-            "DELETE renote: row delete failed"
-        );
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    //
+    // PR #155 round-2 F1: rows_affected = 0 (= 別 request が先に消した) は
+    // 200 で静かに返し、Undo 再配送をスキップする ── 受信側は同 undo_id を
+    // 冪等に無視するが、`delivery_queue` 行が二重に積まれて worker が無駄
+    // 再試行するのを避ける。
+    match repo::announce::delete_by_ap_id(state.pool(), &row.ap_id).await {
+        Ok(0) => {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "deleted": row.id,
+                    "queued_deliveries": 0,
+                })),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            error!(
+                ?err,
+                announce_id = row.id,
+                "DELETE renote: row delete failed"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     }
     let queued = enqueue_announce_delivery(state, local_actor, note.actor_id, &activity).await;
 
@@ -248,21 +282,41 @@ async fn finalize_undo_with_uri_object(
         user = local_actor.preferred_username,
         id = row.id,
     );
-    let activity = json!({
+    // 主経路と同じく外側 to/cc audience を載せる (PR #155 round-2 F2)。
+    let mut activity = json!({
         "@context": "https://www.w3.org/ns/activitystreams",
         "id": undo_id,
         "type": "Undo",
         "actor": local_actor.ap_id,
+        "to": [PUBLIC_AUDIENCE],
         "object": row.ap_id,
     });
+    if let Some(followers) = local_actor.followers_url.as_ref() {
+        activity["cc"] = json!([followers]);
+    }
     // PR #155 review Finding 2: 主経路と同じく DB 削除を先に。
-    if let Err(err) = repo::announce::delete_by_ap_id(state.pool(), &row.ap_id).await {
-        error!(
-            ?err,
-            announce_id = row.id,
-            "DELETE renote (fallback): row delete failed"
-        );
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    // PR #155 round-2 F1: rows_affected = 0 は 200 で静かに返す (= 主経路と
+    // 同じ idempotent 動作)。
+    match repo::announce::delete_by_ap_id(state.pool(), &row.ap_id).await {
+        Ok(0) => {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "deleted": row.id,
+                    "queued_deliveries": 0,
+                })),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            error!(
+                ?err,
+                announce_id = row.id,
+                "DELETE renote (fallback): row delete failed"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     }
     // note が消えていれば note 作者 inbox の解決もできない。followers だけに送る。
     let queued = enqueue_announce_delivery(state, local_actor, local_actor.id, &activity).await;

@@ -353,7 +353,9 @@ async fn create_renote_duplicate_is_idempotent(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(second.status(), StatusCode::CREATED);
+    // PR #155 round-2 F4 / round-3 F2: 既存返却は RFC 9110 に従って 200 OK。
+    // 新規 insert (1 回目) のみ 201 Created。
+    assert_eq!(second.status(), StatusCode::OK);
     let second_json = read_json(second).await;
     assert_eq!(second_json["id"], first_id, "same announce row returned");
     assert_eq!(second_json["queued_deliveries"], 0, "no re-delivery");
@@ -367,8 +369,9 @@ async fn delete_renote_removes_announce_row(pool: PgPool) {
         sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
 
-    // POST → DELETE。
-    let _ = app
+    // POST → DELETE。PR #155 round-2 F5: POST レスポンスも status を assert
+    // して diagnostic を明確にする (= 失敗時の起点が分かりやすい)。
+    let post_resp = app
         .clone()
         .oneshot(
             Request::post(format!("/api/v1/notes/{note_id}/renote"))
@@ -378,6 +381,7 @@ async fn delete_renote_removes_announce_row(pool: PgPool) {
         )
         .await
         .unwrap();
+    assert_eq!(post_resp.status(), StatusCode::CREATED);
 
     let resp = app
         .oneshot(
@@ -395,6 +399,66 @@ async fn delete_renote_removes_announce_row(pool: PgPool) {
         .await
         .unwrap();
     assert!(gone.is_none(), "announce row must be deleted");
+}
+
+/// PR #155 round-2 F1 (Medium): 並行 DELETE で先勝ちした後の Ok(0) 経路が
+/// 二重 Undo 配送に至らないことを保証する。本テストは「同 note を 2 回
+/// DELETE」で代理し、2 回目が 200 OK + `queued_deliveries = 0` で返ること
+/// と `announce` 行が増えないことを assert する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delete_renote_twice_is_idempotent(pool: PgPool) {
+    let (alice_id, note_id) = seed_alice_and_bob_note(&pool, Visibility::Public).await;
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let post = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/notes/{note_id}/renote"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post.status(), StatusCode::CREATED);
+
+    // 1 回目 DELETE: 200 OK で削除。
+    let first = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/notes/{note_id}/renote"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // 2 回目 DELETE: announce row はもう無いので 404 (get_by_pair 段で弾く)。
+    // ※ Ok(0) 経路はサーバ内のレースで `get_by_pair` が成功した後に他の
+    //   request が先に消すケースで発火する ── 本テストは直列で `get_by_pair`
+    //   段から 404 になることを示し、Ok(0) ガードが「同 ap_id を 2 度叩いた
+    //   ときに 500 を返さない」フォールバックとして機能することを assert。
+    let second = app
+        .oneshot(
+            Request::delete(format!("/api/v1/notes/{note_id}/renote"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::NOT_FOUND);
+
+    // DB に行は残っていない。
+    let gone = repo::announce::get_by_pair(&pool, note_id, alice_id)
+        .await
+        .unwrap();
+    assert!(gone.is_none());
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
@@ -447,8 +511,8 @@ async fn home_timeline_reflects_viewer_renoted(pool: PgPool) {
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
 
-    // POST renote。
-    let _ = app
+    // POST renote。PR #155 round-2 F5: POST status を assert。
+    let post = app
         .clone()
         .oneshot(
             Request::post(format!("/api/v1/notes/{note_id}/renote"))
@@ -458,9 +522,11 @@ async fn home_timeline_reflects_viewer_renoted(pool: PgPool) {
         )
         .await
         .unwrap();
+    assert_eq!(post.status(), StatusCode::CREATED);
 
     // home timeline で `announce_count = 1` / `viewer_renoted = true` を確認。
     let resp = app
+        .clone()
         .oneshot(
             Request::get("/api/v1/timeline/home")
                 .header(header::AUTHORIZATION, format!("Bearer {raw}"))
@@ -478,4 +544,38 @@ async fn home_timeline_reflects_viewer_renoted(pool: PgPool) {
         .expect("target note not in timeline");
     assert_eq!(target["announce_count"], 1);
     assert_eq!(target["viewer_renoted"], true);
+
+    // PR #155 round-2 F6: DELETE 後に home timeline 集計が 0 / false に
+    // 戻ることを確認。`counts_for_notes` の削除後集計バグを検出する
+    // 回帰テスト。
+    let del = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/notes/{note_id}/renote"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::OK);
+
+    let resp2 = app
+        .oneshot(
+            Request::get("/api/v1/timeline/home")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json2 = read_json(resp2).await;
+    let target2 = json2["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"].as_i64() == Some(note_id))
+        .expect("target note still in timeline");
+    assert_eq!(target2["announce_count"], 0);
+    assert_eq!(target2["viewer_renoted"], false);
 }
