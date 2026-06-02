@@ -87,9 +87,12 @@ impl NoteDetailScreen {
         if !self.note.reactions.is_empty() {
             n += 2;
         }
-        // 絵文字行
+        // 絵文字行: ヘッダ 1 + emoji 件数を 1 行あたり 8 個と見積もった行数。
+        // round-4 review F3: 大量の emoji を持つ Note で過小推定にならない
+        // ようにする (= 折りたたみ後の wrap で行数が増えるため)。
         if !self.note.emojis.is_empty() {
-            n += 2;
+            let emoji_lines = self.note.emojis.len().div_ceil(8).max(1);
+            n += 1 + emoji_lines;
         }
         // 添付ヘッダ + 各 1 行
         if !self.note.attachments.is_empty() {

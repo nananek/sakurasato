@@ -195,11 +195,12 @@ pub(crate) fn parse_attachments(raw: &JsonValue) -> Vec<AttachmentDto> {
             let media_type = v
                 .get("mediaType")
                 .and_then(JsonValue::as_str)
+                .filter(|s| s.len() <= MEDIA_TYPE_MAX_BYTES)
                 .map(str::to_string);
             let alt = v
                 .get("name")
                 .and_then(JsonValue::as_str)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && s.len() <= ATTACHMENT_ALT_MAX_BYTES)
                 .map(str::to_string);
             let width = v.get("width").and_then(JsonValue::as_u64).and_then(|w| {
                 if w > u64::from(u32::MAX) {
@@ -223,6 +224,7 @@ pub(crate) fn parse_attachments(raw: &JsonValue) -> Vec<AttachmentDto> {
                 height,
             })
         })
+        .take(ATTACHMENTS_PER_NOTE_MAX)
         .collect()
 }
 
@@ -233,6 +235,24 @@ pub(crate) fn parse_attachments(raw: &JsonValue) -> Vec<AttachmentDto> {
 /// なく `chars().count()` で測ることで、CJK 文字 (1 文字 3 byte) でも文字数
 /// として 128 まで通る (= 識別子としての意味で 128 文字、UTF-8 byte で 384)。
 const SHORTCODE_MAX_CHARS: usize = 128;
+
+/// 1 Note あたりの添付件数上限。Mastodon は 4 件、Misskey も 16 件程度が
+/// 通常で、これを超える Note は実用上ない。連合先が 10,000 件の添付を
+/// 送り込んで TUI メモリ / Line span を肥大化させるのを防ぐ防御層。
+const ATTACHMENTS_PER_NOTE_MAX: usize = 32;
+
+/// 1 Note あたりの emoji 件数上限。連合先からの `DoS` 風入力を弾く防御層。
+/// Mastodon / Misskey の通常 Note では 数〜十数件が上限なので余裕を持たせて 128。
+const EMOJIS_PER_NOTE_MAX: usize = 128;
+
+/// 添付 alt text のバイト長上限。AP `name` は本来サイズ制約が無いため、
+/// 連合先が極端に長い文字列を送ってきても TUI Span が爆発しないよう截る。
+/// 識別子ではなく説明文なので chars ではなく byte で十分 (= UTF-8 boundary は
+/// 別途、保存時に保証されている前提)。
+const ATTACHMENT_ALT_MAX_BYTES: usize = 1500;
+
+/// `mediaType` 文字列の上限。実用的な MIME type は 100 byte 以内に収まる。
+const MEDIA_TYPE_MAX_BYTES: usize = 100;
 
 /// `note.tags` JSONB を走査し `type == "Emoji"` の要素だけ [`EmojiDto`] に
 /// 変換する。AP `Emoji` は `name` (shortcode) と `icon.url` を持つ。
@@ -270,6 +290,7 @@ pub(crate) fn parse_emojis(raw: &JsonValue, local_host: &str) -> Vec<EmojiDto> {
             let media_type = icon
                 .and_then(|i| i.get("mediaType"))
                 .and_then(JsonValue::as_str)
+                .filter(|s| s.len() <= MEDIA_TYPE_MAX_BYTES)
                 .map(str::to_string);
             let is_local = image_url
                 .as_deref()
@@ -283,6 +304,7 @@ pub(crate) fn parse_emojis(raw: &JsonValue, local_host: &str) -> Vec<EmojiDto> {
                 is_local,
             })
         })
+        .take(EMOJIS_PER_NOTE_MAX)
         .collect()
 }
 
@@ -571,6 +593,58 @@ mod tests {
         let out = parse_emojis(&raw, "local.test");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].shortcode, name);
+    }
+
+    #[test]
+    fn parse_attachments_caps_count() {
+        // round-4 review F3: 1 Note あたり 32 件で truncate (悪意ある DoS 入力)。
+        let mut arr = Vec::new();
+        for i in 0..200 {
+            arr.push(json!({ "url": format!("https://e.example/{i}.webp") }));
+        }
+        let raw = JsonValue::Array(arr);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), ATTACHMENTS_PER_NOTE_MAX);
+    }
+
+    #[test]
+    fn parse_emojis_caps_count() {
+        let mut arr = Vec::new();
+        for i in 0..500 {
+            arr.push(json!({ "type": "Emoji", "name": format!(":e{i}:") }));
+        }
+        let raw = JsonValue::Array(arr);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), EMOJIS_PER_NOTE_MAX);
+    }
+
+    #[test]
+    fn parse_attachments_caps_alt_length() {
+        // 1500 byte ちょうどは通し、1501 byte は drop。
+        let alt_ok = "a".repeat(ATTACHMENT_ALT_MAX_BYTES);
+        let alt_too_long = "a".repeat(ATTACHMENT_ALT_MAX_BYTES + 1);
+        let raw = json!([
+            {"url": "https://e.example/a.webp", "name": alt_ok.clone()},
+            {"url": "https://e.example/b.webp", "name": alt_too_long},
+        ]);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].alt.as_deref(), Some(alt_ok.as_str()));
+        assert!(out[1].alt.is_none(), "overly long alt should be dropped");
+    }
+
+    #[test]
+    fn parse_attachments_caps_media_type_length() {
+        let mt_too_long = "image/".to_string() + &"x".repeat(200);
+        let raw = json!([
+            {"url": "https://e.example/x.webp", "mediaType": mt_too_long}
+        ]);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].media_type.is_none(),
+            "overly long mediaType should be dropped"
+        );
     }
 
     #[test]

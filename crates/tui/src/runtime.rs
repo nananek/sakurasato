@@ -394,13 +394,42 @@ async fn apply_action(
             submit_note(app, api).await;
         }
         Action::Scroll(delta) => {
-            if delta > 0 {
-                for _ in 0..delta {
-                    app.select_next();
+            // round-4 review Finding 2: モーダル / overlay focus 中はマウス
+            // ホイールが背後 Timeline に抜けないようガード。Note 詳細では
+            // ホイールを `NoteDetailScrollDown/Up` に振り向ける ── UX 改善
+            // も兼ねる。他 overlay (Suppression / Picker / EmojiSearch /
+            // AltPrompt / Command) はホイール無視で十分。
+            match app.focus {
+                Focus::NoteDetail => {
+                    if let Some(s) = app.note_detail.as_mut() {
+                        if delta > 0 {
+                            for _ in 0..delta {
+                                s.scroll_down();
+                            }
+                        } else {
+                            for _ in 0..(-delta) {
+                                s.scroll_up();
+                            }
+                        }
+                    }
                 }
-            } else {
-                for _ in 0..(-delta) {
-                    app.select_prev();
+                Focus::Suppression
+                | Focus::Picker
+                | Focus::EmojiSearch
+                | Focus::AltPrompt
+                | Focus::Command => {
+                    // overlay 中は背後 Timeline を動かさない。
+                }
+                _ => {
+                    if delta > 0 {
+                        for _ in 0..delta {
+                            app.select_next();
+                        }
+                    } else {
+                        for _ in 0..(-delta) {
+                            app.select_prev();
+                        }
+                    }
                 }
             }
         }

@@ -1596,7 +1596,11 @@ fn render_note_detail(
         lines.push(Line::from(""));
         lines.push(reaction_line(note, palette, ""));
     }
-    if !note.emojis.is_empty() {
+    // round-4 review Finding 1: 視覚刺激抑制 `suppression.emoji` が off の
+    // ときは emoji セクションを丸ごとスキップする (= CLAUDE.md §5.2
+    // 「カスタム絵文字表示 on/off」要件)。`emoji_gallery_line` の
+    // docstring も「on のとき」と書いているが実装側で逃げていなかった。
+    if !note.emojis.is_empty() && app.suppression.emoji {
         lines.push(Line::from(""));
         lines.push(emoji_gallery_line(note, palette));
     }
