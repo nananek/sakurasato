@@ -183,7 +183,15 @@ pub(crate) fn parse_attachments(raw: &JsonValue) -> Vec<AttachmentDto> {
     };
     arr.iter()
         .filter_map(|v| {
-            let url = v.get("url").and_then(JsonValue::as_str)?.to_string();
+            // server 側で URL のスキームを `http(s)://` に絞る ── TUI 側
+            // `image_cache::vet_url` でも同様のチェックがあるが、ここで
+            // 落とすことで `file://` / `javascript:` / `data:` 等が API
+            // レスポンス JSON に乗ること自体を防ぐ (= 多層防御)。
+            let url = v
+                .get("url")
+                .and_then(JsonValue::as_str)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))?
+                .to_string();
             let media_type = v
                 .get("mediaType")
                 .and_then(JsonValue::as_str)
@@ -218,11 +226,13 @@ pub(crate) fn parse_attachments(raw: &JsonValue) -> Vec<AttachmentDto> {
         .collect()
 }
 
-/// shortcode (= AP `Emoji.name`) のバイト長上限。AP には明示の規約が無いが
+/// shortcode (= AP `Emoji.name`) の**文字数**上限。AP には明示の規約が無いが
 /// Mastodon は 50 文字未満、Misskey は 100 文字程度を想定している ── 連合
 /// 先が極端に長い文字列を送り込むと TUI レンダリングで Line span が膨らみ
-/// レイアウト計算に響くため、防御的に 128 で切る。
-const SHORTCODE_MAX_LEN: usize = 128;
+/// レイアウト計算に響くため、防御的に 128 で切る。`str::len()` (= byte) では
+/// なく `chars().count()` で測ることで、CJK 文字 (1 文字 3 byte) でも文字数
+/// として 128 まで通る (= 識別子としての意味で 128 文字、UTF-8 byte で 384)。
+const SHORTCODE_MAX_CHARS: usize = 128;
 
 /// `note.tags` JSONB を走査し `type == "Emoji"` の要素だけ [`EmojiDto`] に
 /// 変換する。AP `Emoji` は `name` (shortcode) と `icon.url` を持つ。
@@ -245,7 +255,7 @@ pub(crate) fn parse_emojis(raw: &JsonValue, local_host: &str) -> Vec<EmojiDto> {
                 .get("name")
                 .and_then(JsonValue::as_str)
                 .filter(|s| !s.is_empty())
-                .filter(|s| s.len() <= SHORTCODE_MAX_LEN)?
+                .filter(|s| s.chars().count() <= SHORTCODE_MAX_CHARS)?
                 .to_string();
             let icon = v.get("icon");
             let image_url = icon
@@ -452,7 +462,7 @@ mod tests {
 
     #[test]
     fn parse_attachments_empty_alt_dropped() {
-        let raw = json!([{ "type": "Document", "url": "u", "name": "" }]);
+        let raw = json!([{ "type": "Document", "url": "https://e.example/x.webp", "name": "" }]);
         let out = parse_attachments(&raw);
         assert!(out[0].alt.is_none());
     }
@@ -461,6 +471,22 @@ mod tests {
     fn parse_attachments_non_array_returns_empty() {
         assert!(parse_attachments(&JsonValue::Null).is_empty());
         assert!(parse_attachments(&json!({"key": "val"})).is_empty());
+    }
+
+    #[test]
+    fn parse_attachments_rejects_non_http_schemes() {
+        // round-2 review P3: `file://` / `javascript:` / `data:` などを
+        // server 側で落とす (多層防御)。
+        let raw = json!([
+            { "url": "file:///etc/passwd" },
+            { "url": "javascript:alert(1)" },
+            { "url": "data:text/html,<script>" },
+            { "url": "ftp://e.example/file" },
+            { "url": "https://e.example/ok.webp" },
+        ]);
+        let out = parse_attachments(&raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].url, "https://e.example/ok.webp");
     }
 
     #[test]
@@ -524,22 +550,40 @@ mod tests {
 
     #[test]
     fn parse_emojis_drops_overly_long_shortcode() {
-        // round-1 review ⚠️ 1: shortcode に長さ上限を設ける (128 byte)。
+        // round-1 review ⚠️ 1: shortcode に長さ上限を設ける。
         let long_name = ":".to_string() + &"a".repeat(200) + ":";
         let raw = json!([{ "type": "Emoji", "name": long_name }]);
         let out = parse_emojis(&raw, "local.test");
-        assert!(out.is_empty(), "200-byte shortcode should be dropped");
+        assert!(out.is_empty(), "200-char shortcode should be dropped");
     }
 
     #[test]
     fn parse_emojis_keeps_exactly_max_len_shortcode() {
-        // 境界: 128 byte ちょうどは通す (上限は inclusive)。
-        let name = ":".to_string() + &"a".repeat(126) + ":"; // 128 bytes total
-        assert_eq!(name.len(), 128);
+        // 境界: 128 文字ちょうどは通す (上限は inclusive)。
+        let name = ":".to_string() + &"a".repeat(126) + ":"; // 128 chars total
+        assert_eq!(name.chars().count(), 128);
         let raw = json!([{ "type": "Emoji", "name": name.clone() }]);
         let out = parse_emojis(&raw, "local.test");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].shortcode, name);
+    }
+
+    #[test]
+    fn parse_emojis_shortcode_cap_counts_chars_not_bytes() {
+        // round-2 review C2: 上限は **文字数** であって byte 数ではない。
+        // CJK (1 文字 = 3 byte) でも 128 文字までは通す。byte 比較だと 43
+        // 文字 (= 129 byte) で落ちるが、char 比較なら通る。
+        let cjk_43 = "あ".repeat(43);
+        assert!(cjk_43.len() > 128, "CJK 43 chars exceeds 128 bytes");
+        assert!(cjk_43.chars().count() <= 128);
+        let raw = json!([{ "type": "Emoji", "name": cjk_43.clone() }]);
+        let out = parse_emojis(&raw, "local.test");
+        assert_eq!(out.len(), 1);
+        // 逆に 129 文字 (= 387 byte) は char 上限超で drop。
+        let cjk_129 = "あ".repeat(129);
+        let raw2 = json!([{ "type": "Emoji", "name": cjk_129 }]);
+        let out2 = parse_emojis(&raw2, "local.test");
+        assert!(out2.is_empty());
     }
 
     #[test]

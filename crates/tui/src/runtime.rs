@@ -1419,14 +1419,22 @@ fn handle_upload_outcome(app: &mut App, outcome: UploadOutcome) {
 }
 
 fn handle_click(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
-    // [[m9-pr2-review]] Finding 1: overlay 系 focus (Suppression / Picker /
-    // EmojiSearch / AltPrompt / Command) の最中は背後パネルへの hit test を
-    // 抜けさせない ── クリックでサイレントに overlay が閉じてしまい、背後の
-    // ノートが選択されたり compose にフォーカスが奪われるのを防ぐ。Help は
-    // overlay 中のクリックで明示的に閉じる従来挙動を維持 (既存テストの依存)。
+    // [[m9-pr2-review]] Finding 1 + #133 PR3 round-2 C1: overlay 系 focus
+    // (Suppression / Picker / EmojiSearch / AltPrompt / Command / NoteDetail)
+    // の最中は背後パネルへの hit test を抜けさせない ── クリックでサイレント
+    // に overlay が閉じてしまい、背後のノートが選択されたり compose に
+    // フォーカスが奪われるのを防ぐ。`NoteDetail` を入れずに置くと、モーダル
+    // 外クリックで focus だけが Timeline に書き換わり `app.note_detail` は
+    // ゴミデータとして残る split state を起こす。Help は overlay 中の
+    // クリックで明示的に閉じる従来挙動を維持 (既存テストの依存)。
     if matches!(
         app.focus,
-        Focus::Suppression | Focus::Picker | Focus::EmojiSearch | Focus::AltPrompt | Focus::Command,
+        Focus::Suppression
+            | Focus::Picker
+            | Focus::EmojiSearch
+            | Focus::AltPrompt
+            | Focus::Command
+            | Focus::NoteDetail,
     ) {
         return;
     }

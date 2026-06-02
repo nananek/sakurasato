@@ -1684,11 +1684,14 @@ fn render_note_detail_preview(
         .media_type
         .as_deref()
         .is_some_and(|m| m.starts_with("image/"));
+    // revealed vec が attachments.len() で初期化されるので index 範囲外は
+    // 通常起きないが、防御的に **fail-closed** = 範囲外なら blur 扱い。
+    // `unwrap_or(true)` だと万一 sensitive Note の添付が無音で見えてしまう。
     let revealed = state
         .revealed
         .get(state.selected_attachment)
         .copied()
-        .unwrap_or(true);
+        .unwrap_or(false);
     if !is_image {
         let msg = format!("  [non-image attachment: {}]", att.url);
         frame.render_widget(

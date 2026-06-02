@@ -65,6 +65,11 @@ impl NoteDetailScreen {
     /// 行数で算出 ── 実描画では terminal 幅で wrap が増えるが、wrap を
     /// 過剰に多く見積もると無効スクロールが発生するので「下界」側の
     /// 見積もりに留める。
+    ///
+    /// TODO (PR #154 round-2 review P4): 長 URL や CJK 長文を含む Note では
+    /// wrap で物理行数が増え、推定値が小さすぎて最終行に到達できないことが
+    /// ある。render 側で実描画の行数を `state` にフィードバックする仕組みを
+    /// 別 issue で検討する。
     fn estimated_max_scroll(&self) -> usize {
         // 時刻 1 + permalink 0/1
         let mut n: usize = 1 + usize::from(self.note.url.is_some());

@@ -162,8 +162,10 @@ impl ImageCache {
     /// **最初の variant の結果が再利用される**。お一人様 TUI ではアバター・
     /// 絵文字・添付で URL が重複する場面は想定されない (= 添付は AP `Document`
     /// 由来、絵文字は `Emoji.icon.url` 由来、actor icon は `actor.icon_url`
-    /// 由来で名前空間が衝突しない)。将来衝突を許す場合は cache key を
-    /// `(url, variant)` に拡張する。
+    /// 由来で名前空間が衝突しない)。リモート actor が icon と Note 添付に
+    /// 同じ URL を使った場合は、先に取得された側の variant が再利用されて
+    /// しまう ── PR #154 round-2 review P2 で指摘。将来衝突を許す場合は
+    /// cache key を `(url, variant)` に拡張する (= TODO、別 issue)。
     pub fn ensure_with_variant(&self, url: &str, size: Rect, variant: &'static str) {
         let (Some(picker), Some(api)) = (self.picker.clone(), self.api.clone()) else {
             return;
