@@ -117,24 +117,7 @@ pub(crate) async fn handle_create(
         .with_context(|| format!("insert remote note {note_ap_id}"))
         .map_err(DispatchError::Internal)?;
 
-    // Quote 検出: `quoteUrl` / `quoteUri` / `_misskey_quote` のいずれかが
-    // 我々 local の note を指していたら quote 通知を発火する材料に使う。
-    // 失敗 (DB 接続障害) は webhook 通知の問題に閉じ込めて本筋を巻き込まない
-    // — 通知発火段が握り潰す前提で、ここでは `None` 扱いで先に進む。
-    let quote_target = match extract_quote_target(state, obj).await {
-        Ok(q) => q,
-        Err(err) => {
-            debug!(
-                ?err,
-                "Create: quote target lookup failed; continuing without quote notification"
-            );
-            None
-        }
-    };
-    let is_local_quote = match quote_target.as_ref() {
-        Some(q) if q.is_local => local_actor_id_opt(state).await == Some(q.actor_id),
-        _ => false,
-    };
+    let (quote_target, is_local_quote) = resolve_quote_target(state, obj).await;
 
     info!(
         note_id = inserted.id,
@@ -166,6 +149,30 @@ pub(crate) async fn handle_create(
     .await;
 
     Ok(())
+}
+
+/// 引用先 note を解決し、それが我々 local actor の local note を指しているか
+/// (= `is_local_quote`) を判定して返す。DB エラーは debug ログだけ残して
+/// `None` 扱いで進む ── quote 通知は本筋の Create 受領を巻き込まない。
+async fn resolve_quote_target(
+    state: &AppState,
+    obj: &serde_json::Map<String, JsonValue>,
+) -> (Option<NoteRow>, bool) {
+    let quote_target = match extract_quote_target(state, obj).await {
+        Ok(q) => q,
+        Err(err) => {
+            debug!(
+                ?err,
+                "Create: quote target lookup failed; continuing without quote notification"
+            );
+            None
+        }
+    };
+    let is_local_quote = match quote_target.as_ref() {
+        Some(q) if q.is_local => local_actor_id_opt(state).await == Some(q.actor_id),
+        _ => false,
+    };
+    (quote_target, is_local_quote)
 }
 
 /// `quoteUrl` / `quoteUri` / `_misskey_quote` のうち最初に見つかった URI で
