@@ -25,6 +25,7 @@ mod tests {
         // 0010 note_edited_at (M11: Update Note 受信時刻)
         // 0011 announce (M11: Boost 受信)
         // 0012 actor_manually_approves (M12 / Issue #66: 鍵アカフラグ)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 12);
+        // 0013 notification_channel (Discord 互換 webhook 通知の宛先テーブル)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 13);
     }
 }

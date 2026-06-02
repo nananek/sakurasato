@@ -307,6 +307,118 @@ impl FollowState {
     }
 }
 
+/// Row of the `notification_channel` table.
+///
+/// Discord 互換 webhook の宛先 1 件。`url` が漏れると第三者が同じチャンネルに
+/// 任意メッセージを撃てる (= なりすまし) ので、`Serialize` に乗せても問題ない
+/// 範囲か呼び出し側で見ること。現状は管理 CLI 経由でしか読み書きされない。
+//
+// clippy::struct_excessive_bools: 7 個の `notify_*` フラグは「通知 event 種別」
+// を 1:1 で列挙する DB 列のミラーであり、enum / state machine に置き換える
+// のは不適切 (= 1 channel が複数 event を独立に on/off できる必要があり、
+// `HashSet<NotificationEvent>` 形式に倒すと正規化が壊れる)。本構造体は repo
+// 層の型として閉じているのでフィールドアクセスが分散しない。
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct NotificationChannelRow {
+    pub id: i64,
+    pub name: String,
+    pub url: String,
+    /// `embed` (Discord embed JSON) または `plain` (`{"content": "..."}` の
+    /// Slack / Misskey fallback)。`CHECK` 制約付きなので不正値は入らない。
+    pub format: String,
+    /// master switch (`false` で全 event を黙らせる)。個別 `notify_*` と AND。
+    pub enabled: bool,
+    pub notify_mention: bool,
+    pub notify_direct: bool,
+    pub notify_quote: bool,
+    pub notify_reaction: bool,
+    pub notify_renote: bool,
+    pub notify_follow: bool,
+    pub notify_follow_request: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 通知イベント種別。`notification_channel.notify_<event>` 列と 1:1 対応し、
+/// `delivery_queue.activity` JSONB の `"event"` フィールドに `as_str` の値で
+/// 埋め込む。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationEvent {
+    Mention,
+    Direct,
+    Quote,
+    Reaction,
+    Renote,
+    Follow,
+    FollowRequest,
+}
+
+impl NotificationEvent {
+    /// `delivery_queue.activity.event` で使う wire 表現。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::Direct => "direct",
+            Self::Quote => "quote",
+            Self::Reaction => "reaction",
+            Self::Renote => "renote",
+            Self::Follow => "follow",
+            Self::FollowRequest => "follow_request",
+        }
+    }
+
+    /// 対応する `notification_channel.notify_*` 列名。`list_enabled_for_event`
+    /// の WHERE 句に動的列名で使うために露出する。**ユーザ入力に対しては絶対
+    /// に使わないこと** (`from_str` で enum に倒してから本関数を経由する経路
+    /// にする ── enum 値は静的なので SQL injection の入口にならない)。
+    pub fn column_name(self) -> &'static str {
+        match self {
+            Self::Mention => "notify_mention",
+            Self::Direct => "notify_direct",
+            Self::Quote => "notify_quote",
+            Self::Reaction => "notify_reaction",
+            Self::Renote => "notify_renote",
+            Self::Follow => "notify_follow",
+            Self::FollowRequest => "notify_follow_request",
+        }
+    }
+
+    /// 7 全 variant の配列 (CLI の `toggle --event all` 経路で iterate する用)。
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Mention,
+            Self::Direct,
+            Self::Quote,
+            Self::Reaction,
+            Self::Renote,
+            Self::Follow,
+            Self::FollowRequest,
+        ]
+    }
+}
+
+impl std::str::FromStr for NotificationEvent {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mention" => Ok(Self::Mention),
+            "direct" => Ok(Self::Direct),
+            "quote" => Ok(Self::Quote),
+            "reaction" => Ok(Self::Reaction),
+            "renote" => Ok(Self::Renote),
+            "follow" => Ok(Self::Follow),
+            // CLI は kebab-case / snake_case 両受け (clap が `--event follow-request` を渡してくる)。
+            "follow_request" | "follow-request" => Ok(Self::FollowRequest),
+            other => Err(format!(
+                "unknown notification event {other:?}; expected one of mention|direct|quote|reaction|renote|follow|follow-request"
+            )),
+        }
+    }
+}
+
 /// Delivery-queue state (mirrors `delivery_queue.state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

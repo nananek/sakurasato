@@ -77,6 +77,18 @@ pub enum Command {
     /// 積み、state を `accepted` に遷移。reject は Reject activity を積み、
     /// state を `rejected` に遷移。
     FollowRequest(FollowRequestArgs),
+    /// Manage Discord 互換 webhook 通知チャンネル。
+    ///
+    /// 受信 (mention / DM / quote / reaction / renote / follow / follow-request)
+    /// を Discord (および Slack / Misskey 互換 webhook) に push 通知する宛先を
+    /// 管理する。お一人様サーバには Web UI が無いので「自分宛の何かが来た」
+    /// ことを外部で気付く経路として用意している。
+    ///
+    /// 実 POST は既存 `delivery_queue` 経由 (= retry / backoff / dead 状態機械
+    /// を AP 配送と共有)。delivery worker は `activity.type` が `Webhook:`
+    /// prefix の行に対しては HTTP 署名を skip して `application/json` で
+    /// `payload` を送る。
+    NotificationChannel(NotificationChannelArgs),
 }
 
 #[derive(Debug, Args)]
@@ -280,4 +292,62 @@ pub struct FollowRequestMutateArgs {
     /// `follow.id` (= `follow-request list` で表示される number)。
     #[arg(long)]
     pub id: i64,
+}
+
+#[derive(Debug, Args)]
+pub struct NotificationChannelArgs {
+    #[command(subcommand)]
+    pub command: NotificationChannelCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NotificationChannelCommand {
+    /// Webhook URL を登録する。`url` は登録時に SSRF ガード
+    /// ([`crate::net_guard::host_blocked`]) で検査するが、配送時にも再検査する
+    /// (DNS 再解決後の TOCTOU 防御)。`name` は CLI / 表示用ラベルで UNIQUE。
+    Add(NotificationChannelAddArgs),
+    /// 登録チャンネルを `id`/`name`/`enabled`/`format`/`url ホスト`/`on の event`
+    /// の 1 行で列挙する。**URL 全体は表示しない** (URL が漏れれば第三者が同じ
+    /// チャンネルに任意メッセージを撃てるため)。
+    List,
+    /// `--id N` でハード削除する。
+    Remove(NotificationChannelIdArgs),
+    /// チャンネルの master `enabled` または個別 `notify_<event>` を反転する。
+    /// `--event all` は `enabled` 列を反転、それ以外は対応する `notify_*` を
+    /// 反転する。
+    Toggle(NotificationChannelToggleArgs),
+    /// テスト通知 (固定文言の embed/plain) を 1 件 `delivery_queue` に enqueue
+    /// する。worker が拾って実 POST する (即時送出は worker のティック次第)。
+    Test(NotificationChannelIdArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NotificationChannelAddArgs {
+    /// 表示・CLI 識別用のラベル (例: "discord-personal")。
+    #[arg(long)]
+    pub name: String,
+    /// Webhook URL。public IP / 公開ドメインのみ。private / loopback /
+    /// link-local / reserved は SSRF ガードで遮断される。
+    #[arg(long)]
+    pub url: String,
+    /// `embed` (Discord embed JSON、既定) または `plain` (Slack / Misskey
+    /// 互換 fallback の `{"content": "..."}`)。
+    #[arg(long, default_value = "embed")]
+    pub format: String,
+}
+
+#[derive(Debug, Args)]
+pub struct NotificationChannelIdArgs {
+    #[arg(long)]
+    pub id: i64,
+}
+
+#[derive(Debug, Args)]
+pub struct NotificationChannelToggleArgs {
+    #[arg(long)]
+    pub id: i64,
+    /// `all` / `mention` / `direct` / `quote` / `reaction` / `renote` /
+    /// `follow` / `follow-request` のいずれか。
+    #[arg(long)]
+    pub event: String,
 }

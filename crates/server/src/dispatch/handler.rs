@@ -182,6 +182,8 @@ pub(crate) async fn handle_follow(
                 followed = %followed.ap_id,
                 "follow-request received (manually_approves_followers); awaiting CLI approval",
             );
+            // 鍵アカ pending: 承認待ち通知を webhook に流す (fire-and-forget)。
+            crate::notification::dispatch::notify_follow_request(state, signer).await;
             return Ok(());
         }
     }
@@ -219,6 +221,13 @@ pub(crate) async fn handle_follow(
         followed = %followed.ap_id,
         "Follow accepted; Accept queued for delivery",
     );
+
+    // Auto-accept 経路の通知。retry / mutual で `row.state` が既に `Accepted`
+    // の場合も通知する ── 相手側 UI で「pending のまま」になっていた状態が
+    // 再 Accept されたことを記録しておきたいので。煩ければ `notify_follow` 列
+    // を off にする運用。
+    crate::notification::dispatch::notify_follow(state, signer).await;
+
     Ok(())
 }
 

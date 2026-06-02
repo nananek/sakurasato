@@ -286,6 +286,24 @@ async fn attempt_post(
         });
     }
 
+    // **Webhook 通知の分岐**: `activity.type` が `"Webhook:"` prefix なら、
+    // ActivityPub の HTTP 署名は付けず、`payload` サブツリーを
+    // `application/json` で POST する ── Discord / Slack / Misskey 互換 webhook
+    // への通知配送 (`crate::notification::dispatch`)。
+    //
+    // net_guard / self-host 検査は上で通常経路と同じく適用済み。`sender` の鍵は
+    // 触らないが、`sender_actor_id` 列は NOT NULL 制約で埋まっている前提
+    // (notification dispatch 側で local actor の id を入れている)。
+    let activity_type = row
+        .activity
+        .0
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if activity_type.starts_with("Webhook:") {
+        return attempt_post_webhook(state, &row.activity.0, url).await;
+    }
+
     // `serde_json::Value` のシリアライズは実質失敗しないが、`expect` だと
     // 常駐 worker ループ化後にプロセス落ちのリスクが残る。`Serialize` variant
     // で permanent 扱い (`dead` に倒す) に伝播する (#22)。
@@ -302,6 +320,37 @@ async fn attempt_post(
 
     sign_request::sign_outbox_request(&mut req, sender)?;
 
+    let response = state.http_client().execute(req).await?;
+    Ok(response.status())
+}
+
+/// Webhook 通知 (`activity.type` が `Webhook:Discord` / `Webhook:Plain`) の
+/// 配送本体。`activity.payload` だけを `application/json` で POST する。署名
+/// は一切付けない。
+///
+/// `activity.payload` が無い行は **permanent error** (`Serialize` variant
+/// を再利用して `dead` に倒す) ── notification dispatch 側が必ず `payload`
+/// を埋める契約なので、欠如は DB 直挿入の人為ミス。retry しても直らない。
+async fn attempt_post_webhook(
+    state: &AppState,
+    activity: &JsonValue,
+    url: reqwest::Url,
+) -> Result<StatusCode, AttemptError> {
+    let payload = activity.get("payload").ok_or_else(|| {
+        // `serde_json::Error` の構築は public API が薄いので、無効 JSON を
+        // パースして得る ── ここに到達する経路は notification dispatch が壊れ
+        // た場合 + DB 直挿入で payload を忘れた場合の 2 系のみ。
+        let serde_err = serde_json::from_str::<serde_json::Value>("missing 'payload'")
+            .expect_err("from_str on invalid JSON must error");
+        AttemptError::Serialize(serde_err)
+    })?;
+    let body = serde_json::to_vec(payload)?;
+    let req = state
+        .http_client()
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body)
+        .build()?;
     let response = state.http_client().execute(req).await?;
     Ok(response.status())
 }
