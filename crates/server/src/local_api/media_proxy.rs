@@ -26,8 +26,8 @@
 //! ## クエリパラメータ
 //!
 //! - `url` (必須): 取得対象の絶対 URL。`http`/`https` のみ受理。
-//! - `variant` (任意、既定 `avatar`): `avatar` / `thumbnail` / `preview` /
-//!   `header` のいずれか。media-proxy 側の [`Variant`] と同じ表記。
+//! - `variant` (任意、既定 `avatar`): `avatar` / `emoji` / `thumbnail` /
+//!   `preview` / `header` のいずれか。media-proxy 側の [`Variant`] と同じ表記。
 //!
 //! ## キャッシュ
 //!
@@ -59,7 +59,7 @@ fn default_variant() -> String {
 
 /// media-proxy 側 [`Variant`] にマップできる値だけ通す。
 fn validate_variant(v: &str) -> bool {
-    matches!(v, "avatar" | "thumbnail" | "preview" | "header")
+    matches!(v, "avatar" | "emoji" | "thumbnail" | "preview" | "header")
 }
 
 pub async fn handle(State(state): State<AppState>, Query(q): Query<ProxyQuery>) -> Response {
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn variant_validation() {
-        for v in ["avatar", "thumbnail", "preview", "header"] {
+        for v in ["avatar", "emoji", "thumbnail", "preview", "header"] {
             assert!(validate_variant(v), "{v}");
         }
         assert!(!validate_variant(""));

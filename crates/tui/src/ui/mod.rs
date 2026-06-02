@@ -424,7 +424,12 @@ fn render_emoji_preview(
             let img_y = area.y + (area.height.saturating_sub(img_h)) / 2;
             let img_area = Rect::new(img_x, img_y, img_w, img_h);
 
-            app.images.ensure(&item.url, img_area);
+            // Issue #134: 候補 popup の絵文字プレビューは emoji variant で
+            // 取得する (= 512×512 box)。avatar 固定だった旧経路では
+            // media-proxy で 256×256 に再リサイズされ、サーバ側に保存済みの
+            // 512 焼き WebP を毎回 decode + 縮小 + 再エンコードしていた。
+            app.images
+                .ensure_with_variant(&item.url, img_area, crate::image_cache::VARIANT_EMOJI);
             if let Some(proto) = app.images.get(&item.url) {
                 let widget = Image::new(proto.as_ref());
                 frame.render_widget(widget, img_area);

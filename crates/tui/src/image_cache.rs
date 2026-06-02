@@ -59,7 +59,8 @@ const CACHE_CAP: usize = 64;
 const MAX_IMAGE_DIMENSION: u32 = 4096;
 /// media-proxy に頼むバリアント。呼び出し側が用途に応じて選ぶ:
 ///
-/// - `avatar` (256×256, 既定) ── アイコン / 絵文字 (= 小サイズ用途で十分)
+/// - `avatar` (256×256, 既定) ── アイコン
+/// - `emoji`  (512×512) ── カスタム絵文字 preview / 候補 popup (Issue #134)
 /// - `thumbnail` (320×320) ── リスト中のサムネイル
 /// - `preview` (1280×1280) ── Note 詳細モーダルの添付プレビュー (Issue #133)
 /// - `header` (1500×500) ── プロフィール画像
@@ -68,6 +69,7 @@ const MAX_IMAGE_DIMENSION: u32 = 4096;
 /// 未知の variant が渡ったときは server 側で 400 が返るため、呼び出し側で
 /// 文字列をハードコードせず本モジュールの定数を使う。
 pub const VARIANT_AVATAR: &str = "avatar";
+pub const VARIANT_EMOJI: &str = "emoji";
 pub const VARIANT_PREVIEW: &str = "preview";
 
 /// キャッシュ entry の状態。

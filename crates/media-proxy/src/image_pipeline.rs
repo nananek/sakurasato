@@ -10,7 +10,7 @@
 //! - `thumbnail` — 320x320 上限
 //! - `preview` — 1280x1280 上限
 //! - `header` — 1500x500 上限 (Mastodon バナーサイズ)
-//! - `emoji` — 128x128 上限 (Misskey 互換、`tag: Emoji.icon` で連合される)
+//! - `emoji` — 512x512 上限 (`tag: Emoji.icon` で連合される)
 //!
 //! 上限以下の画像はそのまま、上限を超えるものは **アスペクト比を保ったまま**
 //! 縮小する。出力は常に WebP (lossy, quality 80)。WebP に統一する利点:
@@ -82,8 +82,12 @@ pub enum Variant {
     Thumbnail,
     Preview,
     Header,
-    /// カスタム絵文字 (M8)。Misskey の `emojis/<shortcode>.png` は実物が
-    /// 128px 以下のものが多く、本実装も 128x128 ボックスに揃える。
+    /// カスタム絵文字 (M8 / Issue #134)。Misskey / Mastodon ともに実勢で
+    /// 256〜512px の素材が一般的で、128 まで落とすと `HiDPI` / Kitty graphics
+    /// preview 枠で粗が目立つ。安全化責務 (decode → EXIF 剥がし → WebP 再
+    /// エンコード) は維持しつつ box を 512 に上げ、ユーザがキュレートした
+    /// 素材の元解像度をなるべく保つ ── 小さい入力 (= 32〜128px) はそのまま
+    /// 通る (= 「以下なら resize しない」設計のため)。
     Emoji,
 }
 
@@ -95,7 +99,7 @@ impl Variant {
             Self::Thumbnail => (320, 320),
             Self::Preview => (1280, 1280),
             Self::Header => (1500, 500),
-            Self::Emoji => (128, 128),
+            Self::Emoji => (512, 512),
         }
     }
 }
@@ -638,23 +642,37 @@ mod tests {
     }
 
     #[test]
-    fn emoji_box_is_128() {
-        // Misskey サーバ由来の絵文字は 128px 前後が多い ─ 大きい入力は
-        // アスペクト比保ったまま 128 ボックスに収める。
-        let png = png_bytes(512, 256);
+    fn emoji_box_is_512() {
+        // Issue #134: emoji box は 512x512。box を超える入力 (1024x512) は
+        // アスペクト比を保ったまま 512x256 に収まる。
+        let png = png_bytes(1024, 512);
         let out = process(&png, Variant::Emoji, 1_000_000).unwrap();
-        assert!(out.width <= 128);
-        assert!(out.height <= 128);
+        assert!(out.width <= 512);
+        assert!(out.height <= 512);
         // 2:1 のアスペクト比保持 (高さは幅の半分)。
         assert_eq!(out.height * 2, out.width);
     }
 
     #[test]
     fn emoji_small_input_passes_through() {
+        // 64x64 (box 以下) はそのまま通る ── 小サイズ素材を勝手にアップ
+        // スケールしない。
         let png = png_bytes(64, 64);
         let out = process(&png, Variant::Emoji, 1_000_000).unwrap();
         assert_eq!(out.width, 64);
         assert_eq!(out.height, 64);
+        assert_eq!(out.content_type, "image/webp");
+    }
+
+    #[test]
+    fn emoji_mid_input_passes_through() {
+        // Issue #134: 旧 128 box では潰されていた中サイズ (256x256 等) を
+        // そのまま保持できることを確認。HiDPI / 高解像度 preview 用途の
+        // 主目的の retain ケース。
+        let png = png_bytes(256, 256);
+        let out = process(&png, Variant::Emoji, 1_000_000).unwrap();
+        assert_eq!(out.width, 256);
+        assert_eq!(out.height, 256);
         assert_eq!(out.content_type, "image/webp");
     }
 
@@ -832,8 +850,9 @@ mod tests {
 
     #[test]
     fn animated_resize_preserves_canvas_box() {
-        // 大きめ 200x100 入力 → emoji 128 box にアスペクト比保持で収まる
-        // (= 128x64)。frame 数は 2。
+        // 大きめ 1024x512 入力 → emoji 512 box にアスペクト比保持で収まる
+        // (= 512x256)。frame 数は 2。box を超える入力を選ぶことで
+        // resize 経路 (frame ごとに canvas 寸法へ揃える) を実テストする。
         use image::codecs::gif::{GifEncoder, Repeat};
         use image::{Delay, Frame};
         let mut out = Vec::new();
@@ -842,14 +861,16 @@ mod tests {
             encoder.set_repeat(Repeat::Infinite).unwrap();
             for (r, g) in [(255, 0), (0, 255)] {
                 let buf: ImageBuffer<Rgba<u8>, Vec<u8>> =
-                    ImageBuffer::from_fn(200, 100, |_, _| Rgba([r, g, 0, 255]));
+                    ImageBuffer::from_fn(1024, 512, |_, _| Rgba([r, g, 0, 255]));
                 let frame = Frame::from_parts(buf, 0, 0, Delay::from_numer_denom_ms(40, 1));
                 encoder.encode_frame(frame).unwrap();
             }
         }
-        let result = process(&out, Variant::Emoji, 1_000_000).unwrap();
-        assert!(result.width <= 128);
-        assert!(result.height <= 128);
+        // max_pixels は frame バッファ 1024×512×4 = 2_097_152 を許容できる
+        // よう余裕を持って 8M。
+        let result = process(&out, Variant::Emoji, 8_000_000).unwrap();
+        assert!(result.width <= 512);
+        assert!(result.height <= 512);
         assert_eq!(result.width, result.height * 2); // 2:1 aspect
         assert!(is_animated_webp(&result.bytes));
     }
