@@ -11,6 +11,7 @@
 - TestNoteFromSks                  ── Sakurasato 投稿 → Mastodon Bob の home timeline に届く
 - TestNoteFromMastodon             ── Mastodon 投稿 → Sakurasato Me の home timeline に届く (= #55 で実装)
 - TestReactionInbound              ── Mastodon Bob の Favourite (= Like) が Sakurasato 側 reactions に反映
+- TestAttachmentFederation         ── public/followers 投稿の添付画像が Mastodon の media downloader で取れる (回帰 for PR #143)
 - TestMoveSkip                     ── alsoKnownAs + Move は 2nd Mastodon account が要るため将来 PR で
 
 ポイント:
@@ -735,6 +736,160 @@ class TestVisibilityMatrix:
         tl = sakurasato.home_timeline(limit=80)
         assert not any(marker in (n.get("content") or "") for n in tl), (
             f"direct note {marker} unexpectedly appeared on Sakurasato home"
+        )
+
+
+# ── 6.6. Attachment federation (regression for PR #143) ────
+
+
+def _tiny_png(rgb: tuple[int, int, int]) -> bytes:
+    """Python stdlib (`zlib` + `struct`) で 16x16 単色 PNG を組み立てる。
+
+    sakurasato の media-proxy は受け取った bytes を SHA-256 で `storage_key`
+    に丸めて dedupe する ── テストごとに **違う色** を渡してバイト列を
+    分けないと、後続テストの `attach_to_note` で「既に別 note に紐付き済」
+    の 400 が返る。`rgb` の値はテスト間で衝突しない 3 タプルを使う。
+    """
+    import struct, zlib  # stdlib; placed inline to keep module-top imports lean
+
+    width = height = 16
+    r, g, b = rgb
+    row = b"\x00" + bytes((r, g, b, 255)) * width  # filter byte + RGBA row
+    raw = row * height
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    def _chunk(tag: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + tag
+            + payload
+            + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+        )
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(raw))
+        + _chunk(b"IEND", b"")
+    )
+
+
+class TestAttachmentFederation:
+    """attachment 連合 ── public/followers 投稿の添付画像が Mastodon の
+    media downloader (= 非認証 GET) で取得できることを確認する。
+
+    **回帰テスト for PR #143** (commit 54a5455): PR #108 で
+    `GET /media/{key}` に「紐付き Note の visibility が followers/direct なら
+    404」を入れた over-restriction を Fediverse 慣行 (= URL obscurity 防御) に
+    戻した修正。同 PR は `media_pg.rs` で route の挙動を unit test 化したが、
+    **Mastodon 経由の e2e は本テストが初出**。
+
+    依存順序: `TestFollow` と `TestNoteFromSakurasato` の **後** に走る前提
+    (Bob ⇄ me が相互に accepted で繋がっていること)。各テスト冒頭で
+    `mastodon.follow(...)` を idempotent に叩いて暗黙の前提を明示する。
+    """
+
+    def test_public_note_with_attachment_reaches_mastodon(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        accounts = mastodon.search_accounts(f"me@{SAKURASATO_DOMAIN}", resolve=True)
+        assert accounts
+        mastodon.follow(accounts[0]["id"])
+
+        media = sakurasato.upload_media(
+            body=_tiny_png((192, 64, 64)),  # 赤系 ── followers-only テストの色と衝突させない
+            alt="public test image",
+        )
+        assert media["kind"] == "attachment"
+
+        # 注: orphan media (= note 未紐付け、`note_id IS NULL`) は PR #143 後も
+        # 404 のまま (= 連合に出ていない bytes を露出させない、意図的)。
+        # `create_note` で note に紐付けてから fetch する。
+        marker = f"attach-public-{int(time.time() * 1000)}"
+        sakurasato.create_note(
+            f"with public image: {marker}",
+            visibility="public",
+            attachment_ids=[media["id"]],
+        )
+
+        # url は `https://sakurasato/media/<sha256>.webp`。note 紐付け済みなので
+        # public attachment は誰でも 200 取れる (= PR #108 以前と同じ挙動)。
+        public_resp = sakurasato.fetch_media(media["url"])
+        assert public_resp.status_code == 200, (
+            f"public attachment URL must be reachable unauthenticated after "
+            f"attach: got {public_resp.status_code}"
+        )
+
+        def has_attachment_on_bob_home() -> bool:
+            tl = mastodon.home_timeline(limit=40)
+            for s in tl:
+                if marker not in (s.get("content") or ""):
+                    continue
+                if s.get("media_attachments"):
+                    return True
+            return False
+
+        poll_until(
+            has_attachment_on_bob_home,
+            desc=f"public note {marker} with attachment on Mastodon home",
+        )
+
+    def test_followers_only_note_with_attachment_reaches_mastodon(
+        self, mastodon: MastodonClient, sakurasato: SakurasatoClient
+    ):
+        """PR #143 の回帰テスト本体。
+
+        PR #108 では followers-only 投稿の attachment URL を非認証 GET すると
+        404 が返り、Mastodon が media をダウンロードできず `media_attachments`
+        が空になる over-restriction があった。本テストは以下 2 点を確認する:
+
+        1. `https://sakurasato/media/<key>.webp` を **Bearer 無し** で叩いて 200
+           が返る (= PR #108 の 404 over-restriction が消えている)。
+        2. Mastodon Bob 側に届いた status の `media_attachments` が空でない
+           (= Mastodon の media downloader が同 URL を取得できた)。
+        """
+        accounts = mastodon.search_accounts(f"me@{SAKURASATO_DOMAIN}", resolve=True)
+        assert accounts
+        mastodon.follow(accounts[0]["id"])
+
+        media = sakurasato.upload_media(
+            body=_tiny_png((64, 64, 192)),  # 青系 ── public テストの bytes と衝突させない
+            alt="followers-only test image",
+        )
+
+        # orphan は 404 のままなので、必ず note に紐付けてから fetch する
+        # (= 連合に出る前の bytes は依然 404、PR #143 で公開したのはあくまで
+        # 「note 紐付き + followers/direct」だけ)。
+        marker = f"attach-followers-{int(time.time() * 1000)}"
+        sakurasato.create_note(
+            f"with followers-only image: {marker}",
+            visibility="followers",
+            attachment_ids=[media["id"]],
+        )
+
+        # (1) URL obscurity 防御だけが残っているはずなので、非認証 GET で 200。
+        public_resp = sakurasato.fetch_media(media["url"])
+        assert public_resp.status_code == 200, (
+            f"followers-only attachment URL must still be unauthenticated-reachable "
+            f"after attach (URL obscurity defense only); got {public_resp.status_code}. "
+            f"Regression for PR #143."
+        )
+
+        # (2) Mastodon Bob の home に届き、かつ media_attachments が
+        # 非空である (= Mastodon が attachment URL の取得に成功した) こと。
+        def has_attachment_on_bob_home() -> bool:
+            tl = mastodon.home_timeline(limit=40)
+            for s in tl:
+                if marker not in (s.get("content") or ""):
+                    continue
+                if s.get("media_attachments"):
+                    return True
+            return False
+
+        poll_until(
+            has_attachment_on_bob_home,
+            desc=(
+                f"followers-only note {marker} with attachment on Mastodon home "
+                f"(regression for PR #143: was empty due to /media/{{key}} 404)"
+            ),
         )
 
 

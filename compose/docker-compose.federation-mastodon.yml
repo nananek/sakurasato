@@ -40,16 +40,45 @@ services:
     networks:
       - mastodon-fed
 
+  # versitygw (S3 互換オブジェクトストレージ) ── attachment 連合テスト用
+  # (test/federation-attachment / PR #143 回帰)。Mastodon Bob に画像付き
+  # 投稿を配送して media downloader が `/media/<key>` を引けることを確かめる
+  # ため、sakurasato-server からの PUT 先が要る。本番 `docker-compose.yml` の
+  # `versitygw` を test 用に薄く焼き直したもの (nekonoverse stack と同形)。
+  # posix backend は bucket dir を auto-mkdir しないので entrypoint で
+  # `mkdir -p /data/sakurasato` してから exec する。
+  versitygw-sks:
+    build:
+      context: ..
+      dockerfile: docker/versitygw.Dockerfile
+    image: sakurasato/versitygw:dev
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'mkdir -p /data/sakurasato && exec versitygw --port=:7070 --access=sakurasato posix /data'
+    environment:
+      ROOT_SECRET_ACCESS_KEY: testpass
+    volumes:
+      - versitygw_sks_data:/data
+    networks:
+      - mastodon-fed
+
   sakurasato-init:
     build:
       context: ..
       dockerfile: docker/server.Dockerfile
     image: sakurasato/server:dev
     command: ["init", "--display-name", "Sakurasato Test"]
-    environment:
+    environment: &sakurasato_env
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
+      # attachment 連合テスト用 storage 接続 (= server から versitygw への
+      # PUT)。init / server 双方で同じ値を持たせるため YAML anchor で共有。
+      SAKURASATO_STORAGE__ENDPOINT: http://versitygw-sks:7070
+      SAKURASATO_STORAGE__ACCESS_KEY_ID: sakurasato
+      SAKURASATO_STORAGE__SECRET_ACCESS_KEY: testpass
+      SAKURASATO_STORAGE__BUCKET: sakurasato
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       postgres-sks:
@@ -66,9 +95,7 @@ services:
     image: sakurasato/server:dev
     command: ["serve"]
     environment:
-      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
-      SAKURASATO_SERVER__HOST: sakurasato
-      SAKURASATO_SERVER__USER: me
+      <<: *sakurasato_env
       # distroless の `/home/nonroot` は uid 65532 が 0o700 で所有しており、
       # 名前付き volume の初回マウントでもこの ownership/perms がコピー
       # される (= pytest が同 uid で覗ける)。`/tmp` だと per-container で
@@ -76,12 +103,13 @@ services:
       # ので uid 65532 が socket を bind できない (= 0o700 chmod も失敗)。
       SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
       SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
-      SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       sakurasato-init:
         condition: service_completed_successfully
       sakurasato-media-proxy:
         condition: service_healthy
+      versitygw-sks:
+        condition: service_started
     volumes:
       - certs:/certs:ro
       # pytest が `/home/nonroot/local.sock` を共有 UDS として開く。
@@ -379,6 +407,7 @@ volumes:
   sakurasato_local_api:
   media_sock:
   mastodon_tokens:
+  versitygw_sks_data:
 
 networks:
   mastodon-fed:

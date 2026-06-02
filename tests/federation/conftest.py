@@ -226,15 +226,58 @@ class SakurasatoClient:
         visibility: str = "public",
         summary: str | None = None,
         in_reply_to_ap_id: str | None = None,
+        attachment_ids: list[int] | None = None,
     ) -> dict:
         body: dict[str, Any] = {"content": content, "visibility": visibility}
         if summary is not None:
             body["summary"] = summary
         if in_reply_to_ap_id is not None:
             body["in_reply_to_ap_id"] = in_reply_to_ap_id
+        if attachment_ids is not None:
+            body["attachment_ids"] = attachment_ids
         resp = self._local.post("/api/v1/notes", json=body)
         resp.raise_for_status()
         return resp.json()
+
+    def upload_media(
+        self,
+        *,
+        body: bytes,
+        kind: str = "attachment",
+        content_type: str = "image/png",
+        alt: str | None = None,
+    ) -> dict:
+        """`POST /api/v1/media?kind=...` ── 生バイト列を投げて `MediaResponse` を受ける。
+
+        サーバが media-proxy 経由で再エンコードするので、入力は PNG / JPEG /
+        WebP / GIF など `image` crate がデコードできる形式なら何でも良い。
+        返り値の `id` を `create_note(attachment_ids=[id])` に渡して投稿に
+        紐付ける。
+        """
+        params: dict[str, str] = {"kind": kind}
+        if alt is not None:
+            params["alt"] = alt
+        resp = self._local.post(
+            "/api/v1/media",
+            params=params,
+            content=body,
+            headers={"Content-Type": content_type},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def fetch_media(self, url: str) -> httpx.Response:
+        """`/media/<key>` を公開経路 (= 非認証) で叩く。
+
+        Mastodon の media downloader はここを Bearer 無しで叩くので、
+        regression test for PR #143 (followers-only attachment の 404 over-restriction)
+        は本メソッドで `https://sakurasato/media/<key>.webp` を直接叩いて
+        200 を確認する。
+        """
+        # `_public` は base_url = https://sakurasato。url は full URL でも path でも
+        # 良いが、AP `attachment[].url` で配送されるのは絶対 URL なので
+        # そのまま渡す。
+        return self._public.get(url)
 
     def create_reaction(
         self,
