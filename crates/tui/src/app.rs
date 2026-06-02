@@ -8,6 +8,8 @@
 //! - **selected**: ハイライトされている note の index (`top` 以上)。
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::client::{NoteCreatedPayload, TimelineNote, Whoami};
@@ -143,6 +145,13 @@ pub struct App {
     /// `mode` から決まる (= `ReactToNote` → Timeline、`InsertIntoCompose`
     /// → Compose)。検索 buffer は独立。
     pub emoji_suggest: Option<crate::emoji_suggest::EmojiSuggestState>,
+    /// Issue #131: 現在進行中の async ネットワーク操作の数。`> 0` のとき
+    /// `render_status` が左端に spinner を出す。各 async ハンドラの冒頭で
+    /// [`crate::in_flight::InFlightGuard::new`] を構築して
+    /// increment、関数を抜けるとき (= guard drop 時) に自動 decrement。
+    /// `Arc` なので `app.in_flight.clone()` で guard に渡せる (= `&mut App`
+    /// borrow を await またぎで保持できない Rust の制約への対応)。
+    pub in_flight: Arc<AtomicUsize>,
 }
 
 impl App {
@@ -180,7 +189,16 @@ impl App {
             command: None,
             follow_requests: None,
             emoji_suggest: None,
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Issue #131: 現在 in-flight な async 操作数。`render_status` が `> 0`
+    /// のとき spinner を出すために読む。`Ordering::Relaxed` で読むのは
+    /// 「正確な瞬間値」より「最終的に 0 に戻る」ことの方が重要だから。
+    #[must_use]
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
     }
 
     /// 現在開いている Profile 画面 (= stack 末尾) への可変参照。

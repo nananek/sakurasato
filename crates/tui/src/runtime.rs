@@ -29,6 +29,7 @@ use crate::client::{
 use crate::compose::{AttachmentRef, Visibility};
 use crate::event::{Action, translate};
 use crate::image_cache::ImageCache;
+use crate::in_flight::InFlightGuard;
 use crate::picker::{Activation, FilePicker, PickerMode};
 use crate::profile::ProfileScreen;
 use crate::sse;
@@ -311,25 +312,28 @@ async fn apply_action(
                 Focus::Help
             };
         }
-        Action::RefreshTimeline => match api.timeline_home(None, page_size).await {
-            Ok(resp) => {
-                let n = resp.notes.len();
-                app.replace_timeline(resp.notes, resp.next_before_id);
-                app.set_status(
-                    format!("refreshed: {n} notes"),
-                    StatusKind::Success,
-                    Some(Duration::from_secs(3)),
-                );
+        Action::RefreshTimeline => {
+            let _g = InFlightGuard::new(app.in_flight.clone());
+            match api.timeline_home(None, page_size).await {
+                Ok(resp) => {
+                    let n = resp.notes.len();
+                    app.replace_timeline(resp.notes, resp.next_before_id);
+                    app.set_status(
+                        format!("refreshed: {n} notes"),
+                        StatusKind::Success,
+                        Some(Duration::from_secs(3)),
+                    );
+                }
+                Err(err) => {
+                    error!(?err, "refresh failed");
+                    app.set_status(
+                        format!("refresh failed: {err}"),
+                        StatusKind::Error,
+                        Some(Duration::from_secs(6)),
+                    );
+                }
             }
-            Err(err) => {
-                error!(?err, "refresh failed");
-                app.set_status(
-                    format!("refresh failed: {err}"),
-                    StatusKind::Error,
-                    Some(Duration::from_secs(6)),
-                );
-            }
-        },
+        }
         Action::LoadMore => {
             if app.timeline_exhausted {
                 app.set_status(
@@ -340,6 +344,7 @@ async fn apply_action(
                 return;
             }
             let before = app.next_before_id;
+            let _g = InFlightGuard::new(app.in_flight.clone());
             match api.timeline_home(before, page_size).await {
                 Ok(resp) => {
                     let added = resp.notes.len();
@@ -625,6 +630,9 @@ async fn apply_action(
 
 /// `p` で選択中の Note の author を Profile push する。
 async fn open_profile_from_selected(app: &mut App, api: &LocalApi, page_size: i64) {
+    // 本関数は actor_id を解決して [`push_profile_for_actor_id`] を呼ぶ
+    // 薄い wrapper。後者が `InFlightGuard` を持つので、ここでは二重 inc を
+    // 避けるため guard を作らない。
     let Some(note) = app.notes.get(app.selected) else {
         app.set_status(
             "no note selected",
@@ -640,6 +648,7 @@ async fn open_profile_from_selected(app: &mut App, api: &LocalApi, page_size: i6
 /// `actor_id` から actor + relationship + 直近 notes を取り、Profile stack に
 /// 1 段 push する。失敗時は status だけ更新して focus は変えない。
 async fn push_profile_for_actor_id(app: &mut App, api: &LocalApi, actor_id: i64, page_size: i64) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let actor = match api.get_actor(actor_id).await {
         Ok(resp) => resp.actor,
         Err(err) => {
@@ -693,6 +702,7 @@ async fn push_profile_for_actor_id(app: &mut App, api: &LocalApi, actor_id: i64,
 }
 
 async fn profile_load_more_notes(app: &mut App, api: &LocalApi, page_size: i64) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let Some(profile) = app.current_profile() else {
         return;
     };
@@ -729,6 +739,7 @@ async fn profile_load_more_notes(app: &mut App, api: &LocalApi, page_size: i64) 
 }
 
 async fn profile_toggle_follow(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let Some(profile) = app.current_profile() else {
         return;
     };
@@ -826,6 +837,7 @@ fn profile_back(app: &mut App) {
 }
 
 async fn profile_refresh(app: &mut App, api: &LocalApi, page_size: i64) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let Some(profile) = app.current_profile() else {
         return;
     };
@@ -898,6 +910,7 @@ fn start_reply(app: &mut App) {
 }
 
 async fn undo_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let Some(note) = app.notes.get(app.selected) else {
         app.set_status(
             "no note selected",
@@ -952,6 +965,7 @@ async fn undo_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
 /// が静的 Unicode emoji を merge する。fetch 失敗時はモーダル開かず status
 /// 表示 ── Timeline `e` 経路ではユーザ側で再試行できる。
 async fn open_emoji_search(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let mode = match app.focus {
         Focus::Timeline => {
             let Some(note) = app.notes.get(app.selected) else {
@@ -994,6 +1008,9 @@ async fn open_emoji_search(app: &mut App, api: &LocalApi) {
 /// `Mode::InsertIntoCompose` の場合は `EmojiItem::content_token()` を compose
 /// 本文に挿入し、Compose focus に戻る。
 async fn emoji_search_confirm(app: &mut App, api: &LocalApi, page_size: i64) {
+    // `ReactToNote` 経路は `send_reaction` が `InFlightGuard` を持ち、
+    // `InsertIntoCompose` 経路はネットワーク呼び出しを伴わないため、
+    // 本関数自身では guard を作らない (PR #149 review 二重 inc 修正)。
     let Some(state) = app.emoji_suggest.as_ref() else {
         return;
     };
@@ -1033,6 +1050,7 @@ fn emoji_search_cancel(app: &mut App) {
 /// `POST /api/v1/reactions` 本体。Timeline `e` 経路で確定した `content` を
 /// 送る。成功時は timeline を再取得して reaction count を反映する。
 async fn send_reaction(app: &mut App, api: &LocalApi, note_id: i64, content: &str, page_size: i64) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     match api.create_reaction(note_id, content).await {
         Ok(resp) => {
             // M13 PR6: 取り消し (`u`) で参照するため reaction id を覚えておく。
@@ -1142,7 +1160,11 @@ fn picker_activate(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<Uploa
             close_picker(app, false);
             let api = api.clone();
             let tx = upload_tx.clone();
+            let guard = InFlightGuard::new(app.in_flight.clone());
             tokio::spawn(async move {
+                // guard を move して保持 ── アップロード完了 (= tx.send 後)
+                // にこの closure を抜けて drop され、in_flight が dec される。
+                let _g = guard;
                 let outcome = run_upload(api, mode, path, label, None).await;
                 let _ = tx.send(outcome).await;
             });
@@ -1170,7 +1192,10 @@ fn submit_alt_prompt(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<Upl
     );
     let api = api.clone();
     let tx = upload_tx.clone();
+    let guard = InFlightGuard::new(app.in_flight.clone());
     tokio::spawn(async move {
+        // guard を move して保持 ── alt 入力後アップロード完了で drop。
+        let _g = guard;
         let outcome = run_upload(api, mode, path, label, alt_arg).await;
         let _ = tx.send(outcome).await;
     });
@@ -1394,6 +1419,7 @@ async fn submit_note(app: &mut App, api: &LocalApi) {
         in_reply_to_ap_id: app.compose.in_reply_to_ap_id().map(str::to_string),
         attachment_ids: app.compose.attachment_ids(),
     };
+    let _g = InFlightGuard::new(app.in_flight.clone());
     match api.create_note(&req).await {
         Ok(resp) => {
             app.set_status(
@@ -1467,6 +1493,11 @@ fn current_screen_focus(app: &App) -> Focus {
 
 async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
     use crate::command::Command;
+    // 本関数は dispatcher で、配下の `command_open_*` / `command_follow_*` /
+    // `command_actor_lock` / `command_open_requests` 等が個別に
+    // `InFlightGuard` を持つ。ここで guard を作ると counter が二重に
+    // increment されるので意図的に作らない (= UI には影響しないが意味
+    // のあるカウンタを保つため)。
     let Some(prompt) = app.command.take() else {
         return;
     };
@@ -1532,12 +1563,18 @@ async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
 }
 
 async fn command_open_self(app: &mut App, api: &LocalApi, page_size: i64) {
+    let lookup_guard = InFlightGuard::new(app.in_flight.clone());
     let ap_id = app.whoami.ap_id.clone();
     match api.lookup_actor_by_ap_id(&ap_id).await {
         Ok(resp) => {
+            // `lookup_actor_by_ap_id` 完了済み。続く `push_profile_from_lookup`
+            // も guard を持つので、ここで明示 drop して二重 inc を避ける
+            // (PR #149 review)。
+            drop(lookup_guard);
             push_profile_from_lookup(app, api, page_size, resp).await;
         }
         Err(err) => {
+            // Err 経路は後続 API 呼び出しなしなのでスコープ末尾で自然 drop。
             app.set_status(
                 format!(":me failed: {err}"),
                 StatusKind::Error,
@@ -1553,12 +1590,18 @@ async fn command_open_target(
     page_size: i64,
     target: &crate::command::LookupTarget,
 ) {
+    let lookup_guard = InFlightGuard::new(app.in_flight.clone());
     let resp = match target {
         crate::command::LookupTarget::Acct(acct) => api.lookup_actor_by_acct(acct).await,
         crate::command::LookupTarget::ApId(uri) => api.lookup_actor_by_ap_id(uri).await,
     };
     match resp {
-        Ok(r) => push_profile_from_lookup(app, api, page_size, r).await,
+        Ok(r) => {
+            // lookup 完了。続く `push_profile_from_lookup` も guard を持つ
+            // ので明示 drop して二重 inc を避ける (PR #149 review)。
+            drop(lookup_guard);
+            push_profile_from_lookup(app, api, page_size, r).await;
+        }
         Err(err) => {
             app.set_status(
                 format!(":open failed: {err}"),
@@ -1576,6 +1619,7 @@ async fn push_profile_from_lookup(
     page_size: i64,
     resp: crate::client::ActorWithRelationship,
 ) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let actor_id = resp.actor.id;
     let acct = format!("@{}@{}", resp.actor.preferred_username, resp.actor.host);
     let notes = match api.list_actor_notes(actor_id, None, page_size).await {
@@ -1611,6 +1655,7 @@ async fn command_follow_target(
     target: &crate::command::LookupTarget,
     unfollow: bool,
 ) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     // 共通: target を解決して relationship を得る。
     let resp = match target {
         crate::command::LookupTarget::Acct(acct) => api.lookup_actor_by_acct(acct).await,
@@ -1688,6 +1733,7 @@ async fn command_follow_target(
 /// 副作用 (= 相手側 UI のキャッシュ更新) なので、失敗していても切替は完了して
 /// いる。
 async fn command_actor_lock(app: &mut App, api: &LocalApi, lock: bool) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let verb = if lock { "lock" } else { "unlock" };
     let result = if lock {
         api.actor_lock().await
@@ -1733,6 +1779,7 @@ async fn command_actor_lock(app: &mut App, api: &LocalApi, lock: bool) {
 /// を `await` の **前** に行う。これにより fetch 中も `"loading…"` が描画
 /// され、`requests_refresh` と挙動が揃う。
 async fn command_open_requests(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let mut screen = crate::follow_requests::FollowRequestsScreen::new();
     screen.fetching = true;
     app.follow_requests = Some(screen);
@@ -1760,6 +1807,7 @@ async fn command_open_requests(app: &mut App, api: &LocalApi) {
 /// `a` / `x` ── 選択中の row を approve / reject 配信し、成功すれば list から
 /// 除去する。失敗時は除去せず status に出す (= ユーザが再試行可能)。
 async fn requests_mutate_selected(app: &mut App, api: &LocalApi, approve: bool) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let Some(screen) = app.follow_requests.as_ref() else {
         return;
     };
@@ -1802,6 +1850,7 @@ async fn requests_mutate_selected(app: &mut App, api: &LocalApi, approve: bool) 
 
 /// `r` ── 再取得。
 async fn requests_refresh(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let Some(screen) = app.follow_requests.as_mut() else {
         return;
     };
@@ -1838,6 +1887,7 @@ async fn open_follow_list(
     page_size: i64,
     mode: crate::follow_list::FollowListMode,
 ) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let entries = fetch_follow_list_page(api, mode, None, page_size).await;
     let mut screen = crate::follow_list::FollowListScreen::new(mode);
     match entries {
@@ -1883,6 +1933,7 @@ async fn follow_list_toggle_mode(app: &mut App, api: &LocalApi, page_size: i64) 
     // 短い `:following` ↔ `:followers` 切替時にも常に直近データが見える)。
     if !fl.current().fetched {
         let mode = fl.mode;
+        let _g = InFlightGuard::new(app.in_flight.clone());
         let res = fetch_follow_list_page(api, mode, None, page_size).await;
         if let Some(fl) = app.follow_list.as_mut() {
             match res {
@@ -1928,6 +1979,7 @@ async fn follow_list_load_more(app: &mut App, api: &LocalApi, page_size: i64) {
     }
     let mode = fl.mode;
     let before = page.next_before_id;
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let res = fetch_follow_list_page(api, mode, before, page_size).await;
     if let Some(fl) = app.follow_list.as_mut() {
         match res {
@@ -1956,6 +2008,7 @@ async fn follow_list_refresh(app: &mut App, api: &LocalApi, page_size: i64) {
         return;
     };
     let mode = fl.mode;
+    let _g = InFlightGuard::new(app.in_flight.clone());
     let res = fetch_follow_list_page(api, mode, None, page_size).await;
     if let Some(fl) = app.follow_list.as_mut() {
         match res {
