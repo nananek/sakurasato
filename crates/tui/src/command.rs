@@ -80,6 +80,10 @@ pub enum Command {
     Unlock,
     /// M12 (#66): 承認待ち follow 一覧画面を開く。`a` で approve / `x` で reject。
     OpenRequests,
+    /// #151: 選択中の Note を renote (boost) する。`b` キーと同じ動作。
+    Renote,
+    /// #151: 選択中の Note への自分の renote を取り消し。`B` キーと同じ動作。
+    Unrenote,
     Help,
     Quit,
     /// 引数不足 / 形式エラー。`reason` を status に出す。
@@ -115,6 +119,8 @@ pub fn parse(raw: &str) -> Command {
         "lock" => no_arg(&rest, Command::Lock, "lock"),
         "unlock" => no_arg(&rest, Command::Unlock, "unlock"),
         "requests" => no_arg(&rest, Command::OpenRequests, "requests"),
+        "renote" => no_arg(&rest, Command::Renote, "renote"),
+        "unrenote" => no_arg(&rest, Command::Unrenote, "unrenote"),
         "help" | "?" => Command::Help,
         "q" | "quit" => Command::Quit,
         other => Command::Unknown { name: other.into() },
@@ -332,6 +338,14 @@ mod tests {
     fn parse_requests_no_args() {
         assert_eq!(parse("requests"), Command::OpenRequests);
         assert!(matches!(parse("requests extra"), Command::Invalid { .. }));
+    }
+
+    #[test]
+    fn parse_renote_unrenote_no_args() {
+        assert_eq!(parse("renote"), Command::Renote);
+        assert_eq!(parse("unrenote"), Command::Unrenote);
+        assert!(matches!(parse("renote extra"), Command::Invalid { .. }));
+        assert!(matches!(parse("unrenote extra"), Command::Invalid { .. }));
     }
 
     #[test]

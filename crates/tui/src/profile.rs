@@ -197,6 +197,8 @@ mod tests {
             reactions: Vec::new(),
             attachments: Vec::new(),
             emojis: Vec::new(),
+            announce_count: 0,
+            viewer_renoted: false,
         }
     }
 

@@ -228,6 +228,7 @@ pub async fn list_notes(
     let next_before_id = entries.last().map(|e| e.id);
 
     // M8 PR3 と同じくリアクション集計を 1 クエリで取り、失敗時は warn だけ。
+    // #151: announce 集計も同パターンで追加 (viewer = `viewer` = local actor)。
     let note_ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
     let mut by_note: HashMap<i64, Vec<ReactionSummaryDto>> = HashMap::new();
     match repo::reaction::counts_for_notes(state.pool(), &note_ids).await {
@@ -247,12 +248,29 @@ pub async fn list_notes(
             );
         }
     }
+    let mut announce_by_note: HashMap<i64, sakurasato_core::repo::announce::AnnounceSummaryRow> =
+        HashMap::new();
+    match repo::announce::counts_for_notes(state.pool(), &note_ids, viewer.id).await {
+        Ok(rows) => {
+            for row in rows {
+                announce_by_note.insert(row.note_id, row);
+            }
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                target_id = target.id,
+                "list_notes: announce counts_for_notes failed"
+            );
+        }
+    }
 
     let notes: Vec<TimelineNote> = entries
         .into_iter()
         .map(|e| {
             let reactions = by_note.remove(&e.id).unwrap_or_default();
-            TimelineNote::from_entry_with_reactions(e, reactions, host)
+            let announce = announce_by_note.get(&e.id);
+            TimelineNote::from_entry_with_aggregates(e, reactions, announce, host)
         })
         .collect();
 

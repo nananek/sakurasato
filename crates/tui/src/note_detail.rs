@@ -175,6 +175,8 @@ mod tests {
                 })
                 .collect(),
             emojis: vec![],
+            announce_count: 0,
+            viewer_renoted: false,
         }
     }
 

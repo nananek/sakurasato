@@ -481,6 +481,39 @@ impl LocalApi {
         Ok(())
     }
 
+    /// `POST /api/v1/notes/{id}/renote` ── 自分が **元 Note を boost / renote**
+    /// する (#151)。visibility = public / unlisted の Note にのみ有効、それ以外
+    /// は server が 400 で弾く。同一 Note への 2 回目以降は idempotent (= 既存
+    /// announce 行を返し、`queued_deliveries = 0`)。
+    pub async fn create_renote(&self, note_id: i64) -> Result<AnnounceResponse, ApiError> {
+        let path = format!("/api/v1/notes/{note_id}/renote");
+        let request = self
+            .request_builder(Method::POST, &path)?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// `DELETE /api/v1/notes/{id}/renote` ── 自分の renote を取り消し (#151)。
+    /// path は **元 Note の id** (= announce 行の id ではない)。サーバ側で
+    /// `(note_id, local_actor.id)` の組み合わせを引いて Undo Announce を配送
+    /// する。renote していない Note への DELETE は 404。
+    pub async fn delete_renote(&self, note_id: i64) -> Result<(), ApiError> {
+        let path = format!("/api/v1/notes/{note_id}/renote");
+        let request = self
+            .request_builder(Method::DELETE, &path)?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body_string(resp.into_body()).await.unwrap_or_default();
+            return Err(ApiError::Status { status, body });
+        }
+        Ok(())
+    }
+
     /// `GET /api/v1/stream` を生 Incoming のまま返す。SSE は呼び出し側
     /// ([`crate::sse`]) で `eventsource-stream` に流す。
     pub async fn open_stream(&self) -> Result<hyper::Response<Incoming>, ApiError> {
@@ -674,6 +707,14 @@ pub struct TimelineNote {
     /// 欠ける場合は空。
     #[serde(default)]
     pub emojis: Vec<Emoji>,
+    /// #151: この Note が何回 boost / renote されたか。受信した Announce +
+    /// 自分の renote の合算 (= `announce` テーブル全体での count)。
+    #[serde(default)]
+    pub announce_count: i64,
+    /// #151: viewer (= ローカル actor) 自身が renote 済みか。Timeline 描画の
+    /// 「↻ you renoted」マーカーに使う。
+    #[serde(default)]
+    pub viewer_renoted: bool,
 }
 
 /// `TimelineNote.attachments` の 1 要素。`server::local_api::timeline::AttachmentDto`
@@ -986,6 +1027,19 @@ pub struct ReactionResponse {
     pub queued_deliveries: usize,
 }
 
+/// `POST /api/v1/notes/{id}/renote` の成功レスポンス (#151)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnnounceResponse {
+    /// `announce` テーブルの行 id ── 取り消しのときは TUI 側 hint として
+    /// `last_renote_ids` に覚えておく。
+    pub id: i64,
+    /// この renote の Activity URI (= `Announce` activity の `id`)。
+    pub ap_id: String,
+    /// 元 Note の id。
+    pub note_id: i64,
+    pub queued_deliveries: usize,
+}
+
 /// `GET /api/v1/actor` のレスポンス body。
 /// `server::local_api::actor::ActorWithRelationship` と JSON 形を合わせる。
 #[derive(Debug, Clone, Deserialize)]
@@ -1150,6 +1204,9 @@ impl NoteCreatedPayload {
             // GET /timeline で正しい値が再フェッチされる)。
             attachments: Vec::new(),
             emojis: Vec::new(),
+            // 新規 Note は初期状態 boost 0 / 自分も renote していない。
+            announce_count: 0,
+            viewer_renoted: false,
         }
     }
 }
