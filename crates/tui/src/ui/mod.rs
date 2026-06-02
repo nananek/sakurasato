@@ -1508,6 +1508,37 @@ fn render_compose(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
+/// Issue #131: status bar 左端の spinner 文字を決める。
+///
+/// `animation_on = false` (= suppression.animation off) のときは ● 静止。
+/// それ以外は Braille 10-frame を `SystemTime` 経由で進める ── state を
+/// 持たないので `tick` カウンタや App フィールド追加が不要。位相は
+/// 100 ms ごとに進み、tick 周期 (= 250ms) と整合する。
+#[must_use]
+fn spinner_char_for_now(animation_on: bool) -> char {
+    spinner_char_at_ms(animation_on, current_ms_since_epoch())
+}
+
+#[must_use]
+fn current_ms_since_epoch() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
+}
+
+/// Braille spinner の 10 frame。100 ms / frame で進める。
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// 単体テスト可能な phase 計算本体 (= `SystemTime` を引数化)。
+#[must_use]
+fn spinner_char_at_ms(animation_on: bool, ms_since_epoch: u128) -> char {
+    if !animation_on {
+        return '●';
+    }
+    let idx = ((ms_since_epoch / 100) as usize) % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[idx]
+}
+
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let palette = &app.theme.palette;
     let focus_label = match app.focus {
@@ -1523,8 +1554,22 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::Requests => "requests",
         Focus::EmojiSearch => "emoji",
     };
+    // Issue #131: in-flight な async 操作があれば左端 3 cells に spinner を
+    // 出す。0 件のときも 3 cells 確保して後続 span の位置を揺らさない。
+    let in_flight = app.in_flight_count();
+    let spinner_span: Span<'static> = if in_flight > 0 {
+        let ch = spinner_char_for_now(app.suppression.animation);
+        Span::styled(
+            format!(" {ch} "),
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("   ")
+    };
     let mut spans: Vec<Span<'static>> = vec![
-        Span::raw(" "),
+        spinner_span,
         Span::styled(
             format!("@{}", app.whoami.preferred_username),
             Style::default()
@@ -2022,6 +2067,33 @@ mod tests {
     fn truncate_caps_at_max() {
         assert_eq!(truncate_for_width("hello", 3), "he…");
         assert_eq!(truncate_for_width("hi", 5), "hi");
+    }
+
+    #[test]
+    fn spinner_static_when_animation_off() {
+        // suppression.animation = false: 時刻によらず常に ● 静止。
+        assert_eq!(spinner_char_at_ms(false, 0), '●');
+        assert_eq!(spinner_char_at_ms(false, 12_345), '●');
+        assert_eq!(spinner_char_at_ms(false, u128::MAX), '●');
+    }
+
+    #[test]
+    fn spinner_cycles_braille_when_animation_on() {
+        // animation on: 100 ms ごとに位相が進み、10 周期で wrap する。
+        for (i, expected) in SPINNER_FRAMES.iter().enumerate() {
+            let ms = (i as u128) * 100;
+            assert_eq!(spinner_char_at_ms(true, ms), *expected, "frame {i}");
+        }
+        // 1 周回って先頭に戻る。
+        assert_eq!(spinner_char_at_ms(true, 1_000), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_char_at_ms(true, 1_100), SPINNER_FRAMES[1]);
+    }
+
+    #[test]
+    fn spinner_phase_advances_after_100ms() {
+        // 99ms 以下は同じ frame、100ms 跨ぐと隣の frame に進む。
+        assert_eq!(spinner_char_at_ms(true, 50), spinner_char_at_ms(true, 99));
+        assert_ne!(spinner_char_at_ms(true, 99), spinner_char_at_ms(true, 100));
     }
 
     #[test]
