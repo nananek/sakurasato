@@ -9,10 +9,26 @@
 -- `enable` / `disable` のみで idempotent。`--event all` は 7 列を一斉セット
 -- する直感どおりの意味になる。
 --
--- 既存行は 0 件 (本機能は 0f3e646 で導入されて以降 prod に登録なし) のため
--- データ救済不要。万一 `enabled = FALSE` で master OFF にしていた行があれば
--- `notify_*` がすべて TRUE のまま再有効化される (= 通知が出るようになる)
--- 副作用がある点だけ DOWN 不能のリスクとして記録しておく。
+-- 既存行は 0 件想定 (本機能は 0f3e646 で導入されて以降 prod に登録なし)
+-- だが、test DB や cherry-pick 環境では `enabled = FALSE` の master OFF 行
+-- が存在し得る。`enabled` を撤去するだけだと「master OFF だったので静か
+-- だったチャンネル」が `notify_*` 全 TRUE のまま再有効化されて通知爆発
+-- する事故になる。これを防ぐ corrective UPDATE を DROP の前に流す:
+-- `enabled = FALSE` の行は 7 個の `notify_*` を一斉 FALSE に倒し、「黙ら
+-- せたい」というユーザ意図を保つ。
+--
+-- 影響なしのケース (= prod) では UPDATE は 0 行 affected で no-op。
+UPDATE notification_channel
+SET
+    notify_mention        = FALSE,
+    notify_direct         = FALSE,
+    notify_quote          = FALSE,
+    notify_reaction       = FALSE,
+    notify_renote         = FALSE,
+    notify_follow         = FALSE,
+    notify_follow_request = FALSE,
+    updated_at            = now()
+WHERE enabled = FALSE;
 
 ALTER TABLE notification_channel DROP COLUMN enabled;
 

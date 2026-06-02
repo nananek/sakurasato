@@ -7,8 +7,9 @@
 //!
 //! migration 0014 で master `enabled` 列は撤去 (元は 2 段スイッチだったが
 //! `--event all` の直感と衝突し `toggle` が冪等にならなかったため)。
-//! 全停止は `set_all_events(_, false)` で 7 個 `notify_*` を一斉 FALSE する
-//! 運用に統一。
+//! 全停止は `set_events(_, &NotificationEvent::all(), false)` で 7 個
+//! `notify_*` を一斉 FALSE する運用に統一。`enable --only` の完全宣言
+//! モードでは [`set_exact_state`] が指定 event だけ TRUE / 他 FALSE に倒す。
 //!
 //! `column_name` を動的に WHERE / SET に埋めているため、`NotificationEvent`
 //! enum を経由しない生文字列を受け取ってはならない (= SQL injection 防御)。
@@ -104,60 +105,93 @@ pub async fn delete_by_id(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
-/// 1 個の `notify_<event>` 列を `value` に設定する (idempotent)。CLI
-/// `enable --event mention|...` / `disable --event mention|...` の本体。
+/// 7 個の `notify_*` 列をすべて宣言的に設定する (idempotent + atomic)。
+/// CLI `enable --only mention,quote` の本体 ── 指定 event は TRUE、
+/// それ以外は FALSE に倒す。「希望状態を 1 コマンドで言い切る」用途。
 ///
-/// 列名は [`NotificationEvent::column_name`] から取得した静的文字列なので
-/// SQL injection の入口はない。`query_as!` を使えないので動的 SQL を組むが、
-/// 列名は match で静的に決まる 7 種に限定される。
+/// `enabled` 集合 (= TRUE にする event) を渡す。`NotificationEvent` は `Eq`
+/// なので集合操作は線形探索で十分 (= 高々 7 要素)。
 ///
-/// row があったかを bool で返す。同じ値を再設定しても `rows_affected = 1`
-/// なので「存在する/しない」のシグナルとして使える。
-pub async fn set_event(
+/// row があったかを bool で返す。
+pub async fn set_exact_state(
     pool: &PgPool,
     id: i64,
-    event: NotificationEvent,
-    value: bool,
+    enabled: &[NotificationEvent],
 ) -> sqlx::Result<bool> {
-    // 列名は static &str のみ。ユーザ入力経路はないので AssertSqlSafe で
-    // sqlx 0.9 の `SqlSafeStr` 要件を明示的に満たす。
-    let sql = format!(
-        "UPDATE notification_channel SET {col} = $2, updated_at = now() WHERE id = $1",
-        col = event.column_name(),
-    );
-    let res = sqlx::query(AssertSqlSafe(sql))
-        .bind(id)
-        .bind(value)
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected() > 0)
-}
-
-/// 7 個の `notify_*` 列を一斉に `value` に設定する (idempotent)。CLI
-/// `enable --event all` / `disable --event all` の本体。
-///
-/// 1 channel を完全に黙らせる / 完全に有効化する用途。トランザクションを
-/// 張らない単一 UPDATE なので部分適用は起きない。
-pub async fn set_all_events(pool: &PgPool, id: i64, value: bool) -> sqlx::Result<bool> {
+    let val_for = |ev: NotificationEvent| -> bool { enabled.contains(&ev) };
     let res = sqlx::query!(
         r#"
         UPDATE notification_channel
         SET
             notify_mention = $2,
-            notify_direct = $2,
-            notify_quote = $2,
-            notify_reaction = $2,
-            notify_renote = $2,
-            notify_follow = $2,
-            notify_follow_request = $2,
+            notify_direct = $3,
+            notify_quote = $4,
+            notify_reaction = $5,
+            notify_renote = $6,
+            notify_follow = $7,
+            notify_follow_request = $8,
             updated_at = now()
         WHERE id = $1
         "#,
         id,
-        value,
+        val_for(NotificationEvent::Mention),
+        val_for(NotificationEvent::Direct),
+        val_for(NotificationEvent::Quote),
+        val_for(NotificationEvent::Reaction),
+        val_for(NotificationEvent::Renote),
+        val_for(NotificationEvent::Follow),
+        val_for(NotificationEvent::FollowRequest),
     )
     .execute(pool)
     .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// 複数の `notify_<event>` 列を 1 つの UPDATE 文で一斉に `value` に設定する
+/// (idempotent + atomic)。CLI `enable mention,quote` 等のリスト経路で使う。
+///
+/// `events` は **空でないこと** を呼び出し側が保証する (= clap の
+/// `required = true` で保証される)。重複した event は dedup して最終 SQL の
+/// `SET col = $2, col = $2` 重複を防ぐ ── `PostgreSQL` は同じ列への重複代入を
+/// パースエラーで弾く ("column ... specified more than once") のでガードが必要。
+///
+/// 列名は [`NotificationEvent::column_name`] 由来 (= 静的 &str) なので SQL
+/// injection の入口はない。`query_as!` は使えないが SQL 自体は `$1` (id) と
+/// `$2` (value) の 2 個のみ bind されパース後に固定されるので prepared
+/// statement キャッシュも効く。
+///
+/// row があったかを bool で返す。同じ値を再設定しても `rows_affected = 1`
+/// なので「存在する/しない」のシグナルとして使える。
+pub async fn set_events(
+    pool: &PgPool,
+    id: i64,
+    events: &[NotificationEvent],
+    value: bool,
+) -> sqlx::Result<bool> {
+    if events.is_empty() {
+        // 上位で防いでいるはずだが念のため: 空集合の UPDATE は何もせず not-found
+        // と区別がつかなくなるので呼ばないこと。
+        return Ok(false);
+    }
+    // 重複除去 (順序保持)。NotificationEvent は Copy + Eq。
+    let mut deduped: Vec<NotificationEvent> = Vec::with_capacity(events.len());
+    for ev in events {
+        if !deduped.contains(ev) {
+            deduped.push(*ev);
+        }
+    }
+    let set_clause = deduped
+        .iter()
+        .map(|ev| format!("{} = $2", ev.column_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql =
+        format!("UPDATE notification_channel SET {set_clause}, updated_at = now() WHERE id = $1");
+    let res = sqlx::query(AssertSqlSafe(sql))
+        .bind(id)
+        .bind(value)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected() > 0)
 }
 

@@ -1,4 +1,4 @@
-//! `sakurasato-server notification-channel <add|list|remove|toggle|test>` の実体。
+//! `sakurasato-server notification-channel <add|list|remove|enable|disable|test>` の実体。
 //!
 //! ハンドラは状態 (`AppState`) を受け、`notification_channel` repo と
 //! `delivery::enqueue_activity` だけを操作する。実 HTTP POST は worker 側
@@ -24,7 +24,7 @@ use tracing::info;
 
 use crate::cli::{
     NotificationChannelAddArgs, NotificationChannelArgs, NotificationChannelCommand,
-    NotificationChannelEventArgs, NotificationChannelIdArgs,
+    NotificationChannelEnableArgs, NotificationChannelEventArgs, NotificationChannelIdArgs,
 };
 use crate::delivery;
 use crate::net_guard;
@@ -38,8 +38,8 @@ pub async fn run(config: Config, args: NotificationChannelArgs) -> anyhow::Resul
         NotificationChannelCommand::Add(add) => run_add(&state, add).await,
         NotificationChannelCommand::List => run_list(&state).await,
         NotificationChannelCommand::Remove(rm) => run_remove(&state, rm).await,
-        NotificationChannelCommand::Enable(args) => run_set(&state, args, true).await,
-        NotificationChannelCommand::Disable(args) => run_set(&state, args, false).await,
+        NotificationChannelCommand::Enable(args) => run_enable(&state, args).await,
+        NotificationChannelCommand::Disable(args) => run_disable(&state, args).await,
         NotificationChannelCommand::Test(test) => run_test(&state, test).await,
     }
 }
@@ -168,40 +168,89 @@ async fn run_remove(state: &AppState, args: NotificationChannelIdArgs) -> anyhow
     Ok(())
 }
 
-/// `enable` (value = true) / `disable` (value = false) を共通化したハンドラ。
-/// `--event all` は `set_all_events` で 7 列を一斉セットし、それ以外の event は
-/// `set_event` で 1 列だけセット (両方とも idempotent)。
-async fn run_set(
-    state: &AppState,
-    args: NotificationChannelEventArgs,
-    value: bool,
-) -> anyhow::Result<()> {
-    let updated = if args.event.eq_ignore_ascii_case("all") {
-        repo::notification_channel::set_all_events(state.pool(), args.id, value)
+/// `enable` ハンドラ。
+///
+/// - `--only` 無し (= 既定): 指定 event だけ TRUE、他列は据え置き (部分更新)。
+/// - `--only`: 指定 event を TRUE、他列を FALSE に倒す (完全宣言)。
+///   `--only all` は意味が無いので拒否する (= `all` は単独で「全 ON」を
+///   表すため、`--only` を付けると「他は OFF」 と矛盾する解釈になる)。
+async fn run_enable(state: &AppState, args: NotificationChannelEnableArgs) -> anyhow::Result<()> {
+    let events = parse_events(&args.events)?;
+    if args.only && events.len() == NotificationEvent::all().len() {
+        bail!(
+            "`--only all` is meaningless (all events already covered); \
+             use `enable --id N all` without `--only` for a full-on state"
+        );
+    }
+    let updated = if args.only {
+        repo::notification_channel::set_exact_state(state.pool(), args.id, &events)
             .await
-            .with_context(|| format!("set all events for id={}", args.id))?
+            .with_context(|| format!("set exact state for id={}", args.id))?
     } else {
-        let event = NotificationEvent::from_str(&args.event).map_err(|e| anyhow!(e))?;
-        repo::notification_channel::set_event(state.pool(), args.id, event, value)
+        repo::notification_channel::set_events(state.pool(), args.id, &events, true)
             .await
-            .with_context(|| {
-                format!(
-                    "set event {event} for id={id}",
-                    event = event.as_str(),
-                    id = args.id,
-                )
-            })?
+            .with_context(|| format!("enable events for id={}", args.id))?
     };
     if !updated {
         bail!("no notification channel with id={}", args.id);
     }
-    let verb = if value { "enabled" } else { "disabled" };
-    println!(
-        "{verb} channel id={id} event={event}",
-        id = args.id,
-        event = args.event,
-    );
+    let event_list = events
+        .iter()
+        .map(|e| e.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mode = if args.only { " (--only)" } else { "" };
+    let id = args.id;
+    println!("enabled channel id={id} events={event_list}{mode}");
     Ok(())
+}
+
+/// `disable` ハンドラ。常に部分更新 (= 指定 event のみ FALSE、他列据え置き)。
+/// 「全部 OFF にして特定だけ ON」は `enable --only` 経由で表現する。
+async fn run_disable(state: &AppState, args: NotificationChannelEventArgs) -> anyhow::Result<()> {
+    let events = parse_events(&args.events)?;
+    let updated = repo::notification_channel::set_events(state.pool(), args.id, &events, false)
+        .await
+        .with_context(|| format!("disable events for id={}", args.id))?;
+    if !updated {
+        bail!("no notification channel with id={}", args.id);
+    }
+    let event_list = events
+        .iter()
+        .map(|e| e.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let id = args.id;
+    println!("disabled channel id={id} events={event_list}");
+    Ok(())
+}
+
+/// CLI から渡された event 名トークン群を [`NotificationEvent`] 列に変換する。
+///
+/// - `all` は単独でのみ許可 (他 token と混ぜると拒否)。展開すると 7 個。
+/// - それ以外は 1 個ずつ [`NotificationEvent::from_str`] で検証 → 不正値は
+///   早期 bail (= DB を一切触らない)。
+/// - 重複は保持して返す (= dedup は repo 側で行う ── 「同じ event を 2 回
+///   並べたら CLI エラー」だと混乱するので寛容に倒す)。
+fn parse_events(tokens: &[String]) -> anyhow::Result<Vec<NotificationEvent>> {
+    if tokens.is_empty() {
+        // clap の required = true で防いでいるが念のため。
+        bail!("expected at least one event name");
+    }
+    let has_all = tokens.iter().any(|t| t.eq_ignore_ascii_case("all"));
+    if has_all {
+        if tokens.len() > 1 {
+            bail!(
+                "event 'all' cannot be combined with other events; \
+                 use either 'all' alone or list events explicitly (got {tokens:?})"
+            );
+        }
+        return Ok(NotificationEvent::all().to_vec());
+    }
+    tokens
+        .iter()
+        .map(|t| NotificationEvent::from_str(t).map_err(|e| anyhow!(e)))
+        .collect()
 }
 
 async fn run_test(state: &AppState, args: NotificationChannelIdArgs) -> anyhow::Result<()> {
@@ -287,4 +336,94 @@ fn override_test_text(mut payload: serde_json::Value, format: WebhookFormat) -> 
         }
     }
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 単数 token は 1 要素 Vec として通る。`mention` → `[Mention]`。
+    #[test]
+    fn parse_events_single_token() {
+        let got = parse_events(&["mention".to_string()]).unwrap();
+        assert_eq!(got, vec![NotificationEvent::Mention]);
+    }
+
+    /// kebab-case `follow-request` を `FollowRequest` として認識する。
+    #[test]
+    fn parse_events_kebab_case() {
+        let got = parse_events(&["follow-request".to_string()]).unwrap();
+        assert_eq!(got, vec![NotificationEvent::FollowRequest]);
+    }
+
+    /// clap が `--id 1 mention,quote` を `Vec!["mention", "quote"]` に
+    /// splits した想定。両方 `NotificationEvent` に解決する。
+    #[test]
+    fn parse_events_multiple_tokens() {
+        let got = parse_events(&["mention".to_string(), "quote".to_string()]).unwrap();
+        assert_eq!(
+            got,
+            vec![NotificationEvent::Mention, NotificationEvent::Quote],
+        );
+    }
+
+    /// `all` 単独で 7 個全部に展開される (順序は `NotificationEvent::all()` と
+    /// 一致)。
+    #[test]
+    fn parse_events_all_expands_to_seven() {
+        let got = parse_events(&["all".to_string()]).unwrap();
+        assert_eq!(got, NotificationEvent::all().to_vec());
+        assert_eq!(got.len(), 7);
+    }
+
+    /// 大文字小文字を問わず `all` を `all` と認識する。
+    #[test]
+    fn parse_events_all_case_insensitive() {
+        let got = parse_events(&["ALL".to_string()]).unwrap();
+        assert_eq!(got, NotificationEvent::all().to_vec());
+    }
+
+    /// `all` + 他 event の混在は **拒否** する (「全部 + α」は意味が無く誤入力
+    /// の可能性が高いので寛容に倒さない設計)。
+    #[test]
+    fn parse_events_all_with_other_rejected() {
+        let err = parse_events(&["all".to_string(), "mention".to_string()]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("'all'"), "error should mention 'all': {msg}");
+        assert!(
+            msg.contains("cannot be combined"),
+            "error should explain rejection: {msg}",
+        );
+    }
+
+    /// 不正な event 名は早期 bail (= DB を一切触らない)。
+    #[test]
+    fn parse_events_unknown_token_rejected() {
+        let err = parse_events(&["mentions".to_string()]).unwrap_err(); // typo
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown notification event"),
+            "error should mention unknown event: {msg}",
+        );
+    }
+
+    /// 空 Vec は clap で防がれているが、防御的に bail。
+    #[test]
+    fn parse_events_empty_rejected() {
+        let err = parse_events(&[]).unwrap_err();
+        assert!(format!("{err}").contains("expected at least one event"));
+    }
+
+    /// 重複 token は **拒否しない** (= 寛容に dedup は repo 側に任せる)。
+    /// CLI レベルで重複エラーを出すと shell の `event1 event1` のような
+    /// うっかりや、`enable mention,mention` のスクリプト生成ミスを罰しすぎる。
+    #[test]
+    fn parse_events_duplicate_tokens_passed_through() {
+        let got = parse_events(&["mention".to_string(), "mention".to_string()]).unwrap();
+        assert_eq!(
+            got,
+            vec![NotificationEvent::Mention, NotificationEvent::Mention],
+        );
+        // repo::set_events の dedup ロジックで最終 SQL は単一列 SET に倒れる。
+    }
 }

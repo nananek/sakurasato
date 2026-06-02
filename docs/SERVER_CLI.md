@@ -456,24 +456,45 @@ sakurasato-server notification-channel list
 
 ### 13.3 `notification-channel enable` / `disable`
 
-`notify_<event>` を **ON** / **OFF** に設定します (idempotent ── 同じコマンドを再実行しても結果は変わらず DB 状態は等しい)。
+`notify_<event>` を **ON** / **OFF** に設定します (idempotent ── 同じコマンドを再実行しても結果は変わらず DB 状態は等しい)。event は **positional 引数で 1 個以上**、空白区切りでも `,` 区切りでも、混在でも可。
 
 ```bash
-# 個別 event の有効化
-sakurasato-server notification-channel enable  --id 1 --event mention
-# 個別 event の停止
-sakurasato-server notification-channel disable --id 1 --event reaction
+# 個別 event の有効化 (= partial update / 他列据え置き)
+sakurasato-server notification-channel enable  --id 1 mention
+sakurasato-server notification-channel disable --id 1 reaction
+
+# 複数 event の一括有効化 / 停止 (1 UPDATE 文で atomic)
+sakurasato-server notification-channel enable  --id 1 mention,quote
+sakurasato-server notification-channel disable --id 1 mention reaction renote
+sakurasato-server notification-channel enable  --id 1 mention,quote follow
 
 # チャンネル全停止 (= 7 個の notify_* を一斉 FALSE)
-sakurasato-server notification-channel disable --id 1 --event all
+sakurasato-server notification-channel disable --id 1 all
 # チャンネル全有効化 (= 7 個の notify_* を一斉 TRUE)
-sakurasato-server notification-channel enable  --id 1 --event all
+sakurasato-server notification-channel enable  --id 1 all
 ```
 
-設計メモ:
+#### `--only`: フル状態宣言モード (enable のみ)
+
+`enable --only A,B` は「A と B だけ ON、他は OFF」── 希望状態を 1 コマンドで言い切ります。スクリプトや ansible で「現状を問わず状態 X に揃える」用途。完全冪等。
+
+```bash
+# mention と quote だけ ON、他 5 列は OFF
+sakurasato-server notification-channel enable --id 1 --only mention,quote
+
+# follow だけ ON、他 6 列は OFF (= 「フォロー通知だけ欲しい」)
+sakurasato-server notification-channel enable --id 1 --only follow
+```
+
+- `--only` は **`enable` 限定** (= `disable --only` は提供しない。「X だけ OFF」は `enable --only (complement)` 経由で書ける + 「全部 OFF」は `disable all` で済むため)。
+- `--only all` は意味が無いので拒否 (`enable --id N all` を使ってください)。
+- `all` を `--only` 無しで指定するのと `--only` 付きで指定するのは結果が同じ ── 後者は CLI で reject する設計。
+
+#### 設計メモ
 
 - 旧バージョンには `toggle` サブコマンドと `enabled` master 列がありましたが、`--event all` が「7 個一斉反転」ではなく「master 反転」を意味し直感に反していたこと、`toggle` が冪等にならないこと (= スクリプトから安全に呼べない) から、migration 0014 で master 撤去 + `enable` / `disable` への置換が行われました。
 - 通知 fan-out は `WHERE notify_<event> = TRUE` の単純フィルタです (master の AND 条件は無くなりました)。
+- 不明な event 名 (typo 等) は CLI で早期 `bail!` ── DB を一切触らずに失敗します。受理する token: `mention` / `direct` / `quote` / `reaction` / `renote` / `follow` / `follow-request` / `all`。
 
 ### 13.4 `notification-channel test`
 
