@@ -79,6 +79,9 @@ pub enum Focus {
     /// 挿入」モードとして起動。`App::emoji_suggest` が `Some` のときのみ
     /// 取りうる。Esc で起動元に戻る (= Timeline か Compose、`mode` 由来)。
     EmojiSearch,
+    /// Issue #133 (3): Note 詳細モーダル。Timeline `Enter` で開く。
+    /// `App::note_detail` が `Some` のときのみ取りうる。Esc / q で閉じる。
+    NoteDetail,
 }
 
 #[derive(Debug)]
@@ -145,6 +148,10 @@ pub struct App {
     /// `mode` から決まる (= `ReactToNote` → Timeline、`InsertIntoCompose`
     /// → Compose)。検索 buffer は独立。
     pub emoji_suggest: Option<crate::emoji_suggest::EmojiSuggestState>,
+    /// Issue #133 (3): Note 詳細モーダルの state。Timeline で `Enter` を
+    /// 押した瞬間の Note snapshot を保持する。`Focus::NoteDetail` の
+    /// あいだだけ `Some`。`Esc` / `q` で `None` に戻す。
+    pub note_detail: Option<crate::note_detail::NoteDetailScreen>,
     /// Issue #131: 現在進行中の async ネットワーク操作の数。`> 0` のとき
     /// `render_status` が左端に spinner を出す。各 async ハンドラの冒頭で
     /// [`crate::in_flight::InFlightGuard::new`] を構築して
@@ -189,6 +196,7 @@ impl App {
             command: None,
             follow_requests: None,
             emoji_suggest: None,
+            note_detail: None,
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -350,6 +358,8 @@ mod tests {
             published_at: Utc::now(),
             is_local: actor == "https://x.test/users/me",
             reactions: Vec::new(),
+            attachments: Vec::new(),
+            emojis: Vec::new(),
         }
     }
 

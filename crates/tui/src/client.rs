@@ -665,6 +665,43 @@ pub struct TimelineNote {
     /// と通信した場合は `default` で空 Vec になる。
     #[serde(default)]
     pub reactions: Vec<ReactionSummary>,
+    /// Issue #133 (4): 添付メディアの一覧。Timeline の `📎 N` バッジと
+    /// 詳細モーダルのプレビューに使う。SSE / 旧 server で欠ける場合は空。
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+    /// Issue #133 (5): 本文中 `:shortcode:` に対応する custom emoji の
+    /// shortcode + URL 一覧。詳細モーダルでギャラリー表示。SSE / 旧 server で
+    /// 欠ける場合は空。
+    #[serde(default)]
+    pub emojis: Vec<Emoji>,
+}
+
+/// `TimelineNote.attachments` の 1 要素。`server::local_api::timeline::AttachmentDto`
+/// と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Attachment {
+    pub url: String,
+    #[serde(default)]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub alt: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+/// `TimelineNote.emojis` の 1 要素。`server::local_api::timeline::EmojiDto`
+/// と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Emoji {
+    pub shortcode: String,
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub is_local: Option<bool>,
 }
 
 /// `TimelineNote.reactions` の 1 要素。`server::local_api::timeline::ReactionSummaryDto`
@@ -1108,6 +1145,11 @@ impl NoteCreatedPayload {
             // SSE は reactions を運ばない (= 新規 Note は初期状態リアクション 0)。
             // 既存 Note へのリアクション増減は M9 で SSE 拡張する想定。
             reactions: Vec::new(),
+            // SSE 経路は attachments / emojis も運ばない (= 自分が posted
+            // した瞬間の新 Note は本人 TUI 既に持っているので、後続の
+            // GET /timeline で正しい値が再フェッチされる)。
+            attachments: Vec::new(),
+            emojis: Vec::new(),
         }
     }
 }

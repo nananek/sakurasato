@@ -195,6 +195,8 @@ mod tests {
             published_at: Utc::now(),
             is_local: false,
             reactions: Vec::new(),
+            attachments: Vec::new(),
+            emojis: Vec::new(),
         }
     }
 

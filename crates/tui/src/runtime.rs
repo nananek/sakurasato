@@ -625,7 +625,56 @@ async fn apply_action(
         Action::RequestsRejectSelected => requests_mutate_selected(app, api, false).await,
         Action::RequestsRefresh => requests_refresh(app, api).await,
         Action::RequestsClose => requests_close(app),
+        Action::OpenNoteDetail => open_note_detail(app),
+        Action::NoteDetailClose => close_note_detail(app),
+        Action::NoteDetailScrollDown => {
+            if let Some(s) = app.note_detail.as_mut() {
+                s.scroll_down();
+            }
+        }
+        Action::NoteDetailScrollUp => {
+            if let Some(s) = app.note_detail.as_mut() {
+                s.scroll_up();
+            }
+        }
+        Action::NoteDetailNextAttachment => {
+            if let Some(s) = app.note_detail.as_mut() {
+                s.select_next_attachment();
+            }
+        }
+        Action::NoteDetailPrevAttachment => {
+            if let Some(s) = app.note_detail.as_mut() {
+                s.select_prev_attachment();
+            }
+        }
+        Action::NoteDetailToggleReveal => {
+            if let Some(s) = app.note_detail.as_mut() {
+                s.toggle_reveal();
+            }
+        }
     }
+}
+
+/// Issue #133 (3): Timeline で `Enter` ── 選択中 Note の snapshot を取って
+/// 詳細モーダルを開く。空 timeline / 範囲外なら status だけ更新して focus
+/// は移さない (= UI 状態を壊さない)。
+fn open_note_detail(app: &mut App) {
+    let Some(note) = app.notes.get(app.selected) else {
+        app.set_status(
+            "no note selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    };
+    app.note_detail = Some(crate::note_detail::NoteDetailScreen::new(note.clone()));
+    app.focus = Focus::NoteDetail;
+}
+
+/// Issue #133 (3): `Esc` / `q` でモーダルを閉じる。Timeline に focus 復帰。
+fn close_note_detail(app: &mut App) {
+    app.note_detail = None;
+    app.focus = Focus::Timeline;
 }
 
 /// `p` で選択中の Note の author を Profile push する。

@@ -140,6 +140,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
         render_emoji_suggest(frame, area, app, s);
     }
 
+    // Issue #133 (3): Note 詳細モーダル。Timeline 上に中央 overlay で出す。
+    if app.focus == Focus::NoteDetail
+        && let Some(s) = app.note_detail.as_ref()
+    {
+        render_note_detail(frame, area, app, s);
+    }
+
     // M9 PR2: 視覚刺激抑制トグル overlay。
     if app.focus == Focus::Suppression {
         render_suppression_overlay(frame, area, app);
@@ -888,7 +895,7 @@ fn profile_note_lines(
     let marker = if selected { "▍ " } else { "  " };
     let local_published = note.published_at.with_timezone(&Local);
     let time = local_published.format("%m-%d %H:%M").to_string();
-    out.push(Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(marker.to_string(), marker_style),
         Span::styled(format!("[{time}]"), Style::default().fg(palette.muted)),
         Span::raw("  "),
@@ -896,7 +903,14 @@ fn profile_note_lines(
             format!("({})", note.visibility),
             Style::default().fg(palette.muted),
         ),
-    ]));
+    ];
+    if !note.attachments.is_empty() {
+        header_spans.push(Span::styled(
+            format!("  📎 {}", note.attachments.len()),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    out.push(Line::from(header_spans));
     if let Some(cw) = &note.summary
         && !cw.is_empty()
     {
@@ -1256,7 +1270,7 @@ fn note_lines(
     let local_published = note.published_at.with_timezone(&Local);
     let time = local_published.format("%H:%M").to_string();
     let handle = format_handle(note);
-    let header = Line::from(vec![
+    let mut header_spans = vec![
         Span::raw(pad.clone()),
         Span::styled(marker.to_string(), marker_style),
         Span::styled(format!("[{time}] "), Style::default().fg(palette.muted)),
@@ -1278,8 +1292,16 @@ fn note_lines(
             format!("  ({})", note.visibility),
             Style::default().fg(palette.muted),
         ),
-    ]);
-    out.push(header);
+    ];
+    if !note.attachments.is_empty() {
+        // 添付があれば `📎 N` badge を visibility の隣に出す。Timeline では
+        // 添付実体は出さず、Enter で詳細モーダルに遷移してプレビューする運用。
+        header_spans.push(Span::styled(
+            format!("  📎 {}", note.attachments.len()),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    out.push(Line::from(header_spans));
 
     if let Some(cw) = &note.summary
         && !cw.is_empty()
@@ -1464,6 +1486,289 @@ fn truncate_for_width(s: &str, max: u16) -> String {
     out
 }
 
+/// Issue #133 (3) (4) (5): Note 詳細モーダル。Timeline 上に中央 overlay で
+/// 出して `Esc` で閉じる。本文は折りたたまず (= `max_body=0`) に全文を出す。
+///
+/// レイアウト (上から):
+///   - title bar (Note id + handle + visibility)
+///   - permalink (1 行、`url` があれば)
+///   - CW (full)
+///   - 本文 (HTML strip 済み + 折りたたみ無し)
+///   - リアクション行 (既存 [`reaction_line`] を再利用)
+///   - 添付プレビュー (画像 1 枚 + メタ情報、sensitive blur 対応)
+///   - 絵文字ギャラリー (`:shortcode:` + 画像、suppression.emoji が on のとき)
+///   - footer (key bindings ヒント)
+#[allow(clippy::too_many_lines, reason = "1 画面分の宣言的描画")]
+fn render_note_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    state: &crate::note_detail::NoteDetailScreen,
+) {
+    let palette = &app.theme.palette;
+    let note = &state.note;
+
+    // 全画面の 80% を modal 領域に使う。
+    let modal_w = area.width.saturating_sub(4).max(50);
+    let modal_h = area.height.saturating_sub(2).max(15);
+    let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+    let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+    let rect = Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+    let handle = format_handle(note);
+    let title = format!("  note #{} — {} ({})  ", note.id, handle, note.visibility);
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.accent))
+        .padding(Padding::new(1, 1, 0, 0))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    frame.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    // 縦 split: 本文 (= scroll 対象) / 添付プレビュー / footer。
+    let footer_height: u16 = 1;
+    let preview_height: u16 = if note.attachments.is_empty() {
+        0
+    } else {
+        inner.height.clamp(6, 10)
+    };
+    let body_height = inner.height.saturating_sub(footer_height + preview_height);
+
+    let body_rect = Rect::new(inner.x, inner.y, inner.width, body_height);
+    let preview_rect = Rect::new(inner.x, inner.y + body_height, inner.width, preview_height);
+    let footer_rect = Rect::new(
+        inner.x,
+        inner.y + body_height + preview_height,
+        inner.width,
+        footer_height,
+    );
+
+    // 本文ブロック (= 折りたたみ無しの完全版)。
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(16);
+    let local_published = note.published_at.with_timezone(&Local);
+    lines.push(Line::from(vec![Span::styled(
+        format!("[{}]", local_published.format("%Y-%m-%d %H:%M")),
+        Style::default().fg(palette.muted),
+    )]));
+    if let Some(u) = note.url.as_deref() {
+        lines.push(Line::from(vec![Span::styled(
+            format!("↳ {u}"),
+            Style::default().fg(palette.muted),
+        )]));
+    }
+    if let Some(cw) = note.summary.as_deref()
+        && !cw.is_empty()
+    {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "CW: ",
+                Style::default()
+                    .fg(palette.cw_marker)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(cw.to_string(), Style::default().fg(palette.cw_marker)),
+        ]));
+        lines.push(Line::from(""));
+    }
+    let body_text = crate::content::to_plain_text(&note.content);
+    if body_text.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(empty)",
+            Style::default().fg(palette.muted),
+        )));
+    } else {
+        // `max_body = 0` で折りたたみ無し ── `append_folded_body` のヘルパに
+        // 任せて、Timeline と同じ width / palette 経路で描く。
+        append_folded_body(&mut lines, &body_text, "", body_rect.width, 0, palette);
+    }
+    if !note.reactions.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(reaction_line(note, palette, ""));
+    }
+    if !note.emojis.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(emoji_gallery_line(note, palette));
+    }
+    if !note.attachments.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("📎 attachments ({}):", note.attachments.len()),
+            Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        for (i, att) in note.attachments.iter().enumerate() {
+            let cursor = if i == state.selected_attachment {
+                "▶ "
+            } else {
+                "  "
+            };
+            let mt = att.media_type.as_deref().unwrap_or("?");
+            let dims = match (att.width, att.height) {
+                (Some(w), Some(h)) => format!(" {w}×{h}"),
+                _ => String::new(),
+            };
+            let alt = att.alt.as_deref().unwrap_or("");
+            let alt_part = if alt.is_empty() {
+                String::new()
+            } else {
+                format!(" — {alt}")
+            };
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "{cursor}[{}/{}] {mt}{dims}{alt_part}",
+                    i + 1,
+                    note.attachments.len()
+                ),
+                Style::default().fg(if i == state.selected_attachment {
+                    palette.accent
+                } else {
+                    palette.foreground
+                }),
+            )]));
+        }
+    }
+
+    // スクロール: state.scroll 行分先頭をスキップする。
+    let skipped: Vec<Line<'static>> = lines.into_iter().skip(state.scroll).collect();
+    let p = Paragraph::new(skipped).wrap(Wrap { trim: false });
+    frame.render_widget(p, body_rect);
+
+    // 添付プレビュー (画像)。
+    if preview_height > 0 {
+        render_note_detail_preview(frame, preview_rect, app, state, palette);
+    }
+
+    // footer のキー bindings ヒント。
+    let footer = if note.attachments.is_empty() {
+        " Esc/q close · j/k scroll".to_string()
+    } else {
+        format!(
+            " Esc/q close · j/k scroll · n/p attach ({}/{}) · s reveal",
+            state.selected_attachment + 1,
+            note.attachments.len()
+        )
+    };
+    let f = Paragraph::new(Line::from(Span::styled(
+        footer,
+        Style::default().fg(palette.muted),
+    )));
+    frame.render_widget(f, footer_rect);
+}
+
+/// Issue #133 (4): 詳細モーダル下半分の添付プレビュー。`sensitive` Note の
+/// 場合は初期 blur、`s` で個別 reveal (= [`NoteDetailScreen::toggle_reveal`])。
+/// 画像取得は既存 [`ImageCache`] (= `media-proxy` 経由) を流用。
+fn render_note_detail_preview(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    state: &crate::note_detail::NoteDetailScreen,
+    palette: &Palette,
+) {
+    let Some(att) = state.note.attachments.get(state.selected_attachment) else {
+        return;
+    };
+    let is_image = att
+        .media_type
+        .as_deref()
+        .is_some_and(|m| m.starts_with("image/"));
+    let revealed = state
+        .revealed
+        .get(state.selected_attachment)
+        .copied()
+        .unwrap_or(true);
+    if !is_image {
+        let msg = format!("  [non-image attachment: {}]", att.url);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(palette.muted),
+            ))),
+            area,
+        );
+        return;
+    }
+    if !revealed {
+        let msg = "  [sensitive — press s to reveal]";
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default()
+                    .fg(palette.warning)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            area,
+        );
+        return;
+    }
+    // 視覚刺激抑制 (attachment トグル) が off なら画像描画を抜く。
+    if !app.suppression.attachment || !app.images.enabled() {
+        let msg = "  [preview disabled — toggle in suppression overlay]";
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(palette.muted),
+            ))),
+            area,
+        );
+        return;
+    }
+    app.images.ensure(&att.url, area);
+    if let Some(proto) = app.images.get(&att.url) {
+        let widget = Image::new(proto.as_ref());
+        frame.render_widget(widget, area);
+    } else {
+        let msg = "  loading…";
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(palette.muted),
+            ))),
+            area,
+        );
+    }
+}
+
+/// Issue #133 (5): 詳細モーダル本文に挟む emoji ギャラリー行。本文中の
+/// `:shortcode:` に対応する custom emoji を `:foo:` の形で一覧表示する。
+///
+/// MVP: ratatui のテキスト Span に画像を埋め込めないため、まずは shortcode
+/// テキストだけを accent 色で並べる ── 将来的に行下に小さい画像ストリップ
+/// を `ratatui-image` で描く方針 (= reaction 画像と同じパターン)。
+fn emoji_gallery_line(note: &TimelineNote, palette: &Palette) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(note.emojis.len() * 2 + 1);
+    spans.push(Span::styled(
+        format!("🌸 emojis ({}): ", note.emojis.len()),
+        Style::default()
+            .fg(palette.muted)
+            .add_modifier(Modifier::BOLD),
+    ));
+    for (i, e) in note.emojis.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            e.shortcode.clone(),
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_compose(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let palette = &app.theme.palette;
@@ -1634,6 +1939,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::Command => "cmd",
         Focus::Requests => "requests",
         Focus::EmojiSearch => "emoji",
+        Focus::NoteDetail => "note",
     };
     // Issue #131: in-flight な async 操作があれば左端 3 cells に spinner を
     // 出す。0 件のときも 3 cells 確保して後続 span の位置を揺らさない。
