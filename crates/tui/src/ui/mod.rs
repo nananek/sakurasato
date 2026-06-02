@@ -36,6 +36,14 @@ use crate::theme::{Palette, Theme};
 const AVATAR_CELLS_W: u16 = 4;
 const AVATAR_CELLS_H: u16 = 2;
 
+/// 非フォーカス note の本文を Timeline で折りたたむ最大行数。「最大」は
+/// 超過時の indicator 行を含む最終行数 ── 通常は [`AVATAR_CELLS_H`] と
+/// 同じ 2 行に揃え、視覚的にアバター高さと整合させる。
+const UNFOCUSED_BODY_LINES: usize = 2;
+/// フォーカス中の note の本文を表示する最大行数 (折りたたみ後)。十分
+/// 閲覧できる量を確保しつつ、Timeline 1 画面に複数 note が並ぶ余地を残す。
+const FOCUSED_BODY_LINES: usize = 5;
+
 pub mod hit;
 
 /// 描画したパネルの矩形 (マウスヒット判定用)。
@@ -904,17 +912,14 @@ fn profile_note_lines(
         ]));
     }
     let body_width = width.saturating_sub(2);
-    // Timeline と同じく AP HTML をプレーンテキストにしてから描画する。
+    // Timeline と同じく AP HTML をプレーン化してから折りたたむ。
     let body_text = crate::content::to_plain_text(&note.content);
-    for body_line in body_text.lines() {
-        out.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                truncate_for_width(body_line, body_width),
-                Style::default().fg(palette.foreground),
-            ),
-        ]));
-    }
+    let max_body = if selected {
+        FOCUSED_BODY_LINES
+    } else {
+        UNFOCUSED_BODY_LINES
+    };
+    append_folded_body(&mut out, &body_text, "  ", body_width, max_body, palette);
     if body_text.is_empty() {
         out.push(Line::from(vec![
             Span::raw("  "),
@@ -1297,15 +1302,23 @@ fn note_lines(
     // TUI 描画前にプレーン化する。DB / 配送 / permalink に保存する文字列は
     // 連合互換のため触らない (`content` フィールドは読み取りのみ)。
     let body_text = crate::content::to_plain_text(&note.content);
-    for body_line in body_text.lines() {
-        out.push(Line::from(vec![
-            Span::raw(format!("{pad}  ")),
-            Span::styled(
-                truncate_for_width(body_line, body_width),
-                Style::default().fg(palette.foreground),
-            ),
-        ]));
-    }
+    // 長文 note は Timeline で折りたたむ。フォーカスが当たっているときは
+    // [`FOCUSED_BODY_LINES`] 行、非フォーカスは [`UNFOCUSED_BODY_LINES`]
+    // 行までに切る。超過分は最終行末に ` [+N 行]` の indicator を muted 色
+    // で添える ── 詳細閲覧は別途モーダルに任せる。
+    let max_body = if selected {
+        FOCUSED_BODY_LINES
+    } else {
+        UNFOCUSED_BODY_LINES
+    };
+    append_folded_body(
+        &mut out,
+        &body_text,
+        &format!("{pad}  "),
+        body_width,
+        max_body,
+        palette,
+    );
     if body_text.is_empty() {
         out.push(Line::from(vec![
             Span::raw(pad.clone()),
@@ -1375,6 +1388,60 @@ fn extract_host(ap_id: &str) -> Option<String> {
     url::Url::parse(ap_id)
         .ok()
         .and_then(|u| u.host_str().map(ToOwned::to_owned))
+}
+
+/// 本文行を `max_body` 行に折りたたみ、`out` に push する。
+///
+/// `body_text` を `.lines()` で分解し、`max_body` 行までを `prefix` 付きで
+/// 行として積む。超過がある場合は最後の可視行末に ` [+N 行]` の indicator
+/// を muted 色で追加する。`max_body == 0` は「折りたたみ無し」(= 全行)。
+///
+/// `prefix` は各行先頭に置く文字列 (Timeline は `"  "` + アバター indent、
+/// Profile は `"  "` のみ) で、ヘッダ / CW 行と桁を揃える役目。
+fn append_folded_body(
+    out: &mut Vec<Line<'static>>,
+    body_text: &str,
+    prefix: &str,
+    body_width: u16,
+    max_body: usize,
+    palette: &Palette,
+) {
+    let all: Vec<&str> = body_text.lines().collect();
+    if all.is_empty() {
+        return;
+    }
+    let (visible, truncated): (&[&str], usize) = if max_body == 0 || all.len() <= max_body {
+        (&all[..], 0)
+    } else {
+        (&all[..max_body], all.len() - max_body)
+    };
+    let last_idx = visible.len().saturating_sub(1);
+    for (i, body_line) in visible.iter().enumerate() {
+        if truncated > 0 && i == last_idx {
+            let indicator = format!(" [+{truncated} 行]");
+            // 行末 indicator は `truncate_for_width` の対象外にしたいので、本文側を
+            // 先に狭めて切る。indicator の文字幅 (= char count 近似) を引いた残りで
+            // 本文を truncate する。
+            let indicator_width = u16::try_from(indicator.chars().count()).unwrap_or(u16::MAX);
+            let line_width = body_width.saturating_sub(indicator_width);
+            out.push(Line::from(vec![
+                Span::raw(prefix.to_string()),
+                Span::styled(
+                    truncate_for_width(body_line, line_width),
+                    Style::default().fg(palette.foreground),
+                ),
+                Span::styled(indicator, Style::default().fg(palette.muted)),
+            ]));
+        } else {
+            out.push(Line::from(vec![
+                Span::raw(prefix.to_string()),
+                Span::styled(
+                    truncate_for_width(body_line, body_width),
+                    Style::default().fg(palette.foreground),
+                ),
+            ]));
+        }
+    }
 }
 
 fn truncate_for_width(s: &str, max: u16) -> String {
@@ -2174,5 +2241,109 @@ mod tests {
         // 空 / 不正は素通り (= サーバ側で検証済み)。
         assert_eq!(reaction_label(""), "");
         assert_eq!(reaction_label("::"), "::");
+    }
+
+    /// `append_folded_body` テストのために palette だけ取り出すヘルパ。
+    /// 組み込みテーマの sakura を読んでパレットを使う ── ハードコードしない
+    /// 規約 (CLAUDE.md §10) に沿う。
+    fn test_palette() -> crate::theme::Theme {
+        crate::theme::Theme::builtin("sakura").expect("builtin sakura theme")
+    }
+
+    /// `Line` から prefix 以外の本文 / indicator スパンを「 [+N 行]」を含めて
+    /// 1 文字列に連結する。assert で正確に何が出るか比較するため。
+    fn body_text_of(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .skip(1) // 先頭 Span は prefix
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn fold_no_truncation_when_under_max() {
+        let theme = test_palette();
+        let mut out: Vec<Line<'static>> = Vec::new();
+        append_folded_body(&mut out, "a\nb", "  ", 80, 2, &theme.palette);
+        assert_eq!(out.len(), 2);
+        assert_eq!(body_text_of(&out[0]), "a");
+        assert_eq!(body_text_of(&out[1]), "b");
+    }
+
+    #[test]
+    fn fold_inserts_indicator_when_truncated() {
+        let theme = test_palette();
+        let mut out: Vec<Line<'static>> = Vec::new();
+        append_folded_body(&mut out, "a\nb\nc\nd\ne", "  ", 80, 2, &theme.palette);
+        // max=2 のうち最終行に ` [+3 行]` indicator が付く。
+        assert_eq!(out.len(), 2);
+        assert_eq!(body_text_of(&out[0]), "a");
+        assert_eq!(body_text_of(&out[1]), "b [+3 行]");
+    }
+
+    #[test]
+    fn fold_focused_more_lines() {
+        let theme = test_palette();
+        let mut out: Vec<Line<'static>> = Vec::new();
+        // 6 行入力、max=5 でフォーカス相当。最後 1 行は indicator 付き。
+        append_folded_body(
+            &mut out,
+            "1\n2\n3\n4\n5\n6",
+            "  ",
+            80,
+            FOCUSED_BODY_LINES,
+            &theme.palette,
+        );
+        assert_eq!(out.len(), FOCUSED_BODY_LINES);
+        assert_eq!(body_text_of(&out[FOCUSED_BODY_LINES - 1]), "5 [+1 行]");
+    }
+
+    #[test]
+    fn fold_max_zero_disables_folding() {
+        let theme = test_palette();
+        let mut out: Vec<Line<'static>> = Vec::new();
+        append_folded_body(&mut out, "a\nb\nc", "  ", 80, 0, &theme.palette);
+        assert_eq!(out.len(), 3);
+        // どの行にも indicator は付かない。
+        assert_eq!(body_text_of(&out[2]), "c");
+    }
+
+    #[test]
+    fn fold_empty_input_produces_nothing() {
+        let theme = test_palette();
+        let mut out: Vec<Line<'static>> = Vec::new();
+        append_folded_body(&mut out, "", "  ", 80, 2, &theme.palette);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn fold_exact_max_no_indicator() {
+        let theme = test_palette();
+        let mut out: Vec<Line<'static>> = Vec::new();
+        // 入力 2 行ちょうど、max=2 → 切り詰め無し、indicator なし。
+        append_folded_body(&mut out, "x\ny", "  ", 80, 2, &theme.palette);
+        assert_eq!(out.len(), 2);
+        assert_eq!(body_text_of(&out[1]), "y");
+    }
+
+    #[test]
+    fn fold_indicator_does_not_overflow_body_line() {
+        let theme = test_palette();
+        let mut out: Vec<Line<'static>> = Vec::new();
+        // 1 行目は body_width に収まる長さ、2 行目 (= 切り詰め最終行) は
+        // 本文を indicator 文字分減らした幅で truncate されるはず。
+        let long = "abcdefghijklmnopqrstuvwxyz"; // 26 chars
+        let input = format!("first\n{long}\n3\n4");
+        // body_width = 10、indicator = " [+2 行]" は 7 chars 想定。
+        // 本文側は 10 - 7 = 3 chars に truncate → "a…"(2) + indicator 7 = 合計
+        // 9 cells で 10 以下に収まる。
+        append_folded_body(&mut out, &input, "  ", 10, 2, &theme.palette);
+        assert_eq!(out.len(), 2);
+        let last = body_text_of(&out[1]);
+        assert!(
+            last.contains("[+2 行]"),
+            "last line must keep indicator regardless of truncate: {last:?}"
+        );
+        // 本文側が短すぎて全部 truncate されたとしても indicator は残る。
     }
 }
