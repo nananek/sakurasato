@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT to_recipients, cc_recipients FROM note WHERE actor_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "to_recipients",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "to_recipients"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "cc_recipients",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "cc_recipients"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "f757d8aec928b23f45023a764edf8390976fb61e6181c91072223772ac3f4efd"
+}
