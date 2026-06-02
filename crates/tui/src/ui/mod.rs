@@ -828,12 +828,22 @@ fn render_profile_notes(
         let note = &profile.notes[idx];
         let is_selected = idx == profile.selected_note;
         let block_lines = profile_note_lines(note, palette, is_selected, area.width);
-        for l in block_lines {
+        // **Issue #144 同種**: `profile_note_lines` が返す header (`[time]
+        // (visibility)`) / CW / reaction 行は `truncate_for_width` を通って
+        // いないので、`Wrap { trim: false }` の word boundary 折返しで実描画
+        // 行数が >1 になる。`row_cursor += 1` の単純加算だと `selected_note`
+        // が「実は見えていない」位置に乗ったり、loop が visual 領域を超えて
+        // 余分な Line を push したりする ── `wrapped_line_height` で一致させる。
+        let line_heights: Vec<u16> = block_lines
+            .iter()
+            .map(|l| wrapped_line_height(l, area.width))
+            .collect();
+        for (l, h) in block_lines.into_iter().zip(line_heights) {
             if row_cursor >= area.height {
                 break;
             }
             lines.push(l);
-            row_cursor += 1;
+            row_cursor = row_cursor.saturating_add(h);
         }
         idx += 1;
     }
