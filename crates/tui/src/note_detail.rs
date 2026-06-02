@@ -29,13 +29,23 @@ pub struct NoteDetailScreen {
     /// 現状は Timeline からしか開けないので実用上常に `Timeline` だが、
     /// 将来 Profile などから開いたときの戻り先誤りを防ぐため記録しておく。
     pub origin: crate::app::Focus,
+    /// 開いた時点の `suppression.emoji` snapshot。`estimated_max_scroll`
+    /// の emoji 行加算判定に使う ── render 側と同じ条件で見積もり、
+    /// `suppression.emoji == false` のとき emoji セクションが描画されない
+    /// 分のスクロール水増しを防ぐ (= round-5 review F1)。
+    ///
+    /// モーダル中は Focus が `NoteDetail` 固定で suppression overlay (`i`)
+    /// に切替えられないため snapshot で十分。将来 `i` を bind した場合は
+    /// 動的に再評価する。
+    pub emoji_visible: bool,
 }
 
 impl NoteDetailScreen {
     /// `note` の snapshot を取って開く。`sensitive == true` の Note は添付
-    /// 全件 blur 状態で開き、`s` で個別 reveal させる。
+    /// 全件 blur 状態で開き、`s` で個別 reveal させる。`emoji_visible` は
+    /// 開いた時点の `suppression.emoji` (= 描画側と同じ条件)。
     #[must_use]
-    pub fn new(note: TimelineNote, origin: crate::app::Focus) -> Self {
+    pub fn new(note: TimelineNote, origin: crate::app::Focus, emoji_visible: bool) -> Self {
         let initial_reveal = !note.sensitive;
         let n = note.attachments.len();
         Self {
@@ -44,6 +54,7 @@ impl NoteDetailScreen {
             revealed: vec![initial_reveal; n],
             selected_attachment: 0,
             origin,
+            emoji_visible,
         }
     }
 
@@ -90,7 +101,10 @@ impl NoteDetailScreen {
         // 絵文字行: ヘッダ 1 + emoji 件数を 1 行あたり 8 個と見積もった行数。
         // round-4 review F3: 大量の emoji を持つ Note で過小推定にならない
         // ようにする (= 折りたたみ後の wrap で行数が増えるため)。
-        if !self.note.emojis.is_empty() {
+        // round-5 review F1: 描画側と同じく `emoji_visible` (= 開いた時点の
+        // suppression.emoji) でガード ── off のときは行が描画されないのに
+        // 加算してスクロール上限が水増しされる不整合を解消。
+        if !self.note.emojis.is_empty() && self.emoji_visible {
             let emoji_lines = self.note.emojis.len().div_ceil(8).max(1);
             n += 1 + emoji_lines;
         }
@@ -166,19 +180,19 @@ mod tests {
 
     #[test]
     fn new_sensitive_starts_blurred() {
-        let s = NoteDetailScreen::new(make_note(true, 2), Focus::Timeline);
+        let s = NoteDetailScreen::new(make_note(true, 2), Focus::Timeline, true);
         assert_eq!(s.revealed, vec![false, false]);
     }
 
     #[test]
     fn new_non_sensitive_starts_revealed() {
-        let s = NoteDetailScreen::new(make_note(false, 3), Focus::Timeline);
+        let s = NoteDetailScreen::new(make_note(false, 3), Focus::Timeline, true);
         assert_eq!(s.revealed, vec![true, true, true]);
     }
 
     #[test]
     fn toggle_flips_current_only() {
-        let mut s = NoteDetailScreen::new(make_note(true, 3), Focus::Timeline);
+        let mut s = NoteDetailScreen::new(make_note(true, 3), Focus::Timeline, true);
         s.selected_attachment = 1;
         s.toggle_reveal();
         assert_eq!(s.revealed, vec![false, true, false]);
@@ -188,7 +202,7 @@ mod tests {
 
     #[test]
     fn select_next_wraps() {
-        let mut s = NoteDetailScreen::new(make_note(false, 3), Focus::Timeline);
+        let mut s = NoteDetailScreen::new(make_note(false, 3), Focus::Timeline, true);
         s.select_next_attachment();
         s.select_next_attachment();
         s.select_next_attachment();
@@ -197,14 +211,14 @@ mod tests {
 
     #[test]
     fn select_prev_wraps_backward() {
-        let mut s = NoteDetailScreen::new(make_note(false, 3), Focus::Timeline);
+        let mut s = NoteDetailScreen::new(make_note(false, 3), Focus::Timeline, true);
         s.select_prev_attachment();
         assert_eq!(s.selected_attachment, 2); // wrapped to last
     }
 
     #[test]
     fn empty_attachments_select_is_noop() {
-        let mut s = NoteDetailScreen::new(make_note(false, 0), Focus::Timeline);
+        let mut s = NoteDetailScreen::new(make_note(false, 0), Focus::Timeline, true);
         s.select_next_attachment();
         s.select_prev_attachment();
         s.toggle_reveal();
@@ -214,7 +228,7 @@ mod tests {
 
     #[test]
     fn scroll_saturates_at_zero() {
-        let mut s = NoteDetailScreen::new(make_note(false, 0), Focus::Timeline);
+        let mut s = NoteDetailScreen::new(make_note(false, 0), Focus::Timeline, true);
         s.scroll_up();
         assert_eq!(s.scroll, 0);
         s.scroll_down();
@@ -229,7 +243,7 @@ mod tests {
         // round-1 review Finding 2: 末尾を超えても空白画面にならないよう
         // `scroll_down` で見積もり上限にクランプする。
         let note = make_note(false, 0);
-        let mut s = NoteDetailScreen::new(note, Focus::Timeline);
+        let mut s = NoteDetailScreen::new(note, Focus::Timeline, true);
         // 1000 回押しても見積もり上限を超えない。
         for _ in 0..1000 {
             s.scroll_down();
@@ -242,8 +256,30 @@ mod tests {
 
     #[test]
     fn estimated_max_scroll_grows_with_content() {
-        let small = NoteDetailScreen::new(make_note(false, 0), Focus::Timeline);
-        let big = NoteDetailScreen::new(make_note(false, 4), Focus::Timeline);
+        let small = NoteDetailScreen::new(make_note(false, 0), Focus::Timeline, true);
+        let big = NoteDetailScreen::new(make_note(false, 4), Focus::Timeline, true);
         assert!(big.estimated_max_scroll() > small.estimated_max_scroll());
+    }
+
+    #[test]
+    fn estimated_max_scroll_excludes_hidden_emojis() {
+        // round-5 review F1: `emoji_visible = false` のときは emoji 行を
+        // 加算しない (= 描画側と整合)。
+        use crate::client::Emoji;
+        let mut note = make_note(false, 0);
+        note.emojis = (0..16)
+            .map(|i| Emoji {
+                shortcode: format!(":e{i}:"),
+                image_url: None,
+                media_type: None,
+                is_local: None,
+            })
+            .collect();
+        let shown = NoteDetailScreen::new(note.clone(), Focus::Timeline, true);
+        let hidden = NoteDetailScreen::new(note, Focus::Timeline, false);
+        assert!(
+            shown.estimated_max_scroll() > hidden.estimated_max_scroll(),
+            "emoji_visible=false should skip emoji line counts"
+        );
     }
 }

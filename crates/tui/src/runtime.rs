@@ -697,9 +697,11 @@ fn open_note_detail(app: &mut App) {
         return;
     };
     let origin = app.focus;
+    let emoji_visible = app.suppression.emoji;
     app.note_detail = Some(crate::note_detail::NoteDetailScreen::new(
         note.clone(),
         origin,
+        emoji_visible,
     ));
     app.focus = Focus::NoteDetail;
 }
