@@ -52,6 +52,7 @@ cargo run -p sakurasato-server -- <subcommand> [args]
 | `actor lock` / `unlock` | 鍵アカ運用切替 (M12 / #66) | [§11](#11-actor) |
 | `follow-request` | 鍵アカ時の承認待ち follow の管理 | [§12](#12-follow-request) |
 | `notification-channel` | Discord 互換 webhook 通知の宛先管理 | [§13](#13-notification-channel) |
+| `miauth` | Misskey 互換 MiAuth セッション / トークン管理 (M14 #150 系) | [§14](#14-miauth) |
 
 ---
 
@@ -90,7 +91,7 @@ sakurasato-server init
 - ロールバック手段は postgres dump 復元のみ
 - 緊急時 (= 鍵漏洩) のみ使う
 
-詳細は [DEPLOYMENT.md §7.3 鍵ローテーション](../DEPLOYMENT.md)。
+詳細は [DEPLOYMENT.md §8.3 鍵ローテーション](../DEPLOYMENT.md)。
 
 ### 3.3 `--locked` と既存 lock 状態
 
@@ -520,6 +521,83 @@ sakurasato-server notification-channel remove --id 1
 
 ---
 
+## 14. `miauth`
+
+Misskey 互換 MiAuth セッション / トークンの管理 (= 親 issue [#150](https://github.com/nananek/sakurasato/issues/150) / M14 系)。デフォルト無効の opt-in 機能で、`config/default.toml` の `[miauth]` を有効化した状態で **別 listener** に bind される (= TUI 用 `local_api` とは隔離)。
+
+mobile (= Milktea iOS / MissRirica Android) で `/miauth/{uuid}` を開いたあと、本コマンドで CLI 側から **明示的に approve / reject** する。Sakurasato は Web 認可 UI を持たないため、ホスト側でこのコマンドを叩くまで token は発行されない (= [DEPLOYMENT.md §6](../DEPLOYMENT.md) 参照)。
+
+サブコマンド:
+
+| 引数 | 役割 |
+|---|---|
+| `miauth list` | 承認待ち (pending) session の一覧 (期限切れは自動 sweep) |
+| `miauth approve <uuid> --permission a,b,c` | session を **承認** + token 発行 |
+| `miauth reject <uuid>` | session を **拒否** |
+| `miauth tokens` | 発行済 MiAuth token の一覧 (revoke 対象の探索用) |
+| `miauth revoke --id <id>` | token をハード削除 |
+
+> ✏️ AGPL discipline: 本機能は **misskey-hub.net / api-doc.misskey.io の公開仕様** から clean-room 実装している。Misskey 本体 (AGPL-3.0) の TypeScript handler は参照していない。
+
+### 14.1 `miauth list`
+
+```bash
+sakurasato-server miauth list
+```
+
+`requested_at` 古い順で pending session を表示。各行に `uuid` / `app_name` / `requested` / `expires` / `permission_request` (= クライアントが要求した scope) が並ぶ。期限切れは表示前に `expired` 状態に倒される (= sweep)。
+
+approve する scope はクライアント要求より **絞れる** (= `permission_request` の subset を `approve --permission` で渡す運用が安全)。
+
+### 14.2 `miauth approve`
+
+```bash
+# 例: 読み取り + 投稿 + リアクション送信のみ許可
+sakurasato-server miauth approve 11111111-2222-3333-4444-555555555555 \
+  --permission read:account,write:notes,write:reactions
+```
+
+| 引数 | 役割 |
+|---|---|
+| `<uuid>` | `miauth list` で確認した session UUID |
+| `--permission a,b,c` | 付与する scope (CSV 1 個以上必須、空白は trim) |
+
+**設計** (= 旧仕様との違いに注意):
+
+- CLI 側は **CAS pending → approved だけ** を実行する。token 本体は **クライアントが `POST /api/miauth/{uuid}/check` で polling 受け取る** (= Misskey 公式 wire 仕様)。CLI stdout には token を表示しない。
+- このため Milktea / MissRirica 側で polling が成立した瞬間に認証完了。CLI 側はそのまま終了。
+- pending 以外 (= already approved / rejected / expired) には CAS が失敗し、現在 state を出して error 終了する (= 黙って no-op しないので運用ミスを潰せる)。
+
+scope 検証はサーバ側 endpoint で hardcoded list と突き合わせる (= 未知 scope を CLI で弾くと Misskey 側の scope 追加で運用が壊れるため、CLI は素通し)。
+
+### 14.3 `miauth reject`
+
+```bash
+sakurasato-server miauth reject 11111111-2222-3333-4444-555555555555
+```
+
+CAS pending → rejected。以降 `POST /api/miauth/{uuid}/check` は 404 を返す (= クライアント側でログインに失敗、再度 UUID を発行して `/miauth/{uuid}` を開き直す導線になる)。
+
+### 14.4 `miauth tokens`
+
+```bash
+sakurasato-server miauth tokens
+```
+
+発行済の MiAuth token を一覧 (= `api_token` や TUI 用 Bearer とは **別系統**、混在しない)。各行に `id` / `name` (= クライアントから渡された app 名) / `permissions` / `created` / `last_used` が並ぶ。`last_used` が `never` のまま長期放置されている token は端末紛失や testing 残骸の可能性が高いので revoke を検討。
+
+### 14.5 `miauth revoke`
+
+```bash
+sakurasato-server miauth revoke --id 42
+```
+
+`--id` (= `miauth tokens` の `id` 列) でハード削除。クライアント側は次の API 呼び出しで 401 を受けて再認可フローに入る (= Misskey クライアントは MiAuth UUID を再生成して `/miauth/{uuid}` を再度開き、ユーザは §14.2 をやり直す)。
+
+漏洩 / 端末紛失時の応急処置 = まず全 token を `tokens` で並べ、該当端末の token を `revoke` で潰す → MiAuth listener を一時 disable (= `[miauth]` セクションをコメントアウトして再起動) して攻撃面を 0 に倒すのも選択肢。
+
+---
+
 ## トラブルシューティング
 
 ### TUI から `:lock` を叩いたが反映されない
@@ -528,7 +606,7 @@ sakurasato-server notification-channel remove --id 1
 
 ### `init --force` で間違って鍵を再生成してしまった
 
-postgres の dump 復元しかありません ([DEPLOYMENT.md §7.2 バックアップ](../DEPLOYMENT.md))。バックアップが無い場合、**全フォロワー関係は失われます**。新規鍵で再フォローしてもらうしかありません。
+postgres の dump 復元しかありません ([DEPLOYMENT.md §8.2 バックアップ](../DEPLOYMENT.md))。バックアップが無い場合、**全フォロワー関係は失われます**。新規鍵で再フォローしてもらうしかありません。
 
 ### `follow` が pending のまま遷移しない
 

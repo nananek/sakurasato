@@ -114,7 +114,7 @@ sakurasato/
 - **Actor 構成**: 単一ユーザー actor ＋ `instance.actor`(application actor, 必要に応じて生成)。
 - **ローカル API（server ⇄ tui）**: Unix ドメインソケット上の REST + SSE（タイムライン購読）。お一人様前提でソケットのファイルパーミッションが認証境界。トークン発行は CLI から可能。**メディアアップロード**エンドポイント（アイコン/ヘッダ/添付）を持ち、受領後 media-proxy でサニタイズ・変換 → versitygw 格納 → メタデータを DB 登録。
 - **最小 Web UI**: 投稿のパーマリンク（AP Note を人間可読 HTML で）、WebFinger/NodeInfo/actor JSON、メディア配信エンドポイント `GET /media/<key>`（versitygw から取得して配信。versitygw 自体は非公開）。
-- **管理 CLI**（同バイナリのサブコマンド, `clap`）: `init`（ユーザー/鍵生成、`--locked` で鍵アカ初期化 M12）, `emoji import <zip>`, `follow <acct>`（M10）, `move-accept --from <file>`（M10、inbound `Move` 再処理）, `move-out <target>`（送出側 Move）, `alias add|remove|list|clear`, `actor lock|unlock`（M12 鍵アカ切替）, `follow-request list|approve|reject`（M12 鍵アカ承認待ち管理）, `token issue|list|revoke`, `deliver --queue-id` など。**Web 認証 UI は作らない。**
+- **管理 CLI**（同バイナリのサブコマンド, `clap`）: `init`（ユーザー/鍵生成、`--locked` で鍵アカ初期化 M12）, `emoji import <zip>`, `follow <acct>`（M10）, `move-accept --from <file>`（M10、inbound `Move` 再処理）, `move-out <target>`（送出側 Move）, `alias add|remove|list|clear`, `actor lock|unlock`（M12 鍵アカ切替）, `follow-request list|approve|reject`（M12 鍵アカ承認待ち管理）, `token issue|list|revoke`, `miauth list|approve|reject|tokens|revoke`（M14 #150 系、MiAuth 互換ログイン管理）, `deliver --queue-id` など。**Web 認証 UI は作らない。**
   - **`follow <acct>`** は media-proxy で WebFinger を解決し、Follow を `delivery_queue` に積む。`--actor-uri` で WebFinger をスキップして直接 actor URI 指定も可能。`follow-cli-{follower}-{followed}` 形式の決定論的 activity id で `(follower, followed)` UNIQUE 制約と冪等。既存 row が `accepted` なら no-op、`rejected` は明示拒否、`pending` は再 enqueue。
   - **`move-accept` は HTTP 署名検証を通らない**ため、**自分が控えておいた activity 本文** (= 通常経路で受領したものを保存しておいた JSON) でのみ使うこと。第三者から渡された JSON を流すと「Move を勝手に偽装」の入り口になる。コードレベルのガードは「`type == "Move"`」のみで、補完的には `handle_move` 内の `alsoKnownAs` 双方向同意検査・target actor の fresh fetch が「署名なしの任意 Move 適用」を防ぐ。
 - **Follow 承認制 (鍵アカ運用, M12 / Issue #66)** ── `actor.manually_approves_followers` フラグ (default `FALSE`) で切替可能な opt-in 機能。actor JSON に `manuallyApprovesFollowers: true|false` を常時 emit (Mastodon / Misskey 互換、JSON-LD context に `as:manuallyApprovesFollowers` alias 同梱)。
@@ -122,6 +122,7 @@ sakurasato/
   - **CLI**: `actor lock` / `actor unlock` でフラグ切替 + actor `Update` をフォロワーに配信 (相手側 UI のキャッシュ更新)。`follow-request list` で承認待ち一覧、`follow-request approve --id N` / `reject --id N` で Accept / Reject activity 配送 + state 遷移。`init --locked` で最初から鍵アカ初期化、`init --force` 再鍵化時は既存 lock 状態を保持 (片方向: `--locked` なしで unlock には倒さない、unlock は `actor unlock` で明示)。
   - **unlock しても pending を auto-accept しない**: lock 中に届いた「待ち」を unlock の事故で全部 accept する事故を防ぐ。Mastodon と同じ作法。pending の承認は CLI で明示。
   - **既存 accepted の retry は lock 後でも Accept 再送出**: 過去にフォロー済みの相手が Mastodon 側で Follow を retry してきたとき (`row.state = accepted` で着信)、Accept を返さないと相手側で延々と pending 扱いされる。lock した瞬間に従来フォロワーを切るのではなく、新規 Follow だけ承認制に切替える設計 (`handle_follow` の `Accepted` ブランチが lock 判定より前)。
+- **MiAuth 互換 listener (オプション、M14 / 親 Issue #66 とは別 #150 系)** ── Misskey 互換クライアント (= Milktea iOS / MissRirica Android / Iceshrimp Web 等) から `/api/miauth/*` / `/api/i` / `/api/notes/*` / `/api/users/*` / `/api/following/*` / `/api/emojis` を叩くための **別 listener**。`config.miauth.listen` が設定されたときだけ起動 (default 無効)、`/api/v1/*` (TUI 用) と socket / 認証スキーム / レスポンス形式すべて分離。Web UI を持たない原則を維持するため、`/miauth/{uuid}` 認可ページは「CLI で approve せよ」を返すだけのテキスト landing。ユーザは `sakurasato-server miauth approve <uuid> --permission ...` で明示承認 → クライアント側 `POST /api/miauth/{uuid}/check` polling が token を受け取る (= Misskey 公式 wire 仕様)。Token は新規 `miauth_token` テーブルに permission scope (`read:account` / `write:notes` / `write:reactions` etc) 付きで保管、`api_token` (= TUI 用 Bearer) とは混在しない。デプロイは UDS only + Tailscale tailnet 越しが推奨で、`miauth.sock` を cloudflared / nginx / caddy で公開してはいけない (= [DEPLOYMENT.md §6](DEPLOYMENT.md#6-miauth-経路-mobile-misskey-互換))。clean-room 実装: 一次資料は misskey-hub.net + api-doc.misskey.io、Misskey 本体 (AGPL-3.0) の TypeScript handler は参照していない。
 
 ### 5.2 tui（TUI クライアント・別バイナリ）
 - ホスト端末で動作し、server のローカル API（Unix ソケット）へ接続。
@@ -307,6 +308,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 - **Dependency Review** (`dependency-review.yml`): high 以上で fail、GPL/AGPL/SSPL を deny（MIT 維持）。
 - **Federation Test (Mastodon)** (`federation-test.yml`): pytest + httpx で Sakurasato ↔ Mastodon の連合を programmatic に駆動。nightly cron (UTC 19:00) / `workflow_dispatch` / **`main` 向け PR** で発火 (= release 前の必須通過)。develop PR では発火しない。
 - **Federation Test (Nekonoverse / tmux TUI)** (`federation-test-nekonoverse.yml`): tmux pty + 実 sakurasato-tui binary で Sakurasato ↔ Nekonoverse を駆動。nightly cron (UTC 19:30) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
+- **Federation Test (Misskey / MiAuth)** (`federation-test-misskey.yml`): pytest + httpx + misskey.py (= YuzuRyo61, MIT) で Sakurasato ↔ Misskey を駆動。`test_misskey_smoke.py` (連合) + `test_miauth_{flow,read,write}_parity.py` (MiAuth wire-compat parity) を流す。nightly cron (UTC 20:00) / `workflow_dispatch` / **`main` 向け PR** で発火。Misskey 本体は AGPL-3.0 だが未改変 image の CI 起動は §13 (network copyleft) を起動しない (= [`agpl-discipline-miauth`](DEPLOYMENT.md#6-miauth-経路-mobile-misskey-互換))。
 - **Claude PR レビュー** (`claude-review.yml`): `anthropics/claude-code-action@v1`、認証 **`secrets.CLAUDE_CODE_OAUTH_TOKEN`**。PR 自動 + `@claude` メンション、verdict 付き top-level コメントを必ず投稿。
 - **Dependabot** (`dependabot.yml`): `cargo`/`github-actions`/`docker` を週次更新。
 - **アラート**: Dependabot alerts / 自動セキュリティ修正 / secret scanning + push protection 有効化済み。
@@ -321,6 +323,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 | `claude-review` | `claude-review.yml` | verdict コメント (= 全 PR で必須) |
 | `Mastodon (programmatic)` | `federation-test.yml` | 実 Mastodon との連合疎通 |
 | `Nekonoverse (tmux TUI)` | `federation-test-nekonoverse.yml` | 実 Nekonoverse との TUI 連合 |
+| `Misskey + MiAuth (programmatic)` | `federation-test-misskey.yml` | 実 Misskey との連合 + MiAuth wire-compat parity |
 | `Build server` / `Build media-proxy` / `Build versitygw` / `Build tui` | `release-validation.yml` (matrix) | 4 Dockerfile が個別に build できる |
 | `Stack smoke (compose up + nodeinfo probe)` | `release-validation.yml` | compose stack が起動して well-known が応答 |
 

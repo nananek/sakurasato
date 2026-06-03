@@ -50,7 +50,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 ```
 
-**本番運用** (Cloudflare Tunnel 越しの公開 + Tailscale 経由の TUI アクセス) は [DEPLOYMENT.md](DEPLOYMENT.md) を、**TUI の操作方法** (起動 / キー操作 / コマンド一覧 / トラブルシュート) は [docs/TUI.md](docs/TUI.md) を、**サーバ CLI** (init / token / actor lock / follow-request / emoji import / move-out 等) のリファレンスは [docs/SERVER_CLI.md](docs/SERVER_CLI.md) を参照。
+**本番運用** (Cloudflare Tunnel 越しの公開 + Tailscale 経由の TUI アクセス) は [DEPLOYMENT.md](DEPLOYMENT.md) を、**TUI の操作方法** (起動 / キー操作 / コマンド一覧 / トラブルシュート) は [docs/TUI.md](docs/TUI.md) を、**サーバ CLI** (init / token / actor lock / follow-request / emoji import / move-out / miauth 等) のリファレンスは [docs/SERVER_CLI.md](docs/SERVER_CLI.md) を参照。Misskey 互換クライアント (Milktea / MissRirica など) からログインしたい場合の **MiAuth セットアップ** は [DEPLOYMENT.md §6](DEPLOYMENT.md#6-miauth-経路-mobile-misskey-互換) (デフォルト無効 / opt-in)。
 
 ## ローカル開発
 
@@ -105,9 +105,9 @@ cargo run -p sakurasato-tui
 | ファイル | 内容 |
 | --- | --- |
 | [CLAUDE.md](CLAUDE.md) | 設計方針・実装計画・コーディング規約・マイルストーン |
-| [DEPLOYMENT.md](DEPLOYMENT.md) | 本番デプロイ手順（Cloudflare Tunnel + Tailscale） |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | 本番デプロイ手順（Cloudflare Tunnel + Tailscale + MiAuth opt-in） |
 | [docs/TUI.md](docs/TUI.md) | TUI クライアント操作ガイド (起動 / キー操作 / コマンド一覧 / トラブルシュート) |
-| [docs/SERVER_CLI.md](docs/SERVER_CLI.md) | サーバ CLI リファレンス (init / token / actor / follow-request / emoji import / move-out 等) |
+| [docs/SERVER_CLI.md](docs/SERVER_CLI.md) | サーバ CLI リファレンス (init / token / actor / follow-request / emoji import / move-out / miauth 等) |
 
 ## ロードマップ
 

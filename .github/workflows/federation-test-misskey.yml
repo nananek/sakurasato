@@ -1,0 +1,95 @@
+name: Federation Test (Misskey / MiAuth)
+
+# 連合テスト (pytest + httpx + misskey.py) の自動駆動。
+# Issue #150 / #161 (M14): 実 Misskey (= misskey/misskey:latest) 相手に
+# WebFinger / Note 連合 (`test_misskey_smoke.py`) と MiAuth wire-compat
+# parity test (`test_miauth_{flow,read,write}_parity.py`) を回す。
+#
+# 起動契機:
+#   - nightly cron (UTC 20:00 = JST 05:00 ── mastodon (19:00) / nekonoverse
+#     (19:30) と 30 分ずらして runner 競合を緩める)
+#   - workflow_dispatch (= UI から手動キック)
+#   - **main 向け PR** (= develop → main の release PR)。required check 化を
+#     想定し、release 前に必ず通す。develop 向け PR では発火させない
+#     (Misskey image pull + DB migrate + 4 ファイル分の pytest で重い ──
+#     開発体験を損なうため)。
+#
+# ## AGPL discipline
+#
+# Misskey 本体は AGPL-3.0 (§13 network copyleft)、Sakurasato は MIT。本 CI は
+# **未改変 Misskey Docker image を pull/run** するのみで、Misskey の TypeScript
+# handler を Sakurasato 側に転記したり、改変 image を配布したりはしない (=
+# §13 contagion を起動しない)。MiAuth 実装は misskey-hub.net /
+# api-doc.misskey.io の公開仕様から clean-room で書き起こしており、parity test
+# は misskey.py (= YuzuRyo61, MIT) で双方を叩いて schema diff を取る observation
+# でしかなく derivative work ではない。詳細は親 issue #150 description。
+#
+# 失敗時の調査:
+#   1. Actions タブの個別 run ログ
+#   2. "Collect logs on failure" step の出力 (各 service の tail-300)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 20 * * *"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: federation-test-misskey
+  cancel-in-progress: false
+
+jobs:
+  misskey:
+    name: Misskey + MiAuth (programmatic)
+    runs-on: ubuntu-latest
+    # Misskey image pull + DB migrate + admin seed + MiAuth listener boot +
+    # 4 ファイル分の pytest で全体 30 分上限。
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: docker compose version
+        run: docker compose version
+
+      # BuildKit cache を効かせる: sakurasato server / media-proxy / versitygw /
+      # federation-pytest image の再 build を cache hit に倒す。
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run pytest stack
+        run: ./scripts/federation-test/pytest.sh misskey
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          set +e
+          project="sakurasato-fed-misskey-pytest"
+          compose_file="compose/docker-compose.federation-misskey.yml"
+          for svc in sakurasato-init sakurasato-server sakurasato-media-proxy \
+                     misskey-app redis-mk postgres-mk \
+                     versitygw-sks postgres-sks \
+                     nginx-mk nginx-sks \
+                     sakurasato-token-issuer misskey-seed; do
+            echo "==> ${svc} logs"
+            docker compose -p "$project" -f "$compose_file" \
+              --profile pytest logs --no-color --tail=300 "$svc" || true
+          done
+          echo "==> pytest logs"
+          docker compose -p "$project" -f "$compose_file" \
+            --profile pytest logs --no-color --tail=500 pytest || true
+
+      - name: Tear down on failure
+        if: always()
+        run: |
+          project="sakurasato-fed-misskey-pytest"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-misskey.yml \
+            --profile pytest down -v --remove-orphans || true
