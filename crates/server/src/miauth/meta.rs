@@ -54,9 +54,9 @@ pub struct MetaBody {
 pub async fn handle(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Option<Json<MetaBody>>,
+    _body: Option<Json<MetaBody>>,
 ) -> Response {
-    let _ = body; // detail は currently unused (常に detail=true 相当)
+    // `_body.detail` は currently unused (常に detail=true 相当を返す)。
     let cfg = state.config();
     let info = &cfg.server.info;
 
@@ -83,7 +83,7 @@ pub async fn handle(
         .clone()
         .unwrap_or_else(|| "https://github.com/nananek/sakurasato".to_string());
 
-    let body = build_meta(&MetaInputs {
+    let response = build_meta(&MetaInputs {
         name,
         version: env!("CARGO_PKG_VERSION"),
         uri,
@@ -96,7 +96,7 @@ pub async fn handle(
         banner_url: info.banner_url.clone(),
         max_file_size_mb,
     });
-    Json(body).into_response()
+    Json(response).into_response()
 }
 
 /// 内部用 ── `build_meta` の引数を集約。test から独立に呼べるよう公開。
@@ -183,6 +183,9 @@ fn build_meta_top(i: &MetaInputs) -> Value {
         "iconUrl": Value::Null,
         "backgroundImageUrl": Value::Null,
         "logoImageUrl": Value::Null,
+        // TODO(#168 followup): `config.server.max_note_text_length` を生やして
+        // TUI compose UI 上限と連動させる。現状は Misskey 公式デフォルトと同じ
+        // 3000 でハードコード ── お一人様運用で UI 側と乖離する場面はまだ無い。
         "maxNoteTextLength": 3000,
         "defaultLightTheme": Value::Null,
         "defaultDarkTheme": Value::Null,
@@ -221,6 +224,11 @@ fn build_policies(max_file_size_mb: u64) -> Value {
         "canSearchUsers": false,
         "canUseTranslator": false,
         "canHideAds": true,
+        // `driveCapacityMb: 0` は Misskey 上「アップロード可能ドライブ容量
+        // ゼロ」の意味でクライアント UI に「0 MB」表示される可能性がある。
+        // Sakurasato は Misskey 系の "ドライブ" 概念を持たない (= 添付は note
+        // に紐付くだけ) ので 0 で意味的に正しいが、UI 表示が誤解を招く場合は
+        // 後続 issue で `null` または現実的な値 (= storage 上限) に変更する。
         "driveCapacityMb": 0,
         "maxFileSizeMb": max_file_size_mb,
         "alwaysMarkNsfw": false,
