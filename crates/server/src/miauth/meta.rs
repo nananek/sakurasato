@@ -208,7 +208,11 @@ fn build_meta_top(i: &MetaInputs) -> Value {
 }
 
 /// `policies` object (= お一人様前提のデフォルト)。
-fn build_policies(max_file_size_mb: u64) -> Value {
+///
+/// [`crate::miauth::i::handle`] (= `/api/i` の `MeDetailed` 返却) が
+/// `/api/meta.policies` と完全に同じ object を `MeDetailed.policies` 内に乗
+/// せるため `pub(crate)`。
+pub(crate) fn build_policies(max_file_size_mb: u64) -> Value {
     json!({
         "gtlAvailable": false,
         "ltlAvailable": false,

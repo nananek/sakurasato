@@ -14,3 +14,7 @@ pytest-timeout>=2.3.0
 # AGPL package 名 (= `misskey-py` lowercase + hyphen) が混入していたら fail
 # させる future safeguard を後続 PR で追加予定。
 Misskey.py>=4.0.0,<5.0.0
+# M14 #170 `/streaming` WebSocket smoke test 用。Misskey 公式 streaming も
+# テスト基盤として websockets を採用する慣行 (公式 doc サンプル準拠)。
+# MIT license なので AGPL discipline 維持。
+websockets>=13.0,<15.0

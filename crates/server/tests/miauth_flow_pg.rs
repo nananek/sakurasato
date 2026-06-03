@@ -754,3 +754,106 @@ async fn raw_token_matches_hash_path(pool: PgPool) {
         .unwrap();
     assert_eq!(session.issued_token_id, Some(row.id));
 }
+
+// ─── M14 #170: /api/i が MeDetailed 形を返す ──────────────────────────────
+
+/// `/api/i` のレスポンスに `MeDetailed` 必須フィールドが揃う (= Aria 等の
+/// self profile 描画を成立させるため、`MissUser` 最小サブセットでは足りない
+/// 件への対処)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn api_i_returns_me_detailed_shape(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
+    let app = miauth::router(state);
+
+    // token を full flow 経由で発行する。
+    let uuid = Uuid::new_v4();
+    repo::miauth::insert_session(
+        &pool,
+        repo::miauth::NewMiAuthSession {
+            uuid,
+            app_name: "TestApp".into(),
+            callback_url: None,
+            permissions: vec!["read:account".into()],
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        },
+    )
+    .await
+    .unwrap();
+    repo::miauth::approve_session(&pool, uuid, &["read:account".into()])
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/miauth/{uuid}/check"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let raw = read_json(resp).await["token"].as_str().unwrap().to_string();
+
+    // `/api/i` を叩いて MeDetailed shape を確認。
+    let body = serde_json::json!({"i": raw});
+    let resp = app
+        .oneshot(
+            Request::post("/api/i")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let me = read_json(resp).await;
+
+    // UserLite 部分 (= 既存)。
+    assert_eq!(me["username"], "alice");
+    assert!(me["host"].is_null());
+    assert_eq!(me["name"], "Alice");
+    assert_eq!(me["avatarUrl"], "https://cdn.test/avatar.webp");
+    assert_eq!(me["isLocked"], false);
+
+    // UserDetailed 部分 (= #170 で `/api/i` も含むよう拡張)。
+    assert!(me["createdAt"].is_string(), "createdAt must be string");
+    assert_eq!(me["description"], "hello");
+    assert!(me["bannerUrl"].is_null());
+    assert_eq!(me["isBot"], false);
+    assert_eq!(me["isCat"], false);
+
+    // MeDetailed 専用 (= Aria が要求しているとみられる field 群)。
+    assert_eq!(me["isAdmin"], false);
+    assert_eq!(me["isModerator"], false);
+    assert_eq!(me["isSilenced"], false);
+    assert_eq!(me["isSuspended"], false);
+    assert_eq!(me["isExplorable"], true);
+    assert_eq!(me["mfmEnabled"], true);
+    assert_eq!(me["onlineStatus"], "unknown");
+
+    // 配列系。
+    assert!(me["roles"].as_array().unwrap().is_empty());
+    assert!(me["mutedWords"].as_array().unwrap().is_empty());
+    assert!(me["pinnedNoteIds"].as_array().unwrap().is_empty());
+
+    // object 系。
+    assert!(me["emojis"].is_object());
+    assert!(
+        me["policies"].is_object(),
+        "policies must be an object (= same shape as /api/meta.policies)"
+    );
+
+    // `/api/meta.policies` と同じ shape ── 代表的な field の存在を確認。
+    let policies = &me["policies"];
+    assert!(policies["maxFileSizeMb"].is_number());
+    assert_eq!(policies["canPublicNote"], true);
+
+    // Me 専用 (= 通常の users/show には乗らない field)。
+    assert!(me["email"].is_null());
+    assert_eq!(me["emailVerified"], false);
+    assert_eq!(me["twoFactorEnabled"], false);
+    assert_eq!(me["securityKeys"], false);
+}

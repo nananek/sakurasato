@@ -556,7 +556,10 @@ pub(crate) fn timeline_entry_to_miss_note(
     MissNote {
         id: entry.id.to_string(),
         created_at,
-        text: Some(entry.content.clone()),
+        // AP `Note.content` (= HTML) を MFM 互換 plain text に倒す ── Misskey
+        // クライアントは `text` を MFM として render するため、HTML タグが残ると
+        // エスケープせず生で表示される (= #170 / Aria 実機検証で発覚)。
+        text: Some(crate::miauth::text::html_to_plain_text(&entry.content)),
         cw: entry.summary.clone(),
         user_id: entry.actor_id.to_string(),
         user,
@@ -686,6 +689,95 @@ pub fn from_actor_detailed(
         let is_bot = matches!(actor.actor_type.as_str(), "Service" | "Application" | "Bot");
         map.insert("isBot".to_string(), JsonValue::Bool(is_bot));
         map.insert("isCat".to_string(), JsonValue::Bool(false));
+    }
+    v
+}
+
+/// `ActorRow` を Misskey `MeDetailed` 相当に拡張変換する (= `/api/i` 用、
+/// M14 #170)。`UserDetailed` 部分は [`from_actor_detailed`] と同じ。
+///
+/// Me 専用フィールド (Misskey 仕様、お一人様前提のデフォルト):
+///
+/// - 認証 / 権限: `isAdmin` / `isModerator` / `isSilenced` / `isSuspended` ──
+///   いずれも `false`。お一人様 server なので「自分はオーナー = 全部できる」
+///   だが Misskey 側の `isAdmin`/`isModerator` は instance moderation role の
+///   ことなので true を返しても client UI 上は変な挙動になりうる。`false` で
+///   問題なし (= 全ての操作は通常 user として通る)。
+/// - `roles: []` ── role 機能を持たないため空配列。
+/// - `policies: {...}` ── `/api/meta.policies` と同じ shape。client は self の
+///   permission チェックに使う。
+/// - `emojis: {}` ── 自分の display name や description に絵文字を埋め込んだ
+///   場合の shortcode → URL map。お一人様で empty map で十分。
+/// - `onlineStatus: "unknown"` ── オンライン状態の追跡を実装しないため固定。
+/// - `mfmEnabled: true` ── MFM 記法を `text` 上でレンダリングしてほしい。
+/// - `isExplorable: true` ── public profile に出るかどうかの hint。お一人様で
+///   特に隠す意味はない。
+/// - `noindex: false`, `alwaysMarkNsfw: false` 等 ── プライバシー系の default。
+/// - `avatarBlurhash` / `bannerBlurhash` / `bannerColor` ── null (= blurhash
+///   生成は未実装、client 側は default placeholder を出す)。
+///
+/// 本関数は **`policies` の値を引数で受け取る** ── caller (= [`crate::miauth::i`])
+/// が [`crate::miauth::meta::build_policies_value`] を介して `/api/meta` と
+/// 完全に同じ JSON を渡す形にすることで、`/api/meta` と `/api/i` の policies
+/// が乖離しない設計。
+pub fn from_actor_me_detailed(
+    actor: &ActorRow,
+    followers_count: i64,
+    following_count: i64,
+    notes_count: i64,
+    policies: JsonValue,
+) -> JsonValue {
+    let mut v = from_actor_detailed(actor, followers_count, following_count, notes_count);
+    if let JsonValue::Object(ref mut map) = v {
+        // Me-only flags (= 自分にしか出ないフィールド)。
+        map.insert("isAdmin".to_string(), JsonValue::Bool(false));
+        map.insert("isModerator".to_string(), JsonValue::Bool(false));
+        map.insert("isSilenced".to_string(), JsonValue::Bool(false));
+        map.insert("isSuspended".to_string(), JsonValue::Bool(false));
+        map.insert("isExplorable".to_string(), JsonValue::Bool(true));
+        map.insert("mfmEnabled".to_string(), JsonValue::Bool(true));
+        map.insert("noindex".to_string(), JsonValue::Bool(false));
+        map.insert("alwaysMarkNsfw".to_string(), JsonValue::Bool(false));
+        map.insert("autoAcceptFollowed".to_string(), JsonValue::Bool(false));
+        map.insert("publicReactions".to_string(), JsonValue::Bool(true));
+        map.insert("hideOnlineStatus".to_string(), JsonValue::Bool(false));
+        map.insert(
+            "onlineStatus".to_string(),
+            JsonValue::String("unknown".to_string()),
+        );
+
+        // 配列系 (= empty default)。
+        map.insert("roles".to_string(), JsonValue::Array(vec![]));
+        map.insert("badgeRoles".to_string(), JsonValue::Array(vec![]));
+        map.insert("mutedWords".to_string(), JsonValue::Array(vec![]));
+        map.insert("hardMutedWords".to_string(), JsonValue::Array(vec![]));
+        map.insert("mutedInstances".to_string(), JsonValue::Array(vec![]));
+        map.insert(
+            "mutingNotificationTypes".to_string(),
+            JsonValue::Array(vec![]),
+        );
+        map.insert("pinnedNoteIds".to_string(), JsonValue::Array(vec![]));
+        map.insert("pinnedNotes".to_string(), JsonValue::Array(vec![]));
+        map.insert("fields".to_string(), JsonValue::Array(vec![]));
+
+        // object 系。
+        map.insert("emojis".to_string(), serde_json::json!({}));
+        map.insert("policies".to_string(), policies);
+
+        // 画像系 (= blurhash 未生成、null で client 側 default に倒す)。
+        map.insert("avatarBlurhash".to_string(), JsonValue::Null);
+        map.insert("bannerBlurhash".to_string(), JsonValue::Null);
+        map.insert("bannerColor".to_string(), JsonValue::Null);
+
+        // Me 専用の付加情報。
+        map.insert("email".to_string(), JsonValue::Null);
+        map.insert("emailVerified".to_string(), JsonValue::Bool(false));
+        map.insert("birthday".to_string(), JsonValue::Null);
+        map.insert("location".to_string(), JsonValue::Null);
+        map.insert("lang".to_string(), JsonValue::Null);
+        map.insert("twoFactorEnabled".to_string(), JsonValue::Bool(false));
+        map.insert("usePasswordLessLogin".to_string(), JsonValue::Bool(false));
+        map.insert("securityKeys".to_string(), JsonValue::Bool(false));
     }
     v
 }

@@ -34,9 +34,11 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use sakurasato_core::repo;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 
 use crate::miauth::auth;
-use crate::miauth::conv::{MissUser, from_actor_and_counts};
+use crate::miauth::conv::from_actor_me_detailed;
+use crate::miauth::meta::build_policies;
 use crate::state::AppState;
 
 /// `/api/i` の `read:account` scope (= Misskey 仕様の hardcoded constant)。
@@ -94,19 +96,24 @@ pub async fn handle(
     // 4. `last_used_at` を best-effort 更新 (= block しない)。
     auth::mark_used_async(&state, token_row.id);
 
-    // 5. local actor + 集計 count → MissUser。
-    let user = match build_self_miss_user(&state).await {
-        Ok(u) => u,
+    // 5. local actor + 集計 count → MeDetailed (M14 #170 で MissUser → MeDetailed
+    //    に拡張、Aria / Milktea の self profile 描画用)。
+    let me = match build_self_me_detailed(&state).await {
+        Ok(v) => v,
         Err(resp) => return resp,
     };
-    Json(user).into_response()
+    Json(me).into_response()
 }
 
-/// `/api/i` 用の `MissUser` 構築。`check.rs` の `build_miss_user` と論理は同じ
-/// だが、配置の都合で重複を避けず再記述する (= cross-module で `pub(super)`
-/// にすると `crate::miauth` 配下の見通しが悪くなる)。Sakurasato は単一 actor
-/// 前提なので「自身の actor を返す」固定処理で完結する。
-async fn build_self_miss_user(state: &AppState) -> Result<MissUser, Response> {
+/// `/api/i` 用の `MeDetailed` JSON 構築 (= M14 #170)。
+///
+/// `MissUser` (= `UserLite` 最小) では Aria / Milktea 等が self profile を
+/// 描画できないため、`MeDetailed` 相当に膨らませる。`UserDetailed` 部分は
+/// `users/show` と同じ、Me 専用フィールドは [`from_actor_me_detailed`] で
+/// 上書きする。`policies` は `/api/meta` と完全に同じ object を渡す ──
+/// `media_proxy.max_bytes` を MiB に丸めて [`build_policies`] に渡せば
+/// `maxFileSizeMb` 等が一致する。
+async fn build_self_me_detailed(state: &AppState) -> Result<JsonValue, Response> {
     let host = &state.config().server.host;
     let user = &state.config().server.user;
     let actor = match repo::actor::get_by_username_host(state.pool(), user, host).await {
@@ -127,5 +134,15 @@ async fn build_self_miss_user(state: &AppState) -> Result<MissUser, Response> {
         .await
         .unwrap_or(0);
     let notes = repo::note::count_local(state.pool()).await.unwrap_or(0);
-    Ok(from_actor_and_counts(&actor, followers, following, notes))
+
+    // `/api/meta.policies` と同じ shape を再利用 (`media_proxy.max_bytes` →
+    // MiB は `meta::handle` と同じ算出式)。
+    let cfg = state.config();
+    let max_bytes = cfg.media_proxy.max_bytes;
+    let max_file_size_mb = max_bytes.div_ceil(1024 * 1024);
+    let policies = build_policies(max_file_size_mb);
+
+    Ok(from_actor_me_detailed(
+        &actor, followers, following, notes, policies,
+    ))
 }
