@@ -507,3 +507,39 @@ pub async fn list_followers(
         })
         .collect())
 }
+
+/// **M14 #158** ── `local_actor_id` が `state = 'accepted'` で follow している
+/// 件数 (= `MissUser` の `followingCount` 計算用)。
+///
+/// `list_following` を取得して `len()` を返すより専用 COUNT を持つ方が安く済む ──
+/// お一人様サーバ前提でも following が 100+ になれば差が出る
+/// ため、Misskey クライアントが `/api/i` を polling 的に叩く想定で軽量化。
+/// `Option<i64>` は sqlx の `count(*)` 推論で常に Some を返すため
+/// `unwrap_or(0)` で受ける ([`crate::repo::note::count_local`] と同じ流儀)。
+pub async fn count_following(pool: &PgPool, local_actor_id: i64) -> sqlx::Result<i64> {
+    let count: Option<i64> = sqlx::query_scalar!(
+        r#"
+        SELECT count(*) FROM follow
+        WHERE follower_actor_id = $1 AND state = 'accepted'
+        "#,
+        local_actor_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count.unwrap_or(0))
+}
+
+/// **M14 #158** ── `local_actor_id` を `state = 'accepted'` で follow して
+/// いる件数 (= `MissUser` の `followersCount` 計算用)。[`count_following`] と対称。
+pub async fn count_followers(pool: &PgPool, local_actor_id: i64) -> sqlx::Result<i64> {
+    let count: Option<i64> = sqlx::query_scalar!(
+        r#"
+        SELECT count(*) FROM follow
+        WHERE followed_actor_id = $1 AND state = 'accepted'
+        "#,
+        local_actor_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count.unwrap_or(0))
+}

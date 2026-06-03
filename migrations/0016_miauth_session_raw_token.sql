@@ -1,0 +1,63 @@
+-- Sakurasato M14 #158 — MiAuth `check polling` で raw token を返せるよう
+-- `miauth_session.raw_token_for_polling` 列を追加する。
+--
+-- ## 背景 (#158 設計判断)
+--
+-- M14 #157 で MiAuth foundation を入れた時点では「CLI `miauth approve` が
+-- token 発行 + stdout 出力 + session consume まで一気に進める」設計だった。
+-- これは TUI 用 `api_token` と同じ流儀。
+--
+-- しかし #158 で AC を満たすには **`POST /api/miauth/{uuid}/check` が token を
+-- 返せる** 必要がある (= Misskey クライアント Milktea / MissRirica の wire
+-- 仕様。client は polling で `{token, user}` を受け取ってから動き始める)。
+-- かつ AC「2 回目以降の check は既存 token を返す (冪等)」を満たすには raw
+-- token を **複数回読める形** で保管する必要がある。
+--
+-- ## 採用案: `miauth_session.raw_token_for_polling TEXT`
+--
+-- - check polling が読む raw token を session 行に直接保管する
+-- - 「approve 時に server が raw 発行 → session の raw 列 + token hash 列を
+--    同時に書く → check が raw 列を読む」フロー
+-- - CLI `miauth approve` は **token 発行を行わず CAS pending → approved
+--   のみ** に縮退 (= 後続の `crates/server/src/miauth_cli.rs` 改修と同梱)
+-- - check の race (= 2 つの client が同時に approved を見る) は session 行
+--   への `UPDATE ... WHERE state = 'approved'` で 1 つしか勝てず、負けた側は
+--   再度 get_session で consumed を見て raw 列を読む経路に倒れる
+--
+-- ## 安全性
+--
+-- raw を DB に保管するのはセキュリティ的に弱点になり得るが:
+--
+-- - DB アクセスが取れる時点で server 全体が compromise されており、token 1 個の
+--   漏洩は最も小さい影響
+-- - raw は **session UUID にスコープ付き** (= broadcast 攻撃の入り口にならない)
+-- - `expires_at` 経過 + 所定 grace 後にスイープして NULL に倒すため永続保管
+--   ではない (= grace 期間内に client が polling を完了する前提)
+-- - 監査トレイル: revoke 後でも session 行は残り `issued_token_id` で hash
+--   経路と紐付くため、漏洩経路の追跡は維持される
+--
+-- 既存 sweeper (`expire_old_sessions`) の責務は `pending` → `expired` で
+-- 拡張しない。raw 列の NULL 化は **本 PR では行わない** (= follow-up issue
+-- で grace + sweep を入れる)。raw を長期保管したくない deploy は
+-- `miauth.session_ttl_secs` を短くして session 寿命自体を縮める。
+--
+-- ## down 経路
+--
+-- 本 sqlx migrator は idempotent な up-only モデルなので down は無い。万一
+-- ロールバックが必要な場合は `ALTER TABLE miauth_session DROP COLUMN
+-- raw_token_for_polling` を手動で打つ。
+--
+-- ## NULL の意味
+--
+-- - `state = 'pending'`: 必ず NULL (= raw まだ未生成)
+-- - `state = 'approved'`: 必ず NULL (= approve は CAS のみ、raw 生成は check
+--    時)
+-- - `state = 'consumed'`: 通常は raw 文字列、grace sweep 後は NULL
+-- - `state = 'rejected'` / `state = 'expired'`: 必ず NULL (= raw 未生成)
+--
+-- CHECK 制約は **入れない** ── grace sweep で NULL に倒れる経路 (= consumed
+-- + NULL) を許容する必要があるため。値の意味は server 側の handler 経路に
+-- 集約される。
+
+ALTER TABLE miauth_session
+    ADD COLUMN raw_token_for_polling TEXT;

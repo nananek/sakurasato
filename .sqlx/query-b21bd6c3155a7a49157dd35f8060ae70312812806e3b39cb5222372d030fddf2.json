@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            uuid, app_name, callback_url,\n            permissions as \"permissions: Json<Vec<String>>\",\n            state, issued_token_id, requested_at, approved_at, expires_at\n        FROM miauth_session\n        WHERE state = 'pending'\n        ORDER BY requested_at ASC\n        ",
+  "query": "\n        INSERT INTO miauth_session (uuid, app_name, callback_url, permissions, expires_at)\n        VALUES ($1, $2, $3, $4, $5)\n        RETURNING\n            uuid, app_name, callback_url,\n            permissions as \"permissions: Json<Vec<String>>\",\n            state, issued_token_id, requested_at, approved_at, expires_at,\n            raw_token_for_polling\n        ",
   "describe": {
     "columns": [
       {
@@ -101,10 +101,27 @@
             "name": "expires_at"
           }
         }
+      },
+      {
+        "ordinal": 9,
+        "name": "raw_token_for_polling",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "miauth_session",
+            "name": "raw_token_for_polling"
+          }
+        }
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Timestamptz"
+      ]
     },
     "nullable": [
       false,
@@ -115,8 +132,9 @@
       true,
       false,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "9c09e570ae9a62c51907461d6b7522ba6e9250d12ce768d784d33652de819bb5"
+  "hash": "b21bd6c3155a7a49157dd35f8060ae70312812806e3b39cb5222372d030fddf2"
 }
