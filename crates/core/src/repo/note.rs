@@ -242,6 +242,71 @@ pub async fn list_home_timeline(
     .await
 }
 
+/// **M14 #159** ── Misskey `notes/timeline` 互換のカーソル付き home timeline。
+///
+/// `since_id` / `until_id` は **両方排他** (`>` / `<`)。日時版 `since_date` /
+/// `until_date` も同様に **排他** (`>` / `<`)。これは Misskey の wire 仕様準拠で、
+/// クライアントが「最後に見た id 以降の新規」を取るのに `sinceId = last` を使う
+/// (= last 自身は重複取得しない)。
+///
+/// `list_home_timeline` (= 既存) は `before_id` 1 本のみのカーソルだったので、
+/// 本関数は **Misskey 互換専用** の別ラッパとして追加した。可視性フィルタは
+/// 既存と同じ「自分 OR follow 中 + visibility != direct」。
+#[allow(clippy::similar_names)]
+pub async fn list_home_timeline_window(
+    pool: &PgPool,
+    viewer_actor_id: i64,
+    since_id: Option<i64>,
+    until_id: Option<i64>,
+    since_date: Option<DateTime<Utc>>,
+    until_date: Option<DateTime<Utc>>,
+    limit: i64,
+) -> sqlx::Result<Vec<TimelineEntry>> {
+    sqlx::query_as!(
+        TimelineEntry,
+        r#"
+        SELECT
+            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,
+            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,
+            n.to_recipients as "to_recipients: Json<Vec<String>>",
+            n.cc_recipients as "cc_recipients: Json<Vec<String>>",
+            n.attachments as "attachments: Json<JsonValue>",
+            n.tags as "tags: Json<JsonValue>",
+            n.is_local, n.url, n.published_at, n.edited_at, n.created_at, n.updated_at,
+            a.ap_id AS actor_ap_id,
+            a.preferred_username AS actor_preferred_username,
+            a.display_name AS actor_display_name,
+            a.icon_url AS actor_icon_url
+        FROM note n
+        JOIN actor a ON a.id = n.actor_id
+        WHERE
+            n.visibility <> 'direct'
+            AND (
+                n.actor_id = $1
+                OR n.actor_id IN (
+                    SELECT followed_actor_id
+                    FROM follow
+                    WHERE follower_actor_id = $1 AND state = 'accepted'
+                )
+            )
+            AND ($2::BIGINT IS NULL OR n.id > $2)
+            AND ($3::BIGINT IS NULL OR n.id < $3)
+            AND ($4::TIMESTAMPTZ IS NULL OR n.published_at > $4)
+            AND ($5::TIMESTAMPTZ IS NULL OR n.published_at < $5)
+        ORDER BY n.id DESC
+        LIMIT $6
+        "#,
+        viewer_actor_id,
+        since_id,
+        until_id,
+        since_date,
+        until_date,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// `list_home_timeline` の戻り行。Note の通常カラムに加え、actor 表示
 /// 情報を join 同行に持つ。
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
@@ -274,6 +339,40 @@ pub struct TimelineEntry {
     /// 自インスタンス上の `/media/...` (M4 で配信開始)。M5 PR2 の TUI 画像表示
     /// で使う ── 画像取得とデコードは server ではなく TUI 側で行う (CLAUDE.md §7)。
     pub actor_icon_url: Option<String>,
+}
+
+/// **M14 #159** ── `notes/show` 用: 単一 Note を actor 表示情報と join 同行で取る。
+///
+/// `list_home_timeline*` と同じ `TimelineEntry` を 1 件だけ返すヘルパ。
+/// 可視性フィルタは適用しない (= visibility は呼び出し側で判定する)。
+#[allow(clippy::similar_names)]
+pub async fn get_timeline_entry_by_id(
+    pool: &PgPool,
+    id: i64,
+) -> sqlx::Result<Option<TimelineEntry>> {
+    sqlx::query_as!(
+        TimelineEntry,
+        r#"
+        SELECT
+            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,
+            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,
+            n.to_recipients as "to_recipients: Json<Vec<String>>",
+            n.cc_recipients as "cc_recipients: Json<Vec<String>>",
+            n.attachments as "attachments: Json<JsonValue>",
+            n.tags as "tags: Json<JsonValue>",
+            n.is_local, n.url, n.published_at, n.edited_at, n.created_at, n.updated_at,
+            a.ap_id AS actor_ap_id,
+            a.preferred_username AS actor_preferred_username,
+            a.display_name AS actor_display_name,
+            a.icon_url AS actor_icon_url
+        FROM note n
+        JOIN actor a ON a.id = n.actor_id
+        WHERE n.id = $1
+        "#,
+        id,
+    )
+    .fetch_optional(pool)
+    .await
 }
 
 pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> {
