@@ -1003,3 +1003,58 @@ async fn api_i_avatar_url_non_null_when_icon_url_missing(pool: PgPool) {
         "identicon URL must contain actor id; got {url}"
     );
 }
+
+// ─── M14 #176: /api/endpoints (Aria emoji picker 経由判定) ─────────────────
+
+/// `POST /api/endpoints` が top-level JSON array で endpoint 名一覧を返す
+/// (= Aria が `endpoints.contains('emojis')` で `/api/emojis` を使うか判定する
+/// 経路、`misskey-dart::Misskey.endpoints()` 互換)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn api_endpoints_returns_top_level_array_with_emojis(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
+    let app = miauth::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/endpoints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(b"{}".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_json(resp).await;
+
+    // **top-level array** (= envelope なし、misskey-dart の
+    // `apiService.post<List>("endpoints", {})` 互換)。
+    let arr = body.as_array().expect("response must be a JSON array");
+    assert!(!arr.is_empty(), "endpoints array must not be empty");
+
+    // 全要素が string。
+    for item in arr {
+        assert!(
+            item.is_string(),
+            "each endpoint must be a JSON string; got {item:?}"
+        );
+    }
+
+    // **emojis が含まれる** ── Aria の emoji picker 経路で必須。
+    let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        names.contains(&"emojis"),
+        "endpoints must contain 'emojis' (= Aria emoji picker dependency); got {names:?}"
+    );
+
+    // 主要 endpoint が揃っている。
+    for required in &["meta", "i", "notes/timeline", "users/show", "endpoints"] {
+        assert!(
+            names.contains(required),
+            "endpoints must contain '{required}'; got {names:?}"
+        );
+    }
+}
