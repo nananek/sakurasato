@@ -422,3 +422,17 @@ where
         .await?
         .rows_affected())
 }
+
+/// `MiAuth /api/stats.instances` 用 ── 既知の remote インスタンス数を数える。
+///
+/// `actor` テーブルから `is_local = FALSE` の行で **host が distinct な件数**
+/// を返す。お一人様 server で local actor の host は 1 種類しかないので、
+/// `WHERE is_local = FALSE` の絞り込みで十分。Misskey `/api/stats.instances`
+/// と意味的に一致する。
+pub async fn count_distinct_remote_hosts(pool: &PgPool) -> sqlx::Result<i64> {
+    let count: Option<i64> =
+        sqlx::query_scalar!("SELECT count(DISTINCT host) FROM actor WHERE is_local = FALSE")
+            .fetch_one(pool)
+            .await?;
+    Ok(count.unwrap_or(0))
+}
