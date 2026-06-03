@@ -25,6 +25,18 @@ pub enum Action {
     EnterCompose,
     FocusTimeline,
     ToggleHelp,
+    /// Issue #90: Help overlay の 1 行下スクロール (`j` / `↓`)。
+    HelpScrollDown,
+    /// Issue #90: Help overlay の 1 行上スクロール (`k` / `↑`)。
+    HelpScrollUp,
+    /// Issue #90: Help overlay の 1 ページ下 (`Space` / `PgDn`)。
+    HelpPageDown,
+    /// Issue #90: Help overlay の 1 ページ上 (`PgUp`)。
+    HelpPageUp,
+    /// Issue #90: Help overlay の先頭へ (`g`)。
+    HelpScrollTop,
+    /// Issue #90: Help overlay の末尾へ (`G`)。
+    HelpScrollBottom,
     CycleTheme,
     InsertChar(char),
     InsertNewline,
@@ -426,8 +438,16 @@ fn translate_compose_key(k: KeyEvent) -> Action {
 }
 
 fn translate_help_key(k: KeyEvent) -> Action {
-    match k.code {
-        KeyCode::Esc | KeyCode::Char('?' | 'q') => Action::ToggleHelp,
+    // Issue #90: 単独 `g` で先頭、Shift+`g` (= `G`) で末尾 ── less / vim 慣習。
+    // `?` / `q` / Esc は従来どおり overlay クローズ。
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc | KeyCode::Char('?' | 'q'), _) => Action::ToggleHelp,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::HelpScrollDown,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::HelpScrollUp,
+        (KeyCode::Char(' ') | KeyCode::PageDown, _) => Action::HelpPageDown,
+        (KeyCode::PageUp, _) => Action::HelpPageUp,
+        (KeyCode::Char('g'), m) if !m.contains(KeyModifiers::SHIFT) => Action::HelpScrollTop,
+        (KeyCode::Char('G'), _) => Action::HelpScrollBottom,
         _ => Action::Noop,
     }
 }
@@ -902,5 +922,104 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert!(matches!(translate_mouse(evt), Action::Scroll(n) if n > 0));
+    }
+
+    // Issue #90: Help overlay 上の scroll キー routing。
+    // less / vim 慣習に倣う ── j/k で 1 行、Space/PgDn で 1 ページ、g/G で
+    // 先頭/末尾。Esc / ? / q は従来どおり close。
+
+    #[test]
+    fn help_j_scrolls_down_one_line() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)),
+                Focus::Help,
+            ),
+            Action::HelpScrollDown,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Down, KeyModifiers::NONE)),
+                Focus::Help,
+            ),
+            Action::HelpScrollDown,
+        ));
+    }
+
+    #[test]
+    fn help_k_scrolls_up_one_line() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('k'), KeyModifiers::NONE)),
+                Focus::Help,
+            ),
+            Action::HelpScrollUp,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Up, KeyModifiers::NONE)),
+                Focus::Help,
+            ),
+            Action::HelpScrollUp,
+        ));
+    }
+
+    #[test]
+    fn help_space_and_pgdn_page_down() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char(' '), KeyModifiers::NONE)),
+                Focus::Help,
+            ),
+            Action::HelpPageDown,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::PageDown, KeyModifiers::NONE)),
+                Focus::Help,
+            ),
+            Action::HelpPageDown,
+        ));
+    }
+
+    #[test]
+    fn help_pgup_pages_up() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::PageUp, KeyModifiers::NONE)),
+                Focus::Help,
+            ),
+            Action::HelpPageUp,
+        ));
+    }
+
+    #[test]
+    fn help_g_goes_to_top_capital_g_goes_to_bottom() {
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('g'), KeyModifiers::NONE)),
+                Focus::Help,
+            ),
+            Action::HelpScrollTop,
+        ));
+        // crossterm は Shift+'g' を `Char('G')` + SHIFT で配ってくる。
+        // SHIFT 修飾子の有無に依存しない判定 (= Char('G') を見る) に倒している。
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+                Focus::Help,
+            ),
+            Action::HelpScrollBottom,
+        ));
+    }
+
+    #[test]
+    fn help_q_question_esc_still_close() {
+        for code in [KeyCode::Esc, KeyCode::Char('?'), KeyCode::Char('q')] {
+            assert!(matches!(
+                translate(Event::Key(key(code, KeyModifiers::NONE)), Focus::Help),
+                Action::ToggleHelp,
+            ));
+        }
     }
 }
