@@ -856,4 +856,150 @@ async fn api_i_returns_me_detailed_shape(pool: PgPool) {
     assert_eq!(me["emailVerified"], false);
     assert_eq!(me["twoFactorEnabled"], false);
     assert_eq!(me["securityKeys"], false);
+
+    // M14 #174: misskey-dart MeDetailed の required bool 13 件すべて存在。
+    // 漏れると `_$MeDetailedFromJson` で Aria が crash する。
+    for key in [
+        "injectFeaturedNote",
+        "receiveAnnouncementEmail",
+        "autoSensitive",
+        "carefulBot",
+        "noCrawle",
+        "isDeleted",
+        "hasUnreadSpecifiedNotes",
+        "hasUnreadMentions",
+        "hasUnreadAnnouncement",
+        "hasUnreadAntenna",
+        "hasUnreadChannel",
+        "hasUnreadNotification",
+        "hasPendingReceivedFollowRequest",
+    ] {
+        assert!(
+            me[key].is_boolean(),
+            "MeDetailed.{key} must be a boolean (= misskey-dart required field); got {:?}",
+            me[key],
+        );
+        assert_eq!(me[key], false, "{key} must be false for お一人様 server");
+    }
+
+    // M14 #174: required List/int 3 件。
+    assert!(
+        me["emailNotificationTypes"].is_array(),
+        "emailNotificationTypes must be an array"
+    );
+    assert!(
+        me["achievements"].is_array(),
+        "achievements must be an array"
+    );
+    assert!(
+        me["loggedInDays"].is_number(),
+        "loggedInDays must be a number; got {:?}",
+        me["loggedInDays"]
+    );
+}
+
+// ─── M14 #174: avatarUrl は icon_url が None でも non-null ─────────────────
+
+/// `actor.icon_url` が `None` でも `/api/i` の `avatarUrl` は **non-null
+/// string** (= identicon URL fallback)。misskey-dart `UserLite.avatarUrl:
+/// Uri` は non-null required で、`null` だと Aria が crash する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn api_i_avatar_url_non_null_when_icon_url_missing(pool: PgPool) {
+    // icon_url を None で local actor を仕込む (= seed_local_actor を
+    // 借りずに直接 NewActor を組み立てる)。
+    let host = "sakurasato.test";
+    let user = "alice";
+    let ap_id = format!("https://{host}/users/{user}");
+    let new = sakurasato_core::repo::actor::NewActor {
+        ap_id: ap_id.clone(),
+        preferred_username: user.into(),
+        host: host.into(),
+        display_name: Some("Alice".into()),
+        summary: None,
+        icon_url: None, // ← 重要: avatar 未設定
+        image_url: None,
+        inbox_url: format!("{ap_id}/inbox"),
+        shared_inbox_url: Some(format!("https://{host}/inbox")),
+        outbox_url: Some(format!("{ap_id}/outbox")),
+        followers_url: Some(format!("{ap_id}/followers")),
+        following_url: Some(format!("{ap_id}/following")),
+        public_key_id: format!("{ap_id}#main-key"),
+        public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----".into(),
+        private_key_pem: Some(
+            "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----".into(),
+        ),
+        ed25519_public_key_id: None,
+        ed25519_public_key_pem: None,
+        ed25519_private_key_pem: None,
+        also_known_as: vec![],
+        moved_to_ap_id: None,
+        is_local: true,
+        actor_type: "Person".into(),
+        manually_approves_followers: false,
+    };
+    let actor_id = sakurasato_core::repo::actor::insert(&pool, new)
+        .await
+        .expect("seed actor")
+        .id;
+
+    let state = AppState::from_pool(pool.clone(), common::make_config(host, user));
+    let app = miauth::router(state);
+    let uuid = Uuid::new_v4();
+    repo::miauth::insert_session(
+        &pool,
+        repo::miauth::NewMiAuthSession {
+            uuid,
+            app_name: "TestApp".into(),
+            callback_url: None,
+            permissions: vec!["read:account".into()],
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        },
+    )
+    .await
+    .unwrap();
+    repo::miauth::approve_session(&pool, uuid, &["read:account".into()])
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/miauth/{uuid}/check"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let raw = read_json(resp).await["token"].as_str().unwrap().to_string();
+
+    let body = serde_json::json!({"i": raw});
+    let resp = app
+        .oneshot(
+            Request::post("/api/i")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let me = read_json(resp).await;
+
+    // **non-null** であること。identicon URL の format も確認。
+    assert!(
+        me["avatarUrl"].is_string(),
+        "avatarUrl must be a JSON string, not null; got {:?}",
+        me["avatarUrl"]
+    );
+    let url = me["avatarUrl"].as_str().unwrap();
+    assert!(
+        url.starts_with("https://"),
+        "avatarUrl must be a valid https URL; got {url}"
+    );
+    assert!(
+        url.contains("/identicon/"),
+        "avatarUrl must be the identicon URL fallback; got {url}"
+    );
+    assert!(
+        url.contains(&actor_id.to_string()),
+        "identicon URL must contain actor id; got {url}"
+    );
 }
