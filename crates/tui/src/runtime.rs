@@ -257,7 +257,7 @@ async fn main_loop(
     Ok(())
 }
 
-fn redraw(terminal: &mut TuiTerminal, app: &App) -> anyhow::Result<ui::PanelRects> {
+fn redraw(terminal: &mut TuiTerminal, app: &mut App) -> anyhow::Result<ui::PanelRects> {
     let mut captured = ui::PanelRects::default();
     terminal.draw(|f| {
         captured = ui::draw(f, app);
@@ -309,8 +309,31 @@ async fn apply_action(
             app.focus = if app.focus == Focus::Help {
                 Focus::Timeline
             } else {
+                // 開くたびに先頭から読めるよう scroll をリセット。
+                // `last_*` 寸法は次フレームの render_help が書き戻す。
+                app.help_state.scroll_top();
                 Focus::Help
             };
+        }
+        Action::HelpScrollDown => {
+            app.help_state.scroll_down(1);
+        }
+        Action::HelpScrollUp => {
+            app.help_state.scroll_up(1);
+        }
+        Action::HelpPageDown => {
+            let step = app.help_state.page_step();
+            app.help_state.scroll_down(step);
+        }
+        Action::HelpPageUp => {
+            let step = app.help_state.page_step();
+            app.help_state.scroll_up(step);
+        }
+        Action::HelpScrollTop => {
+            app.help_state.scroll_top();
+        }
+        Action::HelpScrollBottom => {
+            app.help_state.scroll_bottom();
         }
         Action::RefreshTimeline => {
             let _g = InFlightGuard::new(app.in_flight.clone());
@@ -1692,6 +1715,9 @@ async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
         }
         Command::Help => {
             // Help overlay は Focus::Help。コマンド経路では明示的にトグルする。
+            // ToggleHelp 経路と同様、開いたら先頭から読めるよう scroll を
+            // リセット。
+            app.help_state.scroll_top();
             app.focus = Focus::Help;
         }
         Command::OpenSelf => {

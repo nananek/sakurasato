@@ -46,6 +46,60 @@ impl StatusLine {
     }
 }
 
+/// Help overlay のスクロール state。content が overlay 高さを超えるとき、
+/// `scroll` で先頭から何行スキップして描画するかを覚える。
+///
+/// `last_total_lines` / `last_inner_height` は renderer が毎フレーム書き込み、
+/// 次回イベント (= `PgDn` / `G` / 末尾クランプ) で参照する ── overlay が描画
+/// される前にキーが来ても破綻しないよう default はすべて `0`。`page_step()`
+/// 側で `.max(1)` を入れ、`last_inner_height = 0` でも 1 行は進めるようにする。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HelpState {
+    /// 上から何行スキップして描画するか。
+    pub scroll: u16,
+    /// 直近 render 時のコンテンツ総行数 (= `lines.len()`)。
+    pub last_total_lines: u16,
+    /// 直近 render 時の overlay inner 高さ (`PgDn` の step に使う)。
+    pub last_inner_height: u16,
+}
+
+impl HelpState {
+    /// 上限内に `scroll` を保ちつつ `n` 行下にスクロール。
+    pub fn scroll_down(&mut self, n: u16) {
+        self.scroll = self.scroll.saturating_add(n).min(self.max_scroll());
+    }
+
+    pub fn scroll_up(&mut self, n: u16) {
+        self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    pub fn scroll_top(&mut self) {
+        self.scroll = 0;
+    }
+
+    pub fn scroll_bottom(&mut self) {
+        self.scroll = self.max_scroll();
+    }
+
+    /// 描画時に viewport / total を反映し、scroll をクランプする。
+    pub fn sync_geometry(&mut self, total_lines: u16, inner_height: u16) {
+        self.last_total_lines = total_lines;
+        self.last_inner_height = inner_height;
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    #[must_use]
+    pub fn max_scroll(&self) -> u16 {
+        self.last_total_lines.saturating_sub(self.last_inner_height)
+    }
+
+    /// `PgDn` / `Space` のステップ。viewport 全部だと文脈を失うので 1 行残す。
+    #[must_use]
+    pub fn page_step(&self) -> u16 {
+        self.last_inner_height.saturating_sub(1).max(1)
+    }
+}
+
 /// 入力フォーカス。マウスクリックでも切り替えられる ([`crate::event`])。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -159,6 +213,9 @@ pub struct App {
     /// 押した瞬間の Note snapshot を保持する。`Focus::NoteDetail` の
     /// あいだだけ `Some`。`Esc` / `q` で `None` に戻す。
     pub note_detail: Option<crate::note_detail::NoteDetailScreen>,
+    /// Help overlay の scroll 状態。`Focus::Help` の入り口で `scroll = 0` に
+    /// リセットされる ── 毎回先頭から読めるようにする。
+    pub help_state: HelpState,
     /// Issue #131: 現在進行中の async ネットワーク操作の数。`> 0` のとき
     /// `render_status` が左端に spinner を出す。各 async ハンドラの冒頭で
     /// [`crate::in_flight::InFlightGuard::new`] を構築して
@@ -205,6 +262,7 @@ impl App {
             follow_requests: None,
             emoji_suggest: None,
             note_detail: None,
+            help_state: HelpState::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -520,5 +578,77 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         app.tick();
         assert!(app.status.is_none());
+    }
+
+    // Help overlay の scroll state を検証。
+    //
+    // `HelpState` は renderer が毎フレーム `sync_geometry` で書き戻す ──
+    // テストは renderer 抜きで「ジオメトリが既知のときに scroll が
+    // どう振る舞うか」を確かめる。`last_inner_height = 10` / `last_total_lines
+    // = 30` のとき `max_scroll = 20`、`page_step = 9` を期待する。
+
+    #[test]
+    fn help_state_scroll_down_clamps_at_max() {
+        let mut s = HelpState::default();
+        s.sync_geometry(30, 10);
+        s.scroll_down(5);
+        assert_eq!(s.scroll, 5);
+        s.scroll_down(100);
+        assert_eq!(s.scroll, 20, "clamped to max_scroll = 30 - 10");
+    }
+
+    #[test]
+    fn help_state_scroll_up_saturates_at_zero() {
+        let mut s = HelpState::default();
+        s.sync_geometry(30, 10);
+        s.scroll_down(8);
+        s.scroll_up(3);
+        assert_eq!(s.scroll, 5);
+        s.scroll_up(100);
+        assert_eq!(s.scroll, 0);
+    }
+
+    #[test]
+    fn help_state_scroll_top_and_bottom() {
+        let mut s = HelpState::default();
+        s.sync_geometry(30, 10);
+        s.scroll_bottom();
+        assert_eq!(s.scroll, 20);
+        s.scroll_top();
+        assert_eq!(s.scroll, 0);
+    }
+
+    #[test]
+    fn help_state_page_step_leaves_one_line_of_context() {
+        let mut s = HelpState::default();
+        s.sync_geometry(80, 10);
+        assert_eq!(s.page_step(), 9, "viewport-1 step");
+    }
+
+    #[test]
+    fn help_state_no_scroll_when_content_fits() {
+        let mut s = HelpState::default();
+        s.sync_geometry(10, 18); // content shorter than viewport
+        assert_eq!(s.max_scroll(), 0);
+        s.scroll_down(5);
+        assert_eq!(s.scroll, 0, "no scroll possible");
+    }
+
+    #[test]
+    fn help_state_sync_geometry_clamps_existing_scroll() {
+        let mut s = HelpState::default();
+        s.sync_geometry(80, 10); // max_scroll = 70
+        s.scroll_down(50);
+        assert_eq!(s.scroll, 50);
+        // overlay 高さが伸びて max_scroll が縮むケース (resize)。
+        s.sync_geometry(80, 60); // max_scroll = 20
+        assert_eq!(s.scroll, 20, "resize clamps scroll into new range");
+    }
+
+    #[test]
+    fn help_state_page_step_min_one_even_when_viewport_unknown() {
+        // 描画前 (= sync_geometry がまだ呼ばれていない) でも 1 行は進む。
+        let s = HelpState::default();
+        assert_eq!(s.page_step(), 1);
     }
 }

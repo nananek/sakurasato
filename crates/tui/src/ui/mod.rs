@@ -73,7 +73,10 @@ pub struct PanelRects {
 pub type ScrollHits = hit::ScrollHits;
 
 /// 1 frame 分を描画。返り値は次の `MouseClick` を解決するためのレイアウト矩形。
-pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
+///
+/// `app` は `&mut` ── Help overlay scroll で、描画した content の総行数 /
+/// viewport を [`crate::app::HelpState`] に書き戻すため。
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
     let area = frame.area();
 
     // 縦 3 段: timeline / compose / status
@@ -118,7 +121,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) -> PanelRects {
     render_status(frame, status_area, app);
 
     let help_area = if app.focus == Focus::Help {
-        Some(render_help(frame, area, &app.theme))
+        Some(render_help(frame, area, app))
     } else {
         None
     };
@@ -2102,31 +2105,14 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     reason = "矩形 w/h/x/y は ratatui 慣習"
 )]
 #[allow(clippy::too_many_lines, reason = "help は宣言的でひと固まり")]
-fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
-    let palette = &theme.palette;
+fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
+    let palette = &app.theme.palette;
     // 中央に max(60, area.width * 0.6) x min(20, area.height - 4) を浮かべる。
     let w = area.width.clamp(40, 60);
     let h = area.height.saturating_sub(6).clamp(10, 18);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
-    let block = Block::default()
-        .title(Span::styled(
-            "  help — keymap  ",
-            Style::default()
-                .fg(palette.accent_strong)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette.accent))
-        .style(
-            Style::default()
-                .bg(palette.background)
-                .fg(palette.foreground),
-        );
-    frame.render_widget(Clear, rect);
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
 
     let lines = vec![
         Line::from(Span::styled("timeline", help_section(palette))),
@@ -2230,11 +2216,62 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         help_entry(palette, "Ctrl-Enter", "send (Kitty/WezTerm/Alacritty 等)"),
         Line::from(""),
         Line::from(Span::styled(
-            "press ? again to close",
+            "j/k=scroll  Space/PgDn=page  g/G=top/bottom  ?=close",
             Style::default().fg(palette.muted),
         )),
     ];
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+
+    // overlay 内寸 = block.inner で border 2 行を除いたサイズ。総行数と
+    // viewport を `HelpState` に書き戻してから scroll をクランプ、その scroll
+    // で `Paragraph::scroll` を呼ぶ。
+    //
+    // help テキストは静的かつ高々 100 行程度。`u16::MAX` (= 65535) を超える
+    // ことは仕様上ありえないので `debug_assert` で開発時に気付けるようにし、
+    // release では `as u16` で饱和 cast (wrap しない範囲)。
+    debug_assert!(
+        u16::try_from(lines.len()).is_ok(),
+        "help text grew unreasonably large: {} lines",
+        lines.len()
+    );
+    let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let inner_height = h.saturating_sub(2);
+    app.help_state.sync_geometry(total_lines, inner_height);
+    let scroll = app.help_state.scroll;
+    let max_scroll = app.help_state.max_scroll();
+
+    // scroll 可否を `▲▼` で示唆。リサイズで `max_scroll` が 0 ↔ 非 0 を行き来
+    // してもタイトル幅がずれないよう、スクロール不要時も同じ幅 (= スペース 2
+    // 文字) を予約しておく。
+    let (up, down) = if max_scroll == 0 {
+        (' ', ' ')
+    } else {
+        let u = if scroll == 0 { ' ' } else { '▲' };
+        let d = if scroll >= max_scroll { ' ' } else { '▼' };
+        (u, d)
+    };
+    let title = format!("  help {up}{down}  ");
+
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.accent))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    frame.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     frame.render_widget(p, inner);
     rect
 }
