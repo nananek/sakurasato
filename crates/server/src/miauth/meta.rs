@@ -116,7 +116,11 @@ pub(crate) struct MetaInputs {
 
 /// `bytes` → MiB。切り上げで `bytes` を **下回らない** MiB 値を返す
 /// (= upload 上限の意味的安全側)。0 入力は 0 を返す。
-fn max_file_size_mb_from_bytes(bytes: u64) -> u64 {
+///
+/// [`crate::miauth::i::handle`] (= `/api/i.policies.maxFileSizeMb`) からも
+/// 呼ばれる ── `/api/meta.policies.maxFileSizeMb` と同じ算出式に揃えるため
+/// `pub(crate)` に昇格。
+pub(crate) fn max_file_size_mb_from_bytes(bytes: u64) -> u64 {
     const MIB: u64 = 1024 * 1024;
     bytes.div_ceil(MIB)
 }

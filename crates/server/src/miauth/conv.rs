@@ -553,13 +553,24 @@ pub(crate) fn timeline_entry_to_miss_note(
         None
     };
 
+    // AP `Note.content` (= HTML) を MFM 互換 plain text に倒す ── Misskey
+    // クライアントは `text` を MFM として render するため、HTML タグが残ると
+    // エスケープせず生で表示される (= #170 / Aria 実機検証で発覚)。
+    // 空文字列 (= `<p></p>` 等の「HTML はあるが plain text は空」) は
+    // **`None`** に倒す ── Misskey 仕様で本文無しの note は `text: null` (=
+    // empty string ではなく省略) を期待。Aria など `text !== null` 分岐の
+    // client が空テキストボックスを描画する事故を避ける。
+    let stripped_text = crate::miauth::text::html_to_plain_text(&entry.content);
+    let text = if stripped_text.is_empty() {
+        None
+    } else {
+        Some(stripped_text)
+    };
+
     MissNote {
         id: entry.id.to_string(),
         created_at,
-        // AP `Note.content` (= HTML) を MFM 互換 plain text に倒す ── Misskey
-        // クライアントは `text` を MFM として render するため、HTML タグが残ると
-        // エスケープせず生で表示される (= #170 / Aria 実機検証で発覚)。
-        text: Some(crate::miauth::text::html_to_plain_text(&entry.content)),
+        text,
         cw: entry.summary.clone(),
         user_id: entry.actor_id.to_string(),
         user,
@@ -729,12 +740,16 @@ pub fn from_actor_me_detailed(
 ) -> JsonValue {
     let mut v = from_actor_detailed(actor, followers_count, following_count, notes_count);
     // `from_actor_detailed` は実質 `Object` を返すが、型レベルでは保証されて
-    // いない。`Null` 等で来ると Me-only field 挿入が無音で消えるので
-    // `debug_assert!` で意図を明示 (= release ビルドでは graceful)。
-    debug_assert!(
-        matches!(v, JsonValue::Object(_)),
-        "from_actor_detailed must return JsonValue::Object",
-    );
+    // いない。`Null` 等で来ると Me-only field 挿入が無音で消えるため、release
+    // ビルドでも `error!` で気付ける形にする (= [PR #171 round-2 finding 2]
+    // `debug_assert!` は release で no-op → 25+ MeDetailed field が silent 欠落)。
+    if v.as_object_mut().is_none() {
+        tracing::error!(
+            actor_id = actor.id,
+            "from_actor_detailed returned non-Object; MeDetailed fields will be dropped"
+        );
+        return v;
+    }
     if let JsonValue::Object(ref mut map) = v {
         // Me-only flags (= 自分にしか出ないフィールド)。
         map.insert("isAdmin".to_string(), JsonValue::Bool(false));

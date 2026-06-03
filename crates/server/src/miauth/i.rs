@@ -38,7 +38,7 @@ use serde_json::Value as JsonValue;
 
 use crate::miauth::auth;
 use crate::miauth::conv::from_actor_me_detailed;
-use crate::miauth::meta::build_policies;
+use crate::miauth::meta::{build_policies, max_file_size_mb_from_bytes};
 use crate::state::AppState;
 
 /// `/api/i` の `read:account` scope (= Misskey 仕様の hardcoded constant)。
@@ -135,11 +135,12 @@ async fn build_self_me_detailed(state: &AppState) -> Result<JsonValue, Response>
         .unwrap_or(0);
     let notes = repo::note::count_local(state.pool()).await.unwrap_or(0);
 
-    // `/api/meta.policies` と同じ shape を再利用 (`media_proxy.max_bytes` →
-    // MiB は `meta::handle` と同じ算出式)。
+    // `/api/meta.policies` と同じ shape を再利用 ── `media_proxy.max_bytes`
+    // → MiB の丸めも `meta::handle` と **共有 helper** で揃える ([PR #171
+    // round-2 finding 3] 同じ式で両 endpoint の policies.maxFileSizeMb が
+    // 乖離しないことを型レベルで保証)。
     let cfg = state.config();
-    let max_bytes = cfg.media_proxy.max_bytes;
-    let max_file_size_mb = max_bytes.div_ceil(1024 * 1024);
+    let max_file_size_mb = max_file_size_mb_from_bytes(cfg.media_proxy.max_bytes);
     let policies = build_policies(max_file_size_mb);
 
     Ok(from_actor_me_detailed(
