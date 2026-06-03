@@ -36,6 +36,7 @@ pub mod auth;
 pub mod check;
 pub mod conv;
 pub mod emojis;
+pub mod endpoints;
 pub mod following;
 pub mod i;
 pub mod meta;
@@ -82,6 +83,8 @@ pub fn router(state: AppState) -> Router {
         .route("/nodeinfo/2.1", get(crate::routes::nodeinfo::v2_1))
         .route("/api/meta", post(meta::handle))
         .route("/api/stats", post(stats::handle))
+        // M14 #176 ── /api/endpoints (Aria が emoji picker で使うか判定する)
+        .route("/api/endpoints", post(endpoints::handle))
         // M14 #158 ── 認証フロー
         .route("/miauth/{uuid}", get(session::handle))
         .route("/api/miauth/{uuid}/check", post(check::handle))
