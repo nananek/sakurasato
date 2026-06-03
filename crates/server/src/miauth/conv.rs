@@ -1033,9 +1033,9 @@ mod tests {
     /// `display_name` が未設定なら **null** で出力される (omitted ではなく)。
     /// Milktea は `name === null` でフォールバック表示する。
     ///
-    /// `avatarUrl` は M14 #174 で **non-null required** に倒した ── icon_url
-    /// が None でも identicon URL 合成で必ず string になる (= Aria の
-    /// `_$UserLiteFromJson` クラッシュ回避)。
+    /// `avatarUrl` は M14 #174 で **non-null required** に倒した ──
+    /// `icon_url` が `None` でも identicon URL 合成で必ず string になる
+    /// (= Aria の `_$UserLiteFromJson` クラッシュ回避)。
     #[test]
     fn optional_fields_serialize_as_null_when_missing() {
         let mut actor = fake_actor(true, "sakurasato", false);
