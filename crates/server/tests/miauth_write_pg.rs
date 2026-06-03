@@ -612,3 +612,21 @@ async fn notes_renote_returns_501(pool: PgPool) {
     let resp = post_json(app, "/api/notes/renote", body).await;
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
 }
+
+/// **PR #166 review 軽微 1 fix**: `replyId` 指定の `notes/create` は silent
+/// ignore せず **501** で明示拒否する。`renoteId` 未対応経路と同じ流儀。
+/// silent ignore してしまうと client は 200 OK を受け取って「返信した」と
+/// 認識するが、サーバ側では返信関係が切れて単独 note として残るため。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_create_with_reply_id_returns_501(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+
+    let body = json!({"i": token, "text": "reply attempt", "replyId": "1"});
+    let resp = post_json(app, "/api/notes/create", body).await;
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "REPLY_NOT_IMPLEMENTED");
+}

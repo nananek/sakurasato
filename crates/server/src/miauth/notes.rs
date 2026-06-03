@@ -332,6 +332,19 @@ pub async fn create(
         );
     }
 
+    // **PR #166 review 軽微 1**: `replyId` 指定の reply 経路はまだ実装していない
+    // (= `noteId → ap_id` 解決の async ステップが追加で必要)。silent ignore して
+    // 普通の note として投稿してしまうと、client は 200 OK を受け取るが返信
+    // 関係が切れる ── client 側で気付きにくい実害ありなので、`renoteId` と
+    // 同じく **501** で明示拒否する。
+    if body.reply_id.is_some() {
+        return error_with_status(
+            StatusCode::NOT_IMPLEMENTED,
+            "REPLY_NOT_IMPLEMENTED",
+            "reply via notes/create replyId is not implemented in this version; use /api/v1/notes with in_reply_to_ap_id",
+        );
+    }
+
     let internal_req = match translate_create_body(&body, &state) {
         Ok(r) => r,
         Err(resp) => return resp,
@@ -519,31 +532,15 @@ fn translate_create_body(
         }
     };
 
-    // reply_id (= `noteId` 形式 string) を ap_id (= URL) に解決する必要があるが、
-    // 既存 `local_api::notes` の `in_reply_to_ap_id` は URL を期待する。
-    // 本 PR では replyId 経由の reply を「内部 noteId → DB lookup → ap_id」
-    // で組み直す。
-    let in_reply_to_ap_id = if let Some(rid) = body.reply_id.as_deref() {
-        match rid.parse::<i64>() {
-            Ok(_id) => {
-                // 後段の `local_api::notes::create` の tx 内で再 lookup される設計
-                // (= note_id → ap_id 解決は handler 側責務) なので、ap_id を
-                // pool から先に引いて渡す形にする。本翻訳は同期では行えないので、
-                // 一時的に raw replyId を空にして、Misskey replyId 経路は別 PR で
-                // 正式対応する。
-                None
-            }
-            Err(_) => {
-                return Err(error_with_status(
-                    StatusCode::NOT_FOUND,
-                    "NO_SUCH_NOTE",
-                    "no such reply target",
-                ));
-            }
-        }
-    } else {
-        None
-    };
+    // `replyId` は handler 側 (= `create()`) が 501 で先に弾いている。本翻訳に
+    // 到達した時点で `body.reply_id` は `None` 確定なので翻訳しない。Misskey
+    // 仕様の `noteId → ap_id` 解決の async ステップは後続 PR で `in_reply_to_ap_id`
+    // 経路に接続する。
+    debug_assert!(
+        body.reply_id.is_none(),
+        "replyId must be rejected by create() before reaching translate_create_body"
+    );
+    let in_reply_to_ap_id: Option<String> = None;
 
     let attachment_ids: Vec<i64> = body
         .file_ids
