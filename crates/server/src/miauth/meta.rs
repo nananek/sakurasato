@@ -37,7 +37,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::miauth::nodeinfo::build_base_url_pub;
+use crate::miauth::nodeinfo::build_base_url;
 use crate::state::AppState;
 
 /// `POST /api/meta` の body。Misskey 公式は `detail: bool` を受け取り、
@@ -62,7 +62,7 @@ pub async fn handle(
 
     // URI は request の Host header から組み立てる (= nodeinfo discovery と
     // 同じ理由。tailscale 越し client が tailnet host を見るため)。
-    let uri = build_base_url_pub(&headers, &cfg.server.host);
+    let uri = build_base_url(&headers, &cfg.server.host);
 
     // 表示名 (= name) は ServerInfo::name 優先、なければ host を使う。
     let name = info.name.clone().unwrap_or_else(|| cfg.server.host.clone());
@@ -248,7 +248,8 @@ fn build_policies(max_file_size_mb: u64) -> Value {
         "noteDraftLimit": 0,
         "scheduledNoteLimit": 0,
         "watermarkAvailable": false,
-        "fileSizeLimit": max_file_size_mb,
+        // `fileSizeLimit` は Misskey 公式 schema (= api-doc.misskey.io) には
+        // 存在しない field なので emit しない。`maxFileSizeMb` (MiB) が正規。
     })
 }
 

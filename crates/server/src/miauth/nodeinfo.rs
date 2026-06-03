@@ -61,19 +61,26 @@ pub async fn well_known(State(state): State<AppState>, headers: HeaderMap) -> Re
     Json(body).into_response()
 }
 
-/// `/api/meta` などから再利用するための公開ラッパ。
-/// 詳細は [`build_base_url`] のドキュメント参照。
-pub(crate) fn build_base_url_pub(headers: &HeaderMap, fallback_host: &str) -> String {
-    build_base_url(headers, fallback_host)
-}
-
 /// request → base URL (= `<scheme>://<host>`)。
 ///
 /// 優先順:
 /// 1. `X-Forwarded-Host` + `X-Forwarded-Proto` (= reverse proxy 配下)
 /// 2. `Host` header + `https` (= 直接接続、tailscale serve など)
 /// 3. `config.server.host` + `https` (= header が一切無い境界ケース)
-fn build_base_url(headers: &HeaderMap, fallback_host: &str) -> String {
+///
+/// ## セキュリティ前提
+///
+/// `X-Forwarded-Host` の値は **サニタイズせずに URL 組立てに使う**。`MiAuth`
+/// listener は `DEPLOYMENT.md` §6.2 で public reverse proxy 越し公開を禁止して
+/// おり、推奨経路は tailscale tailnet 限定。public reverse proxy の前に置く
+/// 場合は upstream で `X-Forwarded-Host` を allowlist 化する責務が運用側に
+/// ある (= 本実装で allowlist 検査を抱え込むと multi-tenant 用途の柔軟性が
+/// 落ちる)。
+///
+/// `Host` ヘッダ単体の場合は HTTP/1.1 仕様で 1 リクエスト 1 個に縛られて
+/// いるため inject 不可。tailscale serve 経由なら tailscale 側が `Host` を
+/// 上書きするので攻撃面はない。
+pub(crate) fn build_base_url(headers: &HeaderMap, fallback_host: &str) -> String {
     let host = headers
         .get("x-forwarded-host")
         .and_then(|v| v.to_str().ok())
