@@ -505,7 +505,21 @@ pub(crate) fn timeline_entry_to_miss_note(
     host: &str,
     self_actor_id: i64,
 ) -> MissNote {
-    let actor = entry_to_actor_lite(entry);
+    // **PR #165 round-2 fix**: `actor.is_local` を `entry.actor_ap_id` の host が
+    // 自インスタンス (`host`) と一致するかで判定する。`entry_to_actor_lite` は
+    // join に `actor.is_local` 列を持たないので false で構築するが、本関数で
+    // 正しい値に上書きしてから `from_actor_and_counts` を呼ぶ。
+    //
+    // これを忘れると `MissUser.host` が local user でも `Some(host)` で emit
+    // され、Misskey wire 仕様 (= local user は `host: null`) に違反する ──
+    // Milktea / `MissRirica` 等は `host != null` のユーザを remote actor として
+    // 扱うため、自分の投稿が「他インスタンスの user」として表示される。
+    //
+    // dev で `host = "example.com:8443"` のように port が混じってもパースで
+    // `host_str` (= 純粋ホスト名) を取り出してから比較する ── `local_api/timeline.rs`
+    // の `normalize_host_for_compare` と同じ流儀。
+    let mut actor = entry_to_actor_lite(entry);
+    actor.is_local = is_same_host(&entry.actor_ap_id, host);
     let user = from_actor_and_counts(&actor, 0, 0, 0);
     let _ = self_actor_id; // future use: user の count を埋める場合に
 
@@ -561,6 +575,27 @@ pub(crate) fn timeline_entry_to_miss_note(
         uri,
         url,
     }
+}
+
+/// `actor_uri` のホストが `local_host` (= サーバ設定の `server.host`、port 付き
+/// 可) と同一かを判定する。
+///
+/// 両辺を `url::Url::host_str()` 経由で正規化することで、`local_host` が
+/// `"example.com:8443"` のような port 付き文字列でも `actor_uri =
+/// "https://example.com/users/me"` と正しく一致させる。一致判定は ASCII-lowercase。
+///
+/// `actor_uri` がパースできない / host を持たない場合は `false` を返す
+/// (= 安全側で remote 扱い) ── 不正データを local 扱いして
+/// `MissUser.host: null` で emit してしまうリスクを避ける。
+fn is_same_host(actor_uri: &str, local_host: &str) -> bool {
+    let lhs = url::Url::parse(actor_uri)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    let rhs = url::Url::parse(&format!("https://{local_host}"))
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| local_host.to_ascii_lowercase());
+    matches!(lhs, Some(h) if h == rhs)
 }
 
 /// `TimelineEntry` の join 部分 (= actor 表示情報のみ) を `ActorRow` 風に詰め直す。
@@ -886,6 +921,128 @@ mod tests {
         assert!(
             v["createdAt"].as_str().unwrap().ends_with('Z'),
             "createdAt must be UTC RFC3339 with Z suffix"
+        );
+    }
+
+    // ── #165 round-2 fix: MissNote.user.host が local actor で null になる ──
+
+    fn fake_timeline_entry(actor_ap_id: &str) -> TimelineEntry {
+        use chrono::Utc;
+        use sqlx::types::Json as SqlxJson;
+        TimelineEntry {
+            id: 100,
+            ap_id: format!("{actor_ap_id}/note/100"),
+            actor_id: 1,
+            content: "hello".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: "public".into(),
+            sensitive: false,
+            to_recipients: SqlxJson(vec![]),
+            cc_recipients: SqlxJson(vec![]),
+            attachments: SqlxJson(json!([])),
+            tags: SqlxJson(json!([])),
+            is_local: true,
+            url: Some(format!("{actor_ap_id}/note/100")),
+            published_at: Utc::now(),
+            edited_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            actor_ap_id: actor_ap_id.to_string(),
+            actor_preferred_username: "alice".into(),
+            actor_display_name: Some("Alice".into()),
+            actor_icon_url: None,
+        }
+    }
+
+    fn empty_summary() -> NoteSummary {
+        NoteSummary {
+            reactions: Vec::new(),
+            announce: None,
+        }
+    }
+
+    #[test]
+    fn is_same_host_matches_plain_host() {
+        assert!(is_same_host(
+            "https://sakurasato.test/users/alice",
+            "sakurasato.test"
+        ));
+        assert!(!is_same_host(
+            "https://remote.test/users/alice",
+            "sakurasato.test"
+        ));
+    }
+
+    /// dev で `host = "example.com:8443"` (= port 付き) と
+    /// `actor_uri = "https://example.com/users/me"` を一致させる。
+    /// `local_api/timeline.rs::normalize_host_for_compare` と同じ流儀。
+    #[test]
+    fn is_same_host_ignores_port_in_local_host() {
+        assert!(is_same_host(
+            "https://example.com/users/me",
+            "example.com:8443"
+        ));
+    }
+
+    #[test]
+    fn is_same_host_is_case_insensitive() {
+        assert!(is_same_host(
+            "https://Sakurasato.TEST/users/alice",
+            "sakurasato.test"
+        ));
+    }
+
+    /// 不正な `actor_uri` は false (= remote 扱い)。`host: null` が誤って
+    /// 出ないことを保証する安全側 default。
+    #[test]
+    fn is_same_host_unparseable_actor_uri_is_remote() {
+        assert!(!is_same_host("not a url", "sakurasato.test"));
+        assert!(!is_same_host("https:///nopath", "sakurasato.test"));
+    }
+
+    /// **#165 round-2 bug fix の本丸**: local actor のノートに対する
+    /// `MissNote.user.host` が **null** で emit される。
+    #[test]
+    fn timeline_entry_for_local_actor_emits_user_host_null() {
+        let entry = fake_timeline_entry("https://sakurasato.test/users/alice");
+        let summary = empty_summary();
+        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test", 1);
+        let json = serde_json::to_value(&note).unwrap();
+        assert!(
+            json["user"]["host"].is_null(),
+            "local actor note must serialize user.host as null, got {:?}",
+            json["user"]["host"]
+        );
+        assert_eq!(json["user"]["username"], "alice");
+    }
+
+    /// remote actor のノートは `user.host` を `Some(remote_host)` で emit する。
+    #[test]
+    fn timeline_entry_for_remote_actor_emits_user_host_some() {
+        let entry = fake_timeline_entry("https://misskey.io/users/bob");
+        let summary = empty_summary();
+        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test", 1);
+        let json = serde_json::to_value(&note).unwrap();
+        assert_eq!(
+            json["user"]["host"], "misskey.io",
+            "remote actor note must serialize user.host with the remote host"
+        );
+    }
+
+    /// dev で `local_host = "example.com:8443"` でも local user は
+    /// `user.host: null` (= port 違いで remote 扱いされない)。
+    #[test]
+    fn timeline_entry_local_host_with_port_still_emits_null() {
+        let entry = fake_timeline_entry("https://example.com/users/alice");
+        let summary = empty_summary();
+        let note = timeline_entry_to_miss_note(&entry, &summary, "example.com:8443", 1);
+        let json = serde_json::to_value(&note).unwrap();
+        assert!(
+            json["user"]["host"].is_null(),
+            "dev local_host with port must still emit user.host: null"
         );
     }
 }

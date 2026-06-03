@@ -122,8 +122,30 @@ async fn seed_note(
     content: &str,
     visibility: Visibility,
 ) -> i64 {
-    // 適当な placeholder ap_id を当て、後で set_ap_id_and_url で正規化する。
+    seed_note_with_audience(pool, actor_id, host, content, visibility, vec![], vec![]).await
+}
+
+/// `seed_note` の汎用版。`to_recipients` / `cc_recipients` を指定できる。
+/// **#165 round-2 review #3** の `direct` visibility テストで「viewer の
+/// `ap_id` が audience に含まれているか」を切り分けるために使う。
+async fn seed_note_with_audience(
+    pool: &PgPool,
+    actor_id: i64,
+    host: &str,
+    content: &str,
+    visibility: Visibility,
+    to_recipients: Vec<String>,
+    cc_recipients: Vec<String>,
+) -> i64 {
     let ap_id = format!("https://{host}/notes/pending-{}", Uuid::new_v4());
+    // visibility が direct のときは default `Public` 宛 を上書きする。
+    let to = if !to_recipients.is_empty() {
+        to_recipients
+    } else if matches!(visibility, Visibility::Direct) {
+        Vec::new()
+    } else {
+        vec!["https://www.w3.org/ns/activitystreams#Public".into()]
+    };
     let new = NewNote {
         ap_id: ap_id.clone(),
         actor_id,
@@ -134,8 +156,8 @@ async fn seed_note(
         summary: None,
         visibility,
         sensitive: false,
-        to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
-        cc_recipients: vec![],
+        to_recipients: to,
+        cc_recipients,
         attachments: json!([]),
         tags: json!([]),
         is_local: true,
@@ -148,6 +170,55 @@ async fn seed_note(
         .await
         .expect("set canonical url");
     row.id
+}
+
+/// remote actor を 1 件作る (= `direct`/`followers` visibility のアクセス制御
+/// テストで「自分以外の author」を用意するため)。`is_local: false`、秘密鍵なし。
+async fn seed_remote_actor(pool: &PgPool, host: &str, user: &str) -> i64 {
+    let ap_id = format!("https://{host}/users/{user}");
+    let new = NewActor {
+        ap_id: ap_id.clone(),
+        preferred_username: user.into(),
+        host: host.into(),
+        display_name: Some("Bob".into()),
+        summary: Some("remote".into()),
+        icon_url: None,
+        image_url: None,
+        inbox_url: format!("{ap_id}/inbox"),
+        shared_inbox_url: Some(format!("https://{host}/inbox")),
+        outbox_url: Some(format!("{ap_id}/outbox")),
+        followers_url: Some(format!("{ap_id}/followers")),
+        following_url: Some(format!("{ap_id}/following")),
+        public_key_id: format!("{ap_id}#main-key"),
+        public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----".into(),
+        // remote actor は秘密鍵を持たない。
+        private_key_pem: None,
+        ed25519_public_key_id: None,
+        ed25519_public_key_pem: None,
+        ed25519_private_key_pem: None,
+        also_known_as: vec![],
+        moved_to_ap_id: None,
+        is_local: false,
+        actor_type: "Person".into(),
+        manually_approves_followers: false,
+    };
+    repo::actor::insert(pool, new)
+        .await
+        .expect("seed remote actor")
+        .id
+}
+
+/// follower → followed の `follow` 行を `accepted` 状態で 1 件作る。
+/// `notes/show` の `followers` visibility テストで使用。
+#[allow(clippy::similar_names, reason = "follower / followed は AP 用語")]
+async fn seed_accepted_follow(pool: &PgPool, follower: i64, followed: i64) {
+    let ap_id = format!("https://test/follow/{follower}-{followed}");
+    let row = repo::follow::insert_pending(pool, &ap_id, follower, followed)
+        .await
+        .expect("seed pending follow");
+    repo::follow::set_state(pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .expect("accept follow");
 }
 
 async fn issue_token_with_scopes(pool: &PgPool, scopes: &[&str]) -> String {
@@ -232,6 +303,14 @@ async fn timeline_returns_miss_notes_in_id_desc(pool: PgPool) {
     assert_eq!(notes[0]["id"], last.to_string());
     assert_eq!(notes[0]["text"], "third");
     assert_eq!(notes[0]["user"]["username"], "alice");
+    // **#165 round-2 fix**: local actor のノートは `user.host: null`
+    // (Misskey wire 仕様 ── Milktea 等が `host != null` の user を
+    // remote 扱いするのを防ぐ)。
+    assert!(
+        notes[0]["user"]["host"].is_null(),
+        "local actor note must have user.host: null, got {:?}",
+        notes[0]["user"]["host"],
+    );
     // visibility: "public" → "public"
     assert_eq!(notes[0]["visibility"], "public");
     // mentions / fileIds / files / reactions / emojis are always present.
@@ -638,4 +717,186 @@ async fn notes_show_without_scope_returns_401(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─── #165 round-2 review #3: followers / direct visibility access control ─
+
+/// `followers` visibility: viewer (= local actor) が author を **未 follow** の
+/// とき `notes/show` は **404** を返す。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_show_followers_unfollowed_viewer_returns_404(pool: PgPool) {
+    let _viewer_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let author_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let note_id = seed_note_with_audience(
+        &pool,
+        author_id,
+        "misskey.io",
+        "followers-only",
+        Visibility::Followers,
+        vec!["https://misskey.io/users/bob/followers".into()],
+        vec![],
+    )
+    .await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "noteId": note_id.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `followers` visibility: viewer が author を **accepted で follow** している
+/// とき `notes/show` は **200** + `MissNote` を返す。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_show_followers_followed_viewer_returns_200(pool: PgPool) {
+    let viewer_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let author_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    seed_accepted_follow(&pool, viewer_id, author_id).await;
+    let note_id = seed_note_with_audience(
+        &pool,
+        author_id,
+        "misskey.io",
+        "followers-only",
+        Visibility::Followers,
+        vec!["https://misskey.io/users/bob/followers".into()],
+        vec![],
+    )
+    .await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "noteId": note_id.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let note = read_json(resp).await;
+    assert_eq!(note["id"], note_id.to_string());
+    assert_eq!(note["text"], "followers-only");
+    // followers → Misskey の `followers` (= 文字列そのまま)。
+    assert_eq!(note["visibility"], "followers");
+}
+
+/// `direct` visibility: viewer が audience に **居ない** とき `notes/show` は
+/// **404** を返す (= 自分宛 DM ではないので見えない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_show_direct_non_audience_viewer_returns_404(pool: PgPool) {
+    let _viewer_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let author_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // 宛先が carol (= 自分以外の架空 user)。
+    let note_id = seed_note_with_audience(
+        &pool,
+        author_id,
+        "misskey.io",
+        "dm",
+        Visibility::Direct,
+        vec!["https://misskey.io/users/carol".into()],
+        vec![],
+    )
+    .await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "noteId": note_id.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `direct` visibility: viewer が `to` に居る ── 200 + `MissNote` を返す。
+/// Misskey 仕様で `direct` → `visibility: "specified"` (= `conv::map_visibility`)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_show_direct_audience_viewer_returns_200_as_specified(pool: PgPool) {
+    let _viewer_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let author_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let viewer_uri = "https://sakurasato.test/users/alice".to_string();
+    let note_id = seed_note_with_audience(
+        &pool,
+        author_id,
+        "misskey.io",
+        "dm",
+        Visibility::Direct,
+        vec![viewer_uri],
+        vec![],
+    )
+    .await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "noteId": note_id.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let note = read_json(resp).await;
+    assert_eq!(note["text"], "dm");
+    // direct → "specified" (Misskey wire 仕様)。
+    assert_eq!(note["visibility"], "specified");
+}
+
+/// `direct` visibility: viewer が `cc` (= to ではなく) に居ても 200。
+/// audience 判定は to/cc 両方を見る (= AS2 仕様)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_show_direct_in_cc_also_returns_200(pool: PgPool) {
+    let _viewer_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let author_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let viewer_uri = "https://sakurasato.test/users/alice".to_string();
+    let note_id = seed_note_with_audience(
+        &pool,
+        author_id,
+        "misskey.io",
+        "dm-via-cc",
+        Visibility::Direct,
+        vec!["https://misskey.io/users/carol".into()],
+        vec![viewer_uri],
+    )
+    .await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "noteId": note_id.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let note = read_json(resp).await;
+    assert_eq!(note["text"], "dm-via-cc");
 }

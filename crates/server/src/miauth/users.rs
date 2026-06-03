@@ -23,7 +23,7 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use sakurasato_core::repo;
 use serde::Deserialize;
@@ -56,7 +56,9 @@ pub async fn handle(
     body: Option<Json<UsersShowBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) = authorize(&state, &headers, body.i.as_deref()).await else {
+    let Some(_token_row) =
+        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
+    else {
         return auth::unauthorized("invalid or revoked token");
     };
 
@@ -118,40 +120,12 @@ pub async fn handle(
         0
     };
 
-    let mut detailed = from_actor_detailed(&actor, followers, following, notes);
-    // remote actor も host を `Some(...)` で emit する必要があるため、
-    // local 判定だけは ActorRow 由来で fix する (= conv::entry_to_actor_lite と
-    // 異なり、ここは ActorRow をそのまま使うので host は正しい)。
-    if !actor.is_local
-        && let serde_json::Value::Object(ref mut map) = detailed
-    {
-        map.insert(
-            "host".to_string(),
-            serde_json::Value::String(actor.host.clone()),
-        );
-    }
+    // `from_actor_detailed` 内の `from_actor_and_counts` が `actor.is_local` に
+    // 応じて host を `None` (local) / `Some(actor.host)` (remote) に倒すため、
+    // 本 handler は `ActorRow` をそのまま渡せば正しい host が得られる
+    // (= `conv::timeline_entry_to_miss_note` のような上書きは不要)。
+    let detailed = from_actor_detailed(&actor, followers, following, notes);
     Json(detailed).into_response()
-}
-
-async fn authorize(
-    state: &AppState,
-    headers: &HeaderMap,
-    body_i: Option<&str>,
-) -> Option<sakurasato_core::model::MiAuthTokenRow> {
-    let raw = match body_i.filter(|s| !s.is_empty()) {
-        Some(s) => s.to_string(),
-        None => headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(auth::parse_bearer_header)
-            .map(str::to_string)?,
-    };
-    let token_row = auth::validate_token_raw(state, &raw).await?;
-    if !auth::has_scope(&token_row, SCOPE_READ_ACCOUNT) {
-        return None;
-    }
-    auth::mark_used_async(state, token_row.id);
-    Some(token_row)
 }
 
 fn not_found(message: &str) -> Response {

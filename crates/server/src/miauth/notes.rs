@@ -29,7 +29,7 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, TimeZone, Utc};
 use sakurasato_core::repo;
@@ -87,7 +87,9 @@ pub async fn show(
     body: Option<Json<ShowBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) = authorize(&state, &headers, body.i.as_deref()).await else {
+    let Some(_token_row) =
+        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
+    else {
         return auth::unauthorized("invalid or revoked token");
     };
     let Some(note_id_str) = body.note_id else {
@@ -160,7 +162,9 @@ pub async fn timeline(
     body: Option<Json<TimelineBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) = authorize(&state, &headers, body.i.as_deref()).await else {
+    let Some(_token_row) =
+        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
+    else {
         return auth::unauthorized("invalid or revoked token");
     };
 
@@ -213,30 +217,6 @@ pub async fn timeline(
         })
         .collect();
     Json(notes).into_response()
-}
-
-/// body `i` → Authorization Bearer の順で token を抽出し、`read:account` scope
-/// を持つかまで検証する。成功なら `Some(MiAuthTokenRow)`、失敗なら `None`
-/// (= 呼び出し側で `unauthorized` / `forbidden` を返す)。
-async fn authorize(
-    state: &AppState,
-    headers: &HeaderMap,
-    body_i: Option<&str>,
-) -> Option<sakurasato_core::model::MiAuthTokenRow> {
-    let raw = match body_i.filter(|s| !s.is_empty()) {
-        Some(s) => s.to_string(),
-        None => headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(auth::parse_bearer_header)
-            .map(str::to_string)?,
-    };
-    let token_row = auth::validate_token_raw(state, &raw).await?;
-    if !auth::has_scope(&token_row, SCOPE_READ_ACCOUNT) {
-        return None;
-    }
-    auth::mark_used_async(state, token_row.id);
-    Some(token_row)
 }
 
 /// local actor の id を引く。お一人様サーバ前提で 1 件しかない。
