@@ -28,6 +28,9 @@ mod tests {
         // 0013 notification_channel (Discord 互換 webhook 通知の宛先テーブル)
         // 0014 drop notification_channel.enabled (master 撤去 / `--event all`
         //   と `toggle` の混乱を解消)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 14);
+        // 0015 miauth (= 親 issue #150 / M14 #157: MiAuth 互換 API endpoint の
+        //   foundation。miauth_session + miauth_token を一括追加。実 endpoint
+        //   は #158 以降で乗る)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 15);
     }
 }

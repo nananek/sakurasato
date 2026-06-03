@@ -18,6 +18,10 @@ pub(crate) mod http_client;
 pub mod init;
 pub mod local_api;
 pub mod media_proxy_client;
+// M14 #157: MiAuth foundation (= 親 issue #150)。実 endpoint は #158-#160 で
+// 順次追加され、本 module ツリーが膨らんでいく。
+pub mod miauth;
+pub mod miauth_cli;
 pub mod move_accept;
 pub mod move_out;
 pub mod multikey;

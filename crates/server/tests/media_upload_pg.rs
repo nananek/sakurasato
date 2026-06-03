@@ -93,6 +93,7 @@ fn make_config(host: &str) -> sakurasato_core::Config {
             max_bytes: 4 * 1024 * 1024,
             max_pixels: 16_000_000,
         },
+        miauth: None,
     }
 }
 

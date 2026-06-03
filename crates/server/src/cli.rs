@@ -89,6 +89,13 @@ pub enum Command {
     /// prefix の行に対しては HTTP 署名を skip して `application/json` で
     /// `payload` を送る。
     NotificationChannel(NotificationChannelArgs),
+    /// Manage Misskey `MiAuth` 互換 API (= 親 issue #150 / M14 #157)。
+    ///
+    /// Misskey クライアント (Milktea / `MissRirica` など) が `GET /miauth/{uuid}`
+    /// で開始した認可フローを CLI で承認する。`approve` 時に raw token を
+    /// 1 回だけ stdout に出す (`--out` でファイル直書きも可)。詳細は
+    /// `miauth --help` 参照。
+    Miauth(crate::miauth_cli::MiAuthArgs),
 }
 
 #[derive(Debug, Args)]

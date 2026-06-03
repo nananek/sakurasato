@@ -463,3 +463,122 @@ impl DeliveryState {
         }
     }
 }
+
+// ── M14 #157 (= 親 issue #150): MiAuth foundation ───────────────────────
+//
+// Misskey MiAuth 互換 API endpoint の基盤型。`miauth_token` / `miauth_session`
+// テーブル (migration 0015) と 1:1 で対応する。詳細は migration 0015 と
+// [`crate::repo::miauth`] 参照。
+
+/// Row of the `miauth_token` table (M14 #157).
+///
+/// `token_hash` は SHA-256 of raw token (`Base64URL` no-pad)。生 token は
+/// `miauth approve` 時に 1 回だけ stdout に出て、以降は再表示不能。
+/// [`ApiTokenRow`] と同じく `#[serde(skip)]` + redacted `Debug` で多重防御
+/// (= ローカル API の JSON レスポンス漏洩 + `tracing::debug!(?token)` 漏洩
+/// の双方を遮断)。
+///
+/// `permissions` は string array (= `["read:account", "write:reactions"]`)
+/// の `Json` 包み。`sqlx::types::Json<T>` で JSONB 列を `Vec<String>` 相当
+/// として読み書きできる。
+#[derive(Clone, FromRow, Deserialize)]
+pub struct MiAuthTokenRow {
+    pub id: i64,
+    pub name: String,
+    /// Mirror of [`ApiTokenRow::token_hash`] policy ── `serde(skip)` で
+    /// マスアサインメント脆弱性を塞ぎ、`Debug` で redact する。
+    #[serde(skip)]
+    pub token_hash: String,
+    pub permissions: Json<Vec<String>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for MiAuthTokenRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MiAuthTokenRow")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("token_hash", &"<redacted>")
+            .field("permissions", &self.permissions)
+            .field("last_used_at", &self.last_used_at)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+/// `MiAuth` session の状態機械 (= `miauth_session.state` 列のミラー)。
+/// 詳細は migration 0015 の状態機械コメント参照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiAuthSessionState {
+    /// 初期状態 ── browser landing で session が作られた直後。
+    Pending,
+    /// CLI で `miauth approve <uuid>` された後、まだ token 未取得。
+    Approved,
+    /// CLI で `miauth reject <uuid>` された終端状態。`check` は 404。
+    Rejected,
+    /// `POST /api/miauth/{uuid}/check` で token を取得済み (= 1 回成功した)。
+    /// 再 check は冪等 (同じ token を返す)。
+    Consumed,
+    /// `expires_at` 経過で `expire_old_sessions` に倒された終端状態。
+    /// `check` は 404。
+    Expired,
+}
+
+impl MiAuthSessionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Consumed => "consumed",
+            Self::Expired => "expired",
+        }
+    }
+
+    /// DB 由来の文字列 (= `miauth_session.state`) を enum に戻す。
+    /// `CHECK` 制約で値が縛られているため通常は `Some` を返すが、将来
+    /// migration で値が増えたとき防御的に `None` を返す形にしておく。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            "consumed" => Some(Self::Consumed),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
+/// Row of the `miauth_session` table (M14 #157).
+///
+/// `uuid` はクライアント生成 (= Misskey `MiAuth` 仕様準拠)。`permissions` は
+/// browser landing 時の `permission=...` query を JSONB array に正規化した
+/// もの。`issued_token_id` は `consumed` 状態のときのみ Some (= CHECK 制約)。
+///
+/// `state` は文字列のまま保持し、enum 化が必要なときは
+/// [`MiAuthSessionState::parse`] で変換する ── sqlx の `query_as!` 経路で
+/// enum を直接バインドするには `#[sqlx(type_name = "...")]` 等が要り、
+/// `MiAuth` 拡張で state が増えたときの migration が手間になるため。
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct MiAuthSessionRow {
+    pub uuid: uuid::Uuid,
+    pub app_name: String,
+    pub callback_url: Option<String>,
+    pub permissions: Json<Vec<String>>,
+    pub state: String,
+    pub issued_token_id: Option<i64>,
+    pub requested_at: DateTime<Utc>,
+    pub approved_at: Option<DateTime<Utc>>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl MiAuthSessionRow {
+    /// `state` 文字列を [`MiAuthSessionState`] にパースする。
+    /// CHECK 制約があるので通常は `Some` だが、将来の互換性のため Option。
+    pub fn state_enum(&self) -> Option<MiAuthSessionState> {
+        MiAuthSessionState::parse(&self.state)
+    }
+}

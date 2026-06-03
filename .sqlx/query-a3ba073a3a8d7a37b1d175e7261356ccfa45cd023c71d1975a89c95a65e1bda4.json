@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE miauth_session\n        SET state = 'rejected'\n        WHERE uuid = $1\n          AND state = 'pending'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a3ba073a3a8d7a37b1d175e7261356ccfa45cd023c71d1975a89c95a65e1bda4"
+}

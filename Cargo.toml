@@ -177,6 +177,15 @@ webp = "0.3"
 #   OpenSSL / native zlib を引かない (distroless 互換を維持)。
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+# ── M14 #157: MiAuth foundation ─────────────────────────────────────
+# Misskey MiAuth (= 親 issue #150) はクライアント生成 UUID を session 識別子
+# として使う。`v4` で `Uuid::new_v4()` (= テスト fixtures 用)、`serde` で
+# JSON 直列化を有効化。`sqlx` の `uuid` feature 経由で `Uuid` ↔ `UUID` 列の
+# encode/decode は既に通る ── ここで明示 dep を持つことで、CLI / handler が
+# `Uuid::parse_str` 等で文字列受けする経路を素直に書ける (sqlx::types::Uuid
+# 再export だけだと feature 経路が間接的でリファクタが脆い)。
+uuid = { version = "1", features = ["v4", "serde"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

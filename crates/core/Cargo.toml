@@ -23,6 +23,8 @@ chrono.workspace = true
 # `net_guard` モジュールが `url::Url` で SSRF allowlist 判定を提供する。
 # reqwest を引かず軽い url crate だけで完結する。
 url.workspace = true
+# M14 #157: MiAuth session UUID (= クライアント生成、サーバは parse + store)。
+uuid.workspace = true
 
 [build-dependencies]
 serde = { workspace = true }

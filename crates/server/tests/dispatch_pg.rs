@@ -78,6 +78,7 @@ fn make_config() -> sakurasato_core::Config {
             max_bytes: 1024,
             max_pixels: 1024,
         },
+        miauth: None,
     }
 }
 
