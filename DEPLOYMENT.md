@@ -515,11 +515,13 @@ ingress:
 
 #### nginx の例 (reverse proxy 経路)
 
-別の reverse proxy で server を expose する構成では、MiAuth listener が誤って TCP に倒れた場合でも path 単位で潰す多層防御を入れる:
+別の reverse proxy で server を expose する構成では、**一次防御は UDS 分離** (`miauth.sock` ≠ `server:8080`) で MiAuth は構造上 expose されないが、念のため MiAuth listener が誤って TCP に倒れた場合の **二重防壁** として path 単位で 404 を返す設定を入れる:
 
 ```nginx
 server {
-  listen 443 ssl http2;
+  # nginx 1.25.1+: `listen 443 ssl http2;` は非推奨。ssl と http2 を分離する。
+  listen 443 ssl;
+  http2 on;
   server_name sakurasato.example.com;
 
   # 連合 / AP / メディア配信のみ通す
@@ -531,7 +533,8 @@ server {
   location /nodeinfo/    { proxy_pass http://server:8080; }
   location /notes/       { proxy_pass http://server:8080; }   # AP Note パーマリンク
 
-  # MiAuth 経路を明示的に 404 で潰す (設定ミス時の最終防壁)
+  # MiAuth 経路を明示的に 404 で潰す (二重防壁、一次は UDS 分離)。
+  # 正規表現は trailing slash の有無に関係なく捕捉する。
   location ~ ^/(api/miauth|miauth|api/i|api/notes|api/users|api/following|api/emojis) {
     return 404;
   }
@@ -540,9 +543,16 @@ server {
 
 #### caddy の例 (Caddyfile)
 
+同じく **一次防御は UDS 分離**、これは二重防壁。Caddy の `path` matcher は `/api/miauth/*` だと `/api/miauth` (trailing slash なし) を取りこぼす version があるため、双方を併記する:
+
 ```caddy
 sakurasato.example.com {
-  @miauth path /api/miauth/* /miauth/* /api/i /api/notes/* /api/users/* /api/following/* /api/emojis
+  # trailing slash あり / なし 両方を明示してマッチ漏れを防ぐ。
+  @miauth path /api/miauth /api/miauth/* /miauth /miauth/* \
+               /api/i /api/notes /api/notes/* \
+               /api/users /api/users/* \
+               /api/following /api/following/* \
+               /api/emojis
   respond @miauth 404
 
   reverse_proxy server:8080
