@@ -5,6 +5,9 @@
 //! spinning up a real TCP socket or DB pool of their own.
 
 #![forbid(unsafe_code)]
+// `miauth::meta` の `/api/meta` builder で `serde_json::json!{}` を ~50 field の
+// top-level に対して展開するため、default 128 では不足する。256 で足りる。
+#![recursion_limit = "256"]
 
 pub mod actor_admin;
 pub mod cli;

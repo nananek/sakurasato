@@ -38,9 +38,12 @@ pub mod conv;
 pub mod emojis;
 pub mod following;
 pub mod i;
+pub mod meta;
+pub mod nodeinfo;
 pub mod notes;
 pub mod reactions;
 pub mod session;
+pub mod stats;
 pub mod users;
 
 /// `/healthz` レスポンス。listener が生きていることだけを示す liveness probe。
@@ -69,6 +72,15 @@ async fn healthz() -> &'static str {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        // M14 #168 ── instance probe (= client が login URL を入れた瞬間に叩く)
+        .route("/.well-known/nodeinfo", get(nodeinfo::well_known))
+        // 2.1 doc は AP listener と完全に同一 (= software/protocols/usage は
+        // インスタンス全体で 1 つ)。MiAuth 経路からも同じ handler を呼べる
+        // ように [`crate::routes::nodeinfo::v2_1`] を直接 mount する。
+        .route("/nodeinfo/2.1", get(crate::routes::nodeinfo::v2_1))
+        .route("/api/meta", post(meta::handle))
+        .route("/api/stats", post(stats::handle))
+        // M14 #158 ── 認証フロー
         .route("/miauth/{uuid}", get(session::handle))
         .route("/api/miauth/{uuid}/check", post(check::handle))
         .route("/api/i", post(i::handle))

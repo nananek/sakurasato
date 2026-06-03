@@ -608,7 +608,17 @@ tailscale serve status
 
 #### 6.3.3 mobile クライアント側の設定
 
-Milktea iOS / MissRirica Android の「サーバを追加」画面に `https://<host>.<tailnet>.ts.net:8443` を入力する。OS の Tailscale クライアントを on にしたまま操作。`/miauth/{uuid}` を browser で開いた際の landing page が「CLI で approve せよ」というテキストを返すので、ホスト側で §6.4 を踏む。
+Milktea iOS / MissRirica Android の「サーバを追加」画面に `https://<host>.<tailnet>.ts.net:8443` を入力する。OS の Tailscale クライアントを on にしたまま操作。
+
+クライアントは server URL を入れた瞬間に以下を probe する (= **これらは login UI まで進むのに必須**):
+
+1. `POST /api/meta` ── instance 情報 (name / version / features.miauth / policies)。MiAuth listener が `features.miauth: true` を返すことで client が MiAuth 認可フローに進む判定をする。
+2. `GET /.well-known/nodeinfo` → `GET /nodeinfo/2.1` ── server 種別判定 (一部 client)。Sakurasato は `software.name = "sakurasato"` で正直に名乗る (= 偽装しない)。
+3. `POST /api/stats` ── overview UI 上の "投稿数 / インスタンス数" 表示用。
+
+これらは M14 #168 で MiAuth listener 側にも mount されており、tailscale 越しに client が直接叩いて応答する設計 (= AP listener 側 nodeinfo に到達できない経路でも login 可能)。
+
+その後 `/miauth/{uuid}` を browser で開いた際の landing page が「CLI で approve せよ」というテキストを返すので、ホスト側で §6.4 を踏む。
 
 ### 6.4 CLI approve フロー
 

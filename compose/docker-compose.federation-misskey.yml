@@ -10,11 +10,12 @@
 #   サービスは起動しない (= `profiles: [pytest]` で隔離)。
 # - `pytest.sh misskey` (= `--profile pytest`) ── 自動化テスト。`misskey-seed`
 #   が admin user + token を作り、`sakurasato-token-issuer` が local API token を
-#   出し、`pytest` コンテナが `tests/federation/` の以下 4 ファイルを走らせる:
+#   出し、`pytest` コンテナが `tests/federation/` の以下 5 ファイルを走らせる:
 #     - `test_misskey_smoke.py` ── 連合 smoke (#162)
 #     - `test_miauth_flow_parity.py` ── 認証フロー parity (#158)
 #     - `test_miauth_read_parity.py` ── read endpoints parity (#159)
 #     - `test_miauth_write_parity.py` ── write endpoints parity (#160)
+#     - `test_miauth_meta_parity.py` ── /api/meta + nodeinfo + /api/stats parity (#168)
 #
 # ## #162 で追加した services (= profiles: [pytest])
 #
@@ -301,7 +302,8 @@ services:
       context: ../tests/federation
       dockerfile: Dockerfile
     image: sakurasato/federation-pytest:dev
-    # Misskey smoke + MiAuth parity 全件 (#158 flow / #159 read / #160 write)。
+    # Misskey smoke + MiAuth parity 全件 (#158 flow / #159 read / #160 write /
+    # #168 meta+nodeinfo+stats)。
     # `test_mastodon.py` は MASTODON_ENABLED=0 で wait skip + 自然に collect
     # されない (= 該当 fixture が無く skip)。
     command:
@@ -312,6 +314,7 @@ services:
       - "test_miauth_flow_parity.py"
       - "test_miauth_read_parity.py"
       - "test_miauth_write_parity.py"
+      - "test_miauth_meta_parity.py"
     environment:
       SAKURASATO_BASE_URL: https://sakurasato
       SAKURASATO_DOMAIN: sakurasato
