@@ -194,7 +194,8 @@ pub async fn insert_session(
         RETURNING
             uuid, app_name, callback_url,
             permissions as "permissions: Json<Vec<String>>",
-            state, issued_token_id, requested_at, approved_at, expires_at
+            state, issued_token_id, requested_at, approved_at, expires_at,
+            raw_token_for_polling
         "#,
         new.uuid,
         new.app_name,
@@ -213,7 +214,8 @@ pub async fn get_session(pool: &PgPool, uuid: Uuid) -> sqlx::Result<Option<MiAut
         SELECT
             uuid, app_name, callback_url,
             permissions as "permissions: Json<Vec<String>>",
-            state, issued_token_id, requested_at, approved_at, expires_at
+            state, issued_token_id, requested_at, approved_at, expires_at,
+            raw_token_for_polling
         FROM miauth_session
         WHERE uuid = $1
         "#,
@@ -294,6 +296,37 @@ pub async fn mark_session_consumed(pool: &PgPool, uuid: Uuid, token_id: i64) -> 
     Ok(res.rows_affected())
 }
 
+/// **M14 #158**: approved session を consumed に倒し、token id + raw token を
+/// 同時に書き込む CAS。`mark_session_consumed` と違い `raw_token_for_polling`
+/// 列にも値を入れるので、`POST /api/miauth/{uuid}/check` の冪等 (= 2 回目以降
+/// で同じ raw token を返す) を実現する。
+///
+/// `0` を返したら別 polling が先に CAS を成功させた競合 ── 呼び出し側は
+/// `get_session` で raw を読み直して同じ token を返す経路に倒す。
+pub async fn mark_session_consumed_with_raw(
+    pool: &PgPool,
+    uuid: Uuid,
+    token_id: i64,
+    raw_token: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query!(
+        r#"
+        UPDATE miauth_session
+        SET state = 'consumed',
+            issued_token_id = $2,
+            raw_token_for_polling = $3
+        WHERE uuid = $1
+          AND state = 'approved'
+        "#,
+        uuid,
+        token_id,
+        raw_token,
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// `state = 'pending' AND now() > expires_at` の行を `expired` に倒す。
 /// 戻り値は遷移した行数。
 ///
@@ -328,7 +361,8 @@ pub async fn list_pending_sessions(pool: &PgPool) -> sqlx::Result<Vec<MiAuthSess
         SELECT
             uuid, app_name, callback_url,
             permissions as "permissions: Json<Vec<String>>",
-            state, issued_token_id, requested_at, approved_at, expires_at
+            state, issued_token_id, requested_at, approved_at, expires_at,
+            raw_token_for_polling
         FROM miauth_session
         WHERE state = 'pending'
         ORDER BY requested_at ASC

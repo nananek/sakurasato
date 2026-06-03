@@ -1,10 +1,42 @@
-# Misskey ↔ sakurasato 連合テスト (M3b-2 PR3)。
+# Misskey ↔ sakurasato 連合テスト (M3b-2 PR3 / M14 #162 で pytest profile 追加)。
 #
 # Misskey 本家は RSA 鍵のみ (FEP-521a `assertionMethod` 未対応) なので
 # cavage RSA-SHA256 経路の検証要員。Ed25519 検証は nekonoverse compose で。
 #
-# 起動: scripts/federation-test/up.sh misskey
-# 停止: scripts/federation-test/down.sh misskey
+# ## 2 モード
+#
+# - `up.sh misskey` (= default profile) ── 手動 e2e。sakurasato + misskey の
+#   両 instance を立てて `setup-misskey.sh` で admin user を作る。pytest 関連
+#   サービスは起動しない (= `profiles: [pytest]` で隔離)。
+# - `pytest.sh misskey` (= `--profile pytest`) ── 自動化テスト。`misskey-seed`
+#   が admin user + token を作り、`sakurasato-token-issuer` が local API token を
+#   出し、`pytest` コンテナが `tests/federation/test_misskey_smoke.py` /
+#   `test_miauth_flow_parity.py` を走らせる。
+#
+# ## #162 で追加した services (= profiles: [pytest])
+#
+# - `versitygw-sks` ── sakurasato 側オブジェクトストア。MiAuth 単独ではアタッチ
+#   メント不要だが、`miauth` listener を起動するためには `Config` の
+#   `[storage]` が要る (= server skeleton)。
+# - `sakurasato-media-proxy` ── WebFinger / 画像取得経路 (既存 mastodon compose
+#   と同形)。
+# - `sakurasato-token-issuer` ── pytest 用 local API Bearer 発行。
+# - `misskey-seed` ── `POST /api/admin/accounts/create` で admin + i token を
+#   作り共有 volume `/misskey-tokens/admin.token` に出す。
+# - `pytest` ── 上記 ready を待ってから pytest 起動。
+#
+# **MiAuth listener** は sakurasato-server の env で
+# `SAKURASATO_MIAUTH__LISTEN=tcp://0.0.0.0:8081` を渡して有効化。nginx-sks が
+# 443 で `Host: sakurasato` を受け、`/miauth/*` / `/api/miauth/*` / `/api/i` を
+# `:8081` に forward することで Misskey クライアントから Tailscale 越し
+# (= テスト上は同 docker network 内) で叩ける構成にする。
+#
+# ## AGPL discipline (= #150 / [[agpl-discipline-miauth]])
+#
+# Misskey 本体は AGPL-3.0 (§13)。`misskey/misskey:latest` image を **未改変で
+# run** する分には contagion 無し。**`AmaseCocoa/misskey-py` に依存させない** ──
+# pytest 側 `tests/federation/requirements.txt` で `misskey.py` (= YuzuRyo61
+# 製、MIT) を採用すること (= 名前が紛らわしいので CI でも double-check)。
 
 services:
   certs:
@@ -32,16 +64,40 @@ services:
     networks:
       - misskey-fed
 
+  # M14 #162: sakurasato server の `[storage]` 設定が要るため versitygw を上げる。
+  # MiAuth 経路では attachment は使わないが、`AppState::from_config` が S3 client を
+  # 必須構築するため。posix backend は bucket dir を auto-mkdir しないので
+  # entrypoint で `mkdir -p` してから exec する (= mastodon compose と同型)。
+  versitygw-sks:
+    build:
+      context: ..
+      dockerfile: docker/versitygw.Dockerfile
+    image: sakurasato/versitygw:dev
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'mkdir -p /data/sakurasato && exec versitygw --port=:7070 --access=sakurasato posix /data'
+    environment:
+      ROOT_SECRET_ACCESS_KEY: testpass
+    volumes:
+      - versitygw_sks_data:/data
+    networks:
+      - misskey-fed
+
   sakurasato-init:
     build:
       context: ..
       dockerfile: docker/server.Dockerfile
     image: sakurasato/server:dev
     command: ["init", "--display-name", "Sakurasato Test"]
-    environment:
+    environment: &sakurasato_env
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
+      SAKURASATO_STORAGE__ENDPOINT: http://versitygw-sks:7070
+      SAKURASATO_STORAGE__ACCESS_KEY_ID: sakurasato
+      SAKURASATO_STORAGE__SECRET_ACCESS_KEY: testpass
+      SAKURASATO_STORAGE__BUCKET: sakurasato
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       postgres-sks:
@@ -58,26 +114,61 @@ services:
     image: sakurasato/server:dev
     command: ["serve"]
     environment:
-      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
-      SAKURASATO_SERVER__HOST: sakurasato
-      SAKURASATO_SERVER__USER: me
-      # 既定の /run/sakurasato は rootless container では書けない
-      # (M4 PR1 で local API が入った後の compose 漏れ)。federation-test で
-      # TUI は使わないので /tmp 配下に逃がす。
-      SAKURASATO_SERVER__LOCAL_API_SOCKET: /tmp/sakurasato-local.sock
-      SSL_CERT_FILE: /certs/ca.crt
+      <<: *sakurasato_env
+      # mastodon compose と同じく `/home/nonroot` に逃がす ── named volume の
+      # 初回マウントで distroless の 0o700 65532:65532 が seed されるため。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      # M14 #162: MiAuth listener を有効化。TCP listen で nginx-sks 経由
+      # 受け止め、外部からは `https://sakurasato/miauth/...` で見える。
+      # nginx-sks が `/miauth/*` / `/api/miauth/*` / `/api/i` を本 listener に
+      # 振る (= `_common/nginx-sakurasato.conf` を miauth 向けに上書き)。
+      SAKURASATO_MIAUTH__LISTEN: tcp://0.0.0.0:8081
+      SAKURASATO_MIAUTH__SESSION_TTL_SECS: "600"
     depends_on:
       sakurasato-init:
         condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
+      versitygw-sks:
+        condition: service_started
     volumes:
       - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+      - media_sock:/run/sakurasato
+    networks:
+      - misskey-fed
+
+  sakurasato-media-proxy:
+    build:
+      context: ..
+      dockerfile: docker/media-proxy.Dockerfile
+    image: sakurasato/media-proxy:dev
+    environment:
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    healthcheck:
+      test: ["CMD", "/app/sakurasato-media-proxy", "--healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
     networks:
       - misskey-fed
 
   nginx-sks:
     image: nginx:alpine
     volumes:
-      - ./federation-test/_common/nginx-sakurasato.conf:/etc/nginx/nginx.conf:ro
+      # M14 #162: 通常の sks nginx は `/` を 8080 (= public AP) に振る。
+      # MiAuth 経路 (= `/miauth/*`, `/api/miauth/*`, `/api/i`) は別 listener
+      # (= 8081) に振り分ける必要があるため、miauth 向け nginx 設定を使う。
+      - ./federation-test/misskey-federation/nginx-sakurasato-miauth.conf:/etc/nginx/nginx.conf:ro
       - certs:/certs:ro
     depends_on:
       sakurasato-server:
@@ -129,6 +220,14 @@ services:
         condition: service_healthy
     volumes:
       - ./federation-test/misskey-federation/misskey.yml:/misskey/.config/default.yml:ro
+    # `/api/ping` を叩いて起動完了を確認する healthcheck (= setup-misskey.sh の
+    # poll を embed 化)。pytest profile の depends_on で待ち合わせる。
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider --post-data='{}' --header='Content-Type: application/json' http://localhost:3000/api/ping 2>&1 | grep -q '200 OK'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
     networks:
       - misskey-fed
 
@@ -145,8 +244,106 @@ services:
         aliases:
           - misskey
 
+  # ── pytest プロファイル ────────────────────────────────────
+
+  # M14 #162: Misskey の admin account + i token を作って共有 volume に書き出す。
+  # 初回 boot 後 `POST /api/admin/accounts/create` を **認証なしで** 叩けるのは
+  # 「ユーザがまだ 1 人も居ない」間だけ ── これを使って admin を作る。レスポンス
+  # の `token` フィールドが Misskey 個人 API トークン (= `i` で叩ける) になる
+  # ので、それを `/misskey-tokens/admin.token` に書き出す。
+  misskey-seed:
+    image: alpine:3.21
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'apk add --no-cache curl jq >/dev/null 2>&1 && /seed.sh'
+    environment:
+      MISSKEY_BASE: http://misskey-app:3000
+      ADMIN_USERNAME: admin
+      # 12 文字以上の英数字混在 ── Misskey の strong-password 検査を通す。
+      ADMIN_PASSWORD: AdminTestPass1234
+      ADMIN_TOKEN_OUT: /misskey-tokens/admin.token
+    volumes:
+      - ./federation-test/misskey-federation/misskey-seed.sh:/seed.sh:ro
+      - misskey_tokens:/misskey-tokens
+    depends_on:
+      misskey-app:
+        condition: service_healthy
+    networks:
+      - misskey-fed
+    profiles: [pytest]
+    restart: "no"
+
+  sakurasato-token-issuer:
+    image: sakurasato/server:dev
+    command: ["token", "issue", "--name", "pytest", "--out", "/home/nonroot/pytest.token"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+    networks:
+      - misskey-fed
+    profiles: [pytest]
+    restart: "no"
+
+  pytest:
+    build:
+      context: ../tests/federation
+      dockerfile: Dockerfile
+    image: sakurasato/federation-pytest:dev
+    # MiAuth parity test と Misskey smoke の 2 ファイルだけ走らせる。
+    # `test_mastodon.py` は MASTODON_ENABLED=0 で wait skip + 自然に collect
+    # されない (= 該当 fixture が無く skip)。
+    command: ["pytest", "-xvs", "--tb=short", "test_misskey_smoke.py", "test_miauth_flow_parity.py"]
+    environment:
+      SAKURASATO_BASE_URL: https://sakurasato
+      SAKURASATO_DOMAIN: sakurasato
+      SAKURASATO_LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_TOKEN_FILE: /home/nonroot/pytest.token
+      MASTODON_ENABLED: "0"
+      MISSKEY_ENABLED: "1"
+      MISSKEY_BASE_URL: https://misskey
+      MISSKEY_DOMAIN: misskey
+      MISSKEY_USERNAME: admin
+      MISSKEY_TOKEN_FILE: /misskey-tokens/admin.token
+      SSL_CERT_FILE: /certs/ca.crt
+      REQUESTS_CA_BUNDLE: /certs/ca.crt
+    user: "65532:65532"
+    depends_on:
+      sakurasato-server:
+        condition: service_started
+      sakurasato-token-issuer:
+        condition: service_completed_successfully
+      misskey-app:
+        condition: service_healthy
+      misskey-seed:
+        condition: service_completed_successfully
+      nginx-mk:
+        condition: service_started
+      nginx-sks:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot:ro
+      - misskey_tokens:/misskey-tokens:ro
+    networks:
+      - misskey-fed
+    profiles: [pytest]
+    restart: "no"
+
 volumes:
   certs:
+  sakurasato_local_api:
+  media_sock:
+  versitygw_sks_data:
+  misskey_tokens:
 
 networks:
   misskey-fed:

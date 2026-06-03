@@ -562,7 +562,7 @@ impl MiAuthSessionState {
 /// [`MiAuthSessionState::parse`] で変換する ── sqlx の `query_as!` 経路で
 /// enum を直接バインドするには `#[sqlx(type_name = "...")]` 等が要り、
 /// `MiAuth` 拡張で state が増えたときの migration が手間になるため。
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Clone, FromRow, Serialize, Deserialize)]
 pub struct MiAuthSessionRow {
     pub uuid: uuid::Uuid,
     pub app_name: String,
@@ -573,6 +573,42 @@ pub struct MiAuthSessionRow {
     pub requested_at: DateTime<Utc>,
     pub approved_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
+    /// **M14 #158** ── `consumed` 状態のとき、`POST /api/miauth/{uuid}/check`
+    /// で複数回読める raw token (migration 0016 で追加)。
+    ///
+    /// - `state = 'pending' | 'approved' | 'rejected' | 'expired'`: 必ず NULL
+    /// - `state = 'consumed'`: 通常は `Some(raw)`、grace sweep 後は `None`
+    ///
+    /// `#[serde(skip)]` で raw token がレスポンス body や `Debug` log に
+    /// 載らないようにする (= [`MiAuthTokenRow::token_hash`] と同じポリシー、
+    /// マスアサインメント脆弱性 + log 漏洩の両方を遮断)。row を直接 JSON
+    /// dump する CLI / debug 経路 (= `miauth list` で表示する管理者経路) でも
+    /// raw は出ない ── 表示が必要な場合は server crate の handler が明示的に
+    /// 取り出す。
+    #[serde(skip)]
+    pub raw_token_for_polling: Option<String>,
+}
+
+impl std::fmt::Debug for MiAuthSessionRow {
+    /// `raw_token_for_polling` を redact する。`MiAuthTokenRow::Debug` と
+    /// 同じく `tracing::debug!(?row)` 経路で raw が漏れない多重防御。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MiAuthSessionRow")
+            .field("uuid", &self.uuid)
+            .field("app_name", &self.app_name)
+            .field("callback_url", &self.callback_url)
+            .field("permissions", &self.permissions)
+            .field("state", &self.state)
+            .field("issued_token_id", &self.issued_token_id)
+            .field("requested_at", &self.requested_at)
+            .field("approved_at", &self.approved_at)
+            .field("expires_at", &self.expires_at)
+            .field(
+                "raw_token_for_polling",
+                &self.raw_token_for_polling.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl MiAuthSessionRow {

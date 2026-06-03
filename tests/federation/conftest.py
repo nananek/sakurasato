@@ -75,6 +75,23 @@ NEKONOVERSE_TOKEN_FILE = os.environ.get(
 MASTODON_ENABLED = os.environ.get("MASTODON_ENABLED", "1") != "0"
 NEKONOVERSE_ENABLED = os.environ.get("NEKONOVERSE_ENABLED", "0") == "1"
 
+# ── Misskey env (#162 / M14 MiAuth parity test 基盤) ─────────────
+# 本物 Misskey instance を `compose/docker-compose.federation-misskey.yml`
+# pytest profile で起動し、`misskey-seed` が admin user + `i` token を発行する。
+# fixture は `MISSKEY_TOKEN_FILE` から token を読み、`misskey.py` (= YuzuRyo61
+# 製 MIT) でクライアントを構築する。
+#
+# AGPL discipline: `misskey/misskey:latest` の **未改変 run** は contagion 無し。
+# Python client lib は **YuzuRyo61/Misskey.py (MIT)** のみ採用し
+# `AmaseCocoa/misskey-py` (AGPL) は絶対に依存させない (= [[agpl-discipline-miauth]])。
+MISSKEY_BASE_URL = os.environ.get("MISSKEY_BASE_URL", "https://misskey")
+MISSKEY_DOMAIN = os.environ.get("MISSKEY_DOMAIN", "misskey")
+MISSKEY_USERNAME = os.environ.get("MISSKEY_USERNAME", "admin")
+MISSKEY_TOKEN_FILE = os.environ.get(
+    "MISSKEY_TOKEN_FILE", "/misskey-tokens/admin.token"
+)
+MISSKEY_ENABLED = os.environ.get("MISSKEY_ENABLED", "0") == "1"
+
 # 連合経路の伝搬は Mastodon の Sidekiq queue 経由なので秒〜10 秒オーダで
 # 揺れる。ローカル sqlx 経路は サブ秒。Sidekiq の retry は初回失敗から
 # 15-30s 後なので、初回 enqueue が遅れたケースでも吸収できる長さを取る。
@@ -553,6 +570,33 @@ def wait_for_instances() -> None:
     # Nekonoverse 側: 同じく `/api/v1/instance` が 200 で ready。
     if NEKONOVERSE_ENABLED:
         wait_for_http(f"{NEKONOVERSE_BASE_URL}/api/v1/instance", timeout=240)
+    # Misskey 側 (= #162): `/api/meta` を空 body POST で叩いて 200 が返れば ready。
+    # Misskey API は GET ではなく POST + JSON body が前提 (= 唯一の例外は
+    # `/api/ping` だがそれも POST)。`wait_for_http` は GET 専用なので Misskey は
+    # 直接 httpx で probe する。
+    if MISSKEY_ENABLED:
+        deadline = time.time() + 240
+        last_exc: BaseException | None = None
+        last_status: int | None = None
+        while time.time() < deadline:
+            try:
+                resp = httpx.post(
+                    f"{MISSKEY_BASE_URL}/api/meta",
+                    json={},
+                    timeout=5,
+                    verify=_SSL_VERIFY,
+                )
+                last_status = resp.status_code
+                if resp.status_code == 200:
+                    break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+            time.sleep(3)
+        else:
+            raise TimeoutError(
+                f"Misskey not ready within 240s "
+                f"(last_status={last_status} last_exc={last_exc!r})"
+            )
 
 
 @pytest.fixture(scope="session")
@@ -821,3 +865,109 @@ def sakurasato_socket_path() -> str:
 def sakurasato_token_file() -> str:
     """`SAKURASATO_TOKEN_FILE` のパス本体 (= `--token-file` に渡す用)。"""
     return SAKURASATO_TOKEN_FILE
+
+
+# ── Misskey: 本物の Misskey instance に対する parity test 基盤 (#162) ───
+#
+# `misskey.py` (= **YuzuRyo61/Misskey.py**, MIT, 89★) で書く wire-compat 比較
+# クライアント。**AmaseCocoa/misskey-py は AGPL** なので絶対に依存させない
+# ([[agpl-discipline-miauth]] / `requirements.txt` で `misskey.py` を pin)。
+#
+# fixture スコープ:
+#
+# - `misskey_token`: admin token をファイルから 1 度読む (session scope)
+# - `misskey_instance`: dict-like で `base_url` / `domain` / `username` /
+#   `token` を保持。直 httpx で叩く parity test 用
+# - `misskey_py_client`: `misskey.Misskey` インスタンス。token 認証済み
+#
+# parity test (= `test_miauth_flow_parity.py`) は **両 instance 同形** で
+# 動作を駆動し、レスポンス schema を diff する。
+class MisskeyInstance:
+    """Dataclass-like ベース ── parity test は dict よりも attribute access の
+    方が読みやすいので軽量クラスで持つ。
+    """
+
+    def __init__(self, *, base_url: str, domain: str, username: str, token: str) -> None:
+        self.base_url = base_url
+        self.domain = domain
+        self.username = username
+        self.token = token
+        # 直叩き用 httpx Client (= MiAuth landing は misskey.py が知らない経路
+        # なので直接叩く)。`verify` は test CA を信頼させた SSLContext。
+        self.http = httpx.Client(base_url=base_url, timeout=20, verify=_SSL_VERIFY)
+
+    def close(self) -> None:
+        self.http.close()
+
+    # ── MiAuth landing (= 公開 web page、auth 不要) ────────────────
+    def miauth_landing(
+        self,
+        uuid: str,
+        *,
+        name: str | None = None,
+        permission: str | None = None,
+        callback: str | None = None,
+    ) -> httpx.Response:
+        params: dict[str, str] = {}
+        if name is not None:
+            params["name"] = name
+        if permission is not None:
+            params["permission"] = permission
+        if callback is not None:
+            params["callback"] = callback
+        return self.http.get(f"/miauth/{uuid}", params=params)
+
+    def miauth_check(self, uuid: str) -> httpx.Response:
+        """`POST /api/miauth/{uuid}/check`. body 無し、204 / 200 / 404 を返す。"""
+        return self.http.post(f"/api/miauth/{uuid}/check")
+
+    def api_i(self, *, token: str | None = None) -> httpx.Response:
+        """`POST /api/i { i: <token> }`. token 指定無しなら self.token を使う。"""
+        body = {"i": token if token is not None else self.token}
+        return self.http.post(
+            "/api/i", json=body, headers={"Content-Type": "application/json"}
+        )
+
+
+@pytest.fixture(scope="session")
+def misskey_token() -> str:
+    return _read_token_file(MISSKEY_TOKEN_FILE, label="misskey")
+
+
+@pytest.fixture(scope="session")
+def misskey_instance(misskey_token: str):
+    """parity test 用 ── 直叩き用 httpx Client + admin token を持つ。"""
+    inst = MisskeyInstance(
+        base_url=MISSKEY_BASE_URL,
+        domain=MISSKEY_DOMAIN,
+        username=MISSKEY_USERNAME,
+        token=misskey_token,
+    )
+    try:
+        yield inst
+    finally:
+        inst.close()
+
+
+@pytest.fixture(scope="session")
+def misskey_py_client(misskey_token: str):
+    """`misskey.Misskey` (= YuzuRyo61/Misskey.py) インスタンス。
+    `i` token 認証済みで `mk.i()` / `mk.notes_create()` 等が叩ける。
+
+    **未インポート時は test を skip** ── compose 外の手動 debug で
+    `misskey-py` が入っていない環境でも他 fixture が引けるように。
+    """
+    try:
+        from misskey import Misskey  # type: ignore[import-untyped]
+    except ImportError:
+        pytest.skip("misskey-py (YuzuRyo61/Misskey.py) is not installed")
+
+    # `Misskey` ctor は (`address`, `i=...`) を取る。`address` は scheme 無しの
+    # host 名なので URL から組み直す。`session` 引数で httpx 互換 session を
+    # 注入できるが test CA 信頼は env (= `SSL_CERT_FILE` 経由で requests/urllib3)
+    # で吸収させる ── REQUESTS_CA_BUNDLE が compose env で常に設定される前提。
+    addr = MISSKEY_BASE_URL.removeprefix("https://").removeprefix("http://").rstrip("/")
+    try:
+        return Misskey(address=addr, i=misskey_token)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"misskey-py client construction failed: {exc!r}")

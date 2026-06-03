@@ -6,3 +6,11 @@ pytest>=8.0.0
 # 個別 wait は `wait_until_text` / `poll_until` で 30-90s timeout だが、
 # 万一どこかで deadlock した時に pytest 全体を止めるための belt-and-suspenders。
 pytest-timeout>=2.3.0
+# **YuzuRyo61/Misskey.py (MIT, 89★)** ── Misskey 互換 client lib (M14 #162).
+# 詳細は [[agpl-discipline-miauth]] / [`conftest.py`] / 親 issue #150 description。
+# **重要**: PyPI 上の package 名は `Misskey.py` (大文字あり、ハイフン無し)。
+# `AmaseCocoa/misskey-py` (= AGPL-3.0、name が紛らわしい backend re-impl) には
+# **絶対に依存させない** ── CI で `pip freeze | grep -i misskey` を観察し
+# AGPL package 名 (= `misskey-py` lowercase + hyphen) が混入していたら fail
+# させる future safeguard を後続 PR で追加予定。
+Misskey.py>=4.0.0,<5.0.0

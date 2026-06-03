@@ -69,11 +69,6 @@ pub struct MiAuthApproveArgs {
     /// endpoint 側で hardcoded list と突き合わせる)。
     #[arg(long, value_delimiter = ',', required = true)]
     pub permission: Vec<String>,
-    /// 生 token を stdout に出す代わりに **指定ファイルだけ** に書き込む
-    /// (mode 0o600)。compose 内の token 共有ボリュームに落とす運用想定。
-    /// 既存ファイルは上書きせず失敗する (`api_token --out` と同じ rationale)。
-    #[arg(long)]
-    pub out: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -125,6 +120,13 @@ async fn run_list(state: &AppState) -> anyhow::Result<()> {
 async fn run_approve(state: &AppState, args: MiAuthApproveArgs) -> anyhow::Result<()> {
     let uuid = parse_uuid(&args.uuid)?;
     let permissions = normalize_permissions(&args.permission)?;
+    // M14 #158: CLI は **CAS pending → approved のみ** を行う。token 発行は
+    // `POST /api/miauth/{uuid}/check` 側で Misskey クライアントが polling
+    // で受け取る経路に統一する (= 既存 Misskey クライアント wire 仕様)。
+    // 旧 #157 実装では `approve` が token 発行 + stdout 表示 + consumed まで
+    // 一気に進めていたが、これでは Milktea / `MissRirica` が token を受け取れ
+    // ない (= polling レスポンスに raw が乗らない) ため、wire 互換性のため
+    // 役割分担を切り替えた。
     let cas = repo::miauth::approve_session(state.pool(), uuid, &permissions)
         .await
         .with_context(|| format!("CAS approve miauth_session {uuid}"))?;
@@ -142,59 +144,8 @@ async fn run_approve(state: &AppState, args: MiAuthApproveArgs) -> anyhow::Resul
             ),
         }
     }
-
-    // 承認できた ── token を発行する。`name` には session の app_name を
-    // そのまま使う (= 後で `miauth tokens` で「どのアプリの token か」が
-    // 一目でわかる)。raw token は標準入出力を経由してファイル経由でしか
-    // 持ち出されないようにする (= stderr に注意書き)。
-    let session = repo::miauth::get_session(state.pool(), uuid)
-        .await
-        .with_context(|| format!("re-fetch miauth_session {uuid}"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!("approved session {uuid} disappeared between CAS and fetch")
-        })?;
-
-    let raw = crate::token::generate_raw();
-    let token_hash = crate::token::hash(&raw);
-    let token_row = repo::miauth::insert_token(
-        state.pool(),
-        repo::miauth::NewMiAuthToken {
-            name: session.app_name.clone(),
-            token_hash,
-            permissions: permissions.clone(),
-        },
-    )
-    .await
-    .context("insert miauth_token row")?;
-
-    // session を consumed 状態に倒して FK を結ぶ。`POST /api/miauth/{uuid}/check`
-    // の **初回より前** に CLI で consumed まで進めると、Misskey クライアント
-    // 側で polling が 1 回目で成立する (= ユーザ体験的に最も自然)。
-    // CAS が 0 を返すケースはここで作らない (= approved → consumed は同 tx
-    // 上で連続して走るが、別 polling が並走している可能性はゼロ)。
-    let cas = repo::miauth::mark_session_consumed(state.pool(), uuid, token_row.id)
-        .await
-        .with_context(|| format!("CAS consume miauth_session {uuid}"))?;
-    if cas != 1 {
-        bail!(
-            "internal: approved session {uuid} could not be marked consumed \
-             (rows_affected={cas}); this should not happen if approve_session \
-             returned 1 immediately above"
-        );
-    }
-
-    eprintln!(
-        "approved session uuid={uuid} app={:?} token_id={} permissions={:?}",
-        session.app_name, token_row.id, permissions
-    );
-    eprintln!("(this is the only time the raw token is displayed)");
-    if let Some(path) = args.out.as_deref() {
-        crate::token::write_token_file(path, &raw)
-            .with_context(|| format!("write raw token to {}", path.display()))?;
-        eprintln!("wrote raw token to {}", path.display());
-    } else {
-        println!("{raw}");
-    }
+    eprintln!("approved session uuid={uuid} permissions={permissions:?}");
+    eprintln!("(the client will now receive its token via POST /api/miauth/{uuid}/check polling)");
     Ok(())
 }
 

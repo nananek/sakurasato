@@ -16,7 +16,7 @@
 #   - DEBUG_KEEP=1: コンテナを残す (= ログを後から漁れる)
 set -euo pipefail
 
-IMPLS=(mastodon nekonoverse)
+IMPLS=(mastodon nekonoverse misskey)
 
 usage() {
   echo "Usage: $0 <impl>" >&2

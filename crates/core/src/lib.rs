@@ -31,6 +31,8 @@ mod tests {
         // 0015 miauth (= 親 issue #150 / M14 #157: MiAuth 互換 API endpoint の
         //   foundation。miauth_session + miauth_token を一括追加。実 endpoint
         //   は #158 以降で乗る)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 15);
+        // 0016 miauth_session_raw_token (= M14 #158: check polling で raw token
+        //   を冪等返却するための列追加)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 16);
     }
 }
