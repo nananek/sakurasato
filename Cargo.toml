@@ -53,7 +53,8 @@ url = "2"
 unicode-width = "0.2"
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "macros", "chrono", "uuid", "json", "derive", "migrate"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
-axum = "0.8"
+# `ws` feature を有効化 ── M14 #170 で `/streaming` WebSocket stub を追加するため。
+axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 clap = { version = "4", features = ["derive", "env"] }

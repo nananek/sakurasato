@@ -900,3 +900,91 @@ async fn notes_show_direct_in_cc_also_returns_200(pool: PgPool) {
     let note = read_json(resp).await;
     assert_eq!(note["text"], "dm-via-cc");
 }
+
+// ─── M14 #170: HTML タグが MissNote.text に流れない ───────────────────────
+
+/// AP `Note.content` (= HTML) が `MissNote.text` で plain text に倒される。
+/// `<p>` / `<br>` / `<a>` の最小組み合わせを 1 件投入し、Misskey クライアント
+/// が UI に流せる plain text になっていることを確認 (= [`miauth::text`])。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_strips_html_tags_from_text(pool: PgPool) {
+    let actor_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let _ = seed_note(
+        &pool,
+        actor_id,
+        "sakurasato.test",
+        // AP で実際に流れる形 ── Mastodon / Misskey が `<p>` + `<br>` で送ってくる。
+        r#"<p>hello<br><a href="https://example.com">world</a></p>"#,
+        Visibility::Public,
+    )
+    .await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "limit": 10});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/timeline")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().expect("timeline returns array");
+    assert_eq!(notes.len(), 1);
+    // `<a href="X">world</a>` → `world` (= URL は失う、Misskey は bare URL を
+    // auto-detect する設計)。`<p>` / `<br>` → 改行に倒れる。
+    let text = notes[0]["text"].as_str().expect("text must be string");
+    assert!(
+        !text.contains('<'),
+        "text must not contain HTML tags: {text:?}"
+    );
+    assert!(
+        !text.contains('>'),
+        "text must not contain HTML tags: {text:?}"
+    );
+    assert!(
+        text.contains("hello"),
+        "text must contain 'hello': {text:?}"
+    );
+    assert!(
+        text.contains("world"),
+        "text must contain 'world': {text:?}"
+    );
+}
+
+/// HTML entities (= `&amp;` / `&lt;` / `&#39;` 等) が decode される。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_decodes_html_entities_in_text(pool: PgPool) {
+    let actor_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let _ = seed_note(
+        &pool,
+        actor_id,
+        "sakurasato.test",
+        "Tom &amp; Jerry &#39;hi&#39;",
+        Visibility::Public,
+    )
+    .await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/timeline")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let arr = read_json(resp).await;
+    assert_eq!(arr[0]["text"], "Tom & Jerry 'hi'");
+}

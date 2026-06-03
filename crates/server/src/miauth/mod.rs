@@ -44,6 +44,8 @@ pub mod notes;
 pub mod reactions;
 pub mod session;
 pub mod stats;
+pub mod streaming;
+pub mod text;
 pub mod users;
 
 /// `/healthz` レスポンス。listener が生きていることだけを示す liveness probe。
@@ -97,6 +99,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/notes/reactions/delete", post(reactions::delete))
         .route("/api/following/create", post(following::create))
         .route("/api/following/delete", post(following::delete))
+        // M14 #170 ── /streaming WebSocket stub (Aria UI の「接続中…」hang 回避)
+        .route("/streaming", get(streaming::handle))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

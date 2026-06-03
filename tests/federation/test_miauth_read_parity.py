@@ -305,3 +305,49 @@ def test_sakurasato_unit_test_required_keys_match_misskey_users_show(misskey_py_
         f"Sakurasato unit test expects keys {expected!r}, but Misskey only "
         f"returned {actual & expected!r}; difference: {expected - actual!r}"
     )
+
+
+# ─── M14 #170: pagination wire shape (本物 Misskey 側 observation) ──────────
+
+def test_misskey_notes_timeline_pagination_with_until_id(misskey_py_client):
+    """**本物 Misskey** の `/api/notes/timeline` が `untilId` で古い note を
+    返すことを観察する (= Aria が「タイムライン追加読み込み」で叩く経路)。
+
+    Sakurasato 側の挙動は server unit test
+    (`miauth_read_pg.rs::timeline_until_id_filters_strictly_less` +
+    `timeline_since_id_filters_strictly_greater`) で覆ってあり、本 test は
+    **wire 仕様の理解が正しいか** を本物 Misskey 側で確認する役。
+    """
+    # 3 件投稿してから untilId で 2 件目以降を取りに行く。
+    notes = []
+    try:
+        for i in range(3):
+            res = misskey_py_client.notes_create(text=f"parity pagination #170 - {i}")
+            notes.append(res["createdNote"])
+
+        # 全件取って `id DESC` であることを確認。
+        tl = misskey_py_client.notes_timeline(limit=10)
+        ids = [n["id"] for n in tl]
+        assert len(ids) >= 3, f"timeline must contain at least 3 notes; got {len(ids)}"
+
+        # untilId = ids[0] (= 最新の id) で叩くと、それ未満の id (= 古い note)
+        # が返るはず。
+        newest_id = ids[0]
+        older = misskey_py_client.notes_timeline(limit=10, until_id=newest_id)
+        older_ids = [n["id"] for n in older]
+        assert newest_id not in older_ids, (
+            f"untilId is exclusive upper bound; got newest_id={newest_id!r} "
+            f"in older_ids={older_ids!r}"
+        )
+        # 直前の note (= ids[1]) は含まれる想定。
+        if len(ids) >= 2:
+            assert ids[1] in older_ids, (
+                f"untilId pagination must include the note right before "
+                f"untilId; ids[1]={ids[1]!r} not in older_ids={older_ids!r}"
+            )
+    finally:
+        for n in notes:
+            try:
+                misskey_py_client.notes_delete(note_id=n["id"])
+            except Exception:  # noqa: BLE001
+                pass
