@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE miauth_session\n        SET state = 'approved',\n            permissions = $2,\n            approved_at = now()\n        WHERE uuid = $1\n          AND state = 'pending'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "548b4cdfb80cead8c1852fcc7ca7d98f5252fe06fba78643a20e7498f79a528a"
+}

@@ -3377,6 +3377,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3446,6 +3447,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "zip",
 ]
 
@@ -4567,6 +4569,7 @@ dependencies = [
  "atomic",
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

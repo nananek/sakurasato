@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE miauth_session\n        SET state = 'expired'\n        WHERE state = 'pending'\n          AND now() > expires_at\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "bb8cdda96dd03fc15823fc39bf10197a4ea6fe1264e68f171d2ad6b71d58552d"
+}

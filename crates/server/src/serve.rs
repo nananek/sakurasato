@@ -9,6 +9,7 @@ use tracing::{info, warn};
 
 use crate::delivery;
 use crate::local_api;
+use crate::miauth;
 use crate::routes;
 use crate::state::AppState;
 
@@ -34,6 +35,15 @@ use crate::state::AppState;
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let public_listen = config.server.public_listener()?;
     let local_listen = config.server.local_api_listener()?;
+    // M14 #157: optional MiAuth listener (= 親 issue #150)。設定が無ければ
+    // socket を作らず、Misskey クライアント互換 endpoint も一切公開しない
+    // (= 既存 deploy にゼロ影響)。設定があれば listen URI を解釈し、3 つ目
+    // の serve_role task として spawn する。
+    let miauth_listen = config
+        .miauth
+        .as_ref()
+        .map(sakurasato_core::config::MiAuthConfig::listener)
+        .transpose()?;
     let state = AppState::from_config(config).await?;
 
     MIGRATOR
@@ -53,9 +63,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let public_uds_for_cleanup = uds_path_for_cleanup(&public_listen);
     let local_uds_for_cleanup = uds_path_for_cleanup(&local_listen);
+    let miauth_uds_for_cleanup = miauth_listen.as_ref().and_then(uds_path_for_cleanup);
 
     info!(role = "public", listen = %public_listen.display(), "sakurasato-server starting listener");
     info!(role = "local-api", listen = %local_listen.display(), "sakurasato-server starting listener");
+    if let Some(ref listen) = miauth_listen {
+        info!(role = "miauth", listen = %listen.display(), "sakurasato-server starting listener");
+        warn_if_non_loopback_miauth(listen);
+    }
     warn_if_non_loopback_local_api(&local_listen);
 
     let public_fut = serve_role(
@@ -79,7 +94,26 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let result = tokio::try_join!(public_fut, local_fut);
+    // MiAuth listener は **optional**。設定があるときだけ serve_role を
+    // try_join! の対象に追加する。両方の serve future が結果的に `Ok(())`
+    // を返せばよいので、無いときは `async { Ok(()) }` の薄い filler を使う。
+    let miauth_app = miauth::router(state.clone());
+    let miauth_fut = async move {
+        match miauth_listen {
+            Some(listen) => {
+                serve_role(
+                    ListenerRole::MiAuth,
+                    listen,
+                    miauth_app,
+                    shutdown_rx.clone(),
+                )
+                .await
+            }
+            None => Ok(()),
+        }
+    };
+
+    let result = tokio::try_join!(public_fut, local_fut, miauth_fut);
 
     // signal task は通常 shutdown_tx.send で終わるが、念のため abort して
     // 漏れがないようにする。SIGTERM を受け取った時点で `send` は完了して
@@ -100,6 +134,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     for (label, path) in [
         ("public", public_uds_for_cleanup),
         ("local-api", local_uds_for_cleanup),
+        ("miauth", miauth_uds_for_cleanup),
     ] {
         let Some(path) = path else { continue };
         if let Err(err) = tokio::fs::remove_file(&path).await
@@ -118,13 +153,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 }
 
 /// listener の役割。`bind_socket` の chmod 戦略を分けるために使う ──
-/// `LocalApi` は 0o600 厳格 (= Bearer + ファイル権限の二重壁)、`Public` は
-/// 0o666 寛容 (= 同 compose 内の Cloudflared 等が同 volume 越しに繋ぐ
-/// 想定、AP レイヤ側で HTTP 署名検証する)。
+/// `LocalApi` / `MiAuth` は 0o600 厳格 (= Bearer + ファイル権限の二重壁)、
+/// `Public` は 0o666 寛容 (= 同 compose 内の Cloudflared 等が同 volume 越し
+/// に繋ぐ想定、AP レイヤ側で HTTP 署名検証する)。
 #[derive(Debug, Clone, Copy)]
 enum ListenerRole {
     Public,
     LocalApi,
+    /// M14 #157: Misskey `MiAuth` 互換 API endpoint (= 親 issue #150)。
+    /// socket 権限ポリシーは `LocalApi` と同じ (= `miauth::bind_socket` は
+    /// `local_api::bind_socket` への delegation)。
+    MiAuth,
 }
 
 impl ListenerRole {
@@ -132,6 +171,7 @@ impl ListenerRole {
         match self {
             Self::Public => "public",
             Self::LocalApi => "local-api",
+            Self::MiAuth => "miauth",
         }
     }
 }
@@ -161,6 +201,7 @@ async fn serve_role(
         Listen::Unix(path) => {
             let listener = match role {
                 ListenerRole::LocalApi => local_api::bind_socket(&path).await,
+                ListenerRole::MiAuth => miauth::bind_socket(&path).await,
                 ListenerRole::Public => bind_public_unix(&path).await,
             }
             .map_err(|e| {
@@ -238,6 +279,32 @@ fn warn_if_non_loopback_local_api(listen: &Listen) {
             "local API is bound to a non-loopback TCP address. \
              Ensure docker `ports:` uses 127.0.0.1: prefix and Tailscale ACL is configured. \
              (see DEPLOYMENT.md §5.1)"
+        );
+    }
+}
+
+/// M14 #157: `MiAuth` listener が非 loopback の TCP に bind された場合の警告。
+/// Tailscale tailnet を介して mobile から叩く前提の構成では `0.0.0.0` 経由が
+/// 必要だが、`ports:` で host ポートを 127.0.0.1 prefix なしで露出するとイン
+/// ターネットに **Misskey 互換 endpoint がそのまま公開** されることになる。
+/// `MiAuth` は permission scope を強制するが、ハイジャックされた token で投稿
+/// まで通る (= `write:notes` 持ち token なら誰でも投稿可能) ので、多層防御
+/// として起動時に明示警告で防御深度を一段上げる (= `local_api` と同じ rationale)。
+fn warn_if_non_loopback_miauth(listen: &Listen) {
+    let Listen::Tcp(addr) = listen else {
+        return;
+    };
+    let is_loopback = addr
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|sa| sa.ip().is_loopback());
+    if !is_loopback {
+        warn!(
+            addr = %addr,
+            "MiAuth listener is bound to a non-loopback TCP address. \
+             Ensure docker `ports:` uses 127.0.0.1: prefix and Tailscale ACL is configured. \
+             Cloudflared / nginx must NOT proxy this socket — Misskey-compatible \
+             endpoints accept token-bearer write operations including post creation. \
+             (see DEPLOYMENT.md MiAuth section)"
         );
     }
 }

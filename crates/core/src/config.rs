@@ -43,6 +43,11 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
     pub media_proxy: MediaProxyConfig,
+    /// `MiAuth` 互換 API endpoint (= Misskey クライアント向け第二 UDS)。
+    /// **Optional** ── 未設定なら socket を作らず routes も全くマウントしない。
+    /// 詳細は [`MiAuthConfig`] 参照。親 issue #150 / M14 #157 で導入。
+    #[serde(default)]
+    pub miauth: Option<MiAuthConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -442,6 +447,53 @@ pub struct MediaProxyConfig {
     pub max_bytes: u64,
     /// Maximum pixels (width * height) for decoded images.
     pub max_pixels: u64,
+}
+
+/// `MiAuth` 互換 API endpoint (= 親 issue #150 / M14 #157) の設定。
+///
+/// **オプション機能**。`[miauth]` セクションを `config.toml` に書かなければ
+/// socket は作られず、Misskey クライアント互換 endpoint は一切公開されない
+/// (= 既存 TUI 用 `local_api` 経路は無関係)。
+///
+/// 設計方針 (= 詳細は親 issue #150 / sub-issue #157 description 参照):
+/// - 既存 `local_api` (Bearer 認証 + Mastodon 風 path) と **別 listener** に
+///   隔離する。認証スキーム (= Misskey の `MiAuth` + body `i` フィールド) と
+///   レスポンス形式が違うので、混在させると認証境界が曖昧になる。
+/// - 推奨運用は **UDS only + Tailscale TCP 越し**。`miauth.sock` を
+///   cloudflared 等で公開してはいけない (= Misskey 互換クライアントが想定外
+///   endpoint を叩いてくる + Web UI なし運用ゆえ「アカウント乗っ取りの
+///   入口」を増やすため)。`DEPLOYMENT.md` 参照。
+///
+/// ## AGPL discipline
+///
+/// Misskey 本体は AGPL-3.0 (§13 network copyleft)、Sakurasato は MIT。本機能
+/// は **misskey-hub.net + api-doc.misskey.io の公開 API 仕様** のみを一次
+/// 資料とした clean-room 実装で、Misskey の TypeScript handler を参照していない
+/// (API 仕様は interface = 著作権対象外、Oracle v Google)。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MiAuthConfig {
+    /// Listen URI (`tcp://host:port` または `unix:/path`)。
+    /// 推奨は `unix:/run/sakurasato/miauth.sock`。
+    pub listen: String,
+    /// pending session の有効期限 (秒)。期限切れの session は
+    /// `expire_old_sessions` で `expired` 状態に倒され、`/api/miauth/{uuid}/check`
+    /// は 404 を返すようになる。デフォルト 600 秒 (= 10 分、Misskey 公式
+    /// クライアントが UUID 生成 → 認可 URL 表示 → ユーザ承認 → polling 開始
+    /// の現実的所要時間)。
+    #[serde(default = "default_miauth_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+}
+
+fn default_miauth_session_ttl_secs() -> u64 {
+    600
+}
+
+impl MiAuthConfig {
+    /// `MiAuth` listener の有効値。`tcp://` or `unix:` を [`Listen::parse`] で
+    /// 解釈する。`listen` が空文字なら error。
+    pub fn listener(&self) -> anyhow::Result<Listen> {
+        Listen::parse(&self.listen).map_err(|e| anyhow::anyhow!("miauth.listen invalid: {e}"))
+    }
 }
 
 impl Config {
@@ -856,6 +908,80 @@ max_pixels = 33554432
             let cfg = Config::load(&path, None).unwrap();
             assert_eq!(cfg.server.host, "override.test");
             assert_eq!(cfg.media_proxy.max_bytes, 1024);
+            Ok(())
+        });
+    }
+
+    /// `MiAuth` 設定は default で `None` (= 機能無効、socket 作らず routes 無し)。
+    /// 既存 deploy への影響ゼロを保証する。
+    #[test]
+    fn miauth_is_none_by_default() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            let cfg = Config::load(&path, None).unwrap();
+            assert!(
+                cfg.miauth.is_none(),
+                "miauth must default to None to keep existing deploys unchanged"
+            );
+            Ok(())
+        });
+    }
+
+    /// `[miauth]` セクションが書かれていれば読み込まれ、`session_ttl_secs` の
+    /// default (= 600) が適用される。
+    #[test]
+    fn miauth_loads_with_default_ttl() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env(
+                "SAKURASATO_MIAUTH__LISTEN",
+                "unix:/run/sakurasato/miauth.sock",
+            );
+            let cfg = Config::load(&path, None).unwrap();
+            let miauth = cfg.miauth.expect("miauth should be present");
+            assert_eq!(miauth.listen, "unix:/run/sakurasato/miauth.sock");
+            assert_eq!(miauth.session_ttl_secs, 600);
+            assert_eq!(
+                miauth.listener().unwrap(),
+                Listen::Unix(PathBuf::from("/run/sakurasato/miauth.sock"))
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn miauth_session_ttl_overridable_via_env() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env("SAKURASATO_MIAUTH__LISTEN", "tcp://127.0.0.1:19000");
+            jail.set_env("SAKURASATO_MIAUTH__SESSION_TTL_SECS", "1800");
+            let cfg = Config::load(&path, None).unwrap();
+            let miauth = cfg.miauth.expect("miauth should be present");
+            assert_eq!(miauth.session_ttl_secs, 1800);
+            assert_eq!(
+                miauth.listener().unwrap(),
+                Listen::Tcp("127.0.0.1:19000".into())
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn miauth_invalid_listen_uri_surfaces_via_listener() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env("SAKURASATO_MIAUTH__LISTEN", "garbage://nope");
+            let cfg = Config::load(&path, None).unwrap();
+            let err = cfg
+                .miauth
+                .expect("present")
+                .listener()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("miauth.listen invalid"),
+                "expected wrapped error, got {err}"
+            );
             Ok(())
         });
     }

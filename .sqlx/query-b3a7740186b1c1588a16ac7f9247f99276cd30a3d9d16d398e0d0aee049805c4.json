@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            uuid, app_name, callback_url,\n            permissions as \"permissions: Json<Vec<String>>\",\n            state, issued_token_id, requested_at, approved_at, expires_at\n        FROM miauth_session\n        WHERE uuid = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "uuid",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "miauth_session",
+            "name": "uuid"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "app_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "miauth_session",
+            "name": "app_name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "callback_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "miauth_session",
+            "name": "callback_url"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "permissions: Json<Vec<String>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "miauth_session",
+            "name": "permissions"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "miauth_session",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "issued_token_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "miauth_session",
+            "name": "issued_token_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "requested_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "miauth_session",
+            "name": "requested_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "approved_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "miauth_session",
+            "name": "approved_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "miauth_session",
+            "name": "expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "b3a7740186b1c1588a16ac7f9247f99276cd30a3d9d16d398e0d0aee049805c4"
+}

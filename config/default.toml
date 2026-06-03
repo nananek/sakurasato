@@ -65,3 +65,27 @@ secret_access_key = "sakurasato-change-me"
 socket = "/run/sakurasato/media.sock"
 max_bytes = 26214400      # 25 MiB
 max_pixels = 33554432     # 8192 * 4096 相当
+
+# ── #150 / M14 #157: MiAuth 互換 API endpoint (オプション) ───────────────
+#
+# Misskey クライアント (= Milktea / MissRirica など) からリアクション / 投稿
+# などを叩けるようにする「第二 UDS」。**コメントアウト** されている間は
+# socket が作られず、Misskey 互換 endpoint は一切公開されない (= 既存 TUI 用
+# `local_api` 経路には影響しない)。
+#
+# 有効化する場合は推奨設定:
+#   - UDS のみ (= `cloudflared` 等で公開しない)
+#   - Tailscale tailnet 越しに mobile デバイスから叩く場合は `unix:` のままで、
+#     ホスト側に `socat` 等の薄いブリッジを置く (= `DEPLOYMENT.md` 参照)
+#
+# `cloudflared` で公開してはいけない理由 ── Web UI なし運用ゆえ「Misskey
+# 互換クライアントが想定外の endpoint を叩いてくる」+「ハイジャックされた
+# token で投稿まで通る」リスク。Sakurasato は MiAuth トークンに permission
+# scope (read:account / write:notes / write:reactions / ...) を強制するが、
+# 多層防御として socket 自体の公開も避けるべき。
+#
+# [miauth]
+# listen = "unix:/run/sakurasato/miauth.sock"
+# # pending session の有効期限 (秒)。Misskey 公式クライアントが UUID 生成 →
+# # 認可 URL 表示 → CLI で approve → polling 開始までの現実的所要時間で 10 分。
+# session_ttl_secs = 600

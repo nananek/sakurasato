@@ -15,6 +15,7 @@ pub mod delivery_queue;
 pub mod emoji;
 pub mod follow;
 pub mod media;
+pub mod miauth;
 pub mod note;
 pub mod notification_channel;
 pub mod reaction;

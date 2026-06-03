@@ -151,7 +151,11 @@ pub async fn run(config: Config, args: TokenArgs) -> anyhow::Result<()> {
 /// 古いトークンが置かれた状態で黙って上書きすると、テストランナ等が「黙って
 /// 入れ替わったトークン」を読み続ける危険があるため。
 /// 上位は `--out` を毎回新しいパスに向けるか、既存ファイルを事前に削除する。
-fn write_token_file(path: &std::path::Path, raw_token: &str) -> std::io::Result<()> {
+///
+/// `pub(crate)`: M14 #157 (= 親 issue #150) の `MiAuth` CLI も同じ書き出し方を
+/// 共有する (= `miauth approve --out <path>` 経路)。ロジックを 2 重持ちにすると
+/// 「片方だけ EACCES 対応漏れ」等の事故が起きるため crate 内 1 本に統一。
+pub(crate) fn write_token_file(path: &std::path::Path, raw_token: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
