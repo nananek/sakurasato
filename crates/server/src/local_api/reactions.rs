@@ -64,36 +64,60 @@ pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateReactionRequest>,
 ) -> Response {
-    if let Err(reason) = validate_content(&req.content) {
-        return bad_request(reason);
+    match create_reaction_core(&state, req.note_id, &req.content).await {
+        Ok(outcome) => {
+            let location = format!("/api/v1/reactions/{}", outcome.reaction.id);
+            let body = ReactionResponse {
+                id: outcome.reaction.id,
+                ap_id: outcome.reaction.ap_id.clone(),
+                note_id: outcome.reaction.note_id,
+                content: outcome.reaction.content,
+                emoji_id: outcome.reaction.emoji_id,
+                queued_deliveries: outcome.queued_deliveries,
+            };
+            let mut response = (StatusCode::CREATED, Json(body)).into_response();
+            if let Ok(hv) = HeaderValue::from_str(&location) {
+                response
+                    .headers_mut()
+                    .insert(HeaderName::from_static("location"), hv);
+            }
+            response
+        }
+        Err(err) => reaction_core_error_to_local_response(&err),
     }
-    let local_actor = match resolve_local_actor(&state).await {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-    let note = match repo::note::get_by_id(state.pool(), req.note_id).await {
+}
+
+/// `reactions::create` の core 部分 (M14 #160 で抽出)。
+///
+/// 既存 `local_api/reactions::create` と新規 `miauth/reactions::create` が共有する
+/// ロジックを 1 関数に集約。validate → local actor 解決 → note 取得 → emoji 解決 →
+/// 決定論 `ap_id` 採番 → `insert_or_get` (冪等) → 新規なら `EmojiReact`/`Like` Activity
+/// を配送 enqueue。
+///
+/// 返り値:
+/// - `Ok(ReactionCoreOutcome)`: reaction 行と enqueue 件数。`queued_deliveries`
+///   は 0 (= idempotent 再叩き) もあり得る
+/// - `Err(ReactionCoreError)`: 入力 / I/O エラー (HTTP マップは呼び出し側責務)
+pub(crate) async fn create_reaction_core(
+    state: &AppState,
+    note_id: i64,
+    content: &str,
+) -> Result<ReactionCoreOutcome, ReactionCoreError> {
+    validate_content(content).map_err(|m| ReactionCoreError::BadRequest(m.to_string()))?;
+    let local_actor = resolve_local_actor_or_err(state).await?;
+    let note = match repo::note::get_by_id(state.pool(), note_id).await {
         Ok(Some(n)) => n,
-        Ok(None) => {
-            return error_with_body(StatusCode::NOT_FOUND, "note not found");
-        }
+        Ok(None) => return Err(ReactionCoreError::NoteNotFound),
         Err(err) => {
-            error!(?err, "POST /api/v1/reactions: note lookup failed");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            error!(?err, note_id, "create_reaction_core: note lookup failed");
+            return Err(ReactionCoreError::Internal);
         }
     };
 
-    // `:foo:` → ローカル emoji を引く。Unicode はここで None になる。
-    let emoji = match resolve_local_emoji(&state, &req.content).await {
-        Ok(opt) => opt,
-        Err(resp) => return resp,
-    };
+    let emoji = resolve_local_emoji_or_err(state, content).await?;
 
-    // `reaction.ap_id` は決定論的に `reaction-<id>` で組み立てたい (= Undo の
-    // 突き合わせやログ追跡が容易) ので、insert 前に sequence の nextval を
-    // 引いて id を確保する。BIGSERIAL は cycle しないので衝突は起きない。
-    let reaction_id = match next_reaction_id(&state).await {
-        Ok(id) => id,
-        Err(resp) => return resp,
+    let Ok(reaction_id) = next_reaction_id_or_err(state).await else {
+        return Err(ReactionCoreError::Internal);
     };
     let ap_id = format!(
         "https://{host}/users/{user}/activities/reaction-{reaction_id}",
@@ -106,73 +130,225 @@ pub async fn create(
         &ap_id,
         note.id,
         local_actor.id,
-        &req.content,
+        content,
         emoji.as_ref().map(|e| e.id),
     )
     .await
     {
         Ok(r) => r,
         Err(err) => {
-            error!(?err, "POST /api/v1/reactions: insert_or_get failed");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            error!(?err, "create_reaction_core: insert_or_get failed");
+            return Err(ReactionCoreError::Internal);
         }
     };
 
-    // 既存行 (= 同 (note, actor, content) で別 ap_id がすでにあった) を返した
-    // 場合は連合通知を再送しない。冪等性を保つ。
     let queued = if inserted.ap_id == ap_id {
         let activity = build_reaction_activity(
-            &state,
+            state,
             &local_actor,
             &note.ap_id,
-            &req.content,
+            content,
             emoji.as_ref(),
             &inserted.ap_id,
             inserted.created_at,
         );
-        enqueue_reaction_delivery(&state, &local_actor, note.actor_id, &activity).await
+        enqueue_reaction_delivery(state, &local_actor, note.actor_id, &activity).await
     } else {
         0
     };
 
-    let body = ReactionResponse {
-        id: inserted.id,
-        ap_id: inserted.ap_id.clone(),
-        note_id: inserted.note_id,
-        content: inserted.content,
-        emoji_id: inserted.emoji_id,
+    Ok(ReactionCoreOutcome {
+        reaction: inserted,
         queued_deliveries: queued,
-    };
-    let location = format!("/api/v1/reactions/{}", inserted.id);
-    let mut response = (StatusCode::CREATED, Json(body)).into_response();
-    if let Ok(hv) = HeaderValue::from_str(&location) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("location"), hv);
+    })
+}
+
+/// `create_reaction_core` の成功結果。
+#[derive(Debug, Clone)]
+pub(crate) struct ReactionCoreOutcome {
+    pub reaction: sakurasato_core::model::ReactionRow,
+    pub queued_deliveries: usize,
+}
+
+/// `create_reaction_core` / `delete_reaction_core` の終端エラー。HTTP / Misskey
+/// wire の status code は呼び出し側で別途マップする (= `local_api` と miauth で
+/// 別の `error.code` 文字列を返したい)。
+#[derive(Debug)]
+pub(crate) enum ReactionCoreError {
+    BadRequest(String),
+    /// note 行が DB に居ない (= 404)。
+    NoteNotFound,
+    /// reaction 行が DB に居ない (= 404)。
+    ReactionNotFound,
+    /// `:shortcode:` 指定のローカル emoji が DB に無い (= 404)。
+    EmojiNotFound,
+    /// 削除しようとした reaction が local actor の所有ではない (= 403)。
+    NotOwned,
+    /// local actor 未 init / DB 不整合 (= 503)。
+    LocalActorMissing,
+    /// DB / シリアライズエラー (= 500)。
+    Internal,
+}
+
+/// `bad_request` Helper を error 文字列向けに公開。
+fn reaction_core_error_to_local_response(err: &ReactionCoreError) -> Response {
+    match err {
+        ReactionCoreError::BadRequest(msg) => error_with_body(StatusCode::BAD_REQUEST, msg),
+        ReactionCoreError::NoteNotFound => error_with_body(StatusCode::NOT_FOUND, "note not found"),
+        ReactionCoreError::ReactionNotFound => {
+            error_with_body(StatusCode::NOT_FOUND, "reaction not found")
+        }
+        ReactionCoreError::EmojiNotFound => error_with_body(
+            StatusCode::NOT_FOUND,
+            "local emoji not found; run `sakurasato emoji import` or use Unicode",
+        ),
+        ReactionCoreError::NotOwned => {
+            error_with_body(StatusCode::FORBIDDEN, "reaction not owned by local actor")
+        }
+        ReactionCoreError::LocalActorMissing => error_with_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "local actor not initialized; run `sakurasato init`",
+        ),
+        ReactionCoreError::Internal => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    response
+}
+
+async fn resolve_local_actor_or_err(state: &AppState) -> Result<ActorRow, ReactionCoreError> {
+    let host = &state.config().server.host;
+    let user = &state.config().server.user;
+    let row = repo::actor::get_by_username_host(state.pool(), user, host)
+        .await
+        .map_err(|err| {
+            error!(?err, "reactions core: local actor lookup failed");
+            ReactionCoreError::Internal
+        })?;
+    match row {
+        Some(a) if a.is_local => Ok(a),
+        _ => Err(ReactionCoreError::LocalActorMissing),
+    }
+}
+
+async fn resolve_local_emoji_or_err(
+    state: &AppState,
+    content: &str,
+) -> Result<Option<EmojiRow>, ReactionCoreError> {
+    let Some(shortcode_raw) = content.strip_prefix(':').and_then(|s| s.strip_suffix(':')) else {
+        return Ok(None);
+    };
+    if shortcode_raw.contains('@') {
+        return Err(ReactionCoreError::BadRequest(
+            "remote emoji reactions are not supported yet; use a local shortcode or Unicode".into(),
+        ));
+    }
+    match repo::emoji::get_local_by_shortcode(state.pool(), shortcode_raw).await {
+        Ok(Some(row)) => Ok(Some(row)),
+        Ok(None) => Err(ReactionCoreError::EmojiNotFound),
+        Err(err) => {
+            error!(?err, shortcode = shortcode_raw, "emoji lookup failed");
+            Err(ReactionCoreError::Internal)
+        }
+    }
+}
+
+async fn next_reaction_id_or_err(state: &AppState) -> Result<i64, ()> {
+    sqlx::query!("SELECT nextval('reaction_id_seq') AS \"next!\"")
+        .fetch_one(state.pool())
+        .await
+        .map(|r| r.next)
+        .map_err(|err| {
+            error!(?err, "nextval(reaction_id_seq) failed");
+        })
 }
 
 pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    let local_actor = match resolve_local_actor(&state).await {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-    let row = match fetch_reaction_by_id(&state, id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => return error_with_body(StatusCode::NOT_FOUND, "reaction not found"),
-        Err(resp) => return resp,
-    };
-    if row.actor_id != local_actor.id {
-        return error_with_body(StatusCode::FORBIDDEN, "reaction not owned by local actor");
+    match delete_reaction_core(&state, id).await {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(json!({
+                "deleted": outcome.reaction_id,
+                "queued_deliveries": outcome.queued_deliveries,
+            })),
+        )
+            .into_response(),
+        Err(err) => reaction_core_error_to_local_response(&err),
     }
-    build_and_dispatch_delete(&state, &local_actor, row).await
 }
 
-async fn fetch_reaction_by_id(
+/// `delete_reaction_core`: 指定 `reaction_id` を所有者検証してから Undo Reaction
+/// を組み立てて配送 + DB 行削除。
+///
+/// 所有者一致しない場合 [`ReactionCoreError::NotOwned`]、行が無いとき
+/// [`ReactionCoreError::ReactionNotFound`]。
+pub(crate) async fn delete_reaction_core(
+    state: &AppState,
+    reaction_id: i64,
+) -> Result<DeleteReactionOutcome, ReactionCoreError> {
+    let local_actor = resolve_local_actor_or_err(state).await?;
+    let Some(row) = fetch_reaction_by_id_or_err(state, reaction_id).await? else {
+        return Err(ReactionCoreError::ReactionNotFound);
+    };
+    if row.actor_id != local_actor.id {
+        return Err(ReactionCoreError::NotOwned);
+    }
+    let queued = build_and_dispatch_delete_core(state, &local_actor, &row).await;
+    Ok(DeleteReactionOutcome {
+        reaction_id: row.id,
+        queued_deliveries: queued,
+    })
+}
+
+/// **M14 #160**: `notes/reactions/delete` (Misskey 仕様) の `(noteId)` から
+/// reaction を解決して `delete_reaction_core` に流す経路。
+///
+/// Misskey wire は note 単位で「自分の reaction」を消す。`(note_id, actor_id)` で
+/// 1 行特定 (= UNIQUE 制約上 高々 1 件、複数 emoji を同じ note に付けるケースは
+/// 「最初の 1 件」を消す挙動 ── Misskey 公式も同じ semantics)。
+pub(crate) async fn delete_my_reaction_on_note_core(
+    state: &AppState,
+    note_id: i64,
+) -> Result<DeleteReactionOutcome, ReactionCoreError> {
+    let local_actor = resolve_local_actor_or_err(state).await?;
+    let row = sqlx::query_as!(
+        sakurasato_core::model::ReactionRow,
+        r#"
+        SELECT id, ap_id, note_id, actor_id, content, emoji_id, created_at
+        FROM reaction
+        WHERE note_id = $1 AND actor_id = $2
+        ORDER BY created_at ASC
+        LIMIT 1
+        "#,
+        note_id,
+        local_actor.id,
+    )
+    .fetch_optional(state.pool())
+    .await
+    .map_err(|err| {
+        error!(
+            ?err,
+            note_id, "delete_my_reaction_on_note_core: lookup failed"
+        );
+        ReactionCoreError::Internal
+    })?;
+    let Some(row) = row else {
+        return Err(ReactionCoreError::ReactionNotFound);
+    };
+    let queued = build_and_dispatch_delete_core(state, &local_actor, &row).await;
+    Ok(DeleteReactionOutcome {
+        reaction_id: row.id,
+        queued_deliveries: queued,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeleteReactionOutcome {
+    pub reaction_id: i64,
+    pub queued_deliveries: usize,
+}
+
+async fn fetch_reaction_by_id_or_err(
     state: &AppState,
     id: i64,
-) -> Result<Option<sakurasato_core::model::ReactionRow>, Response> {
+) -> Result<Option<sakurasato_core::model::ReactionRow>, ReactionCoreError> {
     match sqlx::query_as!(
         sakurasato_core::model::ReactionRow,
         r#"
@@ -187,120 +363,89 @@ async fn fetch_reaction_by_id(
         Ok(o) => Ok(o),
         Err(err) => {
             error!(?err, reaction_id = id, "fetch_reaction_by_id failed");
-            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+            Err(ReactionCoreError::Internal)
         }
     }
 }
 
-async fn build_and_dispatch_delete(
-    state: &AppState,
-    local_actor: &ActorRow,
-    row: sakurasato_core::model::ReactionRow,
-) -> Response {
-    // Undo の object には元 Activity を inline 埋め込みする。Misskey 系で
-    // URI 参照だと受信側 DB lookup に失敗して Undo を捨てる報告があるため
-    // (Nekonoverse もこのパス)。再構築には元の note ap_id と emoji 行が要る。
-    let note = match repo::note::get_by_id(state.pool(), row.note_id).await {
-        Ok(Some(n)) => n,
-        Ok(None) => {
-            // reaction → note の FK は note 削除時に外れるので通常起き得ない。
-            // 起きたら Undo の object を URI 参照にフォールバック。
-            warn!(reaction_id = row.id, note_id = row.note_id, "note vanished");
-            return finalize_undo_with_uri_object(state, local_actor, &row).await;
-        }
-        Err(err) => {
-            error!(?err, reaction_id = row.id, "DELETE: note lookup failed");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
-    let emoji = match row.emoji_id {
-        Some(eid) => match repo::emoji::get_by_id(state.pool(), eid).await {
-            Ok(opt) => opt,
-            Err(err) => {
-                error!(?err, reaction_id = row.id, "DELETE: emoji lookup failed");
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-        },
-        None => None,
-    };
-
-    let original = build_reaction_activity(
-        state,
-        local_actor,
-        &note.ap_id,
-        &row.content,
-        emoji.as_ref(),
-        &row.ap_id,
-        row.created_at,
-    );
-    let undo_id = format!(
-        "https://{host}/users/{user}/activities/undo-reaction-{id}",
-        host = state.config().server.host,
-        user = local_actor.preferred_username,
-        id = row.id,
-    );
-    let activity = json!({
-        "@context": "https://www.w3.org/ns/activitystreams",
-        "id": undo_id,
-        "type": "Undo",
-        "actor": local_actor.ap_id,
-        "object": original,
-    });
-    let queued = enqueue_reaction_delivery(state, local_actor, note.actor_id, &activity).await;
-
-    // 配送 enqueue が成功してから DB から行を消す。失敗しても自分側だけ消す
-    // と「相手はまだ反応中、自分は消した」のズレが残るので、ベストエフォート。
-    if let Err(err) = repo::reaction::delete_by_ap_id(state.pool(), &row.ap_id).await {
-        warn!(
-            ?err,
-            reaction_id = row.id,
-            "DELETE /api/v1/reactions: row delete failed (Undo already queued)"
-        );
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "deleted": row.id,
-            "queued_deliveries": queued,
-        })),
-    )
-        .into_response()
-}
-
-/// note 行が消失していて元 Activity を再構築できないときの退避経路。
-/// Undo.object に URI だけ載せて出す ── 受信側で取りこぼし可能性はあるが、
-/// ローカル DB の整合性 (= reaction 行を削除する) は確保したい。
-async fn finalize_undo_with_uri_object(
+/// 旧 `build_and_dispatch_delete` の戻り値を `Response` ではなく `queued` だけに
+/// 縮約した core 版。両 wire (`local_api` / miauth) で再利用。
+async fn build_and_dispatch_delete_core(
     state: &AppState,
     local_actor: &ActorRow,
     row: &sakurasato_core::model::ReactionRow,
-) -> Response {
-    let undo_id = format!(
-        "https://{host}/users/{user}/activities/undo-reaction-{id}",
-        host = state.config().server.host,
-        user = local_actor.preferred_username,
-        id = row.id,
-    );
-    let activity = json!({
-        "@context": "https://www.w3.org/ns/activitystreams",
-        "id": undo_id,
-        "type": "Undo",
-        "actor": local_actor.ap_id,
-        "object": row.ap_id,
-    });
-    // note が消えていれば note 作者 inbox の解決もできない。followers だけに送る。
-    let queued = enqueue_reaction_delivery(state, local_actor, local_actor.id, &activity).await;
+) -> usize {
+    let note_opt = match repo::note::get_by_id(state.pool(), row.note_id).await {
+        Ok(n) => n,
+        Err(err) => {
+            error!(
+                ?err,
+                reaction_id = row.id,
+                "DELETE core: note lookup failed"
+            );
+            return 0;
+        }
+    };
+    let queued = if let Some(note) = note_opt {
+        let emoji = match row.emoji_id {
+            Some(eid) => match repo::emoji::get_by_id(state.pool(), eid).await {
+                Ok(opt) => opt,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        reaction_id = row.id,
+                        "DELETE core: emoji lookup failed"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let original = build_reaction_activity(
+            state,
+            local_actor,
+            &note.ap_id,
+            &row.content,
+            emoji.as_ref(),
+            &row.ap_id,
+            row.created_at,
+        );
+        let undo_id = format!(
+            "https://{host}/users/{user}/activities/undo-reaction-{id}",
+            host = state.config().server.host,
+            user = local_actor.preferred_username,
+            id = row.id,
+        );
+        let activity = json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": undo_id,
+            "type": "Undo",
+            "actor": local_actor.ap_id,
+            "object": original,
+        });
+        enqueue_reaction_delivery(state, local_actor, note.actor_id, &activity).await
+    } else {
+        // note が消えているケース ── URI 参照だけの Undo を followers にだけ送る。
+        warn!(reaction_id = row.id, note_id = row.note_id, "note vanished");
+        let undo_id = format!(
+            "https://{host}/users/{user}/activities/undo-reaction-{id}",
+            host = state.config().server.host,
+            user = local_actor.preferred_username,
+            id = row.id,
+        );
+        let activity = json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": undo_id,
+            "type": "Undo",
+            "actor": local_actor.ap_id,
+            "object": row.ap_id,
+        });
+        enqueue_reaction_delivery(state, local_actor, local_actor.id, &activity).await
+    };
     if let Err(err) = repo::reaction::delete_by_ap_id(state.pool(), &row.ap_id).await {
-        warn!(?err, reaction_id = row.id, "DELETE: row delete failed");
+        warn!(?err, reaction_id = row.id, "DELETE core: row delete failed");
     }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "deleted": row.id,
-            "queued_deliveries": queued,
-        })),
-    )
-        .into_response()
+    queued
 }
 
 /// reaction Activity の配送先を組み立てて enqueue する。
@@ -354,50 +499,6 @@ async fn enqueue_reaction_delivery(
         }
     }
     queued
-}
-
-/// `reaction` テーブルの次の BIGSERIAL を消費して i64 を返す。
-async fn next_reaction_id(state: &AppState) -> Result<i64, Response> {
-    let row = sqlx::query!("SELECT nextval('reaction_id_seq') AS \"next!\"")
-        .fetch_one(state.pool())
-        .await;
-    match row {
-        Ok(r) => Ok(r.next),
-        Err(err) => {
-            error!(?err, "nextval(reaction_id_seq) failed");
-            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
-        }
-    }
-}
-
-/// content が `:foo:` 形式ならローカル emoji 行を引く。Unicode の場合は
-/// `Ok(None)` を返す。`:foo@host:` (remote 参照) はローカル emoji を作る
-/// 経路が無いので 400 で弾く ── ローカル user が手動で remote 絵文字を
-/// 指定する場面は M9 以降の remote emoji 自動学習で対応する。
-async fn resolve_local_emoji(
-    state: &AppState,
-    content: &str,
-) -> Result<Option<EmojiRow>, Response> {
-    let Some(shortcode_raw) = content.strip_prefix(':').and_then(|s| s.strip_suffix(':')) else {
-        // Unicode emoji。
-        return Ok(None);
-    };
-    if shortcode_raw.contains('@') {
-        return Err(bad_request(
-            "remote emoji reactions are not supported yet; use a local shortcode or Unicode",
-        ));
-    }
-    match repo::emoji::get_local_by_shortcode(state.pool(), shortcode_raw).await {
-        Ok(Some(row)) => Ok(Some(row)),
-        Ok(None) => Err(error_with_body(
-            StatusCode::NOT_FOUND,
-            "local emoji not found; run `sakurasato emoji import` or use Unicode",
-        )),
-        Err(err) => {
-            error!(?err, shortcode = shortcode_raw, "emoji lookup failed");
-            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
-        }
-    }
 }
 
 fn build_reaction_activity(
@@ -465,28 +566,6 @@ fn validate_content(content: &str) -> Result<(), &'static str> {
         return Err("content exceeds the 256-character limit");
     }
     Ok(())
-}
-
-async fn resolve_local_actor(state: &AppState) -> Result<ActorRow, Response> {
-    let host = &state.config().server.host;
-    let user = &state.config().server.user;
-    let row = repo::actor::get_by_username_host(state.pool(), user, host)
-        .await
-        .map_err(|err| {
-            error!(?err, "reactions: local actor lookup failed");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        })?;
-    match row {
-        Some(a) if a.is_local => Ok(a),
-        _ => Err(error_with_body(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "local actor not initialized; run `sakurasato init`",
-        )),
-    }
-}
-
-fn bad_request(reason: &'static str) -> Response {
-    error_with_body(StatusCode::BAD_REQUEST, reason)
 }
 
 fn error_with_body(status: StatusCode, reason: &str) -> Response {

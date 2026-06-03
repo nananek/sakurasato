@@ -36,8 +36,10 @@ pub mod auth;
 pub mod check;
 pub mod conv;
 pub mod emojis;
+pub mod following;
 pub mod i;
 pub mod notes;
+pub mod reactions;
 pub mod session;
 pub mod users;
 
@@ -75,6 +77,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/notes/timeline", post(notes::timeline))
         .route("/api/emojis", post(emojis::handle))
         .route("/api/users/show", post(users::handle))
+        // M14 #160 ── write endpoints
+        .route("/api/notes/create", post(notes::create))
+        .route("/api/notes/delete", post(notes::delete))
+        .route("/api/notes/renote", post(notes::renote))
+        .route("/api/notes/reactions/create", post(reactions::create))
+        .route("/api/notes/reactions/delete", post(reactions::delete))
+        .route("/api/following/create", post(following::create))
+        .route("/api/following/delete", post(following::delete))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
