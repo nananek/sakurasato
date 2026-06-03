@@ -85,9 +85,15 @@ pub struct MissUser {
     pub username: String,
     /// local user は `null`、remote user は `Some(host)`。詳細は module doc。
     pub host: Option<String>,
-    /// `actor.icon_url`。未設定なら `null` (= Misskey の `avatarUrl` は
-    /// クライアント側で default avatar に倒される)。
-    pub avatar_url: Option<String>,
+    /// `actor.icon_url`。未設定なら **identicon URL で fallback** ── M14 #174。
+    ///
+    /// misskey-dart の `UserLite.avatarUrl: Uri` は **non-null required** で、
+    /// `null` を渡すと `_$UserLiteFromJson` が例外 → Aria iOS が
+    /// timeline/profile 描画 ごと crash する。`actor.icon_url == None` のケース
+    /// (= 直 init 後で avatar 未アップロード) で **identicon URL を合成** して
+    /// 必ず string を返す。`/identicon/{id}` route 自体は未実装なので Aria は
+    /// fetch で 404 を受けるが、default avatar に倒すだけで crash しない。
+    pub avatar_url: String,
     /// `actor.manually_approves_followers` (= 鍵アカウント, #66 / M12)。
     /// Misskey の `isLocked` 慣行と完全に同義。
     pub is_locked: bool,
@@ -122,12 +128,31 @@ pub fn from_actor_and_counts(
         } else {
             Some(actor.host.clone())
         },
-        avatar_url: actor.icon_url.clone(),
+        // M14 #174: misskey-dart UserLite は avatarUrl: Uri (non-null required)。
+        // icon_url が None でも crash しないよう identicon URL を合成する。
+        avatar_url: actor
+            .icon_url
+            .clone()
+            .unwrap_or_else(|| identicon_url_for(&actor.host, actor.id)),
         is_locked: actor.manually_approves_followers,
         followers_count,
         following_count,
         notes_count,
     }
+}
+
+/// `actor.icon_url == None` のケースで合成する identicon URL (= M14 #174)。
+///
+/// misskey-dart の `UserLite.avatarUrl` は **non-null Uri** で、`null` だと
+/// `_$UserLiteFromJson` で例外 → Aria iOS が crash する。Sakurasato は
+/// `/identicon/{id}` route を持たないが、URL 自体が string として valid なら
+/// `Uri.parse` は通り (= Aria 側 fetch で 404 になっても default avatar
+/// placeholder を出すだけ)、本関数の戻り値さえ valid URL なら crash 回避できる。
+///
+/// host は **actor.host** を使う (= remote actor も自分の host を持つので、
+/// remote 経由 identicon URL を合成できる)。
+pub(crate) fn identicon_url_for(host: &str, actor_id: i64) -> String {
+    format!("https://{host}/identicon/{actor_id}")
 }
 
 // ── #159: MissNote / MissFile / MissEmoji (read endpoints) ──────────────────
@@ -874,6 +899,43 @@ pub fn from_actor_me_detailed(
         map.insert("twoFactorEnabled".to_string(), JsonValue::Bool(false));
         map.insert("usePasswordLessLogin".to_string(), JsonValue::Bool(false));
         map.insert("securityKeys".to_string(), JsonValue::Bool(false));
+
+        // M14 #174: misskey-dart の MeDetailed で **required bool** だが
+        // Sakurasato が emit していなかった 13 件。すべて `false` で OK ──
+        // お一人様 server で意味的に「自分の通知未読」「危険な投稿フラグ」など
+        // 該当しないため。漏れていると `_$MeDetailedFromJson` で Dart sound
+        // null-safety 例外 → Aria iOS が profile 描画ごと crash する。
+        map.insert("injectFeaturedNote".to_string(), JsonValue::Bool(false));
+        map.insert(
+            "receiveAnnouncementEmail".to_string(),
+            JsonValue::Bool(false),
+        );
+        map.insert("autoSensitive".to_string(), JsonValue::Bool(false));
+        map.insert("carefulBot".to_string(), JsonValue::Bool(false));
+        map.insert("noCrawle".to_string(), JsonValue::Bool(false));
+        map.insert("isDeleted".to_string(), JsonValue::Bool(false));
+        map.insert(
+            "hasUnreadSpecifiedNotes".to_string(),
+            JsonValue::Bool(false),
+        );
+        map.insert("hasUnreadMentions".to_string(), JsonValue::Bool(false));
+        map.insert("hasUnreadAnnouncement".to_string(), JsonValue::Bool(false));
+        map.insert("hasUnreadAntenna".to_string(), JsonValue::Bool(false));
+        map.insert("hasUnreadChannel".to_string(), JsonValue::Bool(false));
+        map.insert("hasUnreadNotification".to_string(), JsonValue::Bool(false));
+        map.insert(
+            "hasPendingReceivedFollowRequest".to_string(),
+            JsonValue::Bool(false),
+        );
+
+        // M14 #174: required List/int だが Sakurasato が emit していなかった
+        // 3 件。空配列 / 0 で必要十分。
+        map.insert(
+            "emailNotificationTypes".to_string(),
+            JsonValue::Array(vec![]),
+        );
+        map.insert("achievements".to_string(), JsonValue::Array(vec![]));
+        map.insert("loggedInDays".to_string(), JsonValue::Number(0.into()));
     }
     v
 }
@@ -968,9 +1030,12 @@ mod tests {
         assert_eq!(json["notesCount"], 13);
     }
 
-    /// `display_name` / `icon_url` が未設定なら **null** で出力される
-    /// (omitted ではなく)。Milktea は `name === null` でフォールバック表示
-    /// する。
+    /// `display_name` が未設定なら **null** で出力される (omitted ではなく)。
+    /// Milktea は `name === null` でフォールバック表示する。
+    ///
+    /// `avatarUrl` は M14 #174 で **non-null required** に倒した ──
+    /// `icon_url` が `None` でも identicon URL 合成で必ず string になる
+    /// (= Aria の `_$UserLiteFromJson` クラッシュ回避)。
     #[test]
     fn optional_fields_serialize_as_null_when_missing() {
         let mut actor = fake_actor(true, "sakurasato", false);
@@ -979,7 +1044,11 @@ mod tests {
         let miss = from_actor_and_counts(&actor, 0, 0, 0);
         let json = serde_json::to_value(&miss).unwrap();
         assert!(json["name"].is_null());
-        assert!(json["avatarUrl"].is_null());
+        // **non-null**: icon_url が None でも identicon URL で fallback。
+        assert!(json["avatarUrl"].is_string());
+        let url = json["avatarUrl"].as_str().unwrap();
+        assert!(url.starts_with("https://"));
+        assert!(url.contains("/identicon/"));
     }
 
     // ── #159: visibility / file id / reactions / detailed user ────────────
