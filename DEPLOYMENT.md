@@ -170,7 +170,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 2. 設定の `server.user` + `server.host` で local actor を作成
 3. RSA 2048 + Ed25519 鍵ペアを生成し `actor.private_key_pem` / `actor.ed25519_private_key_pem` に DB 保存（`#[serde(skip)]` + Debug redacted で漏洩防止）
 
-再 keying は `init --force`。**フェデレーション関係が事実上ゼロからやり直しになる不可逆操作** ── 既存フォロワーへの配送は全部署名検証失敗で弾かれ、ロールバック手段は postgres dump 復元のみ。緊急時 (鍵漏洩等) のみ。詳細と挙動は §7.3 鍵ローテーションを参照。
+再 keying は `init --force`。**フェデレーション関係が事実上ゼロからやり直しになる不可逆操作** ── 既存フォロワーへの配送は全部署名検証失敗で弾かれ、ロールバック手段は postgres dump 復元のみ。緊急時 (鍵漏洩等) のみ。詳細と挙動は §8.3 鍵ローテーションを参照。
 
 ### 3.6 起動
 
@@ -451,7 +451,193 @@ sakurasato-tui --socket /var/run/sakurasato-local/local.sock
 
 ---
 
-## 6. 連合の動作確認
+## 6. MiAuth 経路 (mobile Misskey 互換)
+
+Misskey 互換クライアント (Milktea iOS / MissRirica Android / Iceshrimp Web 等) から **絵文字リアクションを含む書き込み操作** を行うための専用 listener。`/api/v1/*` (TUI 用) や `/inbox` (連合) とは **別 socket** に隔離されている (M14 #150 系)。
+
+**デフォルト無効**。`config/default.toml` の `[miauth]` セクションをコメントアウト解除して初めて起動する。MiAuth を使わない (= TUI のみ) 運用には一切影響しない。
+
+> ✏️ AGPL discipline: Sakurasato は **misskey-hub.net / api-doc.misskey.io の公開仕様** のみを一次資料に clean-room 実装している (= Misskey 本体 TypeScript handler は参照していない)。Misskey 本体 (AGPL-3.0) と Sakurasato (MIT) は本来非互換だが、**未改変 Docker image の CI 起動 + 公開 API 仕様に基づく独自実装** は §13 (network copyleft) を起動しない。詳細は親 issue [#150](https://github.com/nananek/sakurasato/issues/150)。
+
+### 6.1 設定 (UDS — 推奨)
+
+`config/default.toml`:
+
+```toml
+[miauth]
+listen = "unix:/run/sakurasato/miauth.sock"
+# pending session の有効期限 (秒)。Misskey 公式クライアントが UUID 生成 →
+# 認可 URL 表示 → CLI で approve → polling 開始までの現実的所要時間で 10 分。
+session_ttl_secs = 600
+```
+
+env で上書きする場合 (`docker-compose.override.yml`):
+
+```yaml
+services:
+  server:
+    environment:
+      SAKURASATO_MIAUTH__LISTEN: "unix:/run/sakurasato/miauth.sock"
+      SAKURASATO_MIAUTH__SESSION_TTL_SECS: "600"
+```
+
+UDS のディレクトリ (`/run/sakurasato/`) は server の起動時に nonroot uid で `mkdir` される。別コンテナ (socat ブリッジ等) から共有したい場合は named volume を当てて両側にマウントすれば良い (= §6.3.1)。
+
+### 6.2 公開してはいけない (cloudflared / nginx / caddy)
+
+`miauth.sock` を **インターネットに直接公開してはいけない**。理由:
+
+| 観点 | 内容 |
+|---|---|
+| **Web UI 無し運用** | 認可 URL `/miauth/{uuid}` は landing 専用 (= "CLI で approve せよ" と表示するだけ)。public 側に Web UI が無いため、誤って公開すると未知のクライアントが UUID を作って polling し続ける状態を放置することになる |
+| **endpoint 表面の拡張** | `/api/miauth/*` / `/api/i` / `/api/notes/*` / `/api/users/*` / `/api/following/*` / `/api/emojis` 等、Misskey 互換 endpoint の全表面が露出する (= 攻撃面の拡大) |
+| **token の write 権限** | MiAuth トークンは `write:notes` / `write:reactions` などの permission scope を持つ。token がハイジャックされると **投稿 / リアクション送信 / フォロー操作まで通る** |
+
+#### cloudflared の例 (やってはいけない / OK)
+
+§4 で書いた Cloudflare Tunnel の Public Hostname に `/miauth*` / `/api/miauth*` / `/api/i` / `/api/notes/*` 等を **絶対に足さない**。MiAuth listener は別 socket (`/run/sakurasato/miauth.sock`) なので、`server:8080` だけを expose する限り構造上 expose されない:
+
+```yaml
+# OK ── 連合 (WebFinger / inbox / outbox / actor JSON / media 配信) だけ通す
+ingress:
+  - hostname: sakurasato.example.com
+    service: http://server:8080
+  - service: http_status:404
+
+# NG ── MiAuth listener を TCP に倒して expose してしまう例 (やってはいけない)
+# services:
+#   server:
+#     environment:
+#       SAKURASATO_MIAUTH__LISTEN: "tcp://0.0.0.0:8081"   # ← public ingress 経由で見えてしまう
+#     ports:
+#       - "8081:8081"                                     # ← 一般 LAN に漏れる
+```
+
+#### nginx の例 (reverse proxy 経路)
+
+別の reverse proxy で server を expose する構成では、MiAuth listener が誤って TCP に倒れた場合でも path 単位で潰す多層防御を入れる:
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name sakurasato.example.com;
+
+  # 連合 / AP / メディア配信のみ通す
+  location /.well-known/ { proxy_pass http://server:8080; }
+  location /users/       { proxy_pass http://server:8080; }
+  location /inbox        { proxy_pass http://server:8080; }
+  location /outbox       { proxy_pass http://server:8080; }
+  location /media/       { proxy_pass http://server:8080; }
+  location /nodeinfo/    { proxy_pass http://server:8080; }
+  location /notes/       { proxy_pass http://server:8080; }   # AP Note パーマリンク
+
+  # MiAuth 経路を明示的に 404 で潰す (設定ミス時の最終防壁)
+  location ~ ^/(api/miauth|miauth|api/i|api/notes|api/users|api/following|api/emojis) {
+    return 404;
+  }
+}
+```
+
+#### caddy の例 (Caddyfile)
+
+```caddy
+sakurasato.example.com {
+  @miauth path /api/miauth/* /miauth/* /api/i /api/notes/* /api/users/* /api/following/* /api/emojis
+  respond @miauth 404
+
+  reverse_proxy server:8080
+}
+```
+
+### 6.3 Tailscale tailnet 越しに mobile デバイスから使う (推奨経路)
+
+mobile (= Milktea iOS / MissRirica Android) から MiAuth を叩く運用は **Tailscale ACL で tailnet 内ノードのみに限定** する。`tailscale funnel` (= 公衆公開) は **絶対に使わない** ── MiAuth トークンに write 権限がある以上、公衆公開は §6.2 と同じリスクを抱える。
+
+#### 6.3.1 socat による UDS → TCP ブリッジ
+
+§5.2.1 の TUI ブリッジと同じ構造。MiAuth 専用に別 service を立てる:
+
+```yaml
+# docker-compose.miauth-tailscale.yml (例)
+services:
+  # server サービスと同じ /run/sakurasato volume を共有し、UDS を loopback TCP に中継する。
+  miauth-bridge:
+    image: alpine/socat:latest
+    command: TCP-LISTEN:8444,fork,reuseaddr UNIX-CONNECT:/run/sakurasato/miauth.sock
+    volumes:
+      - miauth_sock:/run/sakurasato
+    networks:
+      - internal
+    # 127.0.0.1: は必須。`"8444:8444"` だと docker が 0.0.0.0:8444 扱いで一般 LAN にも漏れる。
+    ports:
+      - "127.0.0.1:8444:8444"
+    restart: unless-stopped
+
+  server:
+    volumes:
+      - miauth_sock:/run/sakurasato
+
+volumes:
+  miauth_sock:
+```
+
+#### 6.3.2 tailscale serve で tailnet に出す
+
+```bash
+# ホスト機
+sudo tailscale serve --bg --https 8443 http://127.0.0.1:8444
+
+# 公開状態を確認
+tailscale serve status
+
+# tailnet ACL で port 8443 への接続元を mobile デバイスに限定する (= 推奨)
+# 参考: https://tailscale.com/kb/1018/acls
+```
+
+これで `https://<host>.<tailnet>.ts.net:8443/` で **tailnet 内ノードからだけ** MiAuth listener に到達できる。`tailscale funnel` (= 公衆公開) は使わない (= MiAuth トークンが write 権限を持つため)。
+
+#### 6.3.3 mobile クライアント側の設定
+
+Milktea iOS / MissRirica Android の「サーバを追加」画面に `https://<host>.<tailnet>.ts.net:8443` を入力する。OS の Tailscale クライアントを on にしたまま操作。`/miauth/{uuid}` を browser で開いた際の landing page が「CLI で approve せよ」というテキストを返すので、ホスト側で §6.4 を踏む。
+
+### 6.4 CLI approve フロー
+
+クライアントが session UUID を生成して `/miauth/{uuid}` を開いた状態で、ホスト側から:
+
+```bash
+# pending session の一覧 (= 期限切れは sweep される)
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml exec -T server \
+  sakurasato-server miauth list
+
+# 承認 (permission scope を確認しつつ絞れる)
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml exec -T server \
+  sakurasato-server miauth approve <uuid> \
+    --permission read:account,write:notes,write:reactions
+
+# 拒否
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml exec -T server \
+  sakurasato-server miauth reject <uuid>
+```
+
+approve するとクライアント側の polling (`POST /api/miauth/{uuid}/check`) が token を受け取り認証完了 (= Misskey 公式の wire と同じ流れ)。CLI 側は token を直接表示しない (= polling レスポンスでクライアントに渡る、wire 互換の都合)。
+
+発行済み token の一覧 / revoke:
+
+```bash
+# 発行済 MiAuth トークン一覧 (= api_token / TUI Bearer とは別系統)
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml exec -T server \
+  sakurasato-server miauth tokens
+
+# 漏洩・端末紛失時の revoke (= 該当 token はクライアント側で次の API 呼び出し時に 401)
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml exec -T server \
+  sakurasato-server miauth revoke --id <id>
+```
+
+CLI リファレンスの詳細は [docs/SERVER_CLI.md §14](docs/SERVER_CLI.md)。
+
+---
+
+## 7. 連合の動作確認
 
 ```bash
 # WebFinger
@@ -469,7 +655,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 
 `follow-cli-{follower_id}-{followed_id}` 形式の activity id が生成され、`delivery_queue` に積まれて常駐ワーカが送出する。
 
-### 6.1 受信できる activity の範囲 (M11 完了時点 = inbox dispatch 完全化)
+### 7.1 受信できる activity の範囲 (M11 完了時点 = inbox dispatch 完全化)
 
 | activity | 受信 | 備考 |
 |---|---|---|
@@ -489,9 +675,9 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 
 ---
 
-## 7. 運用タスク
+## 8. 運用タスク
 
-### 7.1 イメージ更新
+### 8.1 イメージ更新
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.ghcr.yml pull
@@ -500,7 +686,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 
 `:latest` を追っている限り、毎回最新リリースに上がる。差し戻したい場合は `docker-compose.ghcr.yml` の `image:` を一つ前のバージョンタグに書き換える。
 
-### 7.2 バックアップ
+### 8.2 バックアップ
 
 最低限バックアップすべきもの:
 
@@ -527,7 +713,7 @@ gunzip -c backup-YYYY-MM-DD.sql.gz | docker compose -f docker-compose.yml -f doc
   psql -U sakurasato sakurasato
 ```
 
-### 7.3 鍵ローテーション
+### 8.3 鍵ローテーション
 
 **通常は触らない**。万一秘密鍵が漏れた場合のみ:
 
@@ -539,7 +725,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 
 **不可逆性**: 旧鍵は失われ、postgres バックアップから復元する以外に戻せない。`init --force` は §3.5 (初期化) でも触れたが、**ロールバック手段が postgres dump 復元のみ** であることを承知の上で実行すること。フェデレーション関係は事実上ゼロからやり直し。
 
-### 7.4 引っ越し (Move)
+### 8.4 引っ越し (Move)
 
 別サーバから / 別サーバへの引っ越し手順:
 
@@ -563,7 +749,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm -v $PWD
 
 **`move-accept` は HTTP 署名検証を通らない**ので、自分が控えておいた本文でのみ実行すること。コードレベルのガードは `type == "Move"` チェックだけで (CLAUDE.md §5.1)、第三者から「この JSON を `move-accept` に渡せばフォロワーを引き継げます」と誘導されて流すと **意図しない Move を適用してしまう**。最後の防波堤は `handle_move` 内の `alsoKnownAs` 双方向検査だが、相手側 actor が攻撃者の意図通りに `alsoKnownAs` を書き換えていれば素通る。ソーシャルエンジニアリングへの耐性は低いので、入力経路を自分の inbox 控えに限ること。
 
-### 7.5 ログ確認
+### 8.5 ログ確認
 
 ```bash
 # 全サービス
@@ -580,9 +766,9 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml logs media-proxy
 
 ---
 
-## 8. トラブルシューティング
+## 9. トラブルシューティング
 
-### 8.1 postgres が起動しない (Permission denied)
+### 9.1 postgres が起動しない (Permission denied)
 
 ```
 /usr/local/bin/docker-entrypoint.sh: line 21: /run/secrets/postgres_password: Permission denied
@@ -590,7 +776,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml logs media-proxy
 
 → rootless Docker で `secrets/postgres_password.txt` が 0600 になっている。`chmod 644 secrets/*.txt` に直す。詳細は CLAUDE.md §7.1。
 
-### 8.2 配送が全部失敗する (HTTP 401 from peers)
+### 9.2 配送が全部失敗する (HTTP 401 from peers)
 
 → 鍵が peer 側でキャッシュされた古い値と不一致。`init --force` 直後はよくある。
 
@@ -604,11 +790,11 @@ SET state='pending', retries=0, next_attempt_at=now()
 WHERE state='failed' AND inbox_url LIKE 'https://mastodon.example/%';
 ```
 
-### 8.3 cloudflared 経由で WebFinger が 404
+### 9.3 cloudflared 経由で WebFinger が 404
 
 → Cloudflare Tunnel の Public Hostname 設定が `http://server:8080` を指していない可能性。cloudflared コンテナから `wget http://server:8080/.well-known/webfinger?...` で疎通確認。
 
-### 8.4 TUI が server に繋がらない
+### 9.4 TUI が server に繋がらない
 
 → Unix socket の権限。コンテナ内 nonroot (uid 65532) が書ける状態かを確認:
 
@@ -621,13 +807,13 @@ ls -ln /var/run/sakurasato-local/local.sock
 
 ---
 
-## 9. アンインストール
+## 10. アンインストール
 
 > ⚠️ **先にバックアップを取り、`secrets/` を別の安全な場所に控えてから実行する。**
 > `secrets/postgres_password.txt` を失うと、`down -v` を omit して volume を残しても **postgres に接続不能** になり、データ復号は事実上不可能。順序を間違えると不可逆。
 
 ```bash
-# 1. バックアップ (§7.2 の手順で postgres + versitygw + secrets + config)
+# 1. バックアップ (§8.2 の手順で postgres + versitygw + secrets + config)
 mkdir -p ~/sakurasato-final-backup-$(date +%F)
 cp -r secrets/ config/ ~/sakurasato-final-backup-$(date +%F)/
 docker compose -f docker-compose.yml -f docker-compose.ghcr.yml exec -T postgres \
