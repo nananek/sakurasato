@@ -73,7 +73,11 @@ pub async fn handle(
             .and_then(auth::parse_bearer_header)
         {
             Some(t) => t.to_string(),
-            None => return auth::unauthorized("missing token (provide body `i` or Authorization: Bearer)"),
+            None => {
+                return auth::unauthorized(
+                    "missing token (provide body `i` or Authorization: Bearer)",
+                );
+            }
         },
     };
 

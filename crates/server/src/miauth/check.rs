@@ -55,10 +55,7 @@ struct CheckResponse {
 }
 
 /// `POST /api/miauth/{uuid}/check` handler。
-pub async fn handle(
-    State(state): State<AppState>,
-    Path(uuid_str): Path<String>,
-) -> Response {
+pub async fn handle(State(state): State<AppState>, Path(uuid_str): Path<String>) -> Response {
     let Ok(uuid) = Uuid::parse_str(&uuid_str) else {
         return not_found("invalid UUID");
     };
@@ -86,12 +83,8 @@ pub async fn handle(
             })
             .into_response()
         }
-        Some(MiAuthSessionState::Approved) => {
-            handle_approved(&state, &session).await
-        }
-        Some(MiAuthSessionState::Consumed) => {
-            handle_consumed(&state, &session).await
-        }
+        Some(MiAuthSessionState::Approved) => handle_approved(&state, &session).await,
+        Some(MiAuthSessionState::Consumed) => handle_consumed(&state, &session).await,
         Some(MiAuthSessionState::Rejected | MiAuthSessionState::Expired) => {
             not_found("session is not pending")
         }
@@ -206,19 +199,18 @@ fn not_found(reason: &str) -> Response {
 async fn build_miss_user(state: &AppState) -> Result<MissUser, Response> {
     let host = &state.config().server.host;
     let user = &state.config().server.user;
-    let actor = match sakurasato_core::repo::actor::get_by_username_host(state.pool(), user, host)
-        .await
-    {
-        Ok(Some(row)) if row.is_local => row,
-        Ok(_) => {
-            tracing::error!(host, user, "local actor not found for /api/miauth/check");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
-        }
-        Err(err) => {
-            tracing::error!(?err, "local actor lookup failed for /api/miauth/check");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
-        }
-    };
+    let actor =
+        match sakurasato_core::repo::actor::get_by_username_host(state.pool(), user, host).await {
+            Ok(Some(row)) if row.is_local => row,
+            Ok(_) => {
+                tracing::error!(host, user, "local actor not found for /api/miauth/check");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+            Err(err) => {
+                tracing::error!(?err, "local actor lookup failed for /api/miauth/check");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+        };
     let followers = sakurasato_core::repo::follow::count_followers(state.pool(), actor.id)
         .await
         .unwrap_or(0);

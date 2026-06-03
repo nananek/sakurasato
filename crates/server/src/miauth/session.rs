@@ -324,10 +324,7 @@ fn render_existing_state(uuid: Uuid, state: MiAuthSessionState) -> String {
             "This session expired before approval. The client must generate a new UUID and retry.",
         ),
         // Pending should not reach here (caller branches on it first).
-        MiAuthSessionState::Pending => (
-            "Pending",
-            "Session is awaiting CLI approval.",
-        ),
+        MiAuthSessionState::Pending => ("Pending", "Session is awaiting CLI approval."),
     };
     format!(
         r#"<!doctype html>
@@ -363,7 +360,9 @@ mod tests {
     /// 空白 trim + 重複 dedup (= CLI normalize と同じ流儀)。
     #[test]
     fn parse_permissions_csv_trims_and_dedups() {
-        let v = parse_permissions_csv("  read:account , write:reactions, read:account , ,write:reactions");
+        let v = parse_permissions_csv(
+            "  read:account , write:reactions, read:account , ,write:reactions",
+        );
         assert_eq!(v, vec!["read:account", "write:reactions"]);
     }
 
@@ -412,8 +411,12 @@ mod tests {
     #[test]
     fn render_existing_state_messages() {
         let uuid = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-        assert!(render_existing_state(uuid, MiAuthSessionState::Approved).contains("Already approved"));
-        assert!(render_existing_state(uuid, MiAuthSessionState::Consumed).contains("already produced"));
+        assert!(
+            render_existing_state(uuid, MiAuthSessionState::Approved).contains("Already approved")
+        );
+        assert!(
+            render_existing_state(uuid, MiAuthSessionState::Consumed).contains("already produced")
+        );
         assert!(render_existing_state(uuid, MiAuthSessionState::Rejected).contains("rejected"));
         assert!(render_existing_state(uuid, MiAuthSessionState::Expired).contains("expired"));
     }

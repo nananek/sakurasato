@@ -141,14 +141,18 @@ async fn read_json(resp: axum::response::Response) -> serde_json::Value {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn landing_inserts_pending_session(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state);
 
     let uuid = Uuid::new_v4();
     let path = format!(
         "/miauth/{uuid}?name=Milktea&permission=read:account,write:reactions&callback=https://app.test/cb"
     );
-    let resp = app.oneshot(Request::get(&path).body(Body::empty()).unwrap())
+    let resp = app
+        .oneshot(Request::get(&path).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -181,16 +185,23 @@ async fn landing_inserts_pending_session(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn landing_with_empty_query_records_empty_scope(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state);
 
     let uuid = Uuid::new_v4();
     let path = format!("/miauth/{uuid}");
-    let resp = app.oneshot(Request::get(&path).body(Body::empty()).unwrap())
+    let resp = app
+        .oneshot(Request::get(&path).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let row = repo::miauth::get_session(&pool, uuid).await.unwrap().unwrap();
+    let row = repo::miauth::get_session(&pool, uuid)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.app_name, "unknown app");
     assert!(row.permissions.0.is_empty());
 }
@@ -202,7 +213,11 @@ async fn landing_with_invalid_uuid_returns_400(pool: PgPool) {
     let state = AppState::from_pool(pool, common::make_config("sakurasato.test", "alice"));
     let app = miauth::router(state);
     let resp = app
-        .oneshot(Request::get("/miauth/not-a-uuid").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/miauth/not-a-uuid")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -212,7 +227,10 @@ async fn landing_with_invalid_uuid_returns_400(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn check_pending_returns_polling_response(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state.clone());
 
     let uuid = Uuid::new_v4();
@@ -246,7 +264,10 @@ async fn check_pending_returns_polling_response(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn check_after_approve_returns_token_and_user(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state.clone());
 
     let uuid = Uuid::new_v4();
@@ -279,7 +300,10 @@ async fn check_after_approve_returns_token_and_user(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = read_json(resp).await;
     assert_eq!(body["ok"], true);
-    let raw = body["token"].as_str().expect("token must be string").to_string();
+    let raw = body["token"]
+        .as_str()
+        .expect("token must be string")
+        .to_string();
     assert!(!raw.is_empty());
     assert_eq!(body["user"]["username"], "alice");
     assert!(body["user"]["host"].is_null(), "local user host is null");
@@ -289,7 +313,10 @@ async fn check_after_approve_returns_token_and_user(pool: PgPool) {
     assert_eq!(body["user"]["notesCount"], 0);
 
     // session が consumed に倒れていて、token 行が作られている。
-    let row = repo::miauth::get_session(&pool, uuid).await.unwrap().unwrap();
+    let row = repo::miauth::get_session(&pool, uuid)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.state, "consumed");
     assert!(row.issued_token_id.is_some());
     assert_eq!(row.raw_token_for_polling.as_deref(), Some(raw.as_str()));
@@ -310,7 +337,10 @@ async fn check_after_approve_returns_token_and_user(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn check_rejected_session_returns_404(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state);
 
     let uuid = Uuid::new_v4();
@@ -344,7 +374,10 @@ async fn check_rejected_session_returns_404(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn check_expired_session_returns_404(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state);
 
     let uuid = Uuid::new_v4();
@@ -372,7 +405,10 @@ async fn check_expired_session_returns_404(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     // sweep が走って expired に倒れていることを確認。
-    let row = repo::miauth::get_session(&pool, uuid).await.unwrap().unwrap();
+    let row = repo::miauth::get_session(&pool, uuid)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.state, "expired");
 }
 
@@ -398,7 +434,10 @@ async fn check_unknown_session_returns_404(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn api_i_with_body_token_returns_miss_user(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state);
 
     // full flow を E2E で走らせて token を取り出す。
@@ -457,7 +496,10 @@ async fn api_i_with_body_token_returns_miss_user(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn api_i_with_bearer_header_returns_miss_user(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state);
 
     // token を発行する近道: full flow を走らせる。
@@ -508,7 +550,10 @@ async fn api_i_with_bearer_header_returns_miss_user(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn api_i_without_read_account_scope_returns_403(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state);
 
     let uuid = Uuid::new_v4();
@@ -586,7 +631,10 @@ async fn api_i_without_token_returns_401(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn miss_user_schema_uses_camel_case_with_required_keys(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state);
 
     let uuid = Uuid::new_v4();
@@ -662,7 +710,10 @@ async fn healthz_remains_alive(pool: PgPool) {
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn raw_token_matches_hash_path(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
-    let state = AppState::from_pool(pool.clone(), common::make_config("sakurasato.test", "alice"));
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
     let app = miauth::router(state.clone());
 
     let uuid = Uuid::new_v4();
@@ -697,6 +748,9 @@ async fn raw_token_matches_hash_path(pool: PgPool) {
         .await
         .expect("hash lookup must find the token row");
     // session の issued_token_id と一致。
-    let session = repo::miauth::get_session(&pool, uuid).await.unwrap().unwrap();
+    let session = repo::miauth::get_session(&pool, uuid)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(session.issued_token_id, Some(row.id));
 }

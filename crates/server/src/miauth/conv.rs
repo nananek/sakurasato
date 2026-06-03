@@ -204,7 +204,10 @@ mod tests {
         assert_eq!(json["id"], "42");
         assert_eq!(json["username"], "me");
         assert_eq!(json["name"], "Alice");
-        assert!(json["host"].is_null(), "host must be JSON null, not omitted");
+        assert!(
+            json["host"].is_null(),
+            "host must be JSON null, not omitted"
+        );
         assert_eq!(json["avatarUrl"], "https://cdn.test/avatar.webp");
         assert_eq!(json["isLocked"], false);
         assert_eq!(json["followersCount"], 11);

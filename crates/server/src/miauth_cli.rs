@@ -145,9 +145,7 @@ async fn run_approve(state: &AppState, args: MiAuthApproveArgs) -> anyhow::Resul
         }
     }
     eprintln!("approved session uuid={uuid} permissions={permissions:?}");
-    eprintln!(
-        "(the client will now receive its token via POST /api/miauth/{uuid}/check polling)"
-    );
+    eprintln!("(the client will now receive its token via POST /api/miauth/{uuid}/check polling)");
     Ok(())
 }
 
