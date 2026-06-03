@@ -35,8 +35,11 @@ use crate::state::AppState;
 pub mod auth;
 pub mod check;
 pub mod conv;
+pub mod emojis;
 pub mod i;
+pub mod notes;
 pub mod session;
+pub mod users;
 
 /// `/healthz` レスポンス。listener が生きていることだけを示す liveness probe。
 /// 認証不要 (= compose の healthcheck や Tailscale 越しの reachability test で
@@ -67,6 +70,11 @@ pub fn router(state: AppState) -> Router {
         .route("/miauth/{uuid}", get(session::handle))
         .route("/api/miauth/{uuid}/check", post(check::handle))
         .route("/api/i", post(i::handle))
+        // M14 #159 ── read endpoints
+        .route("/api/notes/show", post(notes::show))
+        .route("/api/notes/timeline", post(notes::timeline))
+        .route("/api/emojis", post(emojis::handle))
+        .route("/api/users/show", post(users::handle))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

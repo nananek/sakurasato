@@ -129,6 +129,43 @@ pub fn parse_bearer_header(header_value: &str) -> Option<&str> {
     crate::token::parse_bearer(header_value)
 }
 
+/// `body.i` → `Authorization: Bearer` の順で raw token を取り出し、DB lookup +
+/// scope 検査までを 1 関数で済ませる共通ヘルパ (= PR #165 round-2 review #1
+/// の duplication 解消)。
+///
+/// 成功時 (= token 解決 + scope OK) は `Some(MiAuthTokenRow)` を返し、
+/// 同時に `last_used_at` の best-effort 更新タスクを spawn する。
+///
+/// 失敗時は `None` を返す。呼び出し側は `None` を見たら
+/// [`unauthorized`] を返す ── token 未提示 / 不正 / scope 不足 のいずれも
+/// 「401 unauthorized」に倒す。Misskey wire 仕様は 401/403 を厳密には区別
+/// しない (= client は再認可フローに倒すだけ) ので、外側からは 1 種類で扱う。
+///
+/// **scope 不足** を明示したいときは戻り値の `MiAuthTokenRow.permissions` を
+/// 別途引いて [`forbidden`] を返す経路が必要だが、本ヘルパは「scope OK」を
+/// boolean に潰す。
+pub async fn require_scope(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body_i: Option<&str>,
+    required_scope: &str,
+) -> Option<MiAuthTokenRow> {
+    let raw = match body_i.filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_bearer_header)
+            .map(str::to_string)?,
+    };
+    let token_row = validate_token_raw(state, &raw).await?;
+    if !has_scope(&token_row, required_scope) {
+        return None;
+    }
+    mark_used_async(state, token_row.id);
+    Some(token_row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
