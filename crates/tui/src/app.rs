@@ -46,12 +46,13 @@ impl StatusLine {
     }
 }
 
-/// Issue #90: Help overlay のスクロール state。content が overlay 高さを
-/// 超えるとき、`scroll` で先頭から何行スキップして描画するかを覚える。
+/// Help overlay のスクロール state。content が overlay 高さを超えるとき、
+/// `scroll` で先頭から何行スキップして描画するかを覚える。
 ///
 /// `last_total_lines` / `last_inner_height` は renderer が毎フレーム書き込み、
 /// 次回イベント (= `PgDn` / `G` / 末尾クランプ) で参照する ── overlay が描画
-/// される前にキーが来ても破綻しないよう default は 0 / 10 にしておく。
+/// される前にキーが来ても破綻しないよう default はすべて `0`。`page_step()`
+/// 側で `.max(1)` を入れ、`last_inner_height = 0` でも 1 行は進めるようにする。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HelpState {
     /// 上から何行スキップして描画するか。
@@ -212,8 +213,8 @@ pub struct App {
     /// 押した瞬間の Note snapshot を保持する。`Focus::NoteDetail` の
     /// あいだだけ `Some`。`Esc` / `q` で `None` に戻す。
     pub note_detail: Option<crate::note_detail::NoteDetailScreen>,
-    /// Issue #90: Help overlay の scroll 状態。`Focus::Help` の入り口で
-    /// `scroll = 0` にリセットされる ── 毎回先頭から読めるようにする。
+    /// Help overlay の scroll 状態。`Focus::Help` の入り口で `scroll = 0` に
+    /// リセットされる ── 毎回先頭から読めるようにする。
     pub help_state: HelpState,
     /// Issue #131: 現在進行中の async ネットワーク操作の数。`> 0` のとき
     /// `render_status` が左端に spinner を出す。各 async ハンドラの冒頭で
@@ -579,7 +580,7 @@ mod tests {
         assert!(app.status.is_none());
     }
 
-    // Issue #90: Help overlay の scroll state を検証。
+    // Help overlay の scroll state を検証。
     //
     // `HelpState` は renderer が毎フレーム `sync_geometry` で書き戻す ──
     // テストは renderer 抜きで「ジオメトリが既知のときに scroll が

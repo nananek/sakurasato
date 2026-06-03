@@ -25,17 +25,17 @@ pub enum Action {
     EnterCompose,
     FocusTimeline,
     ToggleHelp,
-    /// Issue #90: Help overlay の 1 行下スクロール (`j` / `↓`)。
+    /// Help overlay の 1 行下スクロール (`j` / `↓`)。
     HelpScrollDown,
-    /// Issue #90: Help overlay の 1 行上スクロール (`k` / `↑`)。
+    /// Help overlay の 1 行上スクロール (`k` / `↑`)。
     HelpScrollUp,
-    /// Issue #90: Help overlay の 1 ページ下 (`Space` / `PgDn`)。
+    /// Help overlay の 1 ページ下 (`Space` / `PgDn`)。
     HelpPageDown,
-    /// Issue #90: Help overlay の 1 ページ上 (`PgUp`)。
+    /// Help overlay の 1 ページ上 (`PgUp`)。
     HelpPageUp,
-    /// Issue #90: Help overlay の先頭へ (`g`)。
+    /// Help overlay の先頭へ (`g`)。
     HelpScrollTop,
-    /// Issue #90: Help overlay の末尾へ (`G`)。
+    /// Help overlay の末尾へ (`G`)。
     HelpScrollBottom,
     CycleTheme,
     InsertChar(char),
@@ -438,7 +438,7 @@ fn translate_compose_key(k: KeyEvent) -> Action {
 }
 
 fn translate_help_key(k: KeyEvent) -> Action {
-    // Issue #90: 単独 `g` で先頭、Shift+`g` (= `G`) で末尾 ── less / vim 慣習。
+    // 単独 `g` で先頭、Shift+`g` (= `G`) で末尾 ── less / vim 慣習。
     // `?` / `q` / Esc は従来どおり overlay クローズ。
     match (k.code, k.modifiers) {
         (KeyCode::Esc | KeyCode::Char('?' | 'q'), _) => Action::ToggleHelp,
@@ -924,7 +924,7 @@ mod tests {
         assert!(matches!(translate_mouse(evt), Action::Scroll(n) if n > 0));
     }
 
-    // Issue #90: Help overlay 上の scroll キー routing。
+    // Help overlay 上の scroll キー routing。
     // less / vim 慣習に倣う ── j/k で 1 行、Space/PgDn で 1 ページ、g/G で
     // 先頭/末尾。Esc / ? / q は従来どおり close。
 

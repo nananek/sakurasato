@@ -74,8 +74,8 @@ pub type ScrollHits = hit::ScrollHits;
 
 /// 1 frame 分を描画。返り値は次の `MouseClick` を解決するためのレイアウト矩形。
 ///
-/// `app` は `&mut` ── Issue #90 の Help overlay scroll で、描画した
-/// content の総行数 / viewport を [`crate::app::HelpState`] に書き戻すため。
+/// `app` は `&mut` ── Help overlay scroll で、描画した content の総行数 /
+/// viewport を [`crate::app::HelpState`] に書き戻すため。
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
     let area = frame.area();
 
@@ -2221,23 +2221,35 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         )),
     ];
 
-    // Issue #90: overlay 内寸 = block.inner で border 2 行を除いたサイズ。
-    // 総行数と viewport を `HelpState` に書き戻してから scroll をクランプ、
-    // その scroll で `Paragraph::scroll` を呼ぶ。
+    // overlay 内寸 = block.inner で border 2 行を除いたサイズ。総行数と
+    // viewport を `HelpState` に書き戻してから scroll をクランプ、その scroll
+    // で `Paragraph::scroll` を呼ぶ。
+    //
+    // help テキストは静的かつ高々 100 行程度。`u16::MAX` (= 65535) を超える
+    // ことは仕様上ありえないので `debug_assert` で開発時に気付けるようにし、
+    // release では `as u16` で饱和 cast (wrap しない範囲)。
+    debug_assert!(
+        u16::try_from(lines.len()).is_ok(),
+        "help text grew unreasonably large: {} lines",
+        lines.len()
+    );
     let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let inner_height = h.saturating_sub(2);
     app.help_state.sync_geometry(total_lines, inner_height);
     let scroll = app.help_state.scroll;
     let max_scroll = app.help_state.max_scroll();
 
-    let scroll_hint = if max_scroll == 0 {
-        String::new()
+    // scroll 可否を `▲▼` で示唆。リサイズで `max_scroll` が 0 ↔ 非 0 を行き来
+    // してもタイトル幅がずれないよう、スクロール不要時も同じ幅 (= スペース 2
+    // 文字) を予約しておく。
+    let (up, down) = if max_scroll == 0 {
+        (' ', ' ')
     } else {
-        let up = if scroll == 0 { ' ' } else { '▲' };
-        let down = if scroll >= max_scroll { ' ' } else { '▼' };
-        format!(" {up}{down}")
+        let u = if scroll == 0 { ' ' } else { '▲' };
+        let d = if scroll >= max_scroll { ' ' } else { '▼' };
+        (u, d)
     };
-    let title = format!("  help{scroll_hint}  ");
+    let title = format!("  help {up}{down}  ");
 
     let block = Block::default()
         .title(Span::styled(

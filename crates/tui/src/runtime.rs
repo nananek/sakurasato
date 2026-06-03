@@ -309,7 +309,7 @@ async fn apply_action(
             app.focus = if app.focus == Focus::Help {
                 Focus::Timeline
             } else {
-                // Issue #90: 開くたびに先頭から読めるよう scroll をリセット。
+                // 開くたびに先頭から読めるよう scroll をリセット。
                 // `last_*` 寸法は次フレームの render_help が書き戻す。
                 app.help_state.scroll_top();
                 Focus::Help
@@ -1715,8 +1715,8 @@ async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
         }
         Command::Help => {
             // Help overlay は Focus::Help。コマンド経路では明示的にトグルする。
-            // Issue #90: ToggleHelp 経路と同様、開いたら先頭から読めるよう
-            // scroll をリセット。
+            // ToggleHelp 経路と同様、開いたら先頭から読めるよう scroll を
+            // リセット。
             app.help_state.scroll_top();
             app.focus = Focus::Help;
         }
