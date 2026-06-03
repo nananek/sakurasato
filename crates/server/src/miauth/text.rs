@@ -128,7 +128,13 @@ fn decode_entities(s: &str) -> String {
             i += ch.len_utf8();
             continue;
         }
-        // `&` から `;` までを読む (最大 12 文字 = numeric の上限想定)。
+        // `&` から `;` までを読む。entity body の最大長は 12 文字を上限とする
+        // (= 最長の HTML5 named entity `CounterClockwiseContourIntegral` は 33
+        // 文字あるが、AP `Note.content` で実際に流れるのは `amp` / `lt` / `gt`
+        // / `nbsp` 等の数文字 + numeric 参照 `&#1114111;` (= 7 文字、Unicode 上限
+        // U+10FFFF を 10 進表記した最長ケース) で 12 文字あれば余裕で覆える)。
+        // 上限を設けることで `&...... 長い文字列に `;` を含むだけ ......;` を
+        // entity 候補として走査せず O(1) で諦められる。
         let Some(end_rel) = s[i + 1..].find(';') else {
             out.push('&');
             i += 1;

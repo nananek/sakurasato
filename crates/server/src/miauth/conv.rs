@@ -728,6 +728,13 @@ pub fn from_actor_me_detailed(
     policies: JsonValue,
 ) -> JsonValue {
     let mut v = from_actor_detailed(actor, followers_count, following_count, notes_count);
+    // `from_actor_detailed` は実質 `Object` を返すが、型レベルでは保証されて
+    // いない。`Null` 等で来ると Me-only field 挿入が無音で消えるので
+    // `debug_assert!` で意図を明示 (= release ビルドでは graceful)。
+    debug_assert!(
+        matches!(v, JsonValue::Object(_)),
+        "from_actor_detailed must return JsonValue::Object",
+    );
     if let JsonValue::Object(ref mut map) = v {
         // Me-only flags (= 自分にしか出ないフィールド)。
         map.insert("isAdmin".to_string(), JsonValue::Bool(false));
