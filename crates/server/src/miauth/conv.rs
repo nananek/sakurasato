@@ -224,6 +224,21 @@ pub struct MissNote {
 /// Sakurasato 内部の attachment は AP `Document` を素のまま JSON で保持しており、
 /// `id` (= Misskey 側 file row の id) や `md5` を持たない。`id` は URL を hash
 /// 化した安定 ID を発行することで wire 上の string 制約を満たす。
+///
+/// ## misskey-dart 互換 (= M14 #172 / Aria 実機検証で判明)
+///
+/// [shiosyakeyakini-info/misskey_dart](https://github.com/shiosyakeyakini-info/misskey_dart)
+/// の `DriveFile` 定義は **`name: String` (non-null)** + **`properties:
+/// DriveFileProperties` (non-null object)** が required。Dart の sound
+/// null-safety で `name == null` を parse すると `_$DriveFileFromJson` が
+/// 例外を投げ、Aria 等の client が timeline 描画ごと crash する。
+///
+/// 対応:
+/// - `name` ── AP `Document.name` (= alt text) ではなく **URL の basename**
+///   (= file 名相当) で組み立てる。原則 non-null。
+/// - `comment` ── 引き続き AP `Document.name` (= alt text) を保持。
+/// - `properties` ── 新規 [`MissFileProperties`] を required field として
+///   emit。AP `Document` に width/height が無くても `{}` で valid。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MissFile {
@@ -233,7 +248,10 @@ pub struct MissFile {
     /// AP `Document` には `published` が無いので、空文字または親 note の
     /// `createdAt` を使う ── 親 note 側で `MissNote::created_at` をコピー。
     pub created_at: String,
-    pub name: Option<String>,
+    /// **non-null** (= Misskey-dart の `DriveFile.name: String` 仕様準拠)。
+    /// URL の basename を採用 ── AP `Document.name` は alt text で意味が違う
+    /// ため [`Self::comment`] に置く。
+    pub name: String,
     /// MIME type (= AP `mediaType`)。`application/octet-stream` を default に
     /// 倒す ── Misskey クライアントは type 無しを panic することがある。
     #[serde(rename = "type")]
@@ -245,10 +263,28 @@ pub struct MissFile {
     pub size: i64,
     pub url: String,
     pub thumbnail_url: Option<String>,
-    /// AP `name` 相当 (= alt text)。
+    /// AP `name` 相当 (= alt text)。Misskey-dart の `DriveFile.comment: String?`。
     pub comment: Option<String>,
     /// AP `sensitive` を継承。`note.sensitive` を全添付に伝搬する。
     pub is_sensitive: bool,
+    /// Misskey-dart `DriveFile.properties` (= **required**) の表現。AP
+    /// `Document` で width/height が指定されていれば伝搬、無ければ `null` で
+    /// 埋める。全 field null でも有効 (= `{}` で OK)。
+    pub properties: MissFileProperties,
+}
+
+/// Misskey-dart の `DriveFileProperties` 相当。全 field optional。
+///
+/// AP `Document` 内に `width` / `height` が指定されていれば
+/// (`build_miss_file` 内で) 伝搬。`orientation` / `avg_color` は AP では
+/// 表現が無いため常に `None`。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissFileProperties {
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub orientation: Option<i64>,
+    pub avg_color: Option<String>,
 }
 
 /// `POST /api/emojis` レスポンスの 1 要素。
@@ -455,6 +491,10 @@ pub(crate) fn build_mentions(raw: &JsonValue) -> Vec<String> {
 }
 
 /// `note.attachments` JSONB 1 件 → `MissFile`。`url` が無い要素は `None`。
+///
+/// AP `Document.name` は alt text (= Mastodon 慣行) なので [`MissFile::comment`]
+/// に置き、Misskey-dart 期待の non-null [`MissFile::name`] は **URL basename**
+/// から組み立てる (= M14 #172、Aria 実機検証で判明)。
 fn build_miss_file(raw: &JsonValue, created_at: &str, sensitive: bool) -> Option<MissFile> {
     let url = raw.get("url").and_then(JsonValue::as_str)?;
     let mime_type = raw
@@ -462,24 +502,58 @@ fn build_miss_file(raw: &JsonValue, created_at: &str, sensitive: bool) -> Option
         .and_then(JsonValue::as_str)
         .unwrap_or("application/octet-stream")
         .to_string();
-    let name = raw
+    // AP `name` は alt text として `comment` に。
+    let alt_text = raw
         .get("name")
         .and_then(JsonValue::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // Misskey-dart `DriveFile.name` (= non-null) は URL basename を使う。
+    let file_name = miss_file_name_from_url(url);
     let id = miss_file_id_from_url(url);
+    // AP `Document` に width / height が乗っている場合 (= Mastodon / Misskey
+    // 双方の連合は width/height を Document level に書く) は伝搬する。
+    let width = raw.get("width").and_then(JsonValue::as_i64);
+    let height = raw.get("height").and_then(JsonValue::as_i64);
     Some(MissFile {
         id,
         created_at: created_at.to_string(),
-        name: name.clone(),
+        name: file_name,
         mime_type,
         md5: String::new(),
         size: 0,
         url: url.to_string(),
         thumbnail_url: None,
-        comment: name,
+        comment: alt_text,
         is_sensitive: sensitive,
+        properties: MissFileProperties {
+            width,
+            height,
+            orientation: None,
+            avg_color: None,
+        },
     })
+}
+
+/// URL の最後の path segment (= basename) を取り出す。
+///
+/// `https://host/media/abc.webp` → `abc.webp`
+/// `https://host/media/abc.webp?v=1` → `abc.webp` (= query string は剥がす)
+/// `https://host/` → `host` (= path が空なら host 名で fallback)
+///
+/// Misskey-dart の `DriveFile.name` 必須要件を満たすため。AP `Document.name`
+/// (alt text) とは別物。
+fn miss_file_name_from_url(url: &str) -> String {
+    // query / fragment を剥がす。
+    let path_only = url.split(['?', '#']).next().unwrap_or(url);
+    let basename = path_only.rsplit('/').next().filter(|s| !s.is_empty());
+    if let Some(name) = basename {
+        return name.to_string();
+    }
+    // path が空 (= trailing `/`) の URL は host 部分を使う。それも無ければ URL
+    // そのまま (= 異常 URL でも何か返して `null` を避ける、Aria crash 回避が
+    // 第一優先)。
+    url.split('/').nth(2).unwrap_or(url).to_string()
 }
 
 /// `url` の SHA-256 を取って先頭 16 hex 文字を返す ── 安定した opaque string id。
@@ -928,6 +1002,97 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 16, "id must be 16 hex chars");
+    }
+
+    // ── M14 #172: misskey-dart `DriveFile` 互換 ───────────────────────────
+
+    #[test]
+    fn miss_file_name_uses_url_basename() {
+        // 標準 URL は basename を返す。
+        assert_eq!(
+            miss_file_name_from_url("https://host/media/abc.webp"),
+            "abc.webp"
+        );
+        // クエリ文字列付きは strip。
+        assert_eq!(
+            miss_file_name_from_url("https://host/media/photo.jpg?v=1"),
+            "photo.jpg"
+        );
+        // fragment 付きも strip。
+        assert_eq!(
+            miss_file_name_from_url("https://host/media/photo.jpg#section"),
+            "photo.jpg"
+        );
+        // trailing `/` (= path 空) は host 名を返す。
+        assert_eq!(miss_file_name_from_url("https://host/"), "host");
+    }
+
+    #[test]
+    fn build_miss_file_emits_non_null_name_from_url() {
+        let raw = json!({
+            "url": "https://example.test/media/abc123.webp",
+            "mediaType": "image/webp",
+        });
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).expect("url is present");
+        // `name` は string、URL basename。null ではない。
+        assert_eq!(f.name, "abc123.webp");
+    }
+
+    #[test]
+    fn build_miss_file_uses_ap_name_for_comment_not_for_name() {
+        // AP `name` は alt text (= Mastodon 慣行) なので `comment` に置く。
+        // Misskey-dart の non-null `DriveFile.name` 要件を満たすため、
+        // file `name` は URL basename を使う。
+        let raw = json!({
+            "url": "https://example.test/media/abc.webp",
+            "name": "Sakura petals in spring",
+        });
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).unwrap();
+        assert_eq!(f.name, "abc.webp", "file name comes from URL basename");
+        assert_eq!(
+            f.comment.as_deref(),
+            Some("Sakura petals in spring"),
+            "AP name → comment (alt text)"
+        );
+    }
+
+    #[test]
+    fn build_miss_file_emits_properties_object() {
+        // AP `Document` に width / height がある場合は properties に伝搬。
+        let raw = json!({
+            "url": "https://example.test/media/abc.webp",
+            "width": 800,
+            "height": 600,
+        });
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).unwrap();
+        assert_eq!(f.properties.width, Some(800));
+        assert_eq!(f.properties.height, Some(600));
+        // AP には orientation / avg_color が無いので null。
+        assert!(f.properties.orientation.is_none());
+        assert!(f.properties.avg_color.is_none());
+    }
+
+    #[test]
+    fn build_miss_file_emits_properties_object_when_no_width_height() {
+        // width / height が無くても properties field 自体は必須 (= Misskey-dart の
+        // `required DriveFileProperties` 要件)。全 null でも `{}` で valid。
+        let raw = json!({
+            "url": "https://example.test/media/audio.mp3",
+            "mediaType": "audio/mpeg",
+        });
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).unwrap();
+        // serialize して JSON shape を直接確認。
+        let v = serde_json::to_value(&f).unwrap();
+        assert!(v.get("properties").is_some(), "properties must be present");
+        assert!(
+            v["properties"].is_object(),
+            "properties must be an object (= misskey-dart required field)"
+        );
+        // wire 上の `name` も string で null じゃない。
+        assert!(
+            v["name"].is_string(),
+            "name must be a JSON string (= misskey-dart required field)"
+        );
     }
 
     #[test]

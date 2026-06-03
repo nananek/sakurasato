@@ -988,3 +988,99 @@ async fn timeline_decodes_html_entities_in_text(pool: PgPool) {
     let arr = read_json(resp).await;
     assert_eq!(arr[0]["text"], "Tom & Jerry 'hi'");
 }
+
+// ─── M14 #172: MissFile wire shape (= misskey-dart DriveFile 互換) ─────────
+
+/// timeline で attachment 付き note を返したとき、`MissNote.files[].name` が
+/// **non-null string** で、`properties` object が **必須 field として存在**
+/// すること。Aria など misskey-dart 利用 client が parse できる shape。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_attachment_wire_shape_matches_misskey_dart(pool: PgPool) {
+    let actor_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    // attachment 付き note を 1 件投入。AP `Document` に `name` (= alt text) +
+    // `width`/`height` を持たせる ── これらが `MissFile.comment` /
+    // `MissFile.properties.{width,height}` に伝搬する想定。
+    let ap_id = format!("https://sakurasato.test/notes/pending-{}", Uuid::new_v4());
+    let new = NewNote {
+        ap_id: ap_id.clone(),
+        actor_id,
+        content: "with attachment".into(),
+        language: Some("ja".into()),
+        in_reply_to_ap_id: None,
+        in_reply_to_note_id: None,
+        summary: None,
+        visibility: Visibility::Public,
+        sensitive: false,
+        to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+        cc_recipients: vec![],
+        attachments: json!([
+            {
+                "type": "Document",
+                "mediaType": "image/webp",
+                "url": "https://sakurasato.test/media/photo-abc.webp",
+                "name": "Sakura petals in spring",
+                "width": 1024,
+                "height": 768
+            }
+        ]),
+        tags: json!([]),
+        is_local: true,
+        url: None,
+        published_at: chrono::Utc::now(),
+    };
+    let row = repo::note::insert(&pool, new).await.expect("seed note");
+    let canonical = format!("https://sakurasato.test/notes/{}", row.id);
+    repo::note::set_ap_id_and_url(&pool, row.id, &canonical, &canonical)
+        .await
+        .unwrap();
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/timeline")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let files = &arr[0]["files"];
+    assert!(
+        files.is_array() && !files.as_array().unwrap().is_empty(),
+        "files array must contain at least 1 attachment"
+    );
+    let f = &files[0];
+
+    // **non-null name** ── misskey-dart の `DriveFile.name: String` 要件。
+    assert!(
+        f["name"].is_string(),
+        "files[0].name must be a JSON string, not null; got {:?}",
+        f["name"]
+    );
+    assert_eq!(
+        f["name"], "photo-abc.webp",
+        "name should be URL basename (file 名)"
+    );
+
+    // AP `name` (= alt text) は `comment` に。
+    assert_eq!(f["comment"], "Sakura petals in spring");
+
+    // **properties は必須 object** ── misskey-dart の
+    // `DriveFile.properties: DriveFileProperties` 要件。
+    assert!(
+        f["properties"].is_object(),
+        "files[0].properties must be a JSON object; got {:?}",
+        f["properties"]
+    );
+    assert_eq!(f["properties"]["width"], 1024);
+    assert_eq!(f["properties"]["height"], 768);
+    // 我々が emit しない field は null だが key 自体は存在する。
+    assert!(f["properties"]["orientation"].is_null());
+    assert!(f["properties"]["avgColor"].is_null());
+}
