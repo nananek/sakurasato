@@ -72,7 +72,10 @@ pub async fn handle(State(state): State<AppState>) -> Response {
         .await
         .map_or_else(
             |err| {
-                warn!(?err, "stats: count_distinct_remote_hosts failed; emitting 0");
+                warn!(
+                    ?err,
+                    "stats: count_distinct_remote_hosts failed; emitting 0"
+                );
                 0
             },
             |n| u64::try_from(n).unwrap_or(0),
