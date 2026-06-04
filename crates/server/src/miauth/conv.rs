@@ -428,16 +428,25 @@ pub(crate) fn build_reactions(
         // `:shortcode:` または `:shortcode@host:` の中身を取り出して
         // `reactionEmojis` map key に使う (= Misskey 慣行)。
         let key = trim_reaction_emoji_key(&row.content);
-        let url = if row.is_local == Some(true) {
-            format!("https://{host}/media/{image_key}")
-        } else {
-            // remote emoji は image_key 自体が absolute URL (= リモートサーバの
-            // `Emoji.icon.url`)。
+        // Issue #135: local / remote 共に versitygw キー形式 (`emoji/...`) を
+        // 自鯖 `/media/` URL に展開。旧 row (= remote URL を `image_key` に
+        // 直接入れていた頃のデータ) は `http(s)://` 形式なので素通し ──
+        // 再 upsert で `emoji/remote/...` に書き換わるまでの graceful。
+        let url = if is_absolute_url(image_key) {
             image_key.to_string()
+        } else {
+            format!("https://{host}/media/{image_key}")
         };
         reaction_emojis.insert(key, url);
     }
     (reactions, reaction_emojis)
+}
+
+/// `image_key` が絶対 URL (= 旧 row のリモート pass-through データ) かを判定する。
+/// 真なら自鯖 `/media/` URL の prefix を被せず素通しする。Issue #135 で nullable 化 +
+/// 自鯖キャッシュに切り替えた経路の **graceful migration** 用。
+fn is_absolute_url(s: &str) -> bool {
+    s.starts_with("https://") || s.starts_with("http://")
 }
 
 /// `:foo:` or `:foo@host:` の **外側 `:` を剥がす** ── `reactionEmojis` key 用。
@@ -1193,7 +1202,21 @@ mod tests {
                 content: ":blob@misskey.io:".into(),
                 count: 2,
                 emoji_id: Some(8),
-                image_key: Some("https://misskey.io/files/blob.webp".into()),
+                // Issue #135: cached remote ── 自鯖 versitygw キー形式。
+                image_key: Some("emoji/remote/misskey.io/blob.webp".into()),
+                media_type: Some("image/webp".into()),
+                is_local: Some(false),
+                first_at: Utc::now(),
+            },
+            ReactionSummaryRow {
+                note_id: 1,
+                content: ":legacy@old.test:".into(),
+                count: 1,
+                emoji_id: Some(9),
+                // Issue #135: 旧 row (= remote URL 直入れ時代) は素通しで
+                // graceful migration、再 upsert で `emoji/remote/...` に
+                // 置き換わるまで動作を維持する。
+                image_key: Some("https://old.test/files/legacy.webp".into()),
                 media_type: Some("image/webp".into()),
                 is_local: Some(false),
                 first_at: Utc::now(),
@@ -1210,10 +1233,16 @@ mod tests {
             emojis["sakura"],
             "https://sakurasato.test/media/emoji/local/sakura.webp"
         );
-        // remote は image_key の URL を素のまま。
+        // Issue #135: cached remote (= `emoji/remote/...`) も自鯖 /media/
+        // URL に展開する。
         assert_eq!(
             emojis["blob@misskey.io"],
-            "https://misskey.io/files/blob.webp"
+            "https://sakurasato.test/media/emoji/remote/misskey.io/blob.webp"
+        );
+        // 旧 row (URL 直入れ) は素通し。
+        assert_eq!(
+            emojis["legacy@old.test"],
+            "https://old.test/files/legacy.webp"
         );
     }
 

@@ -35,6 +35,8 @@ mod tests {
         //   を冪等返却するための列追加)
         // 0017 emoji_shortcode_128 (= Issue #188: shortcode CHECK 制約の長さ
         //   上限を 64 → 128 に緩和、Misskey に揃え)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 17);
+        // 0018 emoji_image_key_nullable (= Issue #135: remote emoji 取得失敗を
+        //   表現するため image_key 列を NULL 許容化)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 18);
     }
 }

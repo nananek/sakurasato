@@ -168,6 +168,12 @@ pub struct DeliveryQueueRow {
 }
 
 /// Row of the `emoji` table.
+///
+/// `image_key` は M8 まで NOT NULL だったが Issue #135 (M14) で nullable 化
+/// (migration 0018)。remote emoji を media-proxy 経由で取得 + キャッシュする
+/// 設計に切り替えた際、fetch 失敗時に「画像なし、テキストフォールバック」を
+/// 表現するため `None` を許容する。Local emoji は import 時に必ずキーが
+/// 入るので実質 `Some(...)`。
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct EmojiRow {
     pub id: i64,
@@ -175,7 +181,7 @@ pub struct EmojiRow {
     pub host: Option<String>,
     pub category: Option<String>,
     pub aliases: Json<Vec<String>>,
-    pub image_key: String,
+    pub image_key: Option<String>,
     pub media_type: String,
     pub ap_id: Option<String>,
     pub is_local: bool,

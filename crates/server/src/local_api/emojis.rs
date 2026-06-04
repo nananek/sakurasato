@@ -100,15 +100,20 @@ pub async fn list(State(state): State<AppState>, Query(params): Query<ListQuery>
     };
 
     let host = &state.config().server.host;
+    // Issue #135: `image_key` が None の local emoji は画像配信不可なので
+    // listing からも落とす ── TUI 側で `:foo:` のテキストに倒れる。
     let items: Vec<EmojiItem> = rows
         .into_iter()
-        .map(|row| EmojiItem {
-            kind: "custom",
-            url: build_media_url(host, &row.image_key),
-            shortcode: row.shortcode,
-            media_type: row.media_type,
-            category: row.category,
-            aliases: row.aliases.0,
+        .filter_map(|row| {
+            let image_key = row.image_key.as_deref()?;
+            Some(EmojiItem {
+                kind: "custom",
+                url: build_media_url(host, image_key),
+                shortcode: row.shortcode,
+                media_type: row.media_type,
+                category: row.category,
+                aliases: row.aliases.0,
+            })
         })
         .collect();
 

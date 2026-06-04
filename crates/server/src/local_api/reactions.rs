@@ -560,9 +560,14 @@ fn build_reaction_activity(
 ) -> JsonValue {
     let published = published.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    let (activity_type, tag) = if let Some(emoji) = emoji {
+    let (activity_type, tag) = if let Some(emoji) = emoji
+        && let Some(image_key) = emoji.image_key.as_deref()
+    {
         // Misskey 互換: EmojiReact + tag に Emoji オブジェクト。
-        let url = build_media_url(&state.config().server.host, &emoji.image_key);
+        // Issue #135 で `image_key` が nullable 化。Local emoji は import 時に
+        // 必ず入っているのが期待値だが、None で来た場合は連合相手に画像 URL
+        // を含む Emoji tag を出せないので Like (テキスト) で送る安全側挙動。
+        let url = build_media_url(&state.config().server.host, image_key);
         let emoji_ap_id = format!(
             "https://{host}/emojis/{shortcode}",
             host = state.config().server.host,

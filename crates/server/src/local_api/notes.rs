@@ -593,7 +593,14 @@ async fn resolve_emoji_tags(state: &AppState, content: &str) -> Vec<JsonValue> {
     for sc in shortcodes {
         match repo::emoji::get_local_by_shortcode(state.pool(), &sc).await {
             Ok(Some(row)) => {
-                let url = build_media_url(&host, &row.image_key);
+                // Issue #135 で nullable 化: local emoji は import 時に必ず
+                // 入っているはずだが、何らかの原因で None だった場合は
+                // 配信側で `:foo:` テキストに倒すため tag を drop する。
+                let Some(image_key) = row.image_key.as_deref() else {
+                    warn!(shortcode = %sc, "local emoji image_key is NULL; dropping tag");
+                    continue;
+                };
+                let url = build_media_url(&host, image_key);
                 let emoji_ap_id = format!("https://{host}/emojis/{sc}");
                 out.push(json!({
                     "type": "Emoji",

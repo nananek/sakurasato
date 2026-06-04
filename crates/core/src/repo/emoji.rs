@@ -190,11 +190,16 @@ pub async fn search_local_by_substring(
     .await
 }
 
-/// Remote custom emoji の upsert 入力 (M8 PR2)。
+/// Remote custom emoji の upsert 入力 (M8 PR #45 → Issue #135 で改修)。
 ///
-/// `image_url` は連合先サーバの実 URL (= `Emoji.icon.url`)。本 PR では
-/// 取得・キャッシュは行わず URL のまま `image_key` に格納する ── M9 で
-/// media-proxy 経由のキャッシュに切り替える想定 (CLAUDE.md §5.4)。
+/// `image_key` は **versitygw 上のローカルキャッシュキー** (`emoji/remote/<host>/<shortcode>.webp`)
+/// または `None` (= 取得失敗、テキストフォールバック)。M8 時点では「相手
+/// サーバの `Emoji.icon.url` 生 URL」を入れていたが、Issue #135 で
+/// `dispatch::reaction::learn_remote_emoji` 側で media-proxy 経由の取得 +
+/// versitygw 格納まで済ませた状態で本 struct を組むようにした。
+///
+/// 旧 row (= URL のまま入っている既存 row) は `image_key` を上書きする経路で
+/// 自然リハイドレートされる ── 個別バックフィルは行わない (= Issue option 1)。
 #[derive(Debug, Clone)]
 pub struct NewRemoteEmoji {
     pub shortcode: String,
@@ -202,7 +207,8 @@ pub struct NewRemoteEmoji {
     pub ap_id: String,
     /// `Emoji.id` のホスト。`null` は不可 (= remote はホスト必須)。
     pub host: String,
-    pub image_url: String,
+    /// versitygw 上のキャッシュキー、または `None` (= 取得失敗で画像なし)。
+    pub image_key: Option<String>,
     pub media_type: String,
 }
 
@@ -238,7 +244,7 @@ pub async fn upsert_remote(pool: &PgPool, new: NewRemoteEmoji) -> sqlx::Result<E
         "#,
         new.shortcode,
         new.host,
-        new.image_url,
+        new.image_key,
         new.media_type,
         new.ap_id,
     )

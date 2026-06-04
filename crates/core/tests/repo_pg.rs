@@ -673,34 +673,42 @@ async fn reaction_count_by_note_groups_by_content(pool: PgPool) -> sqlx::Result<
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn emoji_upsert_remote_is_idempotent_by_ap_id(pool: PgPool) -> sqlx::Result<()> {
+    // Issue #135 で `image_key` を `Option<String>` に倒したので、自鯖
+    // キャッシュキー (`emoji/remote/<host>/<shortcode>.webp`) を入れる経路と
+    // 取得失敗 (= `None`) を入れる経路の両方を round-trip 検証する。
     let first = repo::emoji::upsert_remote(
         &pool,
         repo::emoji::NewRemoteEmoji {
             shortcode: "blob".into(),
             ap_id: "https://misskey.io/emojis/blob".into(),
             host: "misskey.io".into(),
-            image_url: "https://misskey.io/files/blob.png".into(),
-            media_type: "image/png".into(),
+            image_key: Some("emoji/remote/misskey.io/blob.webp".into()),
+            media_type: "image/webp".into(),
         },
     )
     .await?;
     assert!(!first.is_local);
     assert_eq!(first.host.as_deref(), Some("misskey.io"));
+    assert_eq!(
+        first.image_key.as_deref(),
+        Some("emoji/remote/misskey.io/blob.webp")
+    );
 
-    // 同じ ap_id で再投入 → 同じ行を更新して返す。
+    // 同じ ap_id で再投入 → 同じ行を更新して返す。fetch 失敗を想定して
+    // `image_key = None` に倒す経路。
     let second = repo::emoji::upsert_remote(
         &pool,
         repo::emoji::NewRemoteEmoji {
             shortcode: "blob".into(),
             ap_id: "https://misskey.io/emojis/blob".into(),
             host: "misskey.io".into(),
-            image_url: "https://misskey.io/files/blob2.png".into(),
+            image_key: None,
             media_type: "image/webp".into(),
         },
     )
     .await?;
     assert_eq!(first.id, second.id);
-    assert_eq!(second.image_key, "https://misskey.io/files/blob2.png");
+    assert!(second.image_key.is_none());
     assert_eq!(second.media_type, "image/webp");
 
     // get_by_ap_id でも引ける。
@@ -795,8 +803,8 @@ async fn emoji_upsert_remote_rejects_empty_host(pool: PgPool) -> sqlx::Result<()
             shortcode: "blob".into(),
             ap_id: "https://misskey.io/emojis/blob".into(),
             host: String::new(),
-            image_url: "https://misskey.io/files/blob.png".into(),
-            media_type: "image/png".into(),
+            image_key: Some("emoji/remote/misskey.io/blob.webp".into()),
+            media_type: "image/webp".into(),
         },
     )
     .await
