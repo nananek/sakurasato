@@ -507,10 +507,9 @@ fn render_command_prompt(
             if i > 0 {
                 spans.push(Span::styled("  ", Style::default().fg(palette.muted)));
             }
-            spans.push(Span::styled(
-                (*s).to_string(),
-                Style::default().fg(palette.foreground),
-            ));
+            // `*s` は `&'static str` ── `Span::styled` は `Into<Cow<'static, str>>`
+            // を受けるので `.to_string()` 不要 (= 毎フレーム描画でヒープ確保しない)。
+            spans.push(Span::styled(*s, Style::default().fg(palette.foreground)));
         }
         let p = Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.background));
         frame.render_widget(p, suggest_area);
@@ -2231,7 +2230,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         help_entry(palette, ":unlock", "key-only mode off"),
         help_entry(palette, ":requests", "pending follow requests"),
         help_entry(palette, ":q / :quit", "exit TUI"),
-        help_entry(palette, "Tab", "complete head (Issue #116)"),
+        help_entry(palette, "Tab", "complete command head"),
         Line::from(""),
         Line::from(Span::styled("follow requests", help_section(palette))),
         help_entry(palette, "j / k", "next / prev request"),
