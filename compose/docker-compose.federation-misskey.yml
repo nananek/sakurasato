@@ -227,12 +227,17 @@ services:
       - ./federation-test/misskey-federation/misskey.yml:/misskey/.config/default.yml:ro
     # `/api/ping` を叩いて起動完了を確認する healthcheck (= setup-misskey.sh の
     # poll を embed 化)。pytest profile の depends_on で待ち合わせる。
+    #
+    # GitHub Actions runner では misskey upstream image (= `:latest`) の
+    # bootstrap (yarn install + migration + boot) が 5 分を越える事例が観測された
+    # ため timeout を 10 分に伸ばす。start_period も 60s に拡張して bootstrap 中の
+    # 早期失敗カウントを避ける。
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider --post-data='{}' --header='Content-Type: application/json' http://localhost:3000/api/ping 2>&1 | grep -q '200 OK'"]
       interval: 5s
       timeout: 5s
-      retries: 60
-      start_period: 20s
+      retries: 120
+      start_period: 60s
     networks:
       - misskey-fed
 
