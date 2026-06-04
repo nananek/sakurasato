@@ -35,6 +35,7 @@ fn make_config() -> sakurasato_core::Config {
             user: LOCAL_USER.into(),
             info: sakurasato_core::config::ServerInfo::default(),
             auto_approve_followers_for_followees: false,
+            max_note_text_length: 3000,
         },
         database: sakurasato_core::config::DatabaseConfig {
             url: "unused-by-tests".into(),

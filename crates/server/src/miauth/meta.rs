@@ -95,6 +95,7 @@ pub async fn handle(
         theme_color: info.theme_color.clone(),
         banner_url: info.banner_url.clone(),
         max_file_size_mb,
+        max_note_text_length: cfg.server.max_note_text_length,
     });
     Json(response).into_response()
 }
@@ -112,6 +113,7 @@ pub(crate) struct MetaInputs {
     pub theme_color: Option<String>,
     pub banner_url: Option<String>,
     pub max_file_size_mb: u64,
+    pub max_note_text_length: u32,
 }
 
 /// `bytes` → MiB。切り上げで `bytes` を **下回らない** MiB 値を返す
@@ -187,10 +189,9 @@ fn build_meta_top(i: &MetaInputs) -> Value {
         "iconUrl": Value::Null,
         "backgroundImageUrl": Value::Null,
         "logoImageUrl": Value::Null,
-        // TODO(#168 followup): `config.server.max_note_text_length` を生やして
-        // TUI compose UI 上限と連動させる。現状は Misskey 公式デフォルトと同じ
-        // 3000 でハードコード ── お一人様運用で UI 側と乖離する場面はまだ無い。
-        "maxNoteTextLength": 3000,
+        // `config.server.max_note_text_length` (default 3000 = Misskey 公式値)。
+        // TUI compose UI 上限と連動させるための設定可能化 (#168 followup)。
+        "maxNoteTextLength": i.max_note_text_length,
         "defaultLightTheme": Value::Null,
         "defaultDarkTheme": Value::Null,
         "ads": [],
@@ -302,6 +303,9 @@ mod tests {
             theme_color: Some("#ffb7c5".into()),
             banner_url: None,
             max_file_size_mb: 25,
+            // default (3000) とは別の値にして、ハードコードではなく入力が
+            // そのまま反映されることを下の test で検証する。
+            max_note_text_length: 4096,
         }
     }
 
@@ -374,5 +378,13 @@ mod tests {
     fn build_meta_uri_uses_input() {
         let v = build_meta(&sample_inputs());
         assert_eq!(v["uri"], "https://foo.tailnet.ts.net:8443");
+    }
+
+    /// `maxNoteTextLength` が `MetaInputs` の値をそのまま反映する (= 旧
+    /// ハードコード 3000 ではなく config 由来) ことを検証する (#168 followup)。
+    #[test]
+    fn build_meta_max_note_text_length_uses_input() {
+        let v = build_meta(&sample_inputs());
+        assert_eq!(v["maxNoteTextLength"], 4096);
     }
 }

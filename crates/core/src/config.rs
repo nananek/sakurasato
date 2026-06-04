@@ -108,6 +108,11 @@ pub struct ServerConfig {
     /// (= 双方向 follow の慣習を維持)。
     #[serde(default)]
     pub auto_approve_followers_for_followees: bool,
+    /// 1 投稿あたりの最大文字数。`MiAuth` 互換 `/api/meta` の
+    /// `maxNoteTextLength` に反映され、Misskey クライアントの compose UI
+    /// 上限と連動する。デフォルト 3000 (= Misskey 公式仕様値)。
+    #[serde(default = "default_max_note_text_length")]
+    pub max_note_text_length: u32,
 }
 
 /// `NodeInfo.metadata` 経由で他鯖に公開するサーバ情報。
@@ -488,6 +493,10 @@ fn default_miauth_session_ttl_secs() -> u64 {
     600
 }
 
+fn default_max_note_text_length() -> u32 {
+    3000
+}
+
 impl MiAuthConfig {
     /// `MiAuth` listener の有効値。`tcp://` or `unix:` を [`Listen::parse`] で
     /// 解釈する。`listen` が空文字なら error。
@@ -557,6 +566,29 @@ max_pixels = 33554432
                 cfg.database.url,
                 "postgres://sakurasato:{password}@postgres:5432/sakurasato"
             );
+            Ok(())
+        });
+    }
+
+    /// `max_note_text_length` は `[server]` に書かなくても default 3000 に
+    /// 倒れる (= 既存 config への後方互換)。
+    #[test]
+    fn server_max_note_text_length_defaults_to_3000() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            let cfg = Config::load(&path, None).unwrap();
+            assert_eq!(cfg.server.max_note_text_length, 3000);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn server_max_note_text_length_overridable_via_env() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env("SAKURASATO_SERVER__MAX_NOTE_TEXT_LENGTH", "5000");
+            let cfg = Config::load(&path, None).unwrap();
+            assert_eq!(cfg.server.max_note_text_length, 5000);
             Ok(())
         });
     }

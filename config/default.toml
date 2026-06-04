@@ -9,6 +9,9 @@ host = "localhost"
 bind = "0.0.0.0:8080"
 local_api_socket = "/run/sakurasato/local.sock"
 user = "me"
+# 1 投稿あたりの最大文字数。MiAuth 互換 `/api/meta.maxNoteTextLength` に反映
+# され、Misskey クライアントの compose UI 上限と連動する。既定 3000 (Misskey 公式値)。
+max_note_text_length = 3000
 
 # ── サーバ情報 (任意 / NodeInfo metadata 経由で他鯖に公開) ───────────────
 # `[server.info]` を空にしておくと NodeInfo metadata は `{}` で従来挙動。
