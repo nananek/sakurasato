@@ -19,6 +19,7 @@ Sakurasato 側は **UDS (Unix domain socket) 経由** の Bearer トークン認
 """
 from __future__ import annotations
 
+import json
 import os
 import ssl
 import time
@@ -851,11 +852,9 @@ class NekonoverseClient:
         含むことを要求するため、Scenario B (#140 PR1) で bob_new に bob の
         AP id を 1 件積むのに使う。
         """
-        import json as _json
-
         resp = self.http.patch(
             "/api/v1/accounts/update_credentials",
-            files={"also_known_as": (None, _json.dumps(also_known_as))},
+            files={"also_known_as": (None, json.dumps(also_known_as))},
             headers={"Authorization": f"Bearer {token}"},
         )
         resp.raise_for_status()

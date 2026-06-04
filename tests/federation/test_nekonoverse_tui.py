@@ -1097,11 +1097,15 @@ def test_bob_move_to_bob_new_propagates_to_sks_following(
     # 4. bob として Move を起動する。`POST /accounts/move` は nkv 側で
     #    target.alsoKnownAs を fresh fetch + 検証 → 自身 movedTo を立て →
     #    followers (alice@sks) 全 inbox に Move 配送を enqueue する。
-    move_resp = nekonoverse.initiate_move(
+    #
+    #    成功判定は `initiate_move` 内の `raise_for_status` に任せる ──
+    #    Nekonoverse develop は `{"ok": true}` を返すが、本テストはレスポンス
+    #    body の中身に依存せず HTTP 200 だけを契機にする (PR #194 round-1
+    #    🔴 対応: Mastodon 仕様の空オブジェクト返却に揺れても壊れない)。
+    nekonoverse.initiate_move(
         token=nekonoverse.token,
         target_ap_id=bob_new_ap_id,
     )
-    assert move_resp.get("ok") is True, f"unexpected move response: {move_resp}"
 
     # 5. sks 側 `/api/v1/following` を polling して、bob_new が現れるのを待つ。
     #    観測経路:
