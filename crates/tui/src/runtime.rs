@@ -26,7 +26,7 @@ use crate::app::{App, Focus, StatusKind};
 use crate::client::{
     ApiError, CreateNoteRequest, FollowTarget, LocalApi, MediaResponse, ProfileUpdate, StreamEvent,
 };
-use crate::compose::{AttachmentRef, Visibility};
+use crate::compose::AttachmentRef;
 use crate::event::{Action, translate};
 use crate::image_cache::ImageCache;
 use crate::in_flight::InFlightGuard;
@@ -1632,11 +1632,7 @@ async fn submit_note(app: &mut App, api: &LocalApi) {
                 StatusKind::Success,
                 Some(Duration::from_secs(4)),
             );
-            app.compose.clear();
-            // visibility は記憶しておきたいので clear 後に上書き。
-            for _ in 0..visibility_steps(Visibility::Public, app.compose.visibility()) {
-                app.compose.cycle_visibility();
-            }
+            remember_compose_state_and_reseed(app);
             app.focus = Focus::Timeline;
             // SSE で push されない場合の保険として、即時タイムライン再取得は
             // しない (= POST notes 内の SSE publish が同 socket で先に届く)。
@@ -1658,16 +1654,20 @@ async fn submit_note(app: &mut App, api: &LocalApi) {
     }
 }
 
-fn visibility_steps(from: Visibility, to: Visibility) -> usize {
-    let order = [
-        Visibility::Public,
-        Visibility::Unlisted,
-        Visibility::Followers,
-        Visibility::Direct,
-    ];
-    let i = order.iter().position(|v| *v == from).unwrap_or(0);
-    let j = order.iter().position(|v| *v == to).unwrap_or(0);
-    (j + order.len() - i) % order.len()
+/// Issue #93: 送信成功直後の compose リセット。
+///
+/// 1. 直前送信時の (visibility / sensitive / CW 使用有無) を
+///    `app.last_compose_defaults` に控えておく。
+/// 2. `Compose::clear` で本文・カーソル・添付・返信先などを全部リセット。
+/// 3. `apply_last_defaults` で 1. の 3 値だけを再シードする。CW 本文 (`cw`)
+///    は引き継がない ── 内容は投稿ごとに固有なので毎回新規入力させる。
+///
+/// 「失敗時 (POST エラー / Esc 離脱) には更新しない」という Issue 仕様は
+/// この関数を成功パスからだけ呼ぶことで担保する。
+fn remember_compose_state_and_reseed(app: &mut App) {
+    app.last_compose_defaults = app.compose.snapshot_defaults();
+    app.compose.clear();
+    app.compose.apply_last_defaults(app.last_compose_defaults);
 }
 
 // ── M13 PR5: Command prompt & FollowList ──────────────────────────────
@@ -2386,23 +2386,60 @@ mod tests {
         }
     }
 
+    /// Issue #93: 送信成功時の reseed は (visibility / sensitive / CW 使用有無)
+    /// を覚え、`Compose::clear` で本文側を全部捨てたあと 3 値だけ書き戻す。
+    /// CW 本文 (`cw`) は引き継がない。
     #[test]
-    fn visibility_steps_wraps() {
-        assert_eq!(visibility_steps(Visibility::Public, Visibility::Public), 0);
-        assert_eq!(
-            visibility_steps(Visibility::Public, Visibility::Unlisted),
-            1
-        );
-        assert_eq!(
-            visibility_steps(Visibility::Public, Visibility::Followers),
-            2
-        );
-        // M13 PR6: Direct を含む 4 値 cycle に拡張。
-        assert_eq!(visibility_steps(Visibility::Public, Visibility::Direct), 3);
-        assert_eq!(
-            visibility_steps(Visibility::Followers, Visibility::Public),
-            2
-        );
-        assert_eq!(visibility_steps(Visibility::Direct, Visibility::Public), 1);
+    fn remember_compose_state_reseeds_three_axes_after_clear() {
+        use crate::compose::Visibility;
+
+        let mut app = make_test_app();
+        app.compose.insert_char('h');
+        app.compose.insert_char('i');
+        // visibility = followers, sensitive = on, CW あり (内容 "nsfw")。
+        app.compose.cycle_visibility(); // public -> unlisted
+        app.compose.cycle_visibility(); // unlisted -> followers
+        app.compose.toggle_sensitive();
+        app.compose.toggle_cw_focus(); // CW 入力モードに
+        app.compose.insert_char('n');
+        app.compose.insert_char('s');
+        app.compose.insert_char('f');
+        app.compose.insert_char('w');
+        app.compose.toggle_cw_focus(); // 本文に戻して送信前の状態を再現
+
+        remember_compose_state_and_reseed(&mut app);
+
+        // app.last_compose_defaults に「直前の値」が保存される。
+        assert_eq!(app.last_compose_defaults.visibility, Visibility::Followers);
+        assert!(app.last_compose_defaults.sensitive);
+        assert!(app.last_compose_defaults.cw_enabled);
+        // compose 自身も 3 値だけ再シードされる。
+        assert_eq!(app.compose.visibility(), Visibility::Followers);
+        assert!(app.compose.sensitive());
+        assert!(app.compose.editing_cw());
+        // 本文・CW 本文・カーソルは捨てる (= clear 経路)。
+        assert!(app.compose.buffer().is_empty());
+        assert!(app.compose.cw().is_empty());
+        assert_eq!(app.compose.cursor(), 0);
+    }
+
+    /// CW を使わずに送信したケースは `cw_enabled = false` を保持し、次回
+    /// compose を開いたとき `editing_cw` は false (= 本文フォーカス) で
+    /// 始まる。`sensitive` も同様。
+    #[test]
+    fn remember_compose_state_keeps_defaults_when_axes_unused() {
+        use crate::compose::Visibility;
+
+        let mut app = make_test_app();
+        app.compose.insert_char('y');
+
+        remember_compose_state_and_reseed(&mut app);
+
+        assert_eq!(app.last_compose_defaults.visibility, Visibility::Public);
+        assert!(!app.last_compose_defaults.sensitive);
+        assert!(!app.last_compose_defaults.cw_enabled);
+        assert_eq!(app.compose.visibility(), Visibility::Public);
+        assert!(!app.compose.sensitive());
+        assert!(!app.compose.editing_cw());
     }
 }

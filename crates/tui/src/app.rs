@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::client::{NoteCreatedPayload, TimelineNote, Whoami};
-use crate::compose::Compose;
+use crate::compose::{Compose, LastComposeDefaults};
 use crate::image_cache::ImageCache;
 use crate::suppression::ImageSuppression;
 use crate::theme::Theme;
@@ -223,6 +223,12 @@ pub struct App {
     /// `Arc` なので `app.in_flight.clone()` で guard に渡せる (= `&mut App`
     /// borrow を await またぎで保持できない Rust の制約への対応)。
     pub in_flight: Arc<AtomicUsize>,
+    /// Issue #93: 同一 TUI セッションで「直前に送信した投稿の意図」を覚える。
+    /// `submit_note` 成功時にのみ更新され、`Compose::clear` 後の再シードに使う。
+    /// Esc 離脱 / POST 失敗では更新しない (= ユーザの「うっかり戻し」事故を防ぐ)。
+    /// 起動時の既定値は [`LastComposeDefaults::default`] (= public / sensitive
+    /// off / CW 無し)。TUI 再起動を跨ぐ永続化は別 Issue で扱う。
+    pub last_compose_defaults: LastComposeDefaults,
 }
 
 impl App {
@@ -264,6 +270,7 @@ impl App {
             note_detail: None,
             help_state: HelpState::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            last_compose_defaults: LastComposeDefaults::default(),
         }
     }
 

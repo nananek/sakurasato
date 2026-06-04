@@ -69,6 +69,32 @@ impl FromStr for Visibility {
     }
 }
 
+/// Issue #93: 同一 TUI セッションで「直前に送信した投稿の意図」を覚える
+/// 3 値セット。`submit_note` 成功時にだけ書き換え、`Compose::clear` 後の
+/// 再シードに使う。Esc 離脱 / POST 失敗時には触らない。
+///
+/// CW 本文 (`cw`) は意図的に保持しない ── 内容は投稿ごとに固有で、覚えると
+/// 「前の投稿の警告文を別の投稿に流用してしまう」事故になりやすいため、
+/// `cw_enabled` (= CW 行にフォーカスがあった) フラグだけ持つ。
+///
+/// 起動を跨ぐ永続化は別 Issue で扱う (= `XDG_STATE_HOME` の設計が必要)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastComposeDefaults {
+    pub visibility: Visibility,
+    pub sensitive: bool,
+    pub cw_enabled: bool,
+}
+
+impl Default for LastComposeDefaults {
+    fn default() -> Self {
+        Self {
+            visibility: Visibility::Public,
+            sensitive: false,
+            cw_enabled: false,
+        }
+    }
+}
+
 /// 投稿に添付するメディアの最小情報。`POST /api/v1/notes` の
 /// `attachment_ids` に積む id と、UI 表示用ラベル (= ファイル名/サイズ) を持つ。
 #[derive(Debug, Clone)]
@@ -175,6 +201,29 @@ impl Compose {
         self.attachments.clear();
         self.in_reply_to_ap_id = None;
         self.reply_parent_label = None;
+    }
+
+    /// Issue #93: 直前送信時の 3 値 ([`LastComposeDefaults`]) を `clear`
+    /// 直後の compose に再シードする。CW 本文 (`cw`) は引き継がない ──
+    /// 次の投稿向けに毎回新規入力させる。
+    ///
+    /// 送信成功パスからのみ呼ぶ。Esc 離脱 / 失敗時は呼ばない。
+    pub fn apply_last_defaults(&mut self, defaults: LastComposeDefaults) {
+        self.visibility = defaults.visibility;
+        self.sensitive = defaults.sensitive;
+        self.editing_cw = defaults.cw_enabled;
+    }
+
+    /// Issue #93: 送信直前の compose 状態から `LastComposeDefaults` を作る。
+    /// `submit_note` 成功時に [`crate::app::App::last_compose_defaults`] へ
+    /// 書き戻すために呼ぶ。
+    #[must_use]
+    pub fn snapshot_defaults(&self) -> LastComposeDefaults {
+        LastComposeDefaults {
+            visibility: self.visibility,
+            sensitive: self.sensitive,
+            cw_enabled: !self.cw.is_empty(),
+        }
     }
 
     /// M13 PR6: 返信モードに切り替える。`label` は画面上部の親 note 表示用。
@@ -575,6 +624,36 @@ mod tests {
         c.clear();
         assert!(c.attachments().is_empty());
         assert!(!c.attachments_full());
+    }
+
+    /// Issue #93: `apply_last_defaults` は `clear` の直後に 3 値だけ書き戻す。
+    /// 本文 / CW 本文 / カーソル / 添付 / 返信先などには触らない。
+    #[test]
+    fn apply_last_defaults_only_touches_three_axes() {
+        let mut c = Compose::new();
+        // 普通の compose 状態を作っておく (= 本文 + 添付 + 返信先)。
+        c.insert_char('a');
+        c.add_attachment(AttachmentRef {
+            media_id: 7,
+            label: "p.webp".into(),
+        });
+        c.set_reply_target("https://x/notes/1".into(), "@u: hi".into());
+        // 「送信成功 → clear → apply_last_defaults」の流れを再現。
+        c.clear();
+        c.apply_last_defaults(LastComposeDefaults {
+            visibility: Visibility::Followers,
+            sensitive: true,
+            cw_enabled: true,
+        });
+
+        assert_eq!(c.visibility(), Visibility::Followers);
+        assert!(c.sensitive());
+        assert!(c.editing_cw());
+        // clear 経路で本文・添付・返信先などはすべて捨てられる。
+        assert!(c.buffer().is_empty());
+        assert!(c.cw().is_empty());
+        assert!(c.attachments().is_empty());
+        assert!(c.in_reply_to_ap_id().is_none());
     }
 
     #[test]
