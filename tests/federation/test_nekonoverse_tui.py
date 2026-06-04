@@ -50,9 +50,21 @@ PR2c:
      が conftest に居ないため、まず最重要の SKS 側 chain を切り出して
      検証する。
 
+#140 PR1 (本 PR で追加):
+
+  8. ``test_bob_move_to_bob_new_propagates_to_sks_following``
+     ── Scenario B (nkv → sks Move): bob_new (= 2nd nkv account) をテスト内で
+     登録 → bob_new に ``also_known_as=[bob_ap_id]`` を立てる → bob として
+     ``POST /api/v1/accounts/move`` で bob_new に引っ越し → sks 側
+     ``/api/v1/following`` に bob_new が並ぶまで待つ (= sks ``handle_move`` +
+     auto re-follow + nkv Accept の end-to-end)。compose を 2-sks 拡張せず
+     既存 1-sks + 1-nkv のまま実行できる。
+
 シナリオ外 (= 別 PR で追加 OK):
 
-- Move (#140) / Avatar Update の nkv side 検証 (= follower push の確認)
+- Move Scenario A (#140 PR2): sks-old → sks-new。compose に 2nd sks を立てる
+  必要がありインフラ拡張あり。
+- Avatar Update の nkv side 検証 (= follower push の確認)
 
 実行前提:
 
@@ -949,3 +961,187 @@ def test_sks_tui_avatar_upload_updates_actor_icon(
         shutil.rmtree(fixture_dir, ignore_errors=True)
         # fixture_file は dir 削除で連鎖的に消える ── ループ内で個別 unlink せず。
         _ = fixture_file
+
+
+# ── #140 PR1 (Scenario B): nkv outbound Move → sks 側 alice 自動 re-follow ──
+#
+# Issue #140 の Scenario B = 「Nekonoverse 側 outbound Move」を CI で駆動する。
+# 過去 (= 起票時点) は "Nekonoverse が Move outbound に対応していれば" として
+# blocked の脇に並んでいたが、Nekonoverse develop (= 20260602-3 系列) には
+# `app/services/move_service.py::initiate_move` + Mastodon-compat な
+# `POST /api/v1/accounts/move` が揃っているため、sks 側 `handle_move` を実機
+# 駆動できる。
+#
+# Scenario A (sks-old → sks-new) は compose を 2-sks に拡張する別 PR でやる。
+# 本シナリオは現行 1-sks + 1-nkv compose のまま、bob_new (= 2nd nkv account)
+# を test 内で実行時に生やす経路で完結する。
+#
+# 観測対象 (= sks `handle_move`):
+# - bob (= signer) の actor_row に `moved_to_ap_id = bob_new ap_id` が立つ
+# - bob を follow している local actor (= alice@sks) が bob_new に自動 Follow
+#   を `delivery_queue` 経由で送出 → nkv が Accept → sks `/api/v1/following`
+#   に bob_new が現れる
+#
+# 観測点としては「`/api/v1/following` に bob_new が並ぶ」だけで上記 2 件を間接的
+# にカバーする ── bob_new ap_id を出すには (a) sks が bob_new を fetch + insert
+# (b) auto re-follow が delivery + accept まで成立、の両方が必要。
+
+
+def _next_bob_new_credentials() -> dict[str, str]:
+    """bob_new 用に **テストごとに固有の username/email** を作る。
+
+    Mastodon の `/api/v1/accounts` は同じ username/email を 422 で弾くため、
+    過去 stack 上で 1 度成立すると同 stack の再 run では新規 alias に倒さない
+    と取れない。固有性を担保しつつ、Nekonoverse の email validator (Pydantic
+    `EmailStr`) が syntactic に弾く `.test` / `.example` / `.invalid` /
+    `.local` 等の RFC 6761 予約 TLD を避け、Google 登録の実在 gTLD である
+    `.dev` をベースに uuid を貼る (= DNS 不要、deliverability check は既定
+    無効)。パスワードは固定で十分 (= 本テストでは login しない、token は
+    registration で返る Bearer をそのまま使う)。
+    """
+    suffix = uuid.uuid4().hex[:10]
+    return {
+        "username": f"bobnew{suffix}",
+        "email": f"bobnew{suffix}@bobnew.nekonoverse.dev",
+        "password": "bobnewpass1234",
+    }
+
+
+@pytest.mark.timeout(360)
+def test_bob_move_to_bob_new_propagates_to_sks_following(
+    bob_followed_by_sks,
+    sakurasato: SakurasatoClient,
+    nekonoverse: NekonoverseClient,
+) -> None:
+    """nkv → sks Move (Scenario B): bob が bob_new に引っ越すと alice の
+    follow が bob_new に追従する (= sks `handle_move` + auto re-follow)。
+
+    フェーズ:
+      1. `bob_followed_by_sks` fixture で alice@sks → bob@nkv accepted を確保。
+      2. bob_new (= 2nd nkv user) を `/api/v1/apps` → `/api/v1/accounts` 経路で
+         登録する (= Mastodon 互換 Token 直返しなので OAuth 完走不要)。
+      3. bob_new として `PATCH /accounts/update_credentials` で
+         `also_known_as=[bob_ap_id]` を立てる (= sks 側 `handle_move` の
+         双方向同意チェックで必須)。
+      4. bob として `POST /accounts/move` で target=bob_new ap_id を渡す。
+      5. sks `/api/v1/following` を polling し、`bob_new@nekonoverse` が
+         accepted 一覧に現れるまで待つ (= Move 受領 + auto re-follow + nkv
+         側 Accept 配送 + sks 側 state 遷移の end-to-end)。
+    """
+    _ = bob_followed_by_sks  # fixture 使用が分かるよう明示参照
+
+    # 1. bob の AP id (= Move の source) を `webfinger` から決定論的に引く。
+    #    nkv の WebFinger は `aliases[]` に actor URI を載せる Mastodon 慣行。
+    wf = nekonoverse.webfinger(BOB_ACCT)
+    bob_ap_id = next(
+        (
+            link["href"]
+            for link in wf.get("links", [])
+            if link.get("rel") == "self" and link.get("type", "").startswith("application/")
+        ),
+        None,
+    )
+    assert bob_ap_id, f"WebFinger did not return self link with AP type: {wf}"
+
+    # 2. bob_new を nkv に新規登録する。
+    creds = _next_bob_new_credentials()
+    app = nekonoverse.register_app(client_name=f"sakurasato-move-e2e-{creds['username']}")
+    bob_new_token_resp = nekonoverse.register_account(
+        app_token=app["access_token"],
+        username=creds["username"],
+        email=creds["email"],
+        password=creds["password"],
+    )
+    bob_new_token = bob_new_token_resp.get("access_token")
+    assert bob_new_token, f"register_account did not return access_token: {bob_new_token_resp}"
+
+    # bob_new の AP id を WebFinger 経由で引く (= 登録 → AP actor URI の確立を
+    # 待つ意味も兼ねる)。Nekonoverse の AP URI 形は `https://nekonoverse/users/<id>`
+    # 系なので、文字列構築より WebFinger に任せた方が安全。
+    bob_new_acct = f"{creds['username']}@{NEKONOVERSE_DOMAIN}"
+
+    def bob_new_webfinger_resolves() -> str | None:
+        try:
+            wf_new = nekonoverse.webfinger(bob_new_acct)
+        except Exception:  # noqa: BLE001
+            return None
+        return next(
+            (
+                link["href"]
+                for link in wf_new.get("links", [])
+                if link.get("rel") == "self" and link.get("type", "").startswith("application/")
+            ),
+            None,
+        )
+
+    bob_new_ap_id: str | None = None
+
+    def _resolved() -> bool:
+        nonlocal bob_new_ap_id
+        bob_new_ap_id = bob_new_webfinger_resolves()
+        return bob_new_ap_id is not None
+
+    poll_until(
+        _resolved,
+        timeout=30,
+        interval=1,
+        desc=f"WebFinger for bob_new ({bob_new_acct}) resolves to AP URI",
+    )
+    assert bob_new_ap_id is not None
+
+    # 3. bob_new 側で `also_known_as=[bob_ap_id]` を立てる。Nekonoverse は Form
+    #    入力で受けるので `multipart/form-data` で JSON 配列文字列を送る。
+    nekonoverse.update_credentials_also_known_as(
+        token=bob_new_token,
+        also_known_as=[bob_ap_id],
+    )
+
+    # 4. bob として Move を起動する。`POST /accounts/move` は nkv 側で
+    #    target.alsoKnownAs を fresh fetch + 検証 → 自身 movedTo を立て →
+    #    followers (alice@sks) 全 inbox に Move 配送を enqueue する。
+    #
+    #    成功判定は `initiate_move` 内の `raise_for_status` に任せる ──
+    #    Nekonoverse develop は `{"ok": true}` を返すが、本テストはレスポンス
+    #    body の中身に依存せず HTTP 200 だけを契機にする (PR #194 round-1
+    #    🔴 対応: Mastodon 仕様の空オブジェクト返却に揺れても壊れない)。
+    nekonoverse.initiate_move(
+        token=nekonoverse.token,
+        target_ap_id=bob_new_ap_id,
+    )
+
+    # 5. sks 側 `/api/v1/following` を polling して、bob_new が現れるのを待つ。
+    #    観測経路:
+    #      a) sks `inbox` で Move を受領 → `handle_move`
+    #      b) `handle_move` が `ensure_target_actor` で bob_new を fresh fetch
+    #         + alsoKnownAs 検証
+    #      c) `set_moved_to` で bob の moved_to=bob_new_ap_id
+    #      d) `enqueue_auto_refollow` で alice → bob_new の Follow を queue
+    #      e) sks worker が Follow を nkv (bob_new inbox) に配送
+    #      f) nkv が Accept を返送
+    #      g) sks `accept` 受領で follow.state = accepted
+    #      h) `/api/v1/following` に bob_new が並ぶ
+    #
+    #    nkv → sks Move 配送 (= b 以前のフェーズ) + 上記 e..g の往復で総時間
+    #    が嵩むため、timeout は 180s に倒す。30s 程度の余白を見ておく。
+    def bob_new_in_sks_following() -> bool:
+        try:
+            following = sakurasato.following(limit=120)
+        except Exception:  # noqa: BLE001
+            return False
+        for entry in following:
+            actor = entry.get("actor") or {}
+            host = (actor.get("host") or "").lower()
+            name = (actor.get("preferred_username") or "").lower()
+            if name == creds["username"].lower() and host == NEKONOVERSE_DOMAIN.lower():
+                return True
+        return False
+
+    poll_until(
+        bob_new_in_sks_following,
+        timeout=180,
+        interval=3,
+        desc=(
+            f"sks following includes bob_new ({creds['username']}@{NEKONOVERSE_DOMAIN}) "
+            "after nkv→sks Move propagation"
+        ),
+    )
