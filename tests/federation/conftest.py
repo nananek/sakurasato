@@ -755,6 +755,45 @@ class NekonoverseClient:
         resp.raise_for_status()
         return resp.json()
 
+    def status_context(self, status_id: str) -> dict:
+        """`GET /api/v1/statuses/{id}/context` ── note の親子 thread を取る。
+
+        Mastodon 仕様で ``{ "ancestors": [...], "descendants": [...] }`` を
+        返す。Issue #138 シナリオ A (= sks → nkv reply) で、bob 側 status
+        の descendants に alice の reply が出現するまで polling する経路で
+        使う。auth は ``get_status`` と揃え、Bearer 必須にしておく ──
+        bob token がある前提なので追加コストはなく、reaction 系 helper と
+        同じ防御線で動く。
+        """
+        resp = self.http.get(
+            f"/api/v1/statuses/{status_id}/context", headers=self._auth_headers()
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def lookup_status(self, url: str) -> dict | None:
+        """remote note の URL を nkv 側の local status 行に解決する。
+
+        Mastodon `GET /api/v2/search?q=<url>&resolve=true&type=statuses` を
+        叩き、`statuses[]` の先頭を返す。空なら ``None``。Issue #138 シナリオ
+        B (= nkv → sks reply) で「sks alice の note の ap_id を渡して bob
+        側で `in_reply_to_id` に使える local status id を引く」経路で使う。
+
+        ``resolve=true`` を付けるのは、nkv がまだ取り込んでいない remote
+        note でも fetch して取り込むため (= 連合配送に依存しない決定論的経路)。
+        ``Authorization`` Bearer を付けると `resolve` が許可される
+        (= Mastodon 仕様で resolve は要 auth)。
+        """
+        resp = self.http.get(
+            "/api/v2/search",
+            params={"q": url, "resolve": "true", "type": "statuses"},
+            headers=self._auth_headers(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        statuses = data.get("statuses") or []
+        return statuses[0] if statuses else None
+
     # ── AP / WebFinger ───────────────────────────────────────
     def webfinger(self, acct: str) -> dict:
         resp = self.http.get(

@@ -1,4 +1,4 @@
-"""Sakurasato TUI × Nekonoverse 連合シナリオ (#58 / #120 PR2a + PR2b + PR2c)。
+"""Sakurasato TUI × Nekonoverse 連合シナリオ (#58 / #120 PR2a + PR2b + PR2c + #138)。
 
 PR2a (smoke 1 本):
 
@@ -12,7 +12,7 @@ PR2b:
      ── bob が nkv 側で note 投稿 → 連合配送で sks home timeline に出現する
      ことを確認 (= 取得側 = sks の inbox / TL の受領パス)。
 
-PR2c (本 PR で追加):
+PR2c:
 
   3. ``test_unicode_reaction_propagates_to_bob_status``
      ── bob が note 投稿 → sks TUI で ``e`` → ``+1`` → Enter → ``Like``
@@ -23,9 +23,22 @@ PR2c (本 PR で追加):
      で送り、``EmojiReact`` + ``tag.Emoji`` を nkv に届けて bob 側 status の
      reactions に並ぶことを確認する。
 
+#138 (本 PR で追加):
+
+  5. ``test_sks_tui_reply_propagates_to_nkv_descendants``
+     ── bob が公開 note → sks TUI で ``R`` で reply prompt → 本文入力 → F2 で
+     送出 → bob 側 ``status_context`` の ``descendants`` に sks 由来 reply が
+     出現することを確認 (= ``in_reply_to_ap_id`` 永続化 + mention 自動付与 +
+     ``Compose`` の reply target セット経路の end-to-end)。
+  6. ``test_nkv_reply_appears_in_sks_timeline_with_in_reply_to``
+     ── sks alice が公開 note → bob (= nkv) が ``lookup_status`` で local
+     status id を引き、``in_reply_to_id`` 付きで reply 投稿 → sks home
+     timeline で同 reply が ``in_reply_to_ap_id`` 一致して出現することを
+     確認 (= 受信側 inbox handler が reply の親紐付けを保持する経路)。
+
 シナリオ外 (= 別 PR で追加 OK):
 
-- Reply / Move / Actor Update
+- Move / Actor Update
 
 実行前提:
 
@@ -517,3 +530,229 @@ def test_custom_emoji_reaction_propagates_to_bob_status(
         )
     finally:
         _quit_tui(tui)
+
+
+# ── #138: Reply 双方向 ────────────────────────────────────────
+#
+# シナリオ A (sks → nkv) と B (nkv → sks) の 2 方向で reply の連合パスを
+# 検証する。Reaction PR2c とは独立に、`in_reply_to_ap_id` の永続化と
+# mention 自動付与 (= [`crates/server/src/local_api/notes.rs::recipients_for`])
+# が「親 note 著者 inbox を to に含めて配送」する経路を踏む。
+#
+# 観測モデル:
+#
+# A. sks TUI で bob remote note に reply ── Compose の reply target が
+#    `Note.inReplyTo = <bob note ap_id>` として AP `Create.object` に乗り、
+#    Nekonoverse 側で descendants として bob のスレッドに刺さる。
+#    Mastodon `GET /api/v1/statuses/{id}/context` で descendants を取れる。
+#
+# B. bob (nkv) が `in_reply_to_id` 付きで alice (sks) note に reply ── sks
+#    inbox handler が `Create/Note` を取り込み、`note.in_reply_to_ap_id` に
+#    alice の note ap_id を保存する (M11 で完成済の経路)。home_timeline 経由
+#    で観察、`in_reply_to_ap_id` 一致を assert する。
+
+
+def _open_reply_prompt_from_top(tui, parent_marker: str) -> None:
+    """Timeline focus で `R` を打って **選択中** (= 先頭) note の reply を開く。
+
+    bob 由来 note は `_open_tui_and_wait_for_note` が refresh 後に先頭 (= id
+    最大 = published 最新) で待っているので、追加の選択操作なしで `R` だけで
+    その note への reply prompt が開く。
+
+    ただし「先頭 = bob の note」前提を rely 一本足にすると、将来テストの
+    並列化や別 stack 内のタイミング揺れで誤った note に reply する事故が
+    起き得る (= PR #184 review concern 1)。そのため `R` を打つ直前に
+    `parent_marker` が画面に**まだ**居ることを `wait_until_text` で再確認
+    する ── 選択カーソル位置までは観察できないが、bob の note が timeline
+    から消えていないことは担保できる。
+
+    Compose 上部の「↳ @<author>: <抜粋>」ラベル (= `Compose::set_reply_target`
+    後のレンダリング) を ``↳ @bob`` で待ち、reply 開始が成立したことを確認する。
+    """
+    # parent_marker がまだ可視であることを確認 (= 先頭 selection の暗黙
+    # 前提への safety net、PR #184 review concern 1)。
+    tui.wait_until_text(re.escape(parent_marker), 5)
+    tui.send_keys("R")
+    # `↳ @<bob_local>` を本文末尾抜粋と一緒に当てる ── `↳` は ratatui の
+    # `set_reply_target` 後のヘッダで `compose.rs` の reply_parent_label を
+    # 表示するときに付ける prefix (= `format!("↳ {label}")`, `ui/mod.rs` の
+    # render_compose 経路)。
+    #
+    # timeout は他 polling と整合させて 30s。tmux pty + ratatui 描画は
+    # まれにフレームが遅れることがある (= PR #184 review concern 2、旧
+    # 10s だと CI 負荷時に false-fail のリスク)。
+    tui.wait_until_text(rf"↳ @{BOB_LOCAL}", 30)
+
+
+def _type_compose_body_and_submit(tui, body: str) -> None:
+    """Compose 本文に `body` を入力して F2 で送出する。
+
+    F2 を使うのは tmux 上の VT 端末で Ctrl+Enter が CSI u (Kitty keyboard
+    protocol) でしか届かないため (= [`crates/tui/src/event.rs`] の
+    `KeyCode::F(2) => Action::SubmitNote` 代替経路。CLAUDE.md の M3b 経緯と
+    揃え)。
+    """
+    for ch in body:
+        tui.send_keys(ch)
+    tui.send_keys("F2")
+    # 送出成功時 status: `posted #<id> (<N> delivered)`。失敗時は
+    # `post failed: ...`。前者を厳密に待つ。
+    tui.wait_until_text(r"posted #\d+", 20)
+
+
+def _descendants_contain_marker(
+    nekonoverse: NekonoverseClient,
+    parent_status_id: str,
+    *,
+    marker: str,
+) -> bool:
+    """bob 側 `status_context.descendants` に marker 本文を持つ status が居るか。
+
+    nkv は Mastodon 仕様で `content` に HTML を入れる (= 本文をラップした
+    `<p>...</p>`)。marker 文字列 (= `reply-A-<hex>` 等) は ASCII のみで
+    HTML エスケープを踏まないので、`in` 部分一致で十分。1 件以上見つかれば
+    成功にする ── 連合経路で重複配送がもし発生しても (idempotent insert で
+    重複行は出ない想定だが念のため) 通る。
+    """
+    try:
+        ctx = nekonoverse.status_context(parent_status_id)
+    except Exception:  # noqa: BLE001
+        return False
+    for d in ctx.get("descendants") or []:
+        content = d.get("content") or ""
+        if marker in content:
+            return True
+    return False
+
+
+@pytest.mark.timeout(360)
+def test_sks_tui_reply_propagates_to_nkv_descendants(
+    tmux_tui,
+    sakurasato_socket_path: str,
+    sakurasato_token_file: str,
+    bob_followed_by_sks,
+    sakurasato: SakurasatoClient,
+    nekonoverse: NekonoverseClient,
+) -> None:
+    """#138 シナリオ A: sks TUI から bob remote note への reply を nkv 側で確認。
+
+    Compose の reply target セット経路 + `in_reply_to_ap_id` の wire + AP
+    `Create.object.inReplyTo` の解釈を end-to-end で踏む。
+    """
+    _ = bob_followed_by_sks
+    parent_marker = f"reply-A-parent-{uuid.uuid4().hex[:8]}"
+    fed = _bob_posts_and_waits_for_sks(sakurasato, nekonoverse, parent_marker)
+
+    reply_marker = f"reply-A-{uuid.uuid4().hex[:8]}"
+    tui = _open_tui_and_wait_for_note(
+        tmux_tui,
+        sakurasato_socket_path,
+        sakurasato_token_file,
+        parent_marker,
+        label="reply_sks_to_nkv",
+    )
+    try:
+        _open_reply_prompt_from_top(tui, parent_marker)
+        _type_compose_body_and_submit(tui, reply_marker)
+
+        poll_until(
+            lambda: _descendants_contain_marker(
+                nekonoverse, fed["nkv_status_id"], marker=reply_marker
+            ),
+            timeout=180,
+            interval=3,
+            desc=(
+                f"nkv status {fed['nkv_status_id']} got reply {reply_marker!r} "
+                "in descendants"
+            ),
+        )
+    finally:
+        _quit_tui(tui)
+
+
+def _sks_note_with_in_reply_to(
+    sakurasato: SakurasatoClient,
+    *,
+    parent_ap_id: str,
+    marker: str,
+) -> dict | None:
+    """sks home_timeline で `marker` 本文 + `in_reply_to_ap_id == parent_ap_id`
+    を満たす note を返す。条件を満たさなければ ``None``。
+
+    home_timeline は新しい note を先頭に積むので、limit 80 で初期 horizon を
+    覆える前提。reply 1 件 + 親 1 件 + 自分の post 程度しかない pytest 環境では
+    十分 ── 万一を考えて marker を本文に持つ条件で絞り、他テストの post と
+    取り違えないようにする。
+    """
+    try:
+        timeline = sakurasato.home_timeline(limit=80)
+    except Exception:  # noqa: BLE001
+        return None
+    for note in timeline:
+        if note.get("in_reply_to_ap_id") != parent_ap_id:
+            continue
+        content = note.get("content") or ""
+        if marker in content:
+            return note
+    return None
+
+
+@pytest.mark.timeout(360)
+def test_nkv_reply_appears_in_sks_timeline_with_in_reply_to(
+    bob_followed_by_sks,
+    sakurasato: SakurasatoClient,
+    nekonoverse: NekonoverseClient,
+) -> None:
+    """#138 シナリオ B: bob → alice reply が sks home timeline に `in_reply_to_ap_id`
+    付きで届くことを確認する。
+
+    sks は local API 直叩きで親 note を post し、bob は ``lookup_status`` で
+    nkv 側の local status id を引いてから ``in_reply_to_id`` 付きで reply を
+    投稿する。TUI 経路は使わない (= 受信側 inbox handler の責務だけを見たい)。
+    """
+    _ = bob_followed_by_sks
+    parent_marker = f"reply-B-parent-{uuid.uuid4().hex[:8]}"
+    # 1. sks alice が公開 note を投稿。
+    parent_note = sakurasato.create_note(parent_marker, visibility="public")
+    parent_ap_id = parent_note.get("ap_id") or parent_note.get("uri")
+    assert parent_ap_id, f"sks create_note did not return ap_id: {parent_note}"
+
+    # 2. nkv 側で resolve させて、bob から見える local status id を引く。
+    #    nkv が configure on-demand fetch なので resolve=true で確実に
+    #    取り込む。配送経由でも来るが、双方競合しても idempotent insert で
+    #    1 行に収束する (nkv 側挙動の前提)。
+    def looked_up() -> dict | None:
+        try:
+            return nekonoverse.lookup_status(parent_ap_id)
+        except Exception:  # noqa: BLE001
+            return None
+
+    nkv_parent = poll_until(
+        looked_up,
+        timeout=120,
+        interval=3,
+        desc=f"nkv resolves sks parent {parent_ap_id} into local status",
+    )
+    nkv_parent_id = nkv_parent["id"]
+
+    # 3. bob (nkv) が reply を投稿。`in_reply_to_id` は nkv 側 local id。
+    reply_marker = f"reply-B-{uuid.uuid4().hex[:8]}"
+    nekonoverse.create_status(
+        reply_marker, visibility="public", in_reply_to_id=nkv_parent_id
+    )
+
+    # 4. sks 側に reply が `in_reply_to_ap_id` 一致で federate される。
+    #    親が sks 自身の note なので mention 自動付与 (recipients_for) で
+    #    alice 宛 to が乗り、inbox handler が取り込み + home_timeline 経由で
+    #    観察できる。
+    poll_until(
+        lambda: _sks_note_with_in_reply_to(
+            sakurasato, parent_ap_id=parent_ap_id, marker=reply_marker
+        ),
+        timeout=180,
+        interval=3,
+        desc=(
+            f"bob reply {reply_marker!r} appears in sks home timeline "
+            f"with in_reply_to_ap_id={parent_ap_id}"
+        ),
+    )
