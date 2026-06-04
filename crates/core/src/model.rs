@@ -174,6 +174,12 @@ pub struct DeliveryQueueRow {
 /// 設計に切り替えた際、fetch 失敗時に「画像なし、テキストフォールバック」を
 /// 表現するため `None` を許容する。Local emoji は import 時に必ずキーが
 /// 入るので実質 `Some(...)`。
+///
+/// `last_failed_at` は Issue #192 (M14) で追加 (migration 0019)。最後に
+/// `dispatch::reaction::learn_emoji_tag` が remote fetch を試みて失敗した
+/// 時刻。TTL ベースの backoff 判定 (= 直近 1h は再 fetch しない) + 旧 URL row
+/// の regression 抑止に使う。`None` = 失敗履歴なし / 成功で reset 済。Local
+/// emoji は常に `None`。
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct EmojiRow {
     pub id: i64,
@@ -187,6 +193,7 @@ pub struct EmojiRow {
     pub is_local: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub last_failed_at: Option<DateTime<Utc>>,
 }
 
 /// Row of the `announce` table (M11).

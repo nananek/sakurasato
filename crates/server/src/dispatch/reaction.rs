@@ -19,9 +19,12 @@
 //! - `Emoji.id` の host と `Emoji.icon.url` の host は signer host と一致する
 //!   ことを要求する ── 他インスタンスの絵文字 ID を spoofing 学習させない。
 
+use std::time::Duration;
+
 use anyhow::Context;
 use aws_sdk_s3::primitives::ByteStream;
-use sakurasato_core::model::ActorRow;
+use chrono::Utc;
+use sakurasato_core::model::{ActorRow, EmojiRow};
 use sakurasato_core::repo;
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
@@ -41,6 +44,12 @@ const EMOJI_VARIANT: &str = "emoji";
 /// `routes/media.rs` の許可リスト ([`crate::routes::media::REMOTE_EMOJI_KEY_PREFIX`])
 /// と同期させる ── 名前を grep で揃えやすいよう同 prefix を使う。
 const REMOTE_EMOJI_KEY_PREFIX: &str = "emoji/remote/";
+
+/// Issue #192: remote emoji の fetch が失敗してから再試行するまでの最短間隔。
+/// 相手サーバが恒常的に落ちている / 4xx を返している場合に毎 reaction 受信で
+/// fetch が走らないように backoff する。固定 1h で開始 ── exponential 化は
+/// future issue (= reviewer 推奨だが scope 外)。
+const FAILURE_RETRY_AFTER: Duration = Duration::from_hours(1);
 
 /// 受領 `Like` の処理。
 ///
@@ -381,48 +390,54 @@ async fn learn_emoji_tag(
             continue;
         }
 
-        // Issue #135: 既存 row が新形式 (= `emoji/remote/...`) でキャッシュ済
-        // ならネットワーク fetch をスキップして DB だけ touch する。Mastodon /
-        // Misskey は emoji tag を per-note で送るので、同じ remote 絵文字を
-        // 何度も学習する経路 ── ここを cache hit で短絡しないと毎 note 受信
-        // ごとに相手サーバへ GET が飛ぶ。
-        let cached_key: Option<String> = match repo::emoji::get_by_ap_id(state.pool(), ap_id).await
-        {
-            Ok(Some(existing)) => existing
-                .image_key
-                .filter(|k| k.starts_with(REMOTE_EMOJI_KEY_PREFIX)),
-            Ok(None) => None,
-            Err(err) => {
+        // Issue #135 / #192: 既存 row を見て fetch をスキップできるか判定する。
+        // - 自鯖キャッシュ済 (= `emoji/remote/...`) → DB も触らず id 返却
+        // - 直近 TTL 内に失敗 → fetch せず id 返却 (= backoff)
+        // - 上記いずれでもない → fetch を試みる (= 旧 URL row も含む)
+        let existing = repo::emoji::get_by_ap_id(state.pool(), ap_id)
+            .await
+            .inspect_err(|err| {
                 warn!(?err, emoji_id = ap_id, "get_by_ap_id failed; refetching");
-                None
-            }
-        };
+            })
+            .ok()
+            .flatten();
 
-        let (image_key, stored_media_type) = if let Some(key) = cached_key {
-            (Some(key), media_type.to_string())
-        } else {
+        if let Some(ref row) = existing
+            && let Some(reason) = should_skip_fetch(row)
+        {
+            info!(
+                emoji_id = row.id,
+                shortcode = %shortcode,
+                host = %signer_host,
+                reason,
+                "remote emoji fetch skipped (cache hit / recent failure backoff)",
+            );
+            return Some(row.id);
+        }
+
+        // fetch を試みる。失敗時は `image_key = None` を SQL 側 COALESCE で温存
+        // させ、`last_failed_at = now()` で TTL backoff の起点にする。
+        let (image_key_for_upsert, stored_media_type, last_failed_at) =
             match fetch_and_cache_remote_emoji(state, image_url, &signer_host, shortcode).await {
-                Ok((key, mt)) => (Some(key), mt),
+                Ok((key, mt)) => (Some(key), mt, None),
                 Err(err) => {
-                    // 取得失敗は warn にとどめて upsert を続行 ── image_key=None
-                    // で「画像なし、テキストフォールバック」を記録する (= AC4)。
                     warn!(
                         ?err,
                         emoji_id = ap_id,
                         image_url,
-                        "remote emoji fetch/cache failed; storing without image_key"
+                        "remote emoji fetch/cache failed; recording last_failed_at backoff"
                     );
-                    (None, media_type.to_string())
+                    (None, media_type.to_string(), Some(Utc::now()))
                 }
-            }
-        };
+            };
 
         let new = repo::emoji::NewRemoteEmoji {
             shortcode: shortcode.to_string(),
             ap_id: ap_id.to_string(),
             host: signer_host.clone(),
-            image_key,
+            image_key: image_key_for_upsert,
             media_type: stored_media_type,
+            last_failed_at,
         };
         match repo::emoji::upsert_remote(state.pool(), new).await {
             Ok(row) => {
@@ -431,6 +446,7 @@ async fn learn_emoji_tag(
                     shortcode = %shortcode,
                     host = %signer_host,
                     image_cached = row.image_key.is_some(),
+                    last_failed_at = ?row.last_failed_at,
                     "remote emoji learned",
                 );
                 return Some(row.id);
@@ -443,6 +459,34 @@ async fn learn_emoji_tag(
                 );
                 return None;
             }
+        }
+    }
+    None
+}
+
+/// 既存 emoji row を見て fetch (= media-proxy → versitygw PUT) をスキップする
+/// 判定。`Some(reason)` を返したら `learn_emoji_tag` は即座に `row.id` を返す。
+///
+/// スキップ条件:
+/// 1. `image_key` が `emoji/remote/` prefix を持つ ── 自鯖に焼き済みなので
+///    内容を再取得する必要はない。
+/// 2. `last_failed_at` が直近 [`FAILURE_RETRY_AFTER`] 以内 ── 失敗 backoff。
+///    相手サーバが落ちている / 4xx を返している期間に毎 reaction で fetch を
+///    叩かない。
+///
+/// `&'static str` を返すのは tracing log 用の安定キー (= log filter 対応)。
+fn should_skip_fetch(existing: &EmojiRow) -> Option<&'static str> {
+    if existing
+        .image_key
+        .as_deref()
+        .is_some_and(|k| k.starts_with(REMOTE_EMOJI_KEY_PREFIX))
+    {
+        return Some("cache_hit");
+    }
+    if let Some(failed_at) = existing.last_failed_at {
+        let elapsed = Utc::now().signed_duration_since(failed_at).to_std().ok();
+        if elapsed.is_some_and(|e| e < FAILURE_RETRY_AFTER) {
+            return Some("recent_failure_backoff");
         }
     }
     None
@@ -612,5 +656,74 @@ mod tests {
     fn normalize_inbound_does_not_touch_malformed_empty_shortcode() {
         assert_eq!(normalize_inbound_reaction_content(":@host:"), ":@host:");
         assert_eq!(normalize_inbound_reaction_content("::"), "::");
+    }
+
+    // ── Issue #192: should_skip_fetch のテスト ────────────────────────────
+
+    fn emoji_row_fixture(
+        image_key: Option<&str>,
+        last_failed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> EmojiRow {
+        EmojiRow {
+            id: 1,
+            shortcode: "blob".into(),
+            host: Some("remote.test".into()),
+            category: None,
+            aliases: sqlx::types::Json(vec![]),
+            image_key: image_key.map(str::to_string),
+            media_type: "image/webp".into(),
+            ap_id: Some("https://remote.test/emojis/blob".into()),
+            is_local: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_failed_at,
+        }
+    }
+
+    #[test]
+    fn should_skip_fetch_returns_cache_hit_for_remote_prefix() {
+        let row = emoji_row_fixture(Some("emoji/remote/remote.test/blob.webp"), None);
+        assert_eq!(should_skip_fetch(&row), Some("cache_hit"));
+    }
+
+    #[test]
+    fn should_skip_fetch_returns_none_for_legacy_url() {
+        // 旧 URL row は cache hit でも recent failure でもないので fetch を試みる。
+        let row = emoji_row_fixture(Some("https://remote.test/files/blob.png"), None);
+        assert!(should_skip_fetch(&row).is_none());
+    }
+
+    #[test]
+    fn should_skip_fetch_returns_backoff_for_recent_failure() {
+        // 直近 (30 min 前) に失敗 → backoff TTL (1h) 内なので skip。
+        let recent =
+            chrono::Utc::now() - chrono::Duration::from_std(Duration::from_mins(30)).unwrap();
+        let row = emoji_row_fixture(None, Some(recent));
+        assert_eq!(should_skip_fetch(&row), Some("recent_failure_backoff"));
+    }
+
+    #[test]
+    fn should_skip_fetch_returns_none_after_backoff_window() {
+        // TTL (1h) を超えた失敗 → retry を許す。
+        let old = chrono::Utc::now() - chrono::Duration::from_std(Duration::from_hours(2)).unwrap();
+        let row = emoji_row_fixture(None, Some(old));
+        assert!(should_skip_fetch(&row).is_none());
+    }
+
+    #[test]
+    fn should_skip_fetch_returns_none_for_fresh_row() {
+        // image_key=None かつ last_failed_at=None (= 新規 row 直前) は fetch を試みる。
+        let row = emoji_row_fixture(None, None);
+        assert!(should_skip_fetch(&row).is_none());
+    }
+
+    /// Issue #192 round-2 #1 regression: 旧 URL row + 直近失敗 → backoff で skip。
+    /// COALESCE 保存とあわせて「旧 URL が残ったまま再 fetch も控える」状態を実現する。
+    #[test]
+    fn should_skip_fetch_combines_legacy_url_and_recent_failure() {
+        let recent =
+            chrono::Utc::now() - chrono::Duration::from_std(Duration::from_mins(1)).unwrap();
+        let row = emoji_row_fixture(Some("https://remote.test/files/blob.png"), Some(recent));
+        assert_eq!(should_skip_fetch(&row), Some("recent_failure_backoff"));
     }
 }

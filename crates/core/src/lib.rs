@@ -37,6 +37,8 @@ mod tests {
         //   上限を 64 → 128 に緩和、Misskey に揃え)
         // 0018 emoji_image_key_nullable (= Issue #135: remote emoji 取得失敗を
         //   表現するため image_key 列を NULL 許容化)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 18);
+        // 0019 emoji_last_failed_at (= Issue #192: fetch 失敗 row への backoff
+        //   と旧 URL row の regression 回避用に last_failed_at TIMESTAMPTZ NULL を追加)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 19);
     }
 }

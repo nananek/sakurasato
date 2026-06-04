@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, created_at, updated_at\n        FROM emoji\n        WHERE host IS NULL\n          AND (\n              shortcode ILIKE $1 ESCAPE '\\'\n              OR EXISTS (\n                  SELECT 1 FROM jsonb_array_elements_text(aliases) AS a\n                  WHERE a ILIKE $1 ESCAPE '\\'\n              )\n          )\n        ORDER BY shortcode ASC\n        LIMIT $2\n        ",
+  "query": "\n        SELECT\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at\n        FROM emoji WHERE ap_id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -123,12 +123,22 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 11,
+        "name": "last_failed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "emoji",
+            "name": "last_failed_at"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
@@ -142,8 +152,9 @@
       true,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "c38c77dde5a2f50e7be0df0872b82b40b7b93d01fdacba5456240130e637d9ad"
+  "hash": "434d5075c8117a164b53c7334e2d5539e0b3ba579d2063aabb302f2cf5dcea67"
 }

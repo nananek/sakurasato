@@ -64,7 +64,7 @@ pub async fn upsert_local(pool: &PgPool, new: NewLocalEmoji) -> sqlx::Result<Emo
         RETURNING
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at
+            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
         "#,
         new.shortcode,
         new.category,
@@ -86,7 +86,7 @@ pub async fn get_local_by_shortcode(
         SELECT
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at
+            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
         FROM emoji WHERE shortcode = $1 AND host IS NULL
         "#,
         shortcode,
@@ -113,7 +113,7 @@ pub async fn list_local_by_prefix(
         SELECT
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at
+            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
         FROM emoji
         WHERE host IS NULL
           AND lower(shortcode) LIKE $1
@@ -170,7 +170,7 @@ pub async fn search_local_by_substring(
         SELECT
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at
+            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
         FROM emoji
         WHERE host IS NULL
           AND (
@@ -190,16 +190,27 @@ pub async fn search_local_by_substring(
     .await
 }
 
-/// Remote custom emoji の upsert 入力 (M8 PR #45 → Issue #135 で改修)。
+/// Remote custom emoji の upsert 入力 (M8 PR #45 → Issue #135 / #192 で改修)。
 ///
-/// `image_key` は **versitygw 上のローカルキャッシュキー** (`emoji/remote/<host>/<shortcode>.webp`)
-/// または `None` (= 取得失敗、テキストフォールバック)。M8 時点では「相手
-/// サーバの `Emoji.icon.url` 生 URL」を入れていたが、Issue #135 で
-/// `dispatch::reaction::learn_remote_emoji` 側で media-proxy 経由の取得 +
-/// versitygw 格納まで済ませた状態で本 struct を組むようにした。
+/// - `image_key`: **versitygw 上のローカルキャッシュキー**
+///   (`emoji/remote/<host>/<shortcode>.webp`) または `None`。Issue #192 以降、
+///   `None` は **「今回の試行は失敗、ただし既存 `image_key` は温存」** を意味する
+///   (= 旧 URL row が `NULL` に降格しないよう SQL 側で `COALESCE`)。
+/// - `last_failed_at`: 直近の fetch 失敗時刻。fetch 成功時は `None` を渡して
+///   reset、失敗時は `Some(Utc::now())` を渡す。
 ///
-/// 旧 row (= URL のまま入っている既存 row) は `image_key` を上書きする経路で
-/// 自然リハイドレートされる ── 個別バックフィルは行わない (= Issue option 1)。
+/// 既存 row との挙動マトリクス (`upsert_remote` 内 SQL の `ON CONFLICT` 句):
+///
+/// | 経路 | 入力 `image_key` | 既存 `image_key` | 書き戻し | `last_failed_at` |
+/// |---|---|---|---|---|
+/// | 新規 success | `Some(key)` | (なし、`INSERT`) | `INSERT Some(key)` | `NULL` |
+/// | 新規 failure | `None`     | (なし、`INSERT`) | `INSERT NULL`      | `now()` |
+/// | 既存 success | `Some(key)` | 任意           | `UPDATE Some(key)` | `NULL` |
+/// | 既存 failure | `None`     | `Some(prev)`   | **温存 `Some(prev)`** | `now()` |
+/// | 既存 failure | `None`     | `None`         | `UPDATE NULL`      | `now()` |
+///
+/// `media_type` は `image_key` を書き戻す経路でのみ追従する (= 失敗時は据え置き、
+/// 旧 URL row の `media_type` を巻き戻さない)。
 #[derive(Debug, Clone)]
 pub struct NewRemoteEmoji {
     pub shortcode: String,
@@ -207,13 +218,19 @@ pub struct NewRemoteEmoji {
     pub ap_id: String,
     /// `Emoji.id` のホスト。`null` は不可 (= remote はホスト必須)。
     pub host: String,
-    /// versitygw 上のキャッシュキー、または `None` (= 取得失敗で画像なし)。
+    /// versitygw 上のキャッシュキー、または `None` (= 今回失敗、既存値温存)。
     pub image_key: Option<String>,
     pub media_type: String,
+    /// fetch を試みて失敗した時刻。成功時は `None` (= reset)。Issue #192。
+    pub last_failed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Remote emoji を upsert する。`ap_id` をキーに同じ AP URI なら同じ行を
 /// 返す ── 同じ remote 絵文字を別 reaction で何度学習しても 1 行で済む。
+///
+/// Issue #192: `image_key` を `COALESCE(EXCLUDED.image_key, emoji.image_key)`
+/// で書き戻す ── fetch 失敗時に既存値を温存し、旧 URL row が NULL に降格
+/// しないようにする。`media_type` は `image_key` が新規に来た時のみ追従。
 pub async fn upsert_remote(pool: &PgPool, new: NewRemoteEmoji) -> sqlx::Result<EmojiRow> {
     if !is_valid_shortcode(&new.shortcode) {
         return Err(sqlx::Error::Protocol(format!(
@@ -229,24 +246,29 @@ pub async fn upsert_remote(pool: &PgPool, new: NewRemoteEmoji) -> sqlx::Result<E
     sqlx::query_as!(
         EmojiRow,
         r#"
-        INSERT INTO emoji (shortcode, host, category, aliases, image_key, media_type, ap_id, is_local)
-        VALUES ($1, $2, NULL, '[]'::jsonb, $3, $4, $5, FALSE)
+        INSERT INTO emoji (shortcode, host, category, aliases, image_key, media_type, ap_id, is_local, last_failed_at)
+        VALUES ($1, $2, NULL, '[]'::jsonb, $3, $4, $5, FALSE, $6)
         ON CONFLICT (ap_id) DO UPDATE SET
             shortcode = EXCLUDED.shortcode,
             host = EXCLUDED.host,
-            image_key = EXCLUDED.image_key,
-            media_type = EXCLUDED.media_type,
+            image_key = COALESCE(EXCLUDED.image_key, emoji.image_key),
+            media_type = CASE
+                WHEN EXCLUDED.image_key IS NOT NULL THEN EXCLUDED.media_type
+                ELSE emoji.media_type
+            END,
+            last_failed_at = EXCLUDED.last_failed_at,
             updated_at = now()
         RETURNING
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at
+            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
         "#,
         new.shortcode,
         new.host,
         new.image_key,
         new.media_type,
         new.ap_id,
+        new.last_failed_at,
     )
     .fetch_one(pool)
     .await
@@ -261,7 +283,7 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<EmojiRow>>
         SELECT
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at
+            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
         FROM emoji WHERE id = $1
         "#,
         id,
@@ -278,7 +300,7 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Emo
         SELECT
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at
+            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
         FROM emoji WHERE ap_id = $1
         "#,
         ap_id,
