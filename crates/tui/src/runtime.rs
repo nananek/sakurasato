@@ -632,6 +632,11 @@ async fn apply_action(
         }
         Action::CommandSubmit => command_submit(app, api, page_size).await,
         Action::CommandCancel => command_cancel(app),
+        Action::CommandComplete => {
+            if let Some(p) = app.command.as_mut() {
+                p.complete();
+            }
+        }
         Action::FollowListSelectNext => {
             if let Some(fl) = app.follow_list.as_mut() {
                 fl.select_next();

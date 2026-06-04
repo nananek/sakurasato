@@ -29,11 +29,51 @@
 //!
 //! 未知のコマンドは [`Command::Unknown`] で返し、runtime 側で「unknown
 //! command: ...」を status に出してプロンプトは閉じる。
+//!
+//! ## Tab 補完 (Issue #116)
+//!
+//! 先頭ワード (= head) のみ前方一致補完する。引数 (`@acct@host` / URL) の補完
+//! は scope 外。[`COMMAND_HEADS`] が静的候補一覧、[`ARG_TAKING_HEADS`] は補完
+//! 確定時に末尾スペースを付ける head 集合 (= 引数を 1 個取るもの)。
+//!
+//! 動作 ([`CommandPrompt::complete`] 参照):
+//! - 0 件: buffer も suggestions も触らない
+//! - 1 件: buffer をその head に置換、arg 取るものは末尾 ` ` 付き、suggestions 空
+//! - 複数件: buffer を最長共通接頭辞まで伸ばし、suggestions に候補を入れる
+//!
+//! buffer に空白が含まれる (= 既に引数領域に入っている) ときは Tab を noop。
+
+/// Tab 補完で候補にする `:` コマンドの head 一覧 (アルファベット順)。
+/// `parse` の `match` に追加した head はここにも足す ── grep で見つけやすい
+/// よう、両方を 1 ファイル内に置く。`?` は単一記号のため補完対象外。
+pub const COMMAND_HEADS: &[&str] = &[
+    "follow",
+    "followers",
+    "following",
+    "help",
+    "lock",
+    "lookup",
+    "me",
+    "open",
+    "q",
+    "quit",
+    "renote",
+    "requests",
+    "unfollow",
+    "unlock",
+    "unrenote",
+];
+
+/// 引数を 1 個取る head ── 補完確定時に末尾 space を足して引数入力を促す。
+const ARG_TAKING_HEADS: &[&str] = &["follow", "unfollow", "open", "lookup"];
 
 /// `:` プロンプトの 1 行入力 state。
 #[derive(Debug, Clone, Default)]
 pub struct CommandPrompt {
     pub buffer: String,
+    /// Tab 補完で複数候補が当たったときに UI に出す候補。1 件以下なら空。
+    /// 入力 (`insert_char` / `backspace`) が走ると自動でクリアされる。
+    pub suggestions: Vec<&'static str>,
 }
 
 impl CommandPrompt {
@@ -44,16 +84,80 @@ impl CommandPrompt {
 
     pub fn insert_char(&mut self, c: char) {
         self.buffer.push(c);
+        self.suggestions.clear();
     }
 
     pub fn backspace(&mut self) {
         self.buffer.pop();
+        self.suggestions.clear();
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.buffer.trim().is_empty()
     }
+
+    /// Tab 補完。buffer の head 部 (= 最初の空白までの prefix) を [`COMMAND_HEADS`]
+    /// と前方一致させ、buffer / suggestions を更新する。詳細はモジュール doc 参照。
+    pub fn complete(&mut self) {
+        // 既に引数領域 (= 空白後) に入っているなら触らない。
+        if self.buffer.contains(char::is_whitespace) {
+            self.suggestions.clear();
+            return;
+        }
+        let prefix = self.buffer.to_ascii_lowercase();
+        let matches: Vec<&'static str> = COMMAND_HEADS
+            .iter()
+            .copied()
+            .filter(|h| h.starts_with(&prefix))
+            .collect();
+        match matches.len() {
+            0 => {
+                // 補完不能 ── popup は出さない (= 既存 suggestions は消す)。
+                self.suggestions.clear();
+            }
+            1 => {
+                let head = matches[0];
+                self.buffer.clear();
+                self.buffer.push_str(head);
+                if ARG_TAKING_HEADS.contains(&head) {
+                    self.buffer.push(' ');
+                }
+                self.suggestions.clear();
+            }
+            _ => {
+                let lcp = longest_common_prefix(&matches);
+                if lcp.len() > self.buffer.len() {
+                    self.buffer.clear();
+                    self.buffer.push_str(lcp);
+                }
+                self.suggestions = matches;
+            }
+        }
+    }
+}
+
+/// 入力文字列スライス群の longest common prefix を返す。
+/// 入力が空なら `""`。ASCII 前提 (= [`COMMAND_HEADS`] は全 ASCII)。
+fn longest_common_prefix<'a>(items: &[&'a str]) -> &'a str {
+    let first = match items.first() {
+        Some(s) => *s,
+        None => return "",
+    };
+    let mut end = first.len();
+    for s in &items[1..] {
+        let bytes = s.as_bytes();
+        let f = first.as_bytes();
+        let mut i = 0;
+        while i < end && i < bytes.len() && bytes[i] == f[i] {
+            i += 1;
+        }
+        end = i;
+        if end == 0 {
+            break;
+        }
+    }
+    &first[..end]
 }
 
 /// 解決対象。`:follow` / `:open` / `:lookup` / `:unfollow` で使う。
@@ -359,5 +463,148 @@ mod tests {
         assert!(parse_lookup_target("bob").is_err());
         assert!(parse_lookup_target("@@bob").is_err());
         assert!(parse_lookup_target("bob@").is_err());
+    }
+
+    // ── Issue #116: Tab 補完テスト ────────────────────────────────────────
+
+    /// 候補一覧が `parse` の `match` と漏れなく一致していることを安全側で
+    /// 担保する。`parse` は単独の不明 head を `Command::Unknown` で返すので、
+    /// [`COMMAND_HEADS`] の各 entry が `Unknown` 以外に解決することを確認。
+    #[test]
+    fn command_heads_are_recognized_by_parse() {
+        for head in COMMAND_HEADS {
+            let parsed = parse(head);
+            assert!(
+                !matches!(parsed, Command::Unknown { .. }),
+                "{head:?} should be recognized by parse, got {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_unique_match_fills_buffer() {
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("req");
+        p.complete();
+        assert_eq!(p.buffer, "requests");
+        assert!(p.suggestions.is_empty());
+    }
+
+    #[test]
+    fn complete_arg_taking_appends_space() {
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("foll");
+        p.complete();
+        // `follow` / `followers` / `following` で longest common prefix = `follow`、
+        // suggestions が出る。
+        assert_eq!(p.buffer, "follow");
+        assert_eq!(p.suggestions, vec!["follow", "followers", "following"]);
+
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("lookup");
+        p.complete();
+        // `lookup` 自体が unique なので `lookup ` (trailing space) に確定。
+        assert_eq!(p.buffer, "lookup ");
+        assert!(p.suggestions.is_empty());
+    }
+
+    #[test]
+    fn complete_no_arg_does_not_append_space() {
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("lo");
+        p.complete();
+        // `lock` / `lookup` で lcp = `lo`、suggestions 表示。
+        assert_eq!(p.buffer, "lo");
+        assert_eq!(p.suggestions, vec!["lock", "lookup"]);
+
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("loc");
+        p.complete();
+        // `lock` のみ。arg を取らないので末尾 space 無し。
+        assert_eq!(p.buffer, "lock");
+        assert!(p.suggestions.is_empty());
+    }
+
+    #[test]
+    fn complete_extends_to_longest_common_prefix() {
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("un");
+        p.complete();
+        // `unfollow` / `unlock` / `unrenote` で lcp = `un`。
+        assert_eq!(p.buffer, "un");
+        assert_eq!(p.suggestions, vec!["unfollow", "unlock", "unrenote"]);
+    }
+
+    #[test]
+    fn complete_empty_buffer_lists_all_heads() {
+        let mut p = CommandPrompt::new();
+        p.complete();
+        // 空 prefix なら全 head が候補。lcp は空文字なので buffer は不変。
+        assert!(p.buffer.is_empty());
+        assert_eq!(p.suggestions.len(), COMMAND_HEADS.len());
+    }
+
+    #[test]
+    fn complete_no_match_keeps_buffer_clears_suggestions() {
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("nuke");
+        p.suggestions = vec!["stale"];
+        p.complete();
+        // 不一致は静かに何もしない (= buffer 触らず、過去の suggestions だけ消す)。
+        assert_eq!(p.buffer, "nuke");
+        assert!(p.suggestions.is_empty());
+    }
+
+    #[test]
+    fn complete_is_noop_after_space() {
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("follow ");
+        p.suggestions = vec!["stale"];
+        p.complete();
+        // 引数領域に入ったら Tab は no-op (suggestions だけクリアする)。
+        assert_eq!(p.buffer, "follow ");
+        assert!(p.suggestions.is_empty());
+    }
+
+    #[test]
+    fn complete_case_insensitive() {
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("LOC");
+        p.complete();
+        assert_eq!(p.buffer, "lock");
+        assert!(p.suggestions.is_empty());
+    }
+
+    #[test]
+    fn insert_char_clears_suggestions() {
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("foll");
+        p.complete();
+        // `foll` → lcp `follow` まで伸びる + suggestions に 3 件。
+        assert_eq!(p.buffer, "follow");
+        assert!(!p.suggestions.is_empty());
+        p.insert_char('o');
+        assert!(p.suggestions.is_empty());
+        assert_eq!(p.buffer, "followo");
+    }
+
+    #[test]
+    fn backspace_clears_suggestions() {
+        let mut p = CommandPrompt::new();
+        p.buffer.push_str("foll");
+        p.complete();
+        assert_eq!(p.buffer, "follow");
+        assert!(!p.suggestions.is_empty());
+        p.backspace();
+        assert!(p.suggestions.is_empty());
+        assert_eq!(p.buffer, "follo");
+    }
+
+    #[test]
+    fn longest_common_prefix_basic() {
+        assert_eq!(longest_common_prefix(&["foo", "foobar"]), "foo");
+        assert_eq!(longest_common_prefix(&["foo", "bar"]), "");
+        assert_eq!(longest_common_prefix(&["foo"]), "foo");
+        assert_eq!(longest_common_prefix(&[]), "");
     }
 }

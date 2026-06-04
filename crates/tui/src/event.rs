@@ -129,6 +129,9 @@ pub enum Action {
     CommandSubmit,
     /// M13 PR5: コマンドプロンプト中の Esc ── キャンセル。
     CommandCancel,
+    /// Issue #116: コマンドプロンプト中の Tab ── head の前方一致補完。
+    /// 1 件なら確定、複数なら最長共通接頭辞まで埋めて候補を表示する。
+    CommandComplete,
     /// M13 PR5: `FollowList` で次のエントリを選択。
     FollowListSelectNext,
     /// M13 PR5: `FollowList` で前のエントリを選択。
@@ -311,6 +314,8 @@ fn translate_command_key(k: KeyEvent) -> Action {
     match k.code {
         KeyCode::Esc => Action::CommandCancel,
         KeyCode::Enter => Action::CommandSubmit,
+        // Issue #116: Tab で head の前方一致補完。
+        KeyCode::Tab => Action::CommandComplete,
         KeyCode::Backspace => Action::CommandBackspace,
         KeyCode::Char(c) if !ctrl => Action::CommandInsertChar(c),
         _ => Action::Noop,
@@ -829,6 +834,14 @@ mod tests {
                 Focus::Command,
             ),
             Action::CommandBackspace,
+        ));
+        // Issue #116: Tab → CommandComplete。
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Tab, KeyModifiers::NONE)),
+                Focus::Command,
+            ),
+            Action::CommandComplete,
         ));
     }
 

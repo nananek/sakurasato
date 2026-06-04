@@ -460,6 +460,9 @@ fn scroll_window_top(cursor: usize, visible: usize, total: usize) -> usize {
 }
 
 /// M13 PR5: `:` プロンプトを status バー位置に上書きする 1 行 overlay。
+///
+/// Issue #116: Tab 補完で候補が複数のときは status バー 1 行上にスペース区切りで
+/// 候補を並べる (= popup 風だが Status の直上に重ねるだけの軽量表示)。
 fn render_command_prompt(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -481,12 +484,36 @@ fn render_command_prompt(
         ),
         Span::styled("▏", Style::default().fg(palette.accent)),
         Span::styled(
-            "  Enter=run  Esc=cancel",
+            "  Enter=run  Tab=complete  Esc=cancel",
             Style::default().fg(palette.muted),
         ),
     ]);
     let p = Paragraph::new(line).style(Style::default().bg(palette.background));
     frame.render_widget(p, area);
+
+    // Issue #116: 補完候補が複数あれば status バーの直上 1 行に並べる。
+    // status area の上端 (y) より上に行が無ければ (= 端末が極小) 諦める。
+    if !prompt.suggestions.is_empty() && area.y > 0 {
+        let suggest_area = Rect::new(area.x, area.y - 1, area.width, 1);
+        frame.render_widget(Clear, suggest_area);
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(prompt.suggestions.len() * 2 + 1);
+        spans.push(Span::styled(
+            "  ↳ ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for (i, s) in prompt.suggestions.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("  ", Style::default().fg(palette.muted)));
+            }
+            // `*s` は `&'static str` ── `Span::styled` は `Into<Cow<'static, str>>`
+            // を受けるので `.to_string()` 不要 (= 毎フレーム描画でヒープ確保しない)。
+            spans.push(Span::styled(*s, Style::default().fg(palette.foreground)));
+        }
+        let p = Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.background));
+        frame.render_widget(p, suggest_area);
+    }
 }
 
 fn compose_height(app: &App) -> u16 {
@@ -2203,6 +2230,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         help_entry(palette, ":unlock", "key-only mode off"),
         help_entry(palette, ":requests", "pending follow requests"),
         help_entry(palette, ":q / :quit", "exit TUI"),
+        help_entry(palette, "Tab", "complete command head"),
         Line::from(""),
         Line::from(Span::styled("follow requests", help_section(palette))),
         help_entry(palette, "j / k", "next / prev request"),
