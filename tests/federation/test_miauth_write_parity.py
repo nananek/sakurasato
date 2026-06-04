@@ -191,6 +191,26 @@ def test_misskey_following_self_returns_error(misskey_py_client):
         # parity の本質: Sakurasato も同様にエラーを返すこと (= unit test 経由)。
 
 
+def test_misskey_following_delete_self_returns_error(misskey_py_client):
+    """**自分自身を unfollow する** とエラーが返る (= follow lifecycle の delete 側)。
+    本物 Misskey は self を follow していないのでエラー。Sakurasato も
+    `(follower=self, followed=self)` の follow 行が無いので `404 NOT_FOLLOWING`
+    を返す (= unit test `following_delete_not_following_returns_404` の対)。
+
+    `following_create` の self-error test と対称。error.code 完全一致は強制せず、
+    「両者ともエラーで弾く」ことだけ観察する (= observation parity)。
+    """
+    me = misskey_py_client.i()
+    user_id = me["id"]
+    # method 不在 (= AttributeError) が「期待どおりエラー」と誤判定されないよう、
+    # 先に method の存在を確認してから pytest.raises で API エラーを捕まえる。
+    assert hasattr(misskey_py_client, "following_delete"), (
+        "misskey-py client must expose following_delete"
+    )
+    with pytest.raises(Exception):  # noqa: B017,PT011 — Misskey API 4xx を捕捉
+        misskey_py_client.following_delete(user_id=user_id)
+
+
 # ── meta-assertion ───────────────────────────────────────────────────
 
 def test_sakurasato_unit_test_expectations_match_misskey_observation(misskey_py_client):
