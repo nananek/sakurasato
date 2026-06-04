@@ -115,12 +115,20 @@ pub async fn show(
                 note_id,
                 "miauth notes/show: get_timeline_entry_by_id failed"
             );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return error_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "note lookup failed",
+            );
         }
     };
 
     let Some(viewer) = resolve_self_actor_id(&state).await else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor initialization failed",
+        );
     };
 
     // direct visibility は本人 or audience 含まれている時のみ見える。
@@ -174,7 +182,11 @@ pub async fn timeline(
     };
 
     let Some(viewer) = resolve_self_actor_id(&state).await else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor initialization failed",
+        );
     };
 
     let limit = body
@@ -203,7 +215,11 @@ pub async fn timeline(
                 ?err,
                 "miauth notes/timeline: list_home_timeline_window failed"
             );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return error_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "timeline query failed",
+            );
         }
     };
 
@@ -367,7 +383,11 @@ pub async fn create(
             ?body_json,
             "miauth notes/create: missing id in inner response"
         );
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "note creation failed; missing id",
+        );
     };
 
     let Ok(Some(entry)) = repo::note::get_timeline_entry_by_id(state.pool(), note_id).await else {
@@ -375,10 +395,18 @@ pub async fn create(
             note_id,
             "miauth notes/create: get_timeline_entry_by_id failed after create"
         );
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "note lookup failed after creation",
+        );
     };
     let Some(viewer) = resolve_self_actor_id(&state).await else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor initialization failed",
+        );
     };
     let summaries = bulk_load_note_summaries(state.pool(), &[entry.id], viewer).await;
     let summary = summaries.remove_summary(entry.id);
@@ -416,7 +444,11 @@ pub async fn delete(
     };
 
     let Some(viewer) = resolve_self_actor_id(&state).await else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor initialization failed",
+        );
     };
     let note = match repo::note::get_by_id(state.pool(), note_id).await {
         Ok(Some(n)) => n,
@@ -425,7 +457,11 @@ pub async fn delete(
         }
         Err(err) => {
             tracing::error!(?err, note_id, "miauth notes/delete: lookup failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return error_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "note lookup failed",
+            );
         }
     };
     if note.actor_id != viewer {
@@ -454,7 +490,11 @@ pub async fn delete(
     };
     let Ok(Some(local_actor)) = sakurasato_core::repo::actor::get_by_id(state.pool(), viewer).await
     else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor fetch failed",
+        );
     };
     let delete_activity = build_delete_note_activity(&local_actor, &note);
 
@@ -542,11 +582,22 @@ fn translate_create_body(
     );
     let in_reply_to_ap_id: Option<String> = None;
 
+    // **PR #166 review item 3**: parse 失敗を silent drop せず `400 INVALID_PARAM`
+    // で弾く。黙って捨てると client は「添付付きで投稿した」つもりが添付無し
+    // note になり、原因が分からない。空配列 (= 添付なし) は当然許可。
     let attachment_ids: Vec<i64> = body
         .file_ids
         .iter()
-        .filter_map(|s| s.parse::<i64>().ok())
-        .collect();
+        .map(|s| {
+            s.parse::<i64>().map_err(|_| {
+                error_with_status(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_PARAM",
+                    "fileIds contains a non-numeric id",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(local_api::notes::CreateNoteRequest {
         content: text,
@@ -561,6 +612,13 @@ fn translate_create_body(
 
 /// `local_api::notes::create` の error response (= `{"error": "..."}`) を
 /// Misskey 互換 (= `{"error": {"code", "message"}}`) に翻訳する。
+///
+/// **PR #166 review item 4**: 唯一の呼び出し元は [`create`]。`local_api::notes::
+/// create` はバリデーション失敗 (= 添付不在含む) を **400**、権限拒否を **403**、
+/// サービス不能を **503** で返し、**404 は返さない** (= create に「note 不在」の
+/// 概念が無い)。下記 `404 => NO_SUCH_NOTE` arm は防御的に残すが現状到達しない。
+/// 将来 create 経路が「親 note / 添付が無い」で 404 を返すようになったら、その
+/// 意味は `NO_SUCH_NOTE` ではないので call-site 固有のマッピングに分離すること。
 fn translate_local_error_to_misskey(status: StatusCode, body: &JsonValue) -> Response {
     let message = body
         .get("error")
@@ -572,7 +630,7 @@ fn translate_local_error_to_misskey(status: StatusCode, body: &JsonValue) -> Res
         404 => "NO_SUCH_NOTE",
         409 => "CONFLICT",
         503 => "UNAVAILABLE",
-        _ => "INTERNAL",
+        _ => "INTERNAL_ERROR",
     };
     error_with_status(status, code, message)
 }
@@ -584,10 +642,17 @@ fn build_delete_note_activity(
     note: &sakurasato_core::model::NoteRow,
 ) -> JsonValue {
     let now = chrono::Utc::now();
+    // **PR #166 review item 2**: activity id は `note.id` (BIGSERIAL、再利用
+    // されない) で決定論的に組む。ms timestamp 形式だと Delete 配送の retry や
+    // 同一 note への再呼び出しで毎回違う id になり、受信側で重複適用され得る。
+    // note 本体の Create wrapper (`{note_ap_id}/activity`) と同じく **note-anchored**
+    // な安定 id に揃える ── これで retry や再削除でも id が一定し、受信側の
+    // dedup が効く。`!note.is_local` は呼び出し前 (delete handler) で保証済みなので
+    // base URL は常に自ドメイン。
     let activity_id = format!(
-        "{ap_id}/activity/delete-{ts}",
+        "{ap_id}/activity/delete-{id}",
         ap_id = note.ap_id,
-        ts = now.timestamp_millis(),
+        id = note.id,
     );
     json!({
         "@context": "https://www.w3.org/ns/activitystreams",
@@ -609,7 +674,11 @@ async fn collect_json(resp: Response) -> Result<JsonValue, Response> {
         Ok(b) => b.to_bytes(),
         Err(err) => {
             tracing::error!(?err, "collect_json: body collect failed");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err(error_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "response parsing failed",
+            ));
         }
     };
     if bytes.is_empty() {
@@ -617,7 +686,11 @@ async fn collect_json(resp: Response) -> Result<JsonValue, Response> {
     }
     serde_json::from_slice(&bytes).map_err(|err| {
         tracing::error!(?err, "collect_json: JSON parse failed");
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "response parsing failed",
+        )
     })
 }
 

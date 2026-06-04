@@ -93,7 +93,11 @@ pub async fn delete(
     // 常に local actor なので、`(follower=local, followed=userId)` で UNIQUE 行を
     // 引く。
     let Some(local) = resolve_local_actor_id(&state).await else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return error_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor initialization failed",
+        );
     };
     let follow_row = match repo::follow::get_by_pair(state.pool(), local, target_id).await {
         Ok(Some(row)) => row,
@@ -110,7 +114,11 @@ pub async fn delete(
                 target_id,
                 "miauth following/delete: get_by_pair failed"
             );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return error_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "follow lookup failed",
+            );
         }
     };
 
@@ -208,7 +216,7 @@ fn map_follow_error(err: &FollowError, op: &str) -> Response {
             tracing::error!(error = ?e, op, "miauth following: internal failure");
             error_resp(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "INTERNAL",
+                "INTERNAL_ERROR",
                 "follow operation failed; check server logs",
             )
         }
