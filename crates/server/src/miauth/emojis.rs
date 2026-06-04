@@ -73,13 +73,18 @@ pub async fn handle(State(state): State<AppState>, body: Option<Json<EmojisBody>
     };
 
     let host = &state.config().server.host;
+    // Issue #135: `image_key` が None の row は image なし扱いで落とす
+    // (= MiAuth クライアントは URL 必須の前提で picker を組むため)。
     let emojis: Vec<MissEmoji> = rows
         .into_iter()
-        .map(|row| MissEmoji {
-            aliases: row.aliases.0,
-            name: row.shortcode,
-            category: row.category,
-            url: build_media_url(host, &row.image_key),
+        .filter_map(|row| {
+            let image_key = row.image_key.as_deref()?;
+            Some(MissEmoji {
+                aliases: row.aliases.0,
+                name: row.shortcode,
+                category: row.category,
+                url: build_media_url(host, image_key),
+            })
         })
         .collect();
     Json(EmojisResponse { emojis }).into_response()

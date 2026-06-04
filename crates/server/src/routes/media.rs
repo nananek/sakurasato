@@ -58,6 +58,15 @@ use crate::state::AppState;
 /// authorization 段で prefix チェックを通過させて S3 fetch に進ませる。
 const LOCAL_EMOJI_KEY_PREFIX: &str = "emoji/local/";
 
+/// Issue #135: remote custom emoji を media-proxy 経由で取得・キャッシュした
+/// オブジェクトのキー prefix。`emoji/remote/<host>/<shortcode>.webp` 形式で
+/// `dispatch::reaction::fetch_and_cache_remote_emoji` が書き込む。
+///
+/// remote 由来とはいえ versitygw 上では自鯖が責任を持つオブジェクトなので、
+/// `Emoji.icon.url` として連合配信される URL (= TUI / リモート Mastodon /
+/// Misskey が参照する) を本ハンドラから 200 で返す必要がある。
+const REMOTE_EMOJI_KEY_PREFIX: &str = "emoji/remote/";
+
 pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     if !is_safe_key(&key) {
         tracing::warn!(key = %key, "media GET: rejected unsafe key");
@@ -165,6 +174,12 @@ async fn authorized_for_public(state: &AppState, key: &str) -> bool {
     if key.starts_with(LOCAL_EMOJI_KEY_PREFIX) {
         return true;
     }
+    // Issue #135: 自鯖キャッシュした remote emoji も public 配信。
+    // `is_safe_key` で `..` / 制御文字を弾いた後なので、prefix 一致だけで
+    // 列挙耐性を担保する設計 (= `<host>` の中身は kept as-is)。
+    if key.starts_with(REMOTE_EMOJI_KEY_PREFIX) {
+        return true;
+    }
     let media = match repo::media::get_by_storage_key(state.pool(), key).await {
         Ok(Some(m)) => m,
         Ok(None) => return false,
@@ -221,7 +236,7 @@ fn is_safe_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_safe_key;
+    use super::{LOCAL_EMOJI_KEY_PREFIX, REMOTE_EMOJI_KEY_PREFIX, is_safe_key};
 
     #[test]
     fn safe_keys_pass() {
@@ -263,5 +278,23 @@ mod tests {
         assert!(!is_safe_key("a\nb"));
         assert!(!is_safe_key("a\rb"));
         assert!(!is_safe_key("a\tb"));
+    }
+
+    /// Issue #135: `emoji/remote/<host>/<shortcode>.webp` 形式のキーが
+    /// `is_safe_key` を通り、prefix も新規定数と一致することを担保する。
+    /// `authorized_for_public` 自体は `AppState` を要求するため、ここでは
+    /// prefix と key sanitizer の組み合わせだけを検証する。
+    #[test]
+    fn remote_emoji_prefix_keys_are_safe() {
+        assert_eq!(REMOTE_EMOJI_KEY_PREFIX, "emoji/remote/");
+        assert_eq!(LOCAL_EMOJI_KEY_PREFIX, "emoji/local/");
+        // 典型形: prefix + host + shortcode。
+        assert!(is_safe_key("emoji/remote/misskey.io/blob.webp"));
+        assert!(is_safe_key("emoji/remote/mastodon.social/heart.webp"));
+        // hyphen / digit / dot を含む host も path セグメントとして合法。
+        assert!(is_safe_key("emoji/remote/example.co.jp/blob_party.webp"));
+        // traversal 試行は引き続き弾く。
+        assert!(!is_safe_key("emoji/remote/../escape.webp"));
+        assert!(!is_safe_key("emoji/remote/misskey.io/../../etc/passwd"));
     }
 }

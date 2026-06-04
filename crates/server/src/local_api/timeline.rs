@@ -349,16 +349,20 @@ fn normalize_host_for_compare(s: &str) -> String {
 
 /// `ReactionSummaryRow` (DB) → `ReactionSummaryDto` (API)。
 ///
-/// `image_key` のうち local emoji (`emoji/local/<shortcode>.webp`) は
-/// `build_media_url` で `https://<host>/media/<key>` に展開し、TUI が
-/// `/media/proxy?url=...` 越しに fetch できるようにする。remote emoji
-/// (= 元 URL の絶対 URL) はそのまま渡す。
+/// `image_key` の解釈 (Issue #135 で remote も自鯖キャッシュに移行):
+/// - `emoji/local/<shortcode>.webp` → 自鯖 `/media/...` URL に展開
+/// - `emoji/remote/<host>/<shortcode>.webp` → 同じく自鯖 `/media/...` URL
+/// - `https://...` / `http://...` (= 旧 row の remote pass-through) → 素通し。
+///   再 upsert で `emoji/remote/...` に書き換わるまでの graceful migration。
+/// - `None` (= remote fetch 失敗の placeholder) → `emoji_image_url = None`
 pub(crate) fn row_to_dto(host: &str, row: ReactionSummaryRow) -> ReactionSummaryDto {
-    let emoji_image_url = match (row.is_local, row.image_key.as_ref()) {
-        (Some(true), Some(key)) => Some(build_media_url(host, key)),
-        (Some(false), Some(key)) => Some(key.clone()),
-        _ => None,
-    };
+    let emoji_image_url = row.image_key.as_deref().map(|key| {
+        if key.starts_with("https://") || key.starts_with("http://") {
+            key.to_string()
+        } else {
+            build_media_url(host, key)
+        }
+    });
     ReactionSummaryDto {
         content: row.content,
         count: row.count,
@@ -788,5 +792,65 @@ mod tests {
         // local 判定される。
         let with_port = parse_emojis(&raw, "example.com:8443");
         assert_eq!(with_port[0].is_local, Some(true));
+    }
+
+    // ── Issue #135: row_to_dto の image_key 解釈 ─────────────────────────
+
+    fn reaction_row(image_key: Option<&str>, is_local: Option<bool>) -> ReactionSummaryRow {
+        ReactionSummaryRow {
+            note_id: 1,
+            content: ":blob:".into(),
+            count: 1,
+            emoji_id: Some(1),
+            image_key: image_key.map(str::to_string),
+            media_type: Some("image/webp".into()),
+            is_local,
+            first_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn row_to_dto_local_key_expands_to_self_media_url() {
+        // `emoji/local/...` は自鯖 `/media/...` URL になる (= 従来挙動)。
+        let row = reaction_row(Some("emoji/local/sakura.webp"), Some(true));
+        let dto = row_to_dto("local.test", row);
+        assert_eq!(
+            dto.emoji_image_url.as_deref(),
+            Some("https://local.test/media/emoji/local/sakura.webp")
+        );
+        assert_eq!(dto.emoji_is_local, Some(true));
+    }
+
+    #[test]
+    fn row_to_dto_remote_cached_key_expands_to_self_media_url() {
+        // Issue #135: `emoji/remote/...` も自鯖 `/media/...` URL に展開する
+        // (= TUI が相手サーバに直接 fetch しに行かなくて済む)。
+        let row = reaction_row(Some("emoji/remote/misskey.io/blob.webp"), Some(false));
+        let dto = row_to_dto("local.test", row);
+        assert_eq!(
+            dto.emoji_image_url.as_deref(),
+            Some("https://local.test/media/emoji/remote/misskey.io/blob.webp")
+        );
+        assert_eq!(dto.emoji_is_local, Some(false));
+    }
+
+    #[test]
+    fn row_to_dto_legacy_remote_url_passes_through() {
+        // 旧 row (= remote URL を image_key に直接入れていた頃のデータ) は
+        // 自鯖 prefix を被せず素通しする graceful migration。
+        let row = reaction_row(Some("https://misskey.io/files/blob.webp"), Some(false));
+        let dto = row_to_dto("local.test", row);
+        assert_eq!(
+            dto.emoji_image_url.as_deref(),
+            Some("https://misskey.io/files/blob.webp")
+        );
+    }
+
+    #[test]
+    fn row_to_dto_null_image_key_yields_none() {
+        // Issue #135: fetch 失敗で image_key=NULL の row はテキストフォールバック。
+        let row = reaction_row(None, Some(false));
+        let dto = row_to_dto("local.test", row);
+        assert!(dto.emoji_image_url.is_none());
     }
 }

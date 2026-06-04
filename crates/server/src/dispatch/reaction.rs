@@ -20,6 +20,7 @@
 //!   ことを要求する ── 他インスタンスの絵文字 ID を spoofing 学習させない。
 
 use anyhow::Context;
+use aws_sdk_s3::primitives::ByteStream;
 use sakurasato_core::model::ActorRow;
 use sakurasato_core::repo;
 use serde_json::Value as JsonValue;
@@ -29,6 +30,17 @@ use url::Url;
 use super::DispatchError;
 use crate::notification;
 use crate::state::AppState;
+
+/// Issue #135: remote emoji を media-proxy 経由で取得してキャッシュする
+/// ときの variant 文字列 (= `emoji_import.rs::EMOJI_VARIANT` と同値)。
+/// media-proxy 側の `Variant::Emoji` (512x512 / WebP 単一フレーム or animated)
+/// と揃える ── `crates/media-proxy/src/image_pipeline.rs` を参照。
+const EMOJI_VARIANT: &str = "emoji";
+
+/// Issue #135: 取得済み remote emoji を versitygw に置く prefix。
+/// `routes/media.rs` の許可リスト ([`crate::routes::media::REMOTE_EMOJI_KEY_PREFIX`])
+/// と同期させる ── 名前を grep で揃えやすいよう同 prefix を使う。
+const REMOTE_EMOJI_KEY_PREFIX: &str = "emoji/remote/";
 
 /// 受領 `Like` の処理。
 ///
@@ -264,6 +276,10 @@ fn extract_content(activity: &JsonValue, kind: ReactionKind) -> Result<String, D
 /// host と異なる host の Emoji は無視する (spoofing 防止)。
 ///
 /// 学習自体は best-effort。失敗しても reaction の記録は続行する。
+#[allow(
+    clippy::too_many_lines,
+    reason = "single tag-loop over Activity.tag[]; Issue #135 で cache/fetch 分岐が増えただけで構造は線形"
+)]
 async fn learn_emoji_tag(
     state: &AppState,
     signer: &ActorRow,
@@ -297,6 +313,20 @@ async fn learn_emoji_tag(
             continue;
         };
         if shortcode != name_shortcode {
+            continue;
+        }
+        // PR #191 round-1 ⚠️ #1: `extract_shortcode` は `:` を剥がして `@` で
+        // 分割するだけで charset を見ない。`/` 入りの malicious shortcode が
+        // versitygw に `emoji/remote/<host>/a/b.webp` で書かれて namespace を
+        // 汚染しないよう、fetch + PUT の前で `is_valid_shortcode` を強制する。
+        // `upsert_remote` 内の `is_valid_shortcode` 検査は upsert 前に失敗する
+        // が、その時点では既に versitygw に PUT 済 ── 早期に弾く必要がある。
+        if !repo::emoji::is_valid_shortcode(shortcode) {
+            warn!(
+                shortcode,
+                signer = %signer.ap_id,
+                "Emoji.name shortcode failed charset validation; refusing to learn"
+            );
             continue;
         }
 
@@ -351,12 +381,48 @@ async fn learn_emoji_tag(
             continue;
         }
 
+        // Issue #135: 既存 row が新形式 (= `emoji/remote/...`) でキャッシュ済
+        // ならネットワーク fetch をスキップして DB だけ touch する。Mastodon /
+        // Misskey は emoji tag を per-note で送るので、同じ remote 絵文字を
+        // 何度も学習する経路 ── ここを cache hit で短絡しないと毎 note 受信
+        // ごとに相手サーバへ GET が飛ぶ。
+        let cached_key: Option<String> = match repo::emoji::get_by_ap_id(state.pool(), ap_id).await
+        {
+            Ok(Some(existing)) => existing
+                .image_key
+                .filter(|k| k.starts_with(REMOTE_EMOJI_KEY_PREFIX)),
+            Ok(None) => None,
+            Err(err) => {
+                warn!(?err, emoji_id = ap_id, "get_by_ap_id failed; refetching");
+                None
+            }
+        };
+
+        let (image_key, stored_media_type) = if let Some(key) = cached_key {
+            (Some(key), media_type.to_string())
+        } else {
+            match fetch_and_cache_remote_emoji(state, image_url, &signer_host, shortcode).await {
+                Ok((key, mt)) => (Some(key), mt),
+                Err(err) => {
+                    // 取得失敗は warn にとどめて upsert を続行 ── image_key=None
+                    // で「画像なし、テキストフォールバック」を記録する (= AC4)。
+                    warn!(
+                        ?err,
+                        emoji_id = ap_id,
+                        image_url,
+                        "remote emoji fetch/cache failed; storing without image_key"
+                    );
+                    (None, media_type.to_string())
+                }
+            }
+        };
+
         let new = repo::emoji::NewRemoteEmoji {
             shortcode: shortcode.to_string(),
             ap_id: ap_id.to_string(),
             host: signer_host.clone(),
-            image_url: image_url.to_string(),
-            media_type: media_type.to_string(),
+            image_key,
+            media_type: stored_media_type,
         };
         match repo::emoji::upsert_remote(state.pool(), new).await {
             Ok(row) => {
@@ -364,6 +430,7 @@ async fn learn_emoji_tag(
                     emoji_id = row.id,
                     shortcode = %shortcode,
                     host = %signer_host,
+                    image_cached = row.image_key.is_some(),
                     "remote emoji learned",
                 );
                 return Some(row.id);
@@ -379,6 +446,42 @@ async fn learn_emoji_tag(
         }
     }
     None
+}
+
+/// Issue #135: remote emoji の画像を media-proxy 経由で取得し、versitygw に
+/// 格納する。成功時は `(versitygw_key, "image/webp")` を返す。失敗時は anyhow
+/// エラーを返し、呼び出し側で `image_key = None` を選ばせる。
+///
+/// **副作用**: versitygw 上に `emoji/remote/<host>/<shortcode>.webp` を PUT する。
+/// 同名 key への複数回 PUT は idempotent (= 上書き) なので、cache hit 判定で
+/// 弾けなかった経路で重複 PUT が走っても害は無い。
+async fn fetch_and_cache_remote_emoji(
+    state: &AppState,
+    image_url: &str,
+    signer_host: &str,
+    shortcode: &str,
+) -> anyhow::Result<(String, String)> {
+    let processed = state
+        .media_proxy()
+        .fetch_image(image_url, EMOJI_VARIANT)
+        .await
+        .with_context(|| format!("media-proxy fetch {image_url}"))?;
+
+    // host / shortcode は事前に検証済み (signer_host=正規化済 hostname、
+    // shortcode=`[a-zA-Z0-9_-]{1,128}`)。path traversal にならない。
+    let storage_key = format!("{REMOTE_EMOJI_KEY_PREFIX}{signer_host}/{shortcode}.webp");
+    let media_type = processed.content_type.clone();
+    state
+        .s3_client()
+        .put_object()
+        .bucket(&state.config().storage.bucket)
+        .key(&storage_key)
+        .content_type(&media_type)
+        .body(ByteStream::from(processed.bytes))
+        .send()
+        .await
+        .with_context(|| format!("versitygw PUT {storage_key}"))?;
+    Ok((storage_key, media_type))
 }
 
 /// `:foo:` / `:foo@host:` の `foo` 部分だけを返す。`:` で挟まれていない場合は
@@ -408,6 +511,27 @@ mod tests {
         assert_eq!(extract_shortcode(":"), None);
         assert_eq!(extract_shortcode("::"), None);
         assert_eq!(extract_shortcode(":@host:"), None);
+    }
+
+    /// PR #191 round-1 ⚠️ #1: `extract_shortcode` 自身は charset を見ない。
+    /// `/` 入りの shortcode を Some で返してしまうため、後段の
+    /// `is_valid_shortcode` が弾く責務を持つ ── 本テストはその境界仕様を
+    /// 固定する (= `extract_shortcode` の挙動を不用意に厳しくしないため)。
+    #[test]
+    fn extract_shortcode_does_not_filter_charset() {
+        // `learn_emoji_tag` 側で `is_valid_shortcode` を必ず呼ぶ前提で、
+        // ここでは「`/` を含む値も Some で返る」ことを記録する。
+        assert_eq!(extract_shortcode(":a/b:"), Some("a/b"));
+        // `is_valid_shortcode` 側がそれを拒否することは core 側の責務。
+        assert!(!sakurasato_core::repo::emoji::is_valid_shortcode("a/b"));
+        assert!(!sakurasato_core::repo::emoji::is_valid_shortcode(
+            "../escape"
+        ));
+        assert!(!sakurasato_core::repo::emoji::is_valid_shortcode(""));
+        assert!(sakurasato_core::repo::emoji::is_valid_shortcode("blob"));
+        assert!(sakurasato_core::repo::emoji::is_valid_shortcode(
+            "blob_party-1"
+        ));
     }
 
     #[test]

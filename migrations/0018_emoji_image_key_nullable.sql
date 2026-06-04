@@ -1,0 +1,32 @@
+-- Sakurasato Issue #135 — remote custom emoji の取得失敗を表現するため、
+-- `emoji.image_key` を NULL 許容に倒す。
+--
+-- ## 背景
+--
+-- 旧仕様 (M8 PR #45) では `image_key` に「local: versitygw キー / remote:
+-- 相手サーバの `Emoji.icon.url` をそのまま」を入れていた。文字列は常に
+-- 何か入っている = NOT NULL という前提だった。
+--
+-- M14 Issue #135 で remote emoji を **upsert 時に media-proxy 経由で fetch
+-- して versitygw にキャッシュ** する設計に切り替える。fetch が失敗 (= 相手
+-- サーバが落ちている / 4xx / 画像変換失敗) したケースで `upsert_remote` は
+-- 通すが「画像なし」を記録できるよう `image_key = NULL` を許容する必要が
+-- ある。
+--
+-- ## 互換
+--
+-- - 既存 row は値が必ず入っている (= local: `emoji/local/...`、remote: 旧
+--   URL のまま)。本 migration は制約を緩めるだけで既存 row は触らない。
+-- - 配信側 (`routes/media.rs`, `local_api/timeline.rs::row_to_dto`) は
+--   `image_key` が `emoji/local/` / `emoji/remote/` プレフィックスか、URL
+--   形式 (= 旧 row) か、NULL かを分岐するよう更新する。NULL は「テキスト
+--   フォールバック」(= `:shortcode:` で表示) を意味する。
+--
+-- ## 戻し方
+--
+-- ロールバックは `ALTER TABLE emoji ALTER COLUMN image_key SET NOT NULL` で
+-- 可能だが、image_key=NULL の row が混じった後では失敗する。本 migration の
+-- 適用後に NULL を入れる前なら戻せる、というレベル。
+
+ALTER TABLE emoji
+    ALTER COLUMN image_key DROP NOT NULL;
