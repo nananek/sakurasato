@@ -107,6 +107,11 @@ def test_alice_move_a_propagates_bob_to_sks_new(
         except Exception:  # noqa: BLE001
             return False
         target = ALICE_NEW_ACCT.lower()
+        # PR #195 round-1 軽微 #3 対応: fallback で `in url` 部分一致だと
+        # `sakurasato-new` が別 actor URL に含まれていた場合 (実環境では
+        # 起きにくいが) 誤検知する。`startswith(f"https://{HOST}/users/me")`
+        # で開始 prefix を厳密化する。
+        url_prefix = f"https://{SAKURASATO_NEW_DOMAIN.lower()}/users/me"
         for entry in following:
             # `acct` は Mastodon spec で `username@domain` を返す (remote actor)。
             # `url` には actor の AP id (例: `https://sakurasato-new/users/me`)。
@@ -115,8 +120,8 @@ def test_alice_move_a_propagates_bob_to_sks_new(
             if acct == target:
                 return True
             # fallback: acct が `me@<resolved-host>` 表記で揺れる場合のため、
-            # url の host 部一致で救済する。
-            if SAKURASATO_NEW_DOMAIN.lower() in url and "/users/me" in url:
+            # url の prefix 一致で救済する (= 部分一致より厳密)。
+            if url.startswith(url_prefix):
                 return True
         return False
 

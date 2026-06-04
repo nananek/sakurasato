@@ -12,16 +12,22 @@ cat <<'INFO'
     Nekonoverse       https://nekonoverse      (registration open — register via UI)
 
     #140 PR2 (Scenario A = sks-old → sks-new Move) を実機で踏むための stack。
-    手動で動かすときは以下の順:
+    手動で動かすときは以下の順 (pytest 経路 = `pytest.sh nekonoverse-2sks`
+    は同じ chain を 1-shot コンテナで自動実行する):
 
-      1. alice@sakurasato の alsoKnownAs を確認
+      1. 双方向 alsoKnownAs を確立する (= move-out の bidirectional 検査を pass)
+         docker compose -f compose/docker-compose.federation-nekonoverse-2sks.yml \
+             exec sakurasato-server sakurasato-server alias add https://sakurasato-new/users/me
+         docker compose -f compose/docker-compose.federation-nekonoverse-2sks.yml \
+             exec sakurasato-server-new sakurasato-server alias add https://sakurasato/users/me
+      2. 確認 (任意)
          docker compose -f compose/docker-compose.federation-nekonoverse-2sks.yml \
              exec sakurasato-server sakurasato-server alias list
-      2. alice@sakurasato-new の alsoKnownAs を確認
          docker compose -f compose/docker-compose.federation-nekonoverse-2sks.yml \
              exec sakurasato-server-new sakurasato-server alias list
       3. nekonoverse 側で bob を作る (UI / api/v1/accounts) + alice@sakurasato を follow
-      4. sakurasato-server CLI で move-out
+         → accepted まで待つ (= sks-old の followers に bob が居る状態)
+      4. sks-old で move-out を起動 → Move activity が bob inbox に配送される
          docker compose -f compose/docker-compose.federation-nekonoverse-2sks.yml \
              exec sakurasato-server sakurasato-server move-out https://sakurasato-new/users/me
       5. bob 側で alice@sakurasato-new が follow リストに現れるのを確認
