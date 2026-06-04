@@ -222,6 +222,117 @@ async fn create_reaction_local_shortcode_resolves_emoji(pool: PgPool) {
     assert_eq!(json["emoji_id"], emoji.id);
 }
 
+/// Issue #182: Aria などの Misskey 互換クライアントが送ってくる
+/// `:shortcode@host:` 形式 (= local 絵文字でも host suffix を必ず付ける wire 仕様)
+/// が、ローカル emoji 引きに合流し、**正規化済み `:shortcode:` で DB / wire に
+/// 載る** ことを統合経路で確認する。
+///
+/// `make_config("example.test")` の自ホスト名と一致するパターンと、Tailscale
+/// tailnet 越し (= `*.ts.net:8443`) を模した別ホスト名の双方が同じく
+/// 受理されることを 1 テストで束ねる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_reaction_with_host_suffix_normalizes_to_local_shortcode(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let note_id = seed_note(&pool, actor.id, "example.test").await;
+    let raw = issue_token(&pool, "tui").await;
+
+    let emoji = repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "blob_party".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/blob_party.webp".into(),
+            media_type: "image/webp".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    // (1) 自ホスト exact match。
+    let body = serde_json::json!({
+        "note_id": note_id,
+        "content": ":blob_party@example.test:",
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/reactions")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = read_json(resp).await;
+    assert_eq!(
+        json["content"], ":blob_party:",
+        "host suffix should be stripped before persistence",
+    );
+    assert_eq!(json["emoji_id"], emoji.id);
+
+    // (2) 別 note 上で Tailscale tailnet host を模した suffix。1 ノートに
+    // 同じローカル actor の reaction 2 件は `(note_id, actor_id)` UNIQUE で
+    // 弾かれる (= 同じ第 1 reaction 行が返るだけで、2 回目の content の
+    // 正規化結果を観察できなくなる) ので、`/notes/2` を inline で seed する。
+    // `seed_note` は ap_id を `/notes/1` 固定で作るので使い回せず、毎回呼ぶと
+    // `note_ap_id_key` UNIQUE violation で panic する。
+    let note_2 = repo::note::insert(
+        &pool,
+        repo::note::NewNote {
+            ap_id: "https://example.test/notes/2".into(),
+            actor_id: actor.id,
+            content: "hi 2".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: true,
+            url: Some("https://example.test/notes/2".into()),
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let note_id_2 = note_2.id;
+    let body = serde_json::json!({
+        "note_id": note_id_2,
+        "content": ":blob_party@foo.tailnet.ts.net:8443:",
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/reactions")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "tailnet host suffix should also be stripped (= MiAuth listener 経路)",
+    );
+    let json = read_json(resp).await;
+    assert_eq!(json["content"], ":blob_party:");
+    assert_eq!(json["emoji_id"], emoji.id);
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn create_reaction_unknown_local_shortcode_returns_404(pool: PgPool) {
     let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
@@ -246,8 +357,19 @@ async fn create_reaction_unknown_local_shortcode_returns_404(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// Issue #182: `@host` サフィックスは host が何であろうと無条件 strip され、
+/// 残った bare shortcode (= ここでは `"blob"`) で local 引きする。`misskey.io`
+/// 上の同名 emoji を引き込むわけではなく、**ローカル emoji DB に `blob` 行が
+/// 無い**ので [`ReactionCoreError::EmojiNotFound`] (= 404 "local emoji not found")
+/// に合流する。
+///
+/// 旧挙動 (= `@misskey.io` を見て 400 `INVALID_PARAM`) は捨てた ── サーバが
+/// 同時に複数 hostname (公開 AP host / Tailscale tailnet / cloudflared 等) で
+/// 見える運用では「自ホストとの exact match」で local 判定する手段が
+/// 構造的に取れず、tailnet 越し Aria の reaction も巻き込み拒否してしまうため。
+/// 詳細は [[misskey-reaction-wire-host-suffix]] / Issue #182 を参照。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn create_reaction_remote_shortcode_returns_400(pool: PgPool) {
+async fn create_reaction_remote_shortcode_returns_404_emoji_not_found(pool: PgPool) {
     let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
         .await
         .unwrap();
@@ -267,7 +389,7 @@ async fn create_reaction_remote_shortcode_returns_400(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
