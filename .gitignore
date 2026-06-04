@@ -14,3 +14,8 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# Python (tests/federation)
+__pycache__/
+*.pyc
+.pytest_cache/
