@@ -239,51 +239,51 @@ async fn resolve_local_actor_or_err(state: &AppState) -> Result<ActorRow, Reacti
 ///
 /// Misskey 互換クライアント (`Aria` / `Milktea` / `MissRirica` など) はリアクション
 /// 文字列を **ローカル絵文字でも `:foo@host:` または `:foo@.:` 形式** で送る
-/// (= サーバ側で local-ness を意識しない wire 仕様)。本関数は `@` 以降が
-/// `.` (= Misskey の local sentinel) または自ホストなら local 扱いで suffix
-/// を剥がし、それ以外 (= 真リモート) はエラーで返す。
+/// (= サーバ側で local-ness を意識しない wire 仕様)。
+///
+/// **なぜ host を検証しないか**: 我々のサーバは同時に複数の hostname で見える
+/// (= 公開 AP host = `config.server.host`、Tailscale tailnet host = Aria mobile
+/// が log-in に使う `*.ts.net:8443` 等、cloudflared / 直 IP 等)。`config.server.host`
+/// との exact match では `*.ts.net` 経由の Aria reaction を弾いてしまう。
+/// 自ホスト集合を完全列挙する手段が config に無い (= `miauth.listen` は URI
+/// だけで public-facing hostname を持たない) ため、host 一致検証は諦めて
+/// **`@` 以降は無条件で剥がす** ── どうせ remote emoji reaction は別経路の
+/// 対応が必要 (= 受信側の emoji 行を fetch する話)、本サーバではまだ未実装
+/// なので「真リモートを 400 で弾く」と「shortcode 一致しないので 404」の
+/// 違いは UX 上ほぼ無い。
 ///
 /// 返り値:
-/// - `Ok(None)` ── content が `:...:` 形式でない (= Unicode reaction)。
+/// - `None` ── content が `:...:` 形式でない (= Unicode reaction)。
 ///   caller はそのまま `content` を Unicode リアクションとして扱う。
-/// - `Ok(Some(shortcode))` ── ローカル emoji 引きに使う正規化済み shortcode
+/// - `Some(shortcode)` ── ローカル emoji 引きに使う正規化済み shortcode
 ///   (= `@host` を剥がした後の素の shortcode)。
-/// - `Err(msg)` ── 真リモート絵文字 (= 別ホストへの `@`)。本関数は HTTP に
-///   依存しないので `&'static str` メッセージだけ返し、呼び出し側で
-///   `ReactionCoreError::BadRequest` に包む。
-fn parse_local_emoji_shortcode<'a>(
-    content: &'a str,
-    our_host: &str,
-) -> Result<Option<&'a str>, &'static str> {
-    let Some(shortcode_raw) = content.strip_prefix(':').and_then(|s| s.strip_suffix(':')) else {
-        return Ok(None);
-    };
-    if let Some((shortcode, host)) = shortcode_raw.rsplit_once('@') {
-        // `.` は Misskey の慣行的 local sentinel。host 文字列はサーバ間で
-        // lowercase 正規化されている前提なので exact 比較で十分。
-        if host == "." || host == our_host {
-            Ok(Some(shortcode))
-        } else {
-            Err("remote emoji reactions are not supported yet; use a local shortcode or Unicode")
-        }
-    } else {
-        Ok(Some(shortcode_raw))
-    }
+fn parse_local_emoji_shortcode(content: &str) -> Option<&str> {
+    let shortcode_raw = content
+        .strip_prefix(':')
+        .and_then(|s| s.strip_suffix(':'))?;
+    // `@` 以降は host (`.` / 公開 AP host / tailnet host / 真リモート) の
+    // どれであれ無視。残った bare shortcode で local 引きする。
+    Some(
+        shortcode_raw
+            .rsplit_once('@')
+            .map_or(shortcode_raw, |(sc, _)| sc),
+    )
 }
 
-/// `:foo:` / `:foo@.:` / `:foo@<our_host>:` 形式の content をローカル emoji
+/// `:foo:` / `:foo@.:` / `:foo@<any-host>:` 形式の content をローカル emoji
 /// 行に解決する。返り値は `(emoji, 正規化済み content)` で、ローカル
 /// emoji なら content は常に `:shortcode:` 形 ── 連合先 Misskey に
 /// `:foo@oursakurasato.example:` のような自分専用 wire を送らないため。
+///
+/// shortcode に一致するローカル emoji が無い場合は [`ReactionCoreError::EmojiNotFound`]
+/// (= 404)。「真リモート絵文字を試みた」ケースもここに合流する ── サーバ側で
+/// `@host` を見て分岐しないので [[misskey-reaction-wire-host-suffix]] 参照。
 async fn resolve_local_emoji_or_err(
     state: &AppState,
     content: &str,
 ) -> Result<(Option<EmojiRow>, String), ReactionCoreError> {
-    let host = &state.config().server.host;
-    let shortcode = match parse_local_emoji_shortcode(content, host) {
-        Ok(Some(sc)) => sc,
-        Ok(None) => return Ok((None, content.to_string())),
-        Err(msg) => return Err(ReactionCoreError::BadRequest(msg.into())),
+    let Some(shortcode) = parse_local_emoji_shortcode(content) else {
+        return Ok((None, content.to_string()));
     };
     match repo::emoji::get_local_by_shortcode(state.pool(), shortcode).await {
         Ok(Some(row)) => {
@@ -636,40 +636,63 @@ mod tests {
     /// Issue #182: Unicode リアクション (= `:` 囲みでない) は素通しで `None`。
     #[test]
     fn parse_local_emoji_returns_none_for_unicode_reaction() {
-        let r = parse_local_emoji_shortcode("👍", "ours.example").unwrap();
-        assert!(r.is_none());
-        let r = parse_local_emoji_shortcode("", "ours.example").unwrap();
-        assert!(r.is_none());
+        assert!(parse_local_emoji_shortcode("👍").is_none());
+        assert!(parse_local_emoji_shortcode("").is_none());
     }
 
     /// Issue #182: 素の `:foo:` (= host suffix なし) はそのまま shortcode を返す。
     /// 既存挙動が変わっていないことを確認するための回帰テスト。
     #[test]
     fn parse_local_emoji_accepts_bare_shortcode() {
-        let r = parse_local_emoji_shortcode(":blob:", "ours.example").unwrap();
-        assert_eq!(r, Some("blob"));
+        assert_eq!(parse_local_emoji_shortcode(":blob:"), Some("blob"));
     }
 
-    /// Issue #182 のメイン: `@.` (Misskey の local sentinel) は local 扱い。
+    /// Issue #182: `@.` (Misskey の local sentinel) は剥がす。
     #[test]
-    fn parse_local_emoji_accepts_dot_local_sentinel() {
-        let r = parse_local_emoji_shortcode(":blob@.:", "ours.example").unwrap();
-        assert_eq!(r, Some("blob"));
+    fn parse_local_emoji_strips_dot_local_sentinel() {
+        assert_eq!(parse_local_emoji_shortcode(":blob@.:"), Some("blob"));
     }
 
-    /// Issue #182 のメイン: `@<our_host>` exact match なら local 扱い。
-    /// Aria が自分のログイン先ホスト名をそのまま付けてくる経路。
+    /// Issue #182: 公開 AP host を指す `@oursakurasato.example` も剥がす。
+    /// TUI からの reaction 経路 (= login 先 = 公開 host) で来るパターン。
     #[test]
-    fn parse_local_emoji_accepts_self_host_suffix() {
-        let r = parse_local_emoji_shortcode(":blob@ours.example:", "ours.example").unwrap();
-        assert_eq!(r, Some("blob"));
+    fn parse_local_emoji_strips_public_host_suffix() {
+        assert_eq!(
+            parse_local_emoji_shortcode(":blob@ours.example:"),
+            Some("blob")
+        );
     }
 
-    /// Issue #182: 真に外部ホストを指す `@other-host` は従来どおり拒否。
+    /// Issue #182: **Tailscale tailnet host** からの reaction も剥がす。
+    /// `MiAuth` listener は Tailscale tailnet 越しに公開される想定で、Aria mobile は
+    /// `*.ts.net:8443` の Host header で接続する ── そのため reaction string にも
+    /// tailnet hostname が乗る。`config.server.host` (= 公開 AP host) との exact
+    /// match では拾えないので、無条件 strip でこの経路もカバーする。
     #[test]
-    fn parse_local_emoji_rejects_truly_remote_host() {
-        let err = parse_local_emoji_shortcode(":blob@other.example:", "ours.example").unwrap_err();
-        assert!(err.contains("remote emoji reactions are not supported yet"));
+    fn parse_local_emoji_strips_tailnet_host_suffix() {
+        assert_eq!(
+            parse_local_emoji_shortcode(":blob@foo.tailnet.ts.net:"),
+            Some("blob")
+        );
+        // port 付き Host header (`*.ts.net:8443` 形式) も同じく剥がす。
+        // `rsplit_once('@')` が tail 側を一括で吸うので port も自然に消える。
+        assert_eq!(
+            parse_local_emoji_shortcode(":blob@foo.tailnet.ts.net:8443:"),
+            Some("blob")
+        );
+    }
+
+    /// Issue #182: 真に外部ホストを指す `@other-host` も剥がす ── 我々のサーバが
+    /// 同時に複数 hostname で見える (公開 host / tailnet / etc.) ため、サーバ側で
+    /// 真リモート判定は諦めた。残った shortcode で local 引きして、見つからなければ
+    /// `EmojiNotFound` (= 404) で落ちる。caller (= miauth / local API) で
+    /// 404 ⇒ `NO_SUCH_EMOJI` / 404 "local emoji not found" にマップ済み。
+    #[test]
+    fn parse_local_emoji_strips_truly_remote_host_too() {
+        assert_eq!(
+            parse_local_emoji_shortcode(":blob@other.example:"),
+            Some("blob")
+        );
     }
 
     /// Issue #182: `:` 1 個だけ (= `:foo`) は `strip_suffix(':')` に失敗して
@@ -679,9 +702,7 @@ mod tests {
     /// として残しておく (= 「片側 colon は emoji 引きしない」の明示確認)。
     #[test]
     fn parse_local_emoji_treats_half_colon_as_unicode() {
-        let r = parse_local_emoji_shortcode(":blob", "ours.example").unwrap();
-        assert!(r.is_none());
-        let r = parse_local_emoji_shortcode("blob:", "ours.example").unwrap();
-        assert!(r.is_none());
+        assert!(parse_local_emoji_shortcode(":blob").is_none());
+        assert!(parse_local_emoji_shortcode("blob:").is_none());
     }
 }
