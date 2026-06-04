@@ -1,0 +1,88 @@
+name: Federation Test (Nekonoverse / 2-sks Move A)
+
+# 連合テスト (#140 PR2 / Scenario A = sks-old → sks-new Move) の自動駆動。
+# 1-sks 版 (`federation-test-nekonoverse.yml`) と compose / pytest stack が
+# 完全に独立しているため、別 workflow として分離する (= どちらかの infra
+# 不調が他方を blocking しないように)。
+#
+# 起動契機:
+#   - nightly cron (UTC 19:45 = JST 04:45 ── 1-sks 版 19:30 と 15 分ずらして
+#     runner 競合を緩める。Misskey の 20:00 とも被らない)
+#   - workflow_dispatch (= UI から手動キック)
+#   - **main 向け PR** (= develop → main の release PR)。required check 化を
+#     想定し、release 前に必ず通す。develop 向け PR では発火させない
+#     (= 2-sks の cargo build + 外部 image 依存で 7-20 分 = 開発体験を損なう)。
+#
+# 失敗時の調査:
+#   1. Actions タブの個別 run ログ
+#   2. "Collect logs on failure" step の出力 (各 service の tail-300)
+#   3. move-out-trigger の exit code (= 双方向 alsoKnownAs / fetch_and_upsert
+#      失敗を即見つけられる)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "45 19 * * *"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: federation-test-nekonoverse-2sks
+  cancel-in-progress: false
+
+jobs:
+  nekonoverse-2sks:
+    name: Nekonoverse (2-sks Move A)
+    runs-on: ubuntu-latest
+    # 2 sks stack の cargo build + Nekonoverse image pull + DB migrate +
+    # alias x 2 + bob seed + Follow round-trip + Move + auto re-follow +
+    # Accept round-trip まで全部詰めるので 60 分上限。1-sks 版より長い。
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: docker compose version
+        run: docker compose version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run pytest stack
+        run: ./scripts/federation-test/pytest.sh nekonoverse-2sks
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          set +e
+          project="sakurasato-fed-nekonoverse-2sks-pytest"
+          compose_file="compose/docker-compose.federation-nekonoverse-2sks.yml"
+          for svc in sakurasato-server sakurasato-server-new \
+                     sakurasato-media-proxy sakurasato-media-proxy-new \
+                     nekonoverse-app nekonoverse-worker \
+                     sakurasato-token-issuer sakurasato-token-issuer-new \
+                     nekonoverse-bob-issuer \
+                     alias-add-sks-old alias-add-sks-new \
+                     bob-follow-alice-trigger move-out-trigger \
+                     versitygw-sks versitygw-sks-new; do
+            echo "==> ${svc} logs"
+            docker compose -p "$project" -f "$compose_file" \
+              --profile pytest logs --no-color --tail=300 "$svc" || true
+          done
+          echo "==> pytest logs"
+          docker compose -p "$project" -f "$compose_file" \
+            --profile pytest logs --no-color --tail=500 pytest || true
+
+      - name: Tear down on failure
+        if: always()
+        run: |
+          project="sakurasato-fed-nekonoverse-2sks-pytest"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-nekonoverse-2sks.yml \
+            --profile pytest down -v --remove-orphans || true

@@ -710,6 +710,21 @@ class NekonoverseClient:
         resp.raise_for_status()
         return resp.json()
 
+    def following(self, account_id: str, *, limit: int = 80) -> list[dict]:
+        """``GET /api/v1/accounts/{id}/following`` ── public。
+
+        #140 PR2 (Scenario A) で bob が Move 後に alice@sakurasato-new を
+        follow 状態になることを観測する経路。Mastodon spec で list[Account]
+        を返し、各エントリに ``acct`` / ``username`` / ``url`` 等が乗る。
+        `limit` は Mastodon の default 40 を超えるケースに備えて 80 に倒す。
+        """
+        resp = self.http.get(
+            f"/api/v1/accounts/{account_id}/following",
+            params={"limit": limit},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # ── auth required (PR2b) ─────────────────────────────────
     def verify_credentials(self) -> dict:
         """`GET /api/v1/accounts/verify_credentials` ── token が valid か疎通確認。"""

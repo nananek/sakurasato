@@ -2,10 +2,11 @@
 # Run the programmatic federation pytest suite for a counterpart impl.
 #
 # Usage: scripts/federation-test/pytest.sh <impl>
-#   impl ∈ {mastodon, nekonoverse}
+#   impl ∈ {mastodon, nekonoverse, nekonoverse-2sks, misskey}
 #     - mastodon: httpx + AP プロトコル直叩き (M12 #56 / PR #63)
 #     - nekonoverse: tmux pty 駆動 + httpx + TUI binary (M12 #58 / #120 PR2a)
-#   後続 PR で misskey / pleroma / mitra / fedibird を追加していく予定。
+#     - nekonoverse-2sks: 2-sks 構成、Move Scenario A (#140 PR2)
+#   後続 PR で pleroma / mitra / fedibird を追加していく予定。
 #
 # 同じ compose ファイルを **pytest プロファイル付き** で起動し、`pytest`
 # サービスの exit code をそのままシェルに返す。CI からはこのスクリプトを
@@ -16,7 +17,7 @@
 #   - DEBUG_KEEP=1: コンテナを残す (= ログを後から漁れる)
 set -euo pipefail
 
-IMPLS=(mastodon nekonoverse misskey)
+IMPLS=(mastodon nekonoverse nekonoverse-2sks misskey)
 
 usage() {
   echo "Usage: $0 <impl>" >&2
