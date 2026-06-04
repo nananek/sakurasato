@@ -315,6 +315,20 @@ async fn learn_emoji_tag(
         if shortcode != name_shortcode {
             continue;
         }
+        // PR #191 round-1 ⚠️ #1: `extract_shortcode` は `:` を剥がして `@` で
+        // 分割するだけで charset を見ない。`/` 入りの malicious shortcode が
+        // versitygw に `emoji/remote/<host>/a/b.webp` で書かれて namespace を
+        // 汚染しないよう、fetch + PUT の前で `is_valid_shortcode` を強制する。
+        // `upsert_remote` 内の `is_valid_shortcode` 検査は upsert 前に失敗する
+        // が、その時点では既に versitygw に PUT 済 ── 早期に弾く必要がある。
+        if !repo::emoji::is_valid_shortcode(shortcode) {
+            warn!(
+                shortcode,
+                signer = %signer.ap_id,
+                "Emoji.name shortcode failed charset validation; refusing to learn"
+            );
+            continue;
+        }
 
         let Some(ap_id) = obj.get("id").and_then(JsonValue::as_str) else {
             continue;
@@ -497,6 +511,27 @@ mod tests {
         assert_eq!(extract_shortcode(":"), None);
         assert_eq!(extract_shortcode("::"), None);
         assert_eq!(extract_shortcode(":@host:"), None);
+    }
+
+    /// PR #191 round-1 ⚠️ #1: `extract_shortcode` 自身は charset を見ない。
+    /// `/` 入りの shortcode を Some で返してしまうため、後段の
+    /// `is_valid_shortcode` が弾く責務を持つ ── 本テストはその境界仕様を
+    /// 固定する (= `extract_shortcode` の挙動を不用意に厳しくしないため)。
+    #[test]
+    fn extract_shortcode_does_not_filter_charset() {
+        // `learn_emoji_tag` 側で `is_valid_shortcode` を必ず呼ぶ前提で、
+        // ここでは「`/` を含む値も Some で返る」ことを記録する。
+        assert_eq!(extract_shortcode(":a/b:"), Some("a/b"));
+        // `is_valid_shortcode` 側がそれを拒否することは core 側の責務。
+        assert!(!sakurasato_core::repo::emoji::is_valid_shortcode("a/b"));
+        assert!(!sakurasato_core::repo::emoji::is_valid_shortcode(
+            "../escape"
+        ));
+        assert!(!sakurasato_core::repo::emoji::is_valid_shortcode(""));
+        assert!(sakurasato_core::repo::emoji::is_valid_shortcode("blob"));
+        assert!(sakurasato_core::repo::emoji::is_valid_shortcode(
+            "blob_party-1"
+        ));
     }
 
     #[test]
