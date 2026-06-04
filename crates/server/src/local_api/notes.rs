@@ -529,9 +529,9 @@ struct ResolvedMention {
 /// content から `:foo:` 形式の local emoji shortcode を抽出する。
 ///
 /// 制約 (`repo::emoji::is_valid_shortcode` と同じ): ASCII alphanumeric +
-/// underscore + hyphen、長さ 1..=64。`:foo@host:` のリモート絵文字は本 PR
-/// では対象外で、shortcode に `@` が来た時点で抽出を打ち切る (別 issue で
-/// 対応する)。
+/// underscore + hyphen、長さ 1..=128 (Issue #188 で 64 → 128 緩和、Misskey
+/// 互換)。`:foo@host:` のリモート絵文字は本 PR では対象外で、shortcode に
+/// `@` が来た時点で抽出を打ち切る (別 issue で対応する)。
 ///
 /// 重複 shortcode は ASCII-lowercase で dedupe。上限 [`EMOJI_MAX`] を超えた
 /// ぶんは drop (= attack 防御 + 投稿サイズ抑制)。
@@ -555,13 +555,14 @@ fn parse_emoji_shortcodes(content: &str) -> Vec<String> {
                 break;
             }
         }
-        // 終端 `:` が必要、空 shortcode (`::`) は無視、長さ 1..=64 制約。
+        // 終端 `:` が必要、空 shortcode (`::`) は無視、長さ 1..=128 制約
+        // (Issue #188 で 64 → 128 緩和、`is_valid_shortcode` と整合)。
         if j == start || j >= bytes.len() || bytes[j] != b':' {
             i += 1;
             continue;
         }
         let len = j - start;
-        if !(1..=64).contains(&len) {
+        if !(1..=128).contains(&len) {
             i += 1;
             continue;
         }
@@ -1507,10 +1508,24 @@ mod tests {
 
     #[test]
     fn parse_emoji_skips_too_long_shortcode() {
-        // 65 文字 (= 上限 64 超え) は drop。
-        let long = "a".repeat(65);
-        let v = parse_emoji_shortcodes(&format!(":{long}:"));
-        assert!(v.is_empty(), "got {v:?}");
+        // Issue #188: 上限を 64 → 128 に緩和。128 chars はギリギリ拾い、
+        // 129 chars は drop する境界回帰テスト。
+        let exact_128 = "a".repeat(128);
+        let v = parse_emoji_shortcodes(&format!(":{exact_128}:"));
+        assert_eq!(v, vec![exact_128.clone()], "128 chars should be accepted");
+
+        let too_long = "a".repeat(129);
+        let v = parse_emoji_shortcodes(&format!(":{too_long}:"));
+        assert!(v.is_empty(), "129 chars should be dropped; got {v:?}");
+
+        // 旧上限 (= 65 chars) は受理されるように。これが本 issue の主旨。
+        let medium = "a".repeat(65);
+        let v = parse_emoji_shortcodes(&format!(":{medium}:"));
+        assert_eq!(
+            v,
+            vec![medium],
+            "65 chars should be accepted (was rejected pre-#188)"
+        );
     }
 
     #[test]

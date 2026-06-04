@@ -33,6 +33,8 @@ mod tests {
         //   は #158 以降で乗る)
         // 0016 miauth_session_raw_token (= M14 #158: check polling で raw token
         //   を冪等返却するための列追加)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 16);
+        // 0017 emoji_shortcode_128 (= Issue #188: shortcode CHECK 制約の長さ
+        //   上限を 64 → 128 に緩和、Misskey に揃え)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 17);
     }
 }

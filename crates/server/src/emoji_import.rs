@@ -28,7 +28,8 @@
 //! 1. zip を `std::fs::File` で開き、`zip::ZipArchive` を構築。
 //! 2. `meta.json` を読み、サイズ上限 [`META_MAX_BYTES`] を超えていれば拒否。
 //! 3. `emojis[]` のうち `downloaded == true` のものだけ列挙し、shortcode を
-//!    [`repo::emoji::is_valid_shortcode`] で検査 (= `[a-zA-Z0-9_-]{1,64}`)。
+//!    [`repo::emoji::is_valid_shortcode`] で検査 (= `[a-zA-Z0-9_-]{1,128}`、
+//!    Issue #188 で 64 → 128 緩和、Misskey に揃え)。
 //! 4. 各エントリの画像バイト列を **本体ではデコードせず**、`media-proxy` の
 //!    `/v1/image/sanitize?variant=emoji` に流す。返ってきた WebP を versitygw
 //!    に `emoji/local/<shortcode>.webp` で PUT、`emoji` 行を upsert (同 shortcode
@@ -498,5 +499,22 @@ mod tests {
                 "expected {ok:?} to pass"
             );
         }
+    }
+
+    /// Issue #188: 長さ上限を 64 → 128 に緩和した境界回帰テスト。
+    /// 1 / 64 / 128 が通り、0 / 129 が拒否される。
+    #[test]
+    fn shortcode_length_boundary_at_128() {
+        // 旧上限 (64) を超える 65〜128 char の shortcode は受理されるように。
+        assert!(repo::emoji::is_valid_shortcode("a"));
+        assert!(repo::emoji::is_valid_shortcode(&"a".repeat(64)));
+        assert!(repo::emoji::is_valid_shortcode(&"a".repeat(65)));
+        assert!(repo::emoji::is_valid_shortcode(&"a".repeat(128)));
+        // 0 / 129 は引き続き拒否。
+        assert!(!repo::emoji::is_valid_shortcode(""));
+        assert!(!repo::emoji::is_valid_shortcode(&"a".repeat(129)));
+        // 文字種制約は変えていないので、64 chars までだった旧挙動の
+        // 文字種違反 (空白 / 全角等) は引き続き拒否される。
+        assert!(!repo::emoji::is_valid_shortcode(&"a ".repeat(64)));
     }
 }
