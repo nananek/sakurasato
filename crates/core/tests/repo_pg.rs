@@ -445,13 +445,16 @@ async fn delivery_queue_mark_dead_transitions_immediately(pool: PgPool) -> sqlx:
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn emoji_upsert_rejects_invalid_shortcode(pool: PgPool) -> sqlx::Result<()> {
-    let cases = [
+    // Issue #188: 長さ上限が 64 → 128 に緩和されたので、不正ケースは「文字種違反」
+    // と「129 chars (= 新上限超え)」に更新する。
+    let too_long_129 = "a".repeat(129);
+    let cases: [&str; 5] = [
         "../escape",
         "with space",
         "コロン",
         "",
-        // 65 chars
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        // 129 chars (= 新上限 128 を 1 つ超える)
+        too_long_129.as_str(),
     ];
     for bad in cases {
         let err = repo::emoji::upsert_local(
@@ -472,6 +475,30 @@ async fn emoji_upsert_rejects_invalid_shortcode(pool: PgPool) -> sqlx::Result<()
             msg.contains("invalid emoji shortcode"),
             "wrong error for {bad:?}: {msg}"
         );
+    }
+    Ok(())
+}
+
+/// Issue #188: 旧上限 (64) を超える 65〜128 chars の shortcode が DB CHECK
+/// 制約 (= 新 migration `0017_emoji_shortcode_128`) を通って **受理** される
+/// ことを確認する境界回帰テスト。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn emoji_upsert_accepts_shortcode_up_to_128_chars(pool: PgPool) -> sqlx::Result<()> {
+    for len in [65_usize, 100, 128] {
+        let shortcode = "a".repeat(len);
+        let row = repo::emoji::upsert_local(
+            &pool,
+            repo::emoji::NewLocalEmoji {
+                shortcode: shortcode.clone(),
+                category: None,
+                aliases: vec![],
+                image_key: format!("emoji/local/{shortcode}.webp"),
+                media_type: "image/webp".into(),
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("len {len} should be accepted, got error: {err}"));
+        assert_eq!(row.shortcode, shortcode);
     }
     Ok(())
 }
