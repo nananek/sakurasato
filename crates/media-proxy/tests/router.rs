@@ -32,6 +32,7 @@ fn make_config() -> Config {
             user: "me".into(),
             info: ServerInfo::default(),
             auto_approve_followers_for_followees: false,
+            max_note_text_length: 3000,
         },
         database: DatabaseConfig {
             url: "unused".into(),
