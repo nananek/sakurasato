@@ -281,8 +281,34 @@ async fn create_reaction_with_host_suffix_normalizes_to_local_shortcode(pool: Pg
 
     // (2) 別 note 上で Tailscale tailnet host を模した suffix。1 ノートに
     // 同じローカル actor の reaction 2 件は `(note_id, actor_id)` UNIQUE で
-    // 弾かれる (= idempotent) ので、新規 note を seed して別パスを試す。
-    let note_id_2 = seed_note(&pool, actor.id, "example.test").await;
+    // 弾かれる (= 同じ第 1 reaction 行が返るだけで、2 回目の content の
+    // 正規化結果を観察できなくなる) ので、`/notes/2` を inline で seed する。
+    // `seed_note` は ap_id を `/notes/1` 固定で作るので使い回せず、毎回呼ぶと
+    // `note_ap_id_key` UNIQUE violation で panic する。
+    let note_2 = repo::note::insert(
+        &pool,
+        repo::note::NewNote {
+            ap_id: "https://example.test/notes/2".into(),
+            actor_id: actor.id,
+            content: "hi 2".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: true,
+            url: Some("https://example.test/notes/2".into()),
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let note_id_2 = note_2.id;
     let body = serde_json::json!({
         "note_id": note_id_2,
         "content": ":blob_party@foo.tailnet.ts.net:8443:",
