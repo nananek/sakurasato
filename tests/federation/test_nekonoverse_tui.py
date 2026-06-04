@@ -23,7 +23,7 @@ PR2c:
      で送り、``EmojiReact`` + ``tag.Emoji`` を nkv に届けて bob 側 status の
      reactions に並ぶことを確認する。
 
-#138 (本 PR で追加):
+#138:
 
   5. ``test_sks_tui_reply_propagates_to_nkv_descendants``
      ── bob が公開 note → sks TUI で ``R`` で reply prompt → 本文入力 → F2 で
@@ -36,9 +36,23 @@ PR2c:
      timeline で同 reply が ``in_reply_to_ap_id`` 一致して出現することを
      確認 (= 受信側 inbox handler が reply の親紐付けを保持する経路)。
 
+#139 (本 PR で追加):
+
+  7. ``test_sks_tui_avatar_upload_updates_actor_icon``
+     ── sks TUI で ``A`` (アバターアップロード) → 一時 fixture dir 内の PNG を
+     picker 経由で選択 → アップロード完了 → SKS 側 ``whoami.icon_url`` が
+     新 URL に更新され、同 URL が AP ``/users/<name>`` の ``icon.url`` にも
+     反映されていることを確認 (= TUI key → media-proxy sanitize → versitygw
+     格納 → ``profile.rs::patch`` → AP serving の end-to-end chain)。
+     federation push (= alice 自身の Update activity を bob inbox に届け、
+     nkv 側 cache を更新するパス) の検証は別 PR で扱う ── bob → alice
+     follow fixture が必要だが、現状 ``bob_followed_by_sks`` の逆方向 helper
+     が conftest に居ないため、まず最重要の SKS 側 chain を切り出して
+     検証する。
+
 シナリオ外 (= 別 PR で追加 OK):
 
-- Move / Actor Update
+- Move (#140) / Avatar Update の nkv side 検証 (= follower push の確認)
 
 実行前提:
 
@@ -63,7 +77,12 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
+import shutil
+import struct
 import uuid
+import zlib
+from pathlib import Path
 
 import pytest
 
@@ -756,3 +775,177 @@ def test_nkv_reply_appears_in_sks_timeline_with_in_reply_to(
             f"with in_reply_to_ap_id={parent_ap_id}"
         ),
     )
+
+
+# ── #139: Avatar Update ──────────────────────────────────────
+#
+# TUI `A` で avatar をアップロードし、SKS 側 chain
+# (TUI → local API `/api/v1/media?kind=avatar` → media-proxy sanitize →
+# versitygw 格納 → `profile.rs::patch` → `actor.icon_url` 更新 → AP serving)
+# が end-to-end で動くことを確認する。
+#
+# 観測モデル:
+#
+# 1. 上げる前の `whoami.icon_url` を snapshot しておく (初期状態は通常 None)。
+# 2. TUI で `A` → 一時 picker root dir を経由して PNG を選択 → `avatar updated`
+#    status を待つ。
+# 3. 上げた後 `whoami.icon_url` が **変化** していることを確認。
+# 4. AP `/users/<name>` (= bob/nkv が `Update` 後に fetch する URL) を直接叩き、
+#    `icon.url` が `whoami.icon_url` と一致することを確認 ── これで nkv 側
+#    cache 反映の **前提** (= sks が正しい新 URL を AP で serve する) が成立。
+#
+# nkv 側 cache 更新 (= alice の `Update` を bob 経由で受領しているか) は別 PR。
+# 現状 conftest に「bob が alice を follow」の helper が無いため (= 既存
+# `bob_followed_by_sks` は **sks → bob** の片方向)、push 観測のための fixture
+# は別途整備する。本 PR では SKS 側 chain の最重要部分を切り出して固める。
+
+def _build_unique_1x1_png() -> bytes:
+    """画素値ランダムな 1x1 RGB PNG を stdlib だけで合成する。
+
+    なぜランダム化するか:
+
+    media-proxy は受け取った画像を ``image`` クレートで decode → avatar
+    variant (256x256) に resize → WebP 再エンコードする ([`crates/media-proxy/src/image_pipeline.rs`])。
+    versitygw に格納される storage key は WebP の SHA-256 が入るので、
+    **入力 PNG が同じなら毎回同じ URL** が返る。本テストが「`icon_url` が
+    変化した」ことを観測する設計上、テストを 2 回以上同じ DB で走らせると
+    upload 前後で URL が同一になって false negative する。色をランダム化
+    することで WebP 出力も毎回ユニークになり、URL が衝突しない。
+
+    PNG 仕様 (RFC 2083) に従い、IHDR / IDAT / IEND の 3 chunk を CRC 付きで
+    手書きする。スコープを 1x1 に絞ることで IDAT は filter byte 1 + RGB 3
+    バイトの計 4 バイトに収まる ── ``image`` クレートのデコーダも最小だが
+    valid な PNG として受け入れる (= 過去 PR2c の sanitize 経路と同じ)。
+    """
+    width = height = 1
+    color = (
+        secrets.randbelow(256),
+        secrets.randbelow(256),
+        secrets.randbelow(256),
+    )
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(
+            ">I", zlib.crc32(tag + data)
+        )
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    # IHDR: width(4) height(4) bit_depth(1) color_type(1=RGB) compression(0)
+    # filter(0) interlace(0). color_type=2 = RGB without alpha。
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    # IDAT: 各 scanline の頭に filter type byte (0=None)、続いて RGB バイト列。
+    raw = b"\x00" + bytes(color)
+    idat = zlib.compress(raw, level=9)
+    return sig + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
+
+
+def _prepare_picker_fixture(stem: str = "avatar") -> tuple[Path, Path]:
+    """`/tests/0_<stem>_picker_<uuid>/<stem>.png` を作って (dir, file) を返す。
+
+    Picker は alphabetic sort で entries を並べ、dirs を先に出す
+    ([`crates/tui/src/picker.rs::try_read_dir`])。dir 名を ``0_`` で始めることで:
+
+    - ``__pycache__`` (`_` = 0x5F) や ``D``/``a``/`` から始まる既存 file/dir よりも
+      先頭 (= 0x30 < 0x5F < 0x41 etc.) に位置決めできる。
+    - 隠し dir (``.pytest_cache`` 等) は `show_hidden=false` で picker から見えない。
+
+    結果として TUI 側で ``A`` → ``j`` (= 先頭 dir を選択) → ``Enter`` (= 降りる)
+    → ``j`` (= 内側の唯一の file を選択) → ``Enter`` (= 確定) の 5 打鍵で
+    fixture 画像を upload できる。
+    """
+    base_dir = Path("/tests")
+    unique = uuid.uuid4().hex[:8]
+    dir_path = base_dir / f"0_{stem}_picker_{unique}"
+    dir_path.mkdir(exist_ok=True)
+    file_path = dir_path / f"{stem}.png"
+    file_path.write_bytes(_build_unique_1x1_png())
+    return dir_path, file_path
+
+
+def _select_fixture_in_picker(tui) -> None:
+    """`A` → picker → 「先頭 dir に descend → 内側の唯一の file を select」。
+
+    `_prepare_picker_fixture` で作った dir/file レイアウト前提。タイミング
+    安全のため、各ステップで status / dir 表示の固定マーカーを待つ。
+
+    - status「`file picker: avatar (Enter=select, Esc=cancel)`」(= `open_picker`
+      の `set_status`) を `file picker: avatar` で待つ。
+    - dir descend 後はカレントパス表示 (= `render_picker` でヘッダに `cwd` を出す
+      想定) と、内側の単一 file 名を表示で待つ。
+    """
+    tui.send_keys("A")
+    tui.wait_until_text(r"file picker: avatar", 10)
+    # `j` → 先頭 dir 選択 → `Enter` で descend。
+    tui.send_keys("j", "Enter")
+    # 降りた dir には fixture file 1 個しか無いので `j` + `Enter` で confirm。
+    tui.send_keys("j", "Enter")
+    # 成功 status: `avatar updated (<N> delivered)` (= `handle_upload_outcome`
+    # の Success ブランチ、N は accepted follower 数)。
+    tui.wait_until_text(r"avatar updated", 60)
+
+
+@pytest.mark.timeout(360)
+def test_sks_tui_avatar_upload_updates_actor_icon(
+    tmux_tui,
+    sakurasato_socket_path: str,
+    sakurasato_token_file: str,
+    sakurasato: SakurasatoClient,
+) -> None:
+    """#139: TUI `A` → アバター更新 → SKS の local API + AP actor JSON が新 URL を返す。
+
+    本 test は **`bob_followed_by_sks` fixture に依存しない** ── 既存
+    fixture は ``sks → bob`` の片方向 follow で「alice の follower 集合」
+    には bob が入らない (= [`crates/server/src/local_api/profile.rs::enqueue_to_followers`]
+    は `list_accepted_inboxes(alice.id)` を引き、これは「alice を follow
+    している人」を返す)。そのためこの fixture は本テストの federation push
+    観測には貢献しない。
+
+    push 観測 (= alice の Update を bob inbox に届け、nkv 側 cache が更新
+    される) は別 PR で扱う ── 必要な「bob → alice follow」helper が conftest
+    に居ないため、まず最重要の SKS 側 chain を切り出して検証する。本テスト
+    自体は ``avatar updated (0 delivered)`` 表示 (= 0 follower) でも green
+    する ── status 文字列の数値部は assert していない。
+    """
+    # 1. 上げる前の icon_url を snapshot。
+    before = sakurasato.whoami()
+    icon_before = before.get("icon_url")
+
+    # 2. picker 用の fixture を `/tests/0_avatar_picker_<uuid>/avatar.png` に書く。
+    fixture_dir, fixture_file = _prepare_picker_fixture(stem="avatar")
+
+    tui = tmux_tui(
+        sakurasato_socket_path,
+        sakurasato_token_file,
+        "--no-images",
+        label="avatar_upload",
+    )
+    try:
+        # TUI 起動して whoami が描画される (= status バー / Timeline) のを待つ。
+        tui.wait_until_text(r"@me", 30)
+        _select_fixture_in_picker(tui)
+
+        # 3. whoami が new URL を返す (= local API 経由で server の actor.icon_url
+        #    が更新済)。
+        after = sakurasato.whoami()
+        icon_after = after.get("icon_url")
+        assert icon_after, f"whoami.icon_url should be non-empty after upload: {after}"
+        assert icon_after != icon_before, (
+            f"whoami.icon_url should change after avatar upload "
+            f"(before={icon_before!r}, after={icon_after!r})"
+        )
+
+        # 4. AP `/users/<name>` (= bob/nkv が fetch する URL) も同じ URL を出す。
+        whoami_username = before.get("preferred_username") or "me"
+        actor = sakurasato.actor_json(whoami_username)
+        icon_obj = actor.get("icon") or {}
+        ap_icon_url = icon_obj.get("url")
+        assert ap_icon_url == icon_after, (
+            f"AP actor.icon.url should match whoami.icon_url "
+            f"(ap={ap_icon_url!r}, whoami={icon_after!r})"
+        )
+    finally:
+        _quit_tui(tui)
+        # picker fixture を後始末 (= 後続テストの /tests/ list を汚さない)。
+        shutil.rmtree(fixture_dir, ignore_errors=True)
+        # fixture_file は dir 削除で連鎖的に消える ── ループ内で個別 unlink せず。
+        _ = fixture_file
