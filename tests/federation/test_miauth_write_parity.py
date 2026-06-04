@@ -88,16 +88,21 @@ def test_misskey_notes_create_returns_created_note_envelope(misskey_py_client):
 
 
 def test_misskey_notes_delete_returns_no_content(misskey_py_client):
-    """`notes/delete` の成功は 204 (= misskey-py は実装内で True を返す)。
-    Sakurasato も 204 で揃えている (= unit test
+    """`notes/delete` の成功は 204 No Content。misskey-py は 204 (= 空 body) を
+    JSON parse しようとして例外を投げる版があるため、戻り値ではなく **効果
+    (= note が消えた)** で検証する。Sakurasato も 204 で揃えている (= unit test
     `notes_delete_removes_note_and_returns_204`)。
     """
     res = misskey_py_client.notes_create(text="parity delete #160")
     note_id = res["createdNote"]["id"]
-    ok = misskey_py_client.notes_delete(note_id=note_id)
-    # misskey-py の delete は成功時 True (= 204 内部マップ) を返す慣行。
-    # 一部 fork で `{}` を返すケースもあるので両方許容。
-    assert ok is True or ok == {} or ok is None, f"unexpected delete response: {ok!r}"
+    # delete は HTTP 204 = 成功。misskey-py の空 body parse 例外は許容する。
+    try:
+        misskey_py_client.notes_delete(note_id=note_id)
+    except Exception:  # noqa: BLE001 - misskey-py の 204 (empty body) parse 例外
+        pass
+    # 効果検証: 削除済みなら notes/show は NO_SUCH_NOTE で例外になる。
+    with pytest.raises(Exception):  # noqa: B017,PT011 - Misskey の 404 を捕捉
+        misskey_py_client.notes_show(note_id=note_id)
 
 
 # ── reactions/create + delete ────────────────────────────────────────
@@ -149,17 +154,45 @@ def test_misskey_reactions_create_local_shortcode_succeeds(misskey_py_client):
 
 def test_misskey_reactions_delete_succeeds_after_create(misskey_py_client):
     """`reactions/create` → `reactions/delete` ペアが本物 Misskey で通る。
-    Sakurasato も同 pair で 204 を返す (= unit test
+    どちらも 204 で、misskey-py が空 body を parse して例外を投げる版があるため、
+    戻り値ではなく **効果 (= note の reactions が増えて→消える)** で検証する。
+    Sakurasato も同 pair で 204 (= unit test
     `reactions_delete_removes_my_reaction_on_note`)。
     """
     res = misskey_py_client.notes_create(text="parity delete reaction #160")
     note_id = res["createdNote"]["id"]
+
+    def _reactions() -> dict:
+        shown = misskey_py_client.notes_show(note_id=note_id)
+        return shown.get("reactions", {}) if isinstance(shown, dict) else {}
+
     try:
-        misskey_py_client.notes_reactions_create(note_id=note_id, reaction="👍")
-        # 連合伝搬の遅延がある可能性あり ── 200ms 待つ。
-        time.sleep(0.2)
-        ok = misskey_py_client.notes_reactions_delete(note_id=note_id)
-        assert ok is True or ok == {} or ok is None
+        # 付与 (= 204 例外を許容)。
+        try:
+            misskey_py_client.notes_reactions_create(note_id=note_id, reaction="👍")
+        except Exception:  # noqa: BLE001 - 204 (empty body) parse 例外
+            pass
+        # delete の前提として、付与が note に反映されるまで待つ。
+        present = False
+        for _ in range(20):
+            if _reactions():
+                present = True
+                break
+            time.sleep(0.5)
+        assert present, "reaction must be present before delete"
+        # 取消 (= 204 例外を許容)。
+        try:
+            misskey_py_client.notes_reactions_delete(note_id=note_id)
+        except Exception:  # noqa: BLE001 - 204 (empty body) parse 例外
+            pass
+        # 効果検証: reaction が消えている。
+        gone = False
+        for _ in range(20):
+            if not _reactions():
+                gone = True
+                break
+            time.sleep(0.5)
+        assert gone, f"reaction must be removed after delete; got {_reactions()!r}"
     finally:
         try:
             misskey_py_client.notes_delete(note_id=note_id)
