@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO emoji (shortcode, host, category, aliases, image_key, media_type, ap_id, is_local)\n        VALUES ($1, $2, NULL, '[]'::jsonb, $3, $4, $5, FALSE)\n        ON CONFLICT (ap_id) DO UPDATE SET\n            shortcode = EXCLUDED.shortcode,\n            host = EXCLUDED.host,\n            image_key = EXCLUDED.image_key,\n            media_type = EXCLUDED.media_type,\n            updated_at = now()\n        RETURNING\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, created_at, updated_at\n        ",
+  "query": "\n        SELECT\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at\n        FROM emoji WHERE shortcode = $1 AND host IS NULL\n        ",
   "describe": {
     "columns": [
       {
@@ -123,14 +123,21 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 11,
+        "name": "last_failed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "emoji",
+            "name": "last_failed_at"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text",
-        "Text",
-        "Text",
         "Text"
       ]
     },
@@ -145,8 +152,9 @@
       true,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "3690963c26ad976cae9dc54deb9f2a619324d09cab700baef79aa03f6e8d8415"
+  "hash": "29ea95cc004ce1e37e2e085f6155a83ee34153ff54672d3cfed3121bf10070b4"
 }

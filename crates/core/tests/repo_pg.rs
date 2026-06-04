@@ -673,9 +673,11 @@ async fn reaction_count_by_note_groups_by_content(pool: PgPool) -> sqlx::Result<
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn emoji_upsert_remote_is_idempotent_by_ap_id(pool: PgPool) -> sqlx::Result<()> {
-    // Issue #135 で `image_key` を `Option<String>` に倒したので、自鯖
-    // キャッシュキー (`emoji/remote/<host>/<shortcode>.webp`) を入れる経路と
-    // 取得失敗 (= `None`) を入れる経路の両方を round-trip 検証する。
+    // Issue #135 で `image_key` を `Option<String>` に倒し、Issue #192 で
+    // SQL を COALESCE 保存に切り替えたため、同じ ap_id を再投入したときの
+    // 挙動マトリクスをここで固定する。
+    //
+    // ## (1) 新規 success → image_key=Some, last_failed_at=None
     let first = repo::emoji::upsert_remote(
         &pool,
         repo::emoji::NewRemoteEmoji {
@@ -684,6 +686,7 @@ async fn emoji_upsert_remote_is_idempotent_by_ap_id(pool: PgPool) -> sqlx::Resul
             host: "misskey.io".into(),
             image_key: Some("emoji/remote/misskey.io/blob.webp".into()),
             media_type: "image/webp".into(),
+            last_failed_at: None,
         },
     )
     .await?;
@@ -693,9 +696,11 @@ async fn emoji_upsert_remote_is_idempotent_by_ap_id(pool: PgPool) -> sqlx::Resul
         first.image_key.as_deref(),
         Some("emoji/remote/misskey.io/blob.webp")
     );
+    assert!(first.last_failed_at.is_none());
 
-    // 同じ ap_id で再投入 → 同じ行を更新して返す。fetch 失敗を想定して
-    // `image_key = None` に倒す経路。
+    // ## (2) 既存 failure → image_key は **既存値を温存**、last_failed_at が
+    //       now() で更新される (= COALESCE による保存)。
+    let now = chrono::Utc::now();
     let second = repo::emoji::upsert_remote(
         &pool,
         repo::emoji::NewRemoteEmoji {
@@ -703,17 +708,87 @@ async fn emoji_upsert_remote_is_idempotent_by_ap_id(pool: PgPool) -> sqlx::Resul
             ap_id: "https://misskey.io/emojis/blob".into(),
             host: "misskey.io".into(),
             image_key: None,
-            media_type: "image/webp".into(),
+            media_type: "application/octet-stream".into(),
+            last_failed_at: Some(now),
         },
     )
     .await?;
     assert_eq!(first.id, second.id);
-    assert!(second.image_key.is_none());
+    // 既存 image_key (= 自鯖キャッシュキー) が温存される。
+    assert_eq!(
+        second.image_key.as_deref(),
+        Some("emoji/remote/misskey.io/blob.webp"),
+    );
+    // media_type も既存値が温存される (= 失敗時に巻き戻らない)。
     assert_eq!(second.media_type, "image/webp");
+    assert!(second.last_failed_at.is_some());
+
+    // ## (3) 既存 success (retry 成功) → image_key を新値で上書き + last_failed_at=None
+    let third = repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "blob".into(),
+            ap_id: "https://misskey.io/emojis/blob".into(),
+            host: "misskey.io".into(),
+            image_key: Some("emoji/remote/misskey.io/blob.webp".into()),
+            media_type: "image/webp".into(),
+            last_failed_at: None,
+        },
+    )
+    .await?;
+    assert_eq!(first.id, third.id);
+    assert!(third.last_failed_at.is_none(), "success should reset");
 
     // get_by_ap_id でも引ける。
     let got = repo::emoji::get_by_ap_id(&pool, "https://misskey.io/emojis/blob").await?;
     assert_eq!(got.map(|r| r.id), Some(first.id));
+    Ok(())
+}
+
+/// Issue #192 round-2 regression #1: 旧 URL を持つ row が fetch 失敗で
+/// `image_key = NULL` に降格しないことを担保する。COALESCE 保存の核心テスト。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn emoji_upsert_remote_failure_preserves_legacy_url(pool: PgPool) -> sqlx::Result<()> {
+    // PR #191 前の挙動を模して、image_key に URL を持つ row を作る。
+    let legacy = repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "old".into(),
+            ap_id: "https://old.example/emojis/old".into(),
+            host: "old.example".into(),
+            image_key: Some("https://old.example/files/old.png".into()),
+            media_type: "image/png".into(),
+            last_failed_at: None,
+        },
+    )
+    .await?;
+    assert_eq!(
+        legacy.image_key.as_deref(),
+        Some("https://old.example/files/old.png")
+    );
+
+    // 同じ ap_id で fetch failure を模す (= image_key=None, last_failed_at=now)。
+    let after_fail = repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "old".into(),
+            ap_id: "https://old.example/emojis/old".into(),
+            host: "old.example".into(),
+            image_key: None,
+            media_type: "application/octet-stream".into(),
+            last_failed_at: Some(chrono::Utc::now()),
+        },
+    )
+    .await?;
+    assert_eq!(after_fail.id, legacy.id);
+    // 旧 URL が温存される (= ここが PR #191 round-2 #1 の regression 修正点)。
+    assert_eq!(
+        after_fail.image_key.as_deref(),
+        Some("https://old.example/files/old.png"),
+        "fetch failure must NOT downgrade legacy URL row to NULL"
+    );
+    assert_eq!(after_fail.media_type, "image/png");
+    assert!(after_fail.last_failed_at.is_some());
     Ok(())
 }
 
@@ -805,6 +880,7 @@ async fn emoji_upsert_remote_rejects_empty_host(pool: PgPool) -> sqlx::Result<()
             host: String::new(),
             image_key: Some("emoji/remote/misskey.io/blob.webp".into()),
             media_type: "image/webp".into(),
+            last_failed_at: None,
         },
     )
     .await

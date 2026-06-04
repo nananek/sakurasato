@@ -1,0 +1,37 @@
+-- Sakurasato Issue #192 — remote emoji の fetch 失敗を「最後に試みた日時」
+-- として記録するため `emoji.last_failed_at TIMESTAMPTZ NULL` を追加する。
+--
+-- ## 背景
+--
+-- PR #191 (Issue #135) で remote emoji を受信時に media-proxy 経由で取得 +
+-- versitygw にキャッシュする経路を導入したが、相手サーバが恒常的に落ちている
+-- /4xx を返している remote emoji については、`emoji.image_key = NULL` で row
+-- が作られても **次に同じ emoji を含む reaction を受信したら再 fetch される**。
+-- お一人様 server では頻度は低いが、相手サーバへの上流 GET が毎回出る = polite
+-- 失格 (claude-review PR #191 round-1 minor #2)。
+--
+-- 加えて、旧 row (= URL を `image_key` に直接持つもの) が fetch 失敗で
+-- `image_key = NULL` に **降格** する regression が PR #191 round-2 minor #1
+-- で指摘された ── 瞬断 / URL 変更時に「それまで表示できていた絵文字が消える」。
+--
+-- ## 解決策
+--
+-- `last_failed_at` 列で「最後に fetch を試みて失敗した時刻」を記録する。
+-- `dispatch::reaction::learn_emoji_tag` が起点で:
+-- - `image_key` が `emoji/remote/...` (= 自鯖キャッシュ済) → 即 skip
+-- - `last_failed_at` が直近 TTL (= 1h) 内 → fetch skip + DB も触らない
+-- - 上記いずれでもない → fetch を試みる
+--   - 成功: `image_key = Some(versitygw_key)`, `last_failed_at = NULL`
+--   - 失敗: `image_key` は **既存値を COALESCE で温存**、`last_failed_at = now()`
+--
+-- COALESCE 温存により旧 URL row の regression も同時に解決する (= 取得失敗
+-- 時に URL を消さず、`last_failed_at` だけ更新して TTL 経過まで再試行を抑える)。
+--
+-- ## 互換
+--
+-- 既存 row は `last_failed_at = NULL` で初期化される (= 失敗履歴なし)。
+-- 既存の SELECT クエリは新列を参照しない限り無影響。`upsert_remote` の
+-- ON CONFLICT 句が変わるため `.sqlx/` cache の再生成が必要。
+
+ALTER TABLE emoji
+    ADD COLUMN last_failed_at TIMESTAMPTZ NULL;
