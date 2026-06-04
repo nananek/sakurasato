@@ -552,22 +552,36 @@ def test_custom_emoji_reaction_propagates_to_bob_status(
 #    で観察、`in_reply_to_ap_id` 一致を assert する。
 
 
-def _open_reply_prompt_from_top(tui) -> None:
+def _open_reply_prompt_from_top(tui, parent_marker: str) -> None:
     """Timeline focus で `R` を打って **選択中** (= 先頭) note の reply を開く。
 
     bob 由来 note は `_open_tui_and_wait_for_note` が refresh 後に先頭 (= id
     最大 = published 最新) で待っているので、追加の選択操作なしで `R` だけで
     その note への reply prompt が開く。
 
+    ただし「先頭 = bob の note」前提を rely 一本足にすると、将来テストの
+    並列化や別 stack 内のタイミング揺れで誤った note に reply する事故が
+    起き得る (= PR #184 review concern 1)。そのため `R` を打つ直前に
+    `parent_marker` が画面に**まだ**居ることを `wait_until_text` で再確認
+    する ── 選択カーソル位置までは観察できないが、bob の note が timeline
+    から消えていないことは担保できる。
+
     Compose 上部の「↳ @<author>: <抜粋>」ラベル (= `Compose::set_reply_target`
     後のレンダリング) を ``↳ @bob`` で待ち、reply 開始が成立したことを確認する。
     """
+    # parent_marker がまだ可視であることを確認 (= 先頭 selection の暗黙
+    # 前提への safety net、PR #184 review concern 1)。
+    tui.wait_until_text(re.escape(parent_marker), 5)
     tui.send_keys("R")
     # `↳ @<bob_local>` を本文末尾抜粋と一緒に当てる ── `↳` は ratatui の
     # `set_reply_target` 後のヘッダで `compose.rs` の reply_parent_label を
     # 表示するときに付ける prefix (= `format!("↳ {label}")`, `ui/mod.rs` の
     # render_compose 経路)。
-    tui.wait_until_text(rf"↳ @{BOB_LOCAL}", 10)
+    #
+    # timeout は他 polling と整合させて 30s。tmux pty + ratatui 描画は
+    # まれにフレームが遅れることがある (= PR #184 review concern 2、旧
+    # 10s だと CI 負荷時に false-fail のリスク)。
+    tui.wait_until_text(rf"↳ @{BOB_LOCAL}", 30)
 
 
 def _type_compose_body_and_submit(tui, body: str) -> None:
@@ -638,7 +652,7 @@ def test_sks_tui_reply_propagates_to_nkv_descendants(
         label="reply_sks_to_nkv",
     )
     try:
-        _open_reply_prompt_from_top(tui)
+        _open_reply_prompt_from_top(tui, parent_marker)
         _type_compose_body_and_submit(tui, reply_marker)
 
         poll_until(
