@@ -225,7 +225,7 @@ async fn limit_above_max_is_clamped(pool: PgPool) {
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn like_metacharacters_in_query_are_escaped(pool: PgPool) {
-    // shortcode は `[A-Za-z0-9_-]{1,64}` なので shortcode 直接には `%` は入らない
+    // shortcode は `[A-Za-z0-9_-]{1,128}` (Issue #188) なので shortcode 直接には `%` は入らない
     // が、`_` は valid 文字。`q=_` を投げたとき *全件* マッチに化けないことを
     // 保証する (= `_` は SQL LIKE で「任意 1 文字」だが、エスケープして「文字
     // としての `_`」だけに絞れていること)。

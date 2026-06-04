@@ -11,13 +11,20 @@ use crate::model::EmojiRow;
 /// True if `shortcode` is safe to use as an emoji identifier and as a
 /// component of the versitygw object key (e.g. `emoji/local/<shortcode>.webp`).
 ///
-/// Restricted to ASCII alphanumeric + `_` + `-`, length 1..=64. Matches the
-/// `CHECK` constraint in `0005_emoji.sql` so the application catches the
+/// Restricted to ASCII alphanumeric + `_` + `-`, length 1..=128. Matches the
+/// `CHECK` constraint in `0017_emoji_shortcode_128.sql` (which superseded the
+/// `{1,64}` constraint in `0005_emoji.sql`) so the application catches the
 /// failure before hitting the DB (better error message) but the DB also
 /// refuses it as defence in depth (zip-slip relative to S3 keys).
+///
+/// Issue #188: upper bound widened from 64 to 128 to align with Misskey
+/// (`^[a-zA-Z0-9_]+$` length 128). The charset stays `[a-zA-Z0-9_-]` (= still
+/// allowing `-` even though Misskey itself does not) to preserve existing rows
+/// with hyphenated shortcodes (e.g. `blob-smile`) imported from Misskey-
+/// compatible zip packs.
 pub fn is_valid_shortcode(shortcode: &str) -> bool {
     let len = shortcode.len();
-    (1..=64).contains(&len)
+    (1..=128).contains(&len)
         && shortcode
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -37,7 +44,7 @@ pub struct NewLocalEmoji {
 pub async fn upsert_local(pool: &PgPool, new: NewLocalEmoji) -> sqlx::Result<EmojiRow> {
     if !is_valid_shortcode(&new.shortcode) {
         return Err(sqlx::Error::Protocol(format!(
-            "invalid emoji shortcode {:?}; must match [a-zA-Z0-9_-]{{1,64}}",
+            "invalid emoji shortcode {:?}; must match [a-zA-Z0-9_-]{{1,128}}",
             new.shortcode
         )));
     }
@@ -204,7 +211,7 @@ pub struct NewRemoteEmoji {
 pub async fn upsert_remote(pool: &PgPool, new: NewRemoteEmoji) -> sqlx::Result<EmojiRow> {
     if !is_valid_shortcode(&new.shortcode) {
         return Err(sqlx::Error::Protocol(format!(
-            "invalid emoji shortcode {:?}; must match [a-zA-Z0-9_-]{{1,64}}",
+            "invalid emoji shortcode {:?}; must match [a-zA-Z0-9_-]{{1,128}}",
             new.shortcode
         )));
     }
