@@ -62,7 +62,11 @@ REQUIRED_MISS_NOTE_KEYS = {
     "text",
     "cw",
     "reactions",
-    "emojis",
+    # 現行 Misskey の notes/show は **`reactionEmojis`** を返す (= reaction の
+    # name→URL マップ)。旧 `emojis` キーは廃止された。Sakurasato は互換のため
+    # `emojis` (deprecated 空 object) も emit するが、両者が確実に持つのは
+    # `reactionEmojis` なので必須キーはこちらで照合する (#201)。
+    "reactionEmojis",
 }
 
 # Misskey の MissUser が `users/show` で返す必須キー。
