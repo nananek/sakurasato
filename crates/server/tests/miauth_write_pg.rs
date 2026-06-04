@@ -148,6 +148,51 @@ async fn seed_remote_actor(pool: &PgPool, host: &str, user: &str) -> i64 {
         .id
 }
 
+/// remote actor が所有する note を 1 件 seed する (= ownership 拒否テスト用)。
+async fn seed_remote_note(pool: &PgPool, actor_id: i64, ap_id: &str) -> i64 {
+    repo::note::insert(
+        pool,
+        repo::note::NewNote {
+            ap_id: ap_id.into(),
+            actor_id,
+            content: "remote post".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: json!([]),
+            tags: json!([]),
+            is_local: false,
+            url: Some(ap_id.into()),
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .expect("seed remote note")
+    .id
+}
+
+/// `follower` が `followed` を accepted で follow している状態を作る
+/// (= `list_accepted_inboxes(followed)` が follower の inbox を返すようにする)。
+#[allow(clippy::similar_names)] // follower_id / followed_id は AP 用語
+async fn accepted_follow(pool: &PgPool, follower_id: i64, followed_id: i64) {
+    let row = repo::follow::insert_pending(
+        pool,
+        &format!("https://example.test/follows/{follower_id}-{followed_id}"),
+        follower_id,
+        followed_id,
+    )
+    .await
+    .expect("insert pending follow");
+    repo::follow::set_state(pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .expect("accept follow");
+}
+
 async fn issue_token_with_scopes(pool: &PgPool, scopes: &[&str]) -> String {
     use sakurasato_server::token::{generate_raw, hash};
     let raw = generate_raw();
@@ -244,6 +289,22 @@ async fn notes_create_empty_text_returns_400(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// **PR #166 review item 3 fix**: `fileIds` に数値化できない値が含まれると
+/// silent drop せず `400 INVALID_PARAM` を返す (= 添付欠落の無言失敗を防ぐ)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_create_invalid_file_id_returns_400(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+
+    let body = json!({"i": token, "text": "with attachment", "fileIds": ["not-a-number"]});
+    let resp = post_json(app, "/api/notes/create", body).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "INVALID_PARAM");
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn notes_create_without_scope_is_401(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
@@ -294,6 +355,36 @@ async fn notes_delete_removes_note_and_returns_204(pool: PgPool) {
     assert!(row.is_none(), "note row must be deleted");
 }
 
+/// **PR #166 review item 5(a)**: remote actor が所有する note を local user の
+/// token で削除しようとしても `403 PERMISSION_DENIED` で弾き、note 行は残す
+/// (= ownership 検査が note を消す前に効く)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_delete_remote_owned_note_returns_403(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let remote_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let note_id = seed_remote_note(&pool, remote_id, "https://misskey.io/notes/abc").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/notes/delete",
+        json!({"i": token, "noteId": note_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "PERMISSION_DENIED");
+    // ownership 検査 (`note.actor_id != viewer`) が先に効くことを message で pin
+    // する (= `!note.is_local` 分岐ではなく所有権分岐が短絡している証拠)。
+    assert_eq!(v["error"]["message"], "note not owned by you");
+
+    // 他人の note を消していないこと。
+    let row = repo::note::get_by_id(&pool, note_id).await.unwrap();
+    assert!(row.is_some(), "remote note must not be deleted");
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn notes_delete_unknown_note_returns_404(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
@@ -308,6 +399,63 @@ async fn notes_delete_unknown_note_returns_404(pool: PgPool) {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// **PR #166 review item 2 の test**: delete 配送される Delete activity の id が
+/// `{note_ap_id}/activity/delete-{note.id}` で **決定論的** (= ms timestamp 依存
+/// ではない) ことを `delivery_queue` 経由で検証する。accepted follower を 1 人作って
+/// 配送先 inbox を確保しないと `delivery_queue` が空になるので bob を follow させる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_delete_enqueues_deterministic_delete_activity(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // bob → alice の accepted follow (= alice の note は bob の inbox に配送される)。
+    accepted_follow(&pool, bob, alice).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+
+    // 投稿 → 削除。
+    let v = read_json(
+        post_json(
+            app.clone(),
+            "/api/notes/create",
+            json!({"i": token, "text": "delete me"}),
+        )
+        .await,
+    )
+    .await;
+    let note_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let resp = post_json(
+        app,
+        "/api/notes/delete",
+        json!({"i": token, "noteId": note_id}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // delivery_queue に Delete activity が積まれ、その id が決定論的であること。
+    // runtime クエリ (= マクロでない) なので .sqlx offline cache は不要。
+    let activity: JsonValue = sqlx::query_scalar(
+        "SELECT activity FROM delivery_queue WHERE activity->>'type' = 'Delete' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("a Delete activity must be enqueued to the follower inbox");
+
+    assert_eq!(activity["type"], "Delete");
+    let activity_id = activity["id"].as_str().expect("activity id must be string");
+    assert!(
+        activity_id.ends_with(&format!("/activity/delete-{note_id}")),
+        "delete activity id must be deterministic note-anchored (delete-<note.id>), got {activity_id}"
+    );
+    // object は削除対象 note の ap_id。
+    let object = activity["object"].as_str().expect("object must be string");
+    assert!(
+        object.ends_with(&format!("/notes/{note_id}")),
+        "Delete object must reference the note ap_id, got {object}"
+    );
 }
 
 // ─── reactions/create + delete ─────────────────────────────────────────

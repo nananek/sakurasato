@@ -147,7 +147,11 @@ fn map_reaction_core_err(err: &ReactionCoreError) -> Response {
             "UNAVAILABLE",
             "local actor not initialized; run `sakurasato init`",
         ),
-        ReactionCoreError::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        ReactionCoreError::Internal => error_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "reaction operation failed; check server logs",
+        ),
     }
 }
 
