@@ -4,7 +4,7 @@
 # Usage: scripts/federation-test/down.sh <impl>
 set -euo pipefail
 
-IMPLS=(mastodon misskey pleroma mitra fedibird nekonoverse)
+IMPLS=(mastodon misskey pleroma mitra fedibird nekonoverse nekonoverse-2sks)
 
 usage() {
   echo "Usage: $0 <impl>" >&2

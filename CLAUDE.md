@@ -308,6 +308,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 - **Dependency Review** (`dependency-review.yml`): high 以上で fail、GPL/AGPL/SSPL を deny（MIT 維持）。
 - **Federation Test (Mastodon)** (`federation-test.yml`): pytest + httpx で Sakurasato ↔ Mastodon の連合を programmatic に駆動。nightly cron (UTC 19:00) / `workflow_dispatch` / **`main` 向け PR** で発火 (= release 前の必須通過)。develop PR では発火しない。
 - **Federation Test (Nekonoverse / tmux TUI)** (`federation-test-nekonoverse.yml`): tmux pty + 実 sakurasato-tui binary で Sakurasato ↔ Nekonoverse を駆動。nightly cron (UTC 19:30) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
+- **Federation Test (Nekonoverse / 2-sks Move A)** (`federation-test-nekonoverse-2sks.yml`): 2-sks 構成で Issue #140 PR2 (Scenario A = sks-old → sks-new Move) を駆動。alias-add x 2 + bob follow + move-out CLI 1-shot + Move propagation 観測。nightly cron (UTC 19:45) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
 - **Federation Test (Misskey / MiAuth)** (`federation-test-misskey.yml`): pytest + httpx + misskey.py (= YuzuRyo61, MIT) で Sakurasato ↔ Misskey を駆動。`test_misskey_smoke.py` (連合) + `test_miauth_{flow,read,write}_parity.py` (MiAuth wire-compat parity) を流す。nightly cron (UTC 20:00) / `workflow_dispatch` / **`main` 向け PR** で発火。Misskey 本体は AGPL-3.0 だが未改変 image の CI 起動は §13 (network copyleft) を起動しない (= [`agpl-discipline-miauth`](DEPLOYMENT.md#6-miauth-経路-mobile-misskey-互換))。
 - **Claude PR レビュー** (`claude-review.yml`): `anthropics/claude-code-action@v1`、認証 **`secrets.CLAUDE_CODE_OAUTH_TOKEN`**。PR 自動 + `@claude` メンション、verdict 付き top-level コメントを必ず投稿。
 - **Dependabot** (`dependabot.yml`): `cargo`/`github-actions`/`docker` を週次更新。
@@ -323,6 +324,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 | `claude-review` | `claude-review.yml` | verdict コメント (= 全 PR で必須) |
 | `Mastodon (programmatic)` | `federation-test.yml` | 実 Mastodon との連合疎通 |
 | `Nekonoverse (tmux TUI)` | `federation-test-nekonoverse.yml` | 実 Nekonoverse との TUI 連合 |
+| `Nekonoverse (2-sks Move A)` | `federation-test-nekonoverse-2sks.yml` | sks-old → sks-new Move を 2-sks 構成で観測 (#140 PR2) |
 | `Misskey + MiAuth (programmatic)` | `federation-test-misskey.yml` | 実 Misskey との連合 + MiAuth wire-compat parity |
 | `Build server` / `Build media-proxy` / `Build versitygw` / `Build tui` | `release-validation.yml` (matrix) | 4 Dockerfile が個別に build できる |
 | `Stack smoke (compose up + nodeinfo probe)` | `release-validation.yml` | compose stack が起動して well-known が応答 |

@@ -1,0 +1,613 @@
+# Sakurasato ↔ Nekonoverse 連合テスト (#140 PR2 / Scenario A = 2-sks Move).
+#
+# **既存 `docker-compose.federation-nekonoverse.yml` との関係**: 本ファイルは
+# 派生ではなく *独立した stack* として扱う。`extends:` を使うと compose のキー
+# 解決が読みにくくなる + setup chain が両 file 横断で grep しづらくなる、と
+# いう既存方針 (= Mastodon / Misskey / Mitra / Fedibird / Nekonoverse 各 file
+# が独立) を踏襲する。重複コードは増えるが grep 性を優先する。
+#
+# **Scenario A の流れ**: alice@sakurasato が alice@sakurasato-new に Move
+# する経路を nkv (= bob) 側から観測する:
+#   1. alias-add x 2 が双方向 alsoKnownAs を確立
+#   2. bob-follow-alice-trigger が bob から alice@sakurasato への Follow を
+#      投入し accepted まで polling
+#   3. move-out-trigger が `sakurasato-server move-out` で sks-old から
+#      Move activity を bob inbox に enqueue
+#   4. pytest が bob の following に alice@sakurasato-new が現れるまで polling
+#      (= nkv `handle_incoming_move` が auto re-follow を立て、sks-new alice が
+#      Accept で応える end-to-end)
+#
+# 起動: scripts/federation-test/up.sh nekonoverse-2sks
+# 停止: scripts/federation-test/down.sh nekonoverse-2sks
+# pytest: scripts/federation-test/pytest.sh nekonoverse-2sks
+
+services:
+  certs:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache openssl >/dev/null 2>&1 && /gen-certs.sh"
+    environment:
+      # Scenario A 用: 旧 alice の `sakurasato` と新 alice の `sakurasato-new` の
+      # 双方を CA で発行する。1-sks 版と nginx config を共有しないため別 host
+      # alias で立てる必要がある。
+      CERT_DOMAINS: sakurasato,sakurasato-new,nekonoverse
+    volumes:
+      - certs:/certs
+      - ./federation-test/_common/gen-certs.sh:/gen-certs.sh:ro
+
+  # ── Sakurasato (sks-old) Instance ─────────────────────────
+  postgres-sks:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: sakurasato
+      POSTGRES_USER: sakurasato
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U sakurasato
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - nekonoverse-fed
+
+  versitygw-sks:
+    build:
+      context: ..
+      dockerfile: docker/versitygw.Dockerfile
+    image: sakurasato/versitygw:dev
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'mkdir -p /data/sakurasato && exec versitygw --port=:7070 --access=sakurasato posix /data'
+    environment:
+      ROOT_SECRET_ACCESS_KEY: testpass
+    volumes:
+      - versitygw_sks_data:/data
+    networks:
+      - nekonoverse-fed
+
+  sakurasato-init:
+    build:
+      context: ..
+      dockerfile: docker/server.Dockerfile
+    image: sakurasato/server:dev
+    command: ["init", "--display-name", "Sakurasato Old"]
+    environment: &sakurasato_old_env
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SAKURASATO_STORAGE__ENDPOINT: http://versitygw-sks:7070
+      SAKURASATO_STORAGE__ACCESS_KEY_ID: sakurasato
+      SAKURASATO_STORAGE__SECRET_ACCESS_KEY: testpass
+      SAKURASATO_STORAGE__BUCKET: sakurasato
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      postgres-sks:
+        condition: service_healthy
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - nekonoverse-fed
+    restart: "no"
+
+  sakurasato-server:
+    image: sakurasato/server:dev
+    command: ["serve"]
+    environment:
+      <<: *sakurasato_old_env
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
+      versitygw-sks:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+      - media_sock:/run/sakurasato
+    networks:
+      - nekonoverse-fed
+
+  sakurasato-media-proxy:
+    build:
+      context: ..
+      dockerfile: docker/media-proxy.Dockerfile
+    image: sakurasato/media-proxy:dev
+    environment:
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    healthcheck:
+      test: ["CMD", "/app/sakurasato-media-proxy", "--healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
+    networks:
+      - nekonoverse-fed
+
+  nginx-sks:
+    image: nginx:alpine
+    volumes:
+      - ./federation-test/_common/nginx-sakurasato.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      sakurasato-server:
+        condition: service_started
+      certs:
+        condition: service_completed_successfully
+    networks:
+      nekonoverse-fed:
+        aliases:
+          - sakurasato
+
+  # ── Sakurasato (sks-new) Instance ─────────────────────────
+  # sks-old と完全に分離した 2nd インスタンス。DB / versitygw / server / nginx
+  # の名前を `*-new` 化、share する volume を分離 (`media_sock_new` / `versitygw_sks_new_data`)。
+  # nginx は別 cert + 別 upstream で `sakurasato-new` alias を握る。
+  postgres-sks-new:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: sakurasato
+      POSTGRES_USER: sakurasato
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U sakurasato
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - nekonoverse-fed
+
+  versitygw-sks-new:
+    image: sakurasato/versitygw:dev
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'mkdir -p /data/sakurasato && exec versitygw --port=:7070 --access=sakurasato posix /data'
+    environment:
+      ROOT_SECRET_ACCESS_KEY: testpass
+    volumes:
+      - versitygw_sks_new_data:/data
+    depends_on:
+      versitygw-sks:
+        condition: service_started
+    networks:
+      - nekonoverse-fed
+
+  sakurasato-init-new:
+    image: sakurasato/server:dev
+    command: ["init", "--display-name", "Sakurasato New"]
+    environment: &sakurasato_new_env
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks-new:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato-new
+      SAKURASATO_SERVER__USER: me
+      SAKURASATO_STORAGE__ENDPOINT: http://versitygw-sks-new:7070
+      SAKURASATO_STORAGE__ACCESS_KEY_ID: sakurasato
+      SAKURASATO_STORAGE__SECRET_ACCESS_KEY: testpass
+      SAKURASATO_STORAGE__BUCKET: sakurasato
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      postgres-sks-new:
+        condition: service_healthy
+      certs:
+        condition: service_completed_successfully
+      sakurasato-init:
+        # 同じ image build を直列にする (= 並列で同一 Dockerfile のキャッシュを
+        # 取り合わずに済む)。sks-old init が build を済ませてから sks-new init
+        # に進む。
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - nekonoverse-fed
+    restart: "no"
+
+  sakurasato-server-new:
+    image: sakurasato/server:dev
+    command: ["serve"]
+    environment:
+      <<: *sakurasato_new_env
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot-new/local.sock
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+    depends_on:
+      sakurasato-init-new:
+        condition: service_completed_successfully
+      sakurasato-media-proxy-new:
+        condition: service_healthy
+      versitygw-sks-new:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api_new:/home/nonroot-new
+      - media_sock_new:/run/sakurasato
+    networks:
+      - nekonoverse-fed
+
+  sakurasato-media-proxy-new:
+    image: sakurasato/media-proxy:dev
+    environment:
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      sakurasato-media-proxy:
+        # 同 Dockerfile build を直列化 (sks-old → sks-new)。
+        condition: service_healthy
+    volumes:
+      - certs:/certs:ro
+      - media_sock_new:/run/sakurasato
+    healthcheck:
+      test: ["CMD", "/app/sakurasato-media-proxy", "--healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
+    networks:
+      - nekonoverse-fed
+
+  nginx-sks-new:
+    image: nginx:alpine
+    volumes:
+      - ./federation-test/_common/nginx-sakurasato-new.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      sakurasato-server-new:
+        condition: service_started
+      certs:
+        condition: service_completed_successfully
+    networks:
+      nekonoverse-fed:
+        aliases:
+          - sakurasato-new
+
+  # ── Nekonoverse Instance ──────────────────────────────────
+  postgres-neko:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: nekonoverse
+      POSTGRES_USER: nekonoverse
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U nekonoverse
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - nekonoverse-fed
+
+  valkey-neko:
+    image: valkey/valkey:8-alpine
+    healthcheck:
+      test: valkey-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - nekonoverse-fed
+
+  nekonoverse-app:
+    image: ghcr.io/nekonoverse/nekonoverse-backend:latest
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level info"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nekonoverse:testpass@postgres-neko:5432/nekonoverse
+      VALKEY_URL: valkey://valkey-neko:6379/0
+      DOMAIN: nekonoverse
+      SECRET_KEY: test-secret-key-neko
+      FRONTEND_URL: https://nekonoverse
+      DEBUG: "true"
+      REGISTRATION_OPEN: "true"
+      SKIP_SSL_VERIFY: "true"
+      ALLOW_PRIVATE_NETWORKS: "true"
+    depends_on:
+      postgres-neko:
+        condition: service_healthy
+      valkey-neko:
+        condition: service_healthy
+    healthcheck:
+      test: python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    networks:
+      - nekonoverse-fed
+
+  nekonoverse-worker:
+    image: ghcr.io/nekonoverse/nekonoverse-backend:latest
+    command: python -m app.worker.main
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nekonoverse:testpass@postgres-neko:5432/nekonoverse
+      VALKEY_URL: valkey://valkey-neko:6379/0
+      DOMAIN: nekonoverse
+      SECRET_KEY: test-secret-key-neko
+      FRONTEND_URL: https://nekonoverse
+      DEBUG: "true"
+      REGISTRATION_OPEN: "true"
+      SKIP_SSL_VERIFY: "true"
+      ALLOW_PRIVATE_NETWORKS: "true"
+    depends_on:
+      nekonoverse-app:
+        condition: service_healthy
+    networks:
+      - nekonoverse-fed
+
+  nginx-neko:
+    image: nginx:alpine
+    volumes:
+      - ./federation-test/nekonoverse-federation/nginx-nekonoverse.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      nekonoverse-app:
+        condition: service_healthy
+      certs:
+        condition: service_completed_successfully
+    networks:
+      nekonoverse-fed:
+        aliases:
+          - nekonoverse
+
+  # ── pytest profile (#140 PR2 / Scenario A) ───────────────────
+  # `scripts/federation-test/pytest.sh nekonoverse-2sks` から発火。
+  # `up.sh nekonoverse-2sks` (= 手動 e2e) では起動しない。
+
+  # sks-old / sks-new の両方に Bearer token を発行する。Test は sks-new 側 token
+  # を直接は使わないが (bob の Move 後 follow を polling するだけ)、将来 sks-new
+  # API を直接観測する経路を追加するときのため両方を生やしておく。
+  sakurasato-token-issuer:
+    image: sakurasato/server:dev
+    command: ["token", "issue", "--name", "pytest", "--out", "/home/nonroot/pytest.token"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+  sakurasato-token-issuer-new:
+    image: sakurasato/server:dev
+    command: ["token", "issue", "--name", "pytest", "--out", "/home/nonroot-new/pytest.token"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks-new:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato-new
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init-new:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api_new:/home/nonroot-new
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+  # bob 用 OAuth Bearer (PR2b で使ったのと同じスクリプトを流用)。Scenario A
+  # では bob → alice@sakurasato Follow を成立させるために必須。
+  nekonoverse-bob-issuer:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache curl jq ca-certificates postgresql-client >/dev/null &&
+             cp /certs/ca.crt /usr/local/share/ca-certificates/test-ca.crt &&
+             update-ca-certificates >/dev/null &&
+             /seed-bob.sh"
+    environment:
+      NKV_BASE: https://nekonoverse
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      NKV_DB_HOST: postgres-neko
+      NKV_DB_PORT: "5432"
+      NKV_DB_USER: nekonoverse
+      NKV_DB_NAME: nekonoverse
+      NKV_DB_PASSWORD: testpass
+      NKV_TOKEN_OUT: /nkv-tokens/bob.token
+    depends_on:
+      nekonoverse-app:
+        condition: service_healthy
+      nginx-neko:
+        condition: service_started
+      certs:
+        condition: service_completed_successfully
+      postgres-neko:
+        condition: service_healthy
+    volumes:
+      - certs:/certs:ro
+      - ./federation-test/nekonoverse-federation/seed-bob.sh:/seed-bob.sh:ro
+      - nekonoverse_tokens:/nkv-tokens
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+  # ── Scenario A 専用 setup 1-shot chain ─────────────────────
+  #
+  # `sakurasato-server` の管理 CLI (= alias add / move-out) は **DB 直叩き**
+  # で local actor を編集する経路。docker socket をマウントせず、コンテナ
+  # 内部から `image: sakurasato/server:dev` を 1-shot で立ち上げて CLI
+  # subcommand を流す pattern で実現する。
+
+  alias-add-sks-old:
+    image: sakurasato/server:dev
+    command: ["alias", "add", "https://sakurasato-new/users/me"]
+    environment:
+      <<: *sakurasato_old_env
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+  alias-add-sks-new:
+    image: sakurasato/server:dev
+    command: ["alias", "add", "https://sakurasato/users/me"]
+    environment:
+      <<: *sakurasato_new_env
+    depends_on:
+      sakurasato-init-new:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+  # bob から alice@sakurasato への Follow を Mastodon API 経由で投入し、
+  # nkv 側で accepted まで polling する。完了をもって移動元の followers に
+  # bob が居ることが担保され、続く move-out-trigger が意味を持つ。
+  bob-follow-alice-trigger:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache curl jq ca-certificates >/dev/null &&
+             cp /certs/ca.crt /usr/local/share/ca-certificates/test-ca.crt &&
+             update-ca-certificates >/dev/null &&
+             /bob-follow-alice.sh"
+    environment:
+      NKV_BASE: https://nekonoverse
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      NKV_TOKEN_FILE: /nkv-tokens/bob.token
+      # 旧 alice の AP URI (= alias-add sks-old / sks-new の cross-reference
+      # と同一 host を使う)。
+      ALICE_OLD_AP_ID: https://sakurasato/users/me
+    depends_on:
+      nekonoverse-bob-issuer:
+        condition: service_completed_successfully
+      sakurasato-server:
+        condition: service_started
+      nginx-sks:
+        condition: service_started
+      nginx-neko:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - nekonoverse_tokens:/nkv-tokens:ro
+      - ./federation-test/nekonoverse-2sks/bob-follow-alice.sh:/bob-follow-alice.sh:ro
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+  # 全 prerequisite (alias x2 + bob-follow) 完了後、sks-old で move-out を起動。
+  # `sakurasato-server move-out https://sakurasato-new/users/me` は内部で:
+  #   1. target actor (= sks-new alice) を media-proxy 経由で fetch + upsert
+  #   2. 双方向 alsoKnownAs を検証 (alias-add 2 件で satisfy 済)
+  #   3. local actor.moved_to_ap_id を set
+  #   4. delivery_queue に Move activity を全 followers (= bob) 宛に enqueue
+  # 配送自体は sakurasato-server (= daemon) の delivery worker が非同期で行う。
+  # pytest は配送 + nkv 受領 + auto re-follow + Accept の chain を polling で見る。
+  move-out-trigger:
+    image: sakurasato/server:dev
+    command: ["move-out", "https://sakurasato-new/users/me"]
+    environment:
+      <<: *sakurasato_old_env
+      # fetch_and_upsert が media-proxy を経由するので socket を共有。
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+    depends_on:
+      alias-add-sks-old:
+        condition: service_completed_successfully
+      alias-add-sks-new:
+        condition: service_completed_successfully
+      bob-follow-alice-trigger:
+        condition: service_completed_successfully
+      sakurasato-server:
+        # delivery worker が立っていないと Move を enqueue しても出口がない。
+        condition: service_started
+      sakurasato-media-proxy:
+        condition: service_healthy
+      # sks-new の actor JSON が WebFinger で引けないと fetch_and_upsert が
+      # 失敗する。daemon + nginx を up にしておく。
+      sakurasato-server-new:
+        condition: service_started
+      nginx-sks-new:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+  pytest:
+    build:
+      context: ..
+      dockerfile: tests/federation/Dockerfile.tmux
+    image: sakurasato/federation-pytest-tmux:dev
+    command: ["pytest", "-xvs", "--tb=short", "test_nekonoverse_move_a.py"]
+    environment:
+      SAKURASATO_BASE_URL: https://sakurasato
+      SAKURASATO_DOMAIN: sakurasato
+      SAKURASATO_LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_TOKEN_FILE: /home/nonroot/pytest.token
+      # sks-new の接続情報。本 PR の test は直接は使わないが、将来観測点を
+      # 追加するときのため env で揃えておく (= 1-sks 系 conftest と同じ pattern)。
+      SAKURASATO_NEW_BASE_URL: https://sakurasato-new
+      SAKURASATO_NEW_DOMAIN: sakurasato-new
+      SAKURASATO_NEW_LOCAL_API_SOCKET: /home/nonroot-new/local.sock
+      SAKURASATO_NEW_TOKEN_FILE: /home/nonroot-new/pytest.token
+      NEKONOVERSE_BASE_URL: https://nekonoverse
+      NEKONOVERSE_DOMAIN: nekonoverse
+      NEKONOVERSE_USERNAME: bob
+      NEKONOVERSE_TOKEN_FILE: /nkv-tokens/bob.token
+      MASTODON_ENABLED: "0"
+      NEKONOVERSE_ENABLED: "1"
+      SSL_CERT_FILE: /certs/ca.crt
+      REQUESTS_CA_BUNDLE: /certs/ca.crt
+      TERM: xterm-256color
+    user: "65532:65532"
+    depends_on:
+      # move-out-trigger 完了をもって setup chain 全部の完了が保証される。
+      move-out-trigger:
+        condition: service_completed_successfully
+      sakurasato-token-issuer:
+        condition: service_completed_successfully
+      sakurasato-token-issuer-new:
+        condition: service_completed_successfully
+      nekonoverse-worker:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot:ro
+      - sakurasato_local_api_new:/home/nonroot-new:ro
+      - nekonoverse_tokens:/nkv-tokens:ro
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
+volumes:
+  certs:
+  media_sock:
+  media_sock_new:
+  sakurasato_local_api:
+  sakurasato_local_api_new:
+  nekonoverse_tokens:
+  versitygw_sks_data:
+  versitygw_sks_new_data:
+
+networks:
+  nekonoverse-fed:

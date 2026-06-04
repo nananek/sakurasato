@@ -2,14 +2,19 @@
 # Bring up a federation test stack for a given counterpart implementation.
 #
 # Usage: scripts/federation-test/up.sh <impl>
-#   impl ∈ {mastodon, misskey, pleroma, mitra, fedibird, nekonoverse}
+#   impl ∈ {mastodon, misskey, pleroma, mitra, fedibird, nekonoverse,
+#           nekonoverse-2sks}
 #
 # Each stack is fully self-contained: sakurasato + its postgres + nginx +
 # certs + the counterpart impl. CI does not run these (excluded via
 # paths-ignore) — they are for manual e2e verification on a dev machine.
+#
+# `nekonoverse-2sks` は #140 PR2 (Move Scenario A) 用の 2-sks stack。
+# sks-old (`sakurasato`) と sks-new (`sakurasato-new`) を並走させ、
+# alice の Move を bob 視点で観測する。
 set -euo pipefail
 
-IMPLS=(mastodon misskey pleroma mitra fedibird nekonoverse)
+IMPLS=(mastodon misskey pleroma mitra fedibird nekonoverse nekonoverse-2sks)
 
 usage() {
   echo "Usage: $0 <impl>" >&2
@@ -36,5 +41,12 @@ echo "==> bringing up federation test stack: $impl"
 docker compose -f "$compose_file" up -d --build --wait
 
 echo "==> stack is up. Hosts (add to /etc/hosts if you want browser access):"
-echo "    127.0.0.1 sakurasato $impl"
+case "$impl" in
+  nekonoverse-2sks)
+    echo "    127.0.0.1 sakurasato sakurasato-new nekonoverse"
+    ;;
+  *)
+    echo "    127.0.0.1 sakurasato $impl"
+    ;;
+esac
 echo "==> follow-up: scripts/federation-test/setup-${impl}.sh"
