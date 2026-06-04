@@ -771,6 +771,115 @@ class NekonoverseClient:
         resp.raise_for_status()
         return resp.json()
 
+    # ── Move (#140 PR1 / Scenario B) ─────────────────────────
+    def register_app(
+        self,
+        *,
+        client_name: str = "sakurasato-e2e",
+        scopes: str = "read write follow",
+    ) -> dict:
+        """``POST /api/v1/apps`` → ``POST /oauth/token`` (client_credentials)
+        の 2 段を 1 関数で済ませる。返り値は ``{client_id, client_secret,
+        access_token}`` 形式の dict ── `register_account` への `app_token`
+        として ``access_token`` を渡す経路。
+        """
+        app_resp = self.http.post(
+            "/api/v1/apps",
+            json={
+                "client_name": client_name,
+                "redirect_uris": "urn:ietf:wg:oauth:2.0:oob",
+                "scopes": scopes,
+            },
+        )
+        app_resp.raise_for_status()
+        app = app_resp.json()
+        token_resp = self.http.post(
+            "/oauth/token",
+            json={
+                "grant_type": "client_credentials",
+                "client_id": app["client_id"],
+                "client_secret": app["client_secret"],
+                "scope": scopes,
+            },
+        )
+        token_resp.raise_for_status()
+        return {
+            "client_id": app["client_id"],
+            "client_secret": app["client_secret"],
+            "access_token": token_resp.json()["access_token"],
+        }
+
+    def register_account(
+        self,
+        *,
+        app_token: str,
+        username: str,
+        email: str,
+        password: str,
+    ) -> dict:
+        """``POST /api/v1/accounts`` ── 新規アカウントを Mastodon 互換で登録。
+
+        2nd 用 OAuth app を別途立てる手間を省くため、呼び出し側で
+        `register_app` で取った `app_token` を渡してもらう。返り値は
+        Mastodon 仕様の Token (`{access_token, token_type, scope, ...}`)
+        ── このアカウントとして login 済の Bearer として直後の auth 操作
+        (= `update_credentials_also_known_as`) に使える。
+        """
+        payload = {
+            "username": username,
+            "email": email,
+            "password": password,
+            "agreement": True,
+            "locale": "en",
+        }
+        resp = self.http.post(
+            "/api/v1/accounts",
+            json=payload,
+            headers={"Authorization": f"Bearer {app_token}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def update_credentials_also_known_as(
+        self, *, token: str, also_known_as: list[str]
+    ) -> dict:
+        """``PATCH /api/v1/accounts/update_credentials`` で `also_known_as`
+        を更新する。Nekonoverse は Form 入力で受けるので
+        ``multipart/form-data`` で JSON 配列を文字列として送る。
+
+        Move 受領 (sks 側 `handle_move`) が target.alsoKnownAs に signer を
+        含むことを要求するため、Scenario B (#140 PR1) で bob_new に bob の
+        AP id を 1 件積むのに使う。
+        """
+        import json as _json
+
+        resp = self.http.patch(
+            "/api/v1/accounts/update_credentials",
+            files={"also_known_as": (None, _json.dumps(also_known_as))},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def initiate_move(self, *, token: str, target_ap_id: str) -> dict:
+        """``POST /api/v1/accounts/move`` で **このアカウント本人** から
+        ``target_ap_id`` へのアカウント引っ越しを開始する (= Nekonoverse の
+        ``initiate_move`` 経路、`activitypub/renderer.render_move_activity`)。
+
+        nkv は target の AP JSON を fetch し、`alsoKnownAs` に自分が含まれて
+        いるか検証 → 自身に `moved_to_ap_id` を立て → followers 全 inbox に
+        `Move` activity を配送する。`Bearer` を明示渡しできるよう
+        `_auth_headers` ではなく引数の `token` を使う ── 2nd actor (= bob_new)
+        の token と切り替えたい場面が多い。
+        """
+        resp = self.http.post(
+            "/api/v1/accounts/move",
+            json={"target_ap_id": target_ap_id},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def lookup_status(self, url: str) -> dict | None:
         """remote note の URL を nkv 側の local status 行に解決する。
 
