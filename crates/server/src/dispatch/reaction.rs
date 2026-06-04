@@ -133,7 +133,14 @@ async fn process_inbound_reaction(
 ) -> Result<(), DispatchError> {
     let activity_id = super::extract_activity_id(activity)?.to_string();
     let object_uri = super::extract_object_uri(activity)?.to_string();
-    let content = extract_content(activity, kind)?;
+    let raw_content = extract_content(activity, kind)?;
+    // Issue #186: inbound 側でも `:foo@host:` の `@host` suffix を剥がし、
+    // DB / wire 上の reaction key を OUTBOUND (PR #183) と同じ `:foo:` 形に揃える。
+    // 連合相手の wire form が `:foo:` だったり `:foo@theirhost:` だったり
+    // `:foo@oursakurasato:` だったりするのを **shortcode 単位で 1 つのバケツに
+    // まとめる** ── これで Aria など Misskey-compat client の `notes/show`
+    // 表示で「同じ shortcode が 2 行に分かれて出る」現象を抑える。
+    let content = normalize_inbound_reaction_content(&raw_content);
 
     // 対象 Note は **local** でなければ受けない (= remote 同士の reaction が
     // 我々の inbox に流れてくる経路は想定しないし、流れてきても DB に Note
@@ -162,6 +169,10 @@ async fn process_inbound_reaction(
     }
 
     // `tag: [Emoji]` を学習し、対応する emoji_id があれば reaction に紐付ける。
+    // [`learn_emoji_tag`] は内部で `extract_shortcode` を呼ぶので `content` /
+    // `raw_content` のどちらを渡しても shortcode 比較は同じ結果になるが、
+    // normalize 後の content を渡しておく方が「DB に書く値で学習する」一貫性
+    // が取れる。
     let emoji_id = learn_emoji_tag(state, signer, activity, &content).await;
 
     let inserted = repo::reaction::insert_or_get(
@@ -181,16 +192,45 @@ async fn process_inbound_reaction(
         reaction_id = inserted.id,
         note_id = note.id,
         signer = %signer.ap_id,
+        raw_content = %raw_content,
         content = %content,
         emoji_id = ?emoji_id,
         "reaction recorded",
     );
 
     // 通知発火 (fire-and-forget)。reaction target は local note のみここに来る
-    // (上で `is_local` チェック済み)。
+    // (上で `is_local` チェック済み)。通知本文も正規化済 content (= UI 表示
+    // と一致する文字列) を使う。
     notification::dispatch::notify_reaction(state, signer, &note, &content).await;
 
     Ok(())
+}
+
+/// Issue #186: inbound reaction の content を `:shortcode:` 形に正規化する。
+///
+/// PR #183 の OUTBOUND 側 [`parse_local_emoji_shortcode`](crate::local_api::reactions)
+/// と対称形。**`@host` の host が何であろうと無条件で剥がす** ── 我々の
+/// サーバが同時に複数 hostname (公開 AP host / Tailscale tailnet host 等) で
+/// 見える運用 ([[deployment-tailscale-cloudflared]]) で、相手が hint してきた
+/// host が「本当のリモートホスト」か「我々を指す別名」か区別する手段が
+/// サーバ側に無い (= `config.server.host` との exact match だけでは tailnet
+/// 経由 Aria を巻き込み拒否する)。
+///
+/// Unicode / 素 `:shortcode:` は touch せずそのまま返す。`:` で囲まれていない
+/// 入力は Unicode 扱いで素通し。
+///
+/// 連合先の `tag.Emoji.name` は通常 `:shortcode:` (host suffix なし) で来るので、
+/// 本関数で content から host を剥がしても [`learn_emoji_tag`] の shortcode 比較
+/// は変わらず動く ── どちらも `extract_shortcode` 経由で shortcode 部だけ比較
+/// しているため。
+fn normalize_inbound_reaction_content(content: &str) -> String {
+    let Some(shortcode) = extract_shortcode(content) else {
+        // Unicode (= `:` 囲みでない) や empty / malformed は素通し。
+        // empty は呼び出し元 ([`extract_content`]) が `EmojiReact` でだけ
+        // ガード済 (`Like` は空 OK)。
+        return content.to_string();
+    };
+    format!(":{shortcode}:")
 }
 
 /// `content` を Activity から取り出す。
@@ -388,5 +428,65 @@ mod tests {
         let activity = serde_json::json!({"type": "EmojiReact", "content": big});
         let err = extract_content(&activity, ReactionKind::EmojiReact).unwrap_err();
         assert!(matches!(err, DispatchError::Malformed(_)));
+    }
+
+    /// Issue #186: 素の `:foo:` (= 標準的な Misskey/Mastodon wire) は touch せず
+    /// そのまま返す。`build_reactions` の `BTreeMap` key として既存パスを壊さない
+    /// ことを担保する回帰テスト。
+    #[test]
+    fn normalize_inbound_passes_through_bare_shortcode() {
+        assert_eq!(normalize_inbound_reaction_content(":blob:"), ":blob:");
+        assert_eq!(
+            normalize_inbound_reaction_content(":blob_party:"),
+            ":blob_party:"
+        );
+    }
+
+    /// Issue #186 のメイン: `:foo@<anyhost>:` 形式は `:foo:` に正規化する。
+    /// host が「真リモート」「自ホスト」「`.` (= local sentinel)」のいずれでも
+    /// 同じく strip ── サーバ側で「自ホスト集合の正確な enumeration」が
+    /// 取れない (= tailnet / 公開 AP / cloudflared 等で複数 hostname) ため、
+    /// PR #183 OUTBOUND と同じく無条件 strip にする。
+    #[test]
+    fn normalize_inbound_strips_host_suffix_unconditionally() {
+        assert_eq!(
+            normalize_inbound_reaction_content(":blob@misskey.io:"),
+            ":blob:"
+        );
+        assert_eq!(
+            normalize_inbound_reaction_content(":blob@oursakurasato.test:"),
+            ":blob:"
+        );
+        assert_eq!(normalize_inbound_reaction_content(":blob@.:"), ":blob:");
+        // Misskey-dart 系の port 付き host (例: tailnet `:8443`) も `extract_shortcode`
+        // が `split('@').next()` で先頭 `:foo` 部分だけ拾うので OK。
+        assert_eq!(
+            normalize_inbound_reaction_content(":blob@foo.tailnet.ts.net:8443:"),
+            ":blob:"
+        );
+    }
+
+    /// Issue #186: Unicode リアクション (= `:` 囲みでない裸文字列) は touch せず
+    /// 素通し。`Like` activity の空 content も同じく素通し。
+    #[test]
+    fn normalize_inbound_passes_through_unicode_and_empty() {
+        assert_eq!(normalize_inbound_reaction_content("👍"), "👍");
+        assert_eq!(normalize_inbound_reaction_content("❤"), "❤");
+        // 空文字 ── `Like` (= Mastodon の favourite) で来る wire 形式。
+        assert_eq!(normalize_inbound_reaction_content(""), "");
+        // 片側 colon ── `extract_shortcode` が `None` を返すので素通し。
+        // downstream で `(note_id, actor_id, content)` UNIQUE を踏まないよう
+        // にしているのは insert_or_get 側責務。
+        assert_eq!(normalize_inbound_reaction_content(":blob"), ":blob");
+        assert_eq!(normalize_inbound_reaction_content("blob:"), "blob:");
+    }
+
+    /// Issue #186: `:@host:` (= shortcode 部が空) は不正形式として touch しない。
+    /// `extract_shortcode` の既存挙動 (= `None` を返す) と整合し、`learn_emoji_tag`
+    /// もこの content では emoji を学習しない。
+    #[test]
+    fn normalize_inbound_does_not_touch_malformed_empty_shortcode() {
+        assert_eq!(normalize_inbound_reaction_content(":@host:"), ":@host:");
+        assert_eq!(normalize_inbound_reaction_content("::"), "::");
     }
 }
