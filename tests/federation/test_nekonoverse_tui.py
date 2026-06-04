@@ -992,10 +992,12 @@ def _next_bob_new_credentials() -> dict[str, str]:
 
     Mastodon の `/api/v1/accounts` は同じ username/email を 422 で弾くため、
     過去 stack 上で 1 度成立すると同 stack の再 run では新規 alias に倒さない
-    と取れない。固有性を担保しつつ Nekonoverse の email validator (RFC 6761
-    予約 TLD を syntactic に弾く) も避けるため、`.dev` ベースで uuid を貼る。
-    パスワードは固定で十分 (= 本テストでは login しない、token は registration
-    で返る Bearer をそのまま使う)。
+    と取れない。固有性を担保しつつ、Nekonoverse の email validator (Pydantic
+    `EmailStr`) が syntactic に弾く `.test` / `.example` / `.invalid` /
+    `.local` 等の RFC 6761 予約 TLD を避け、Google 登録の実在 gTLD である
+    `.dev` をベースに uuid を貼る (= DNS 不要、deliverability check は既定
+    無効)。パスワードは固定で十分 (= 本テストでは login しない、token は
+    registration で返る Bearer をそのまま使う)。
     """
     suffix = uuid.uuid4().hex[:10]
     return {

@@ -870,6 +870,12 @@ class NekonoverseClient:
         `Move` activity を配送する。`Bearer` を明示渡しできるよう
         `_auth_headers` ではなく引数の `token` を使う ── 2nd actor (= bob_new)
         の token と切り替えたい場面が多い。
+
+        成功は `raise_for_status()` で 2xx を境にする。返却 body の中身
+        (= 現状 ``{"ok": true}``、Mastodon 仕様の空オブジェクト、将来の
+        ``204 No Content`` まで含めて) には依存しない ── 呼び出し側も
+        Move 伝播は sks 側の DB 観測で判定するため、ここで `resp.json()` を
+        呼ばず `{}` 固定で返す (PR #194 round-2 ⚠️ #1 対応)。
         """
         resp = self.http.post(
             "/api/v1/accounts/move",
@@ -877,7 +883,7 @@ class NekonoverseClient:
             headers={"Authorization": f"Bearer {token}"},
         )
         resp.raise_for_status()
-        return resp.json()
+        return {}
 
     def lookup_status(self, url: str) -> dict | None:
         """remote note の URL を nkv 側の local status 行に解決する。
