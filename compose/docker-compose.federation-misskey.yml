@@ -230,11 +230,19 @@ services:
     # poll を embed 化)。pytest profile の depends_on で待ち合わせる。
     #
     # GitHub Actions runner では misskey upstream image (= `:latest`) の
-    # bootstrap (yarn install + migration + boot) が 5 分を越える事例が観測された
-    # ため timeout を 10 分に伸ばす。start_period も 60s に拡張して bootstrap 中の
-    # 早期失敗カウントを避ける。
+    # bootstrap (migration + boot) が 5 分を越える事例が観測されたため
+    # retries 120 × interval 5s + start_period 60s = ~11 分窓を取る。
+    #
+    # **#201**: 旧 healthcheck は `wget` 依存だったが、Misskey 公式 image
+    # (Debian / node ベース) に `wget` が無く healthcheck コマンドが常に非ゼロ
+    # 終了 → misskey-app が永久 unhealthy → stack が一度も起動しなかった疑いが
+    # 濃厚。Misskey は node app なので **node でヘルスチェック** する (= node は
+    # image に必ず存在、`fetch` は Node 18+ で global)。`/api/ping` は POST で
+    # 200 + `{pong}` を返す公開 endpoint。
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider --post-data='{}' --header='Content-Type: application/json' http://localhost:3000/api/ping 2>&1 | grep -q '200 OK'"]
+      test:
+        - "CMD-SHELL"
+        - "node -e \"fetch('http://localhost:3000/api/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>{process.exit(r.ok?0:1)}).catch(()=>{process.exit(1)})\""
       interval: 5s
       timeout: 5s
       retries: 120

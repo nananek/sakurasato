@@ -32,9 +32,35 @@ from __future__ import annotations
 
 import time
 
+import httpx
 import pytest
 
-from conftest import MISSKEY_ENABLED  # noqa: E402
+from conftest import (  # noqa: E402
+    MISSKEY_BASE_URL,
+    MISSKEY_ENABLED,
+    _SSL_VERIFY,
+)
+
+
+def _misskey_post(token: str, path: str, body: dict, *, retries: int = 6) -> httpx.Response:
+    """Misskey API を raw httpx で叩く (body に `i` = token を載せる)。
+
+    **429 (RATE_LIMIT_EXCEEDED) は短い backoff で retry** する ── parity suite は
+    同一 admin token で多数の create/delete を高速連投するため、特に全テストの
+    cleanup で叩かれる `notes/delete` が Misskey の minInterval 制限に当たりやすい。
+    """
+    resp: httpx.Response | None = None
+    for attempt in range(retries):
+        resp = httpx.post(
+            f"{MISSKEY_BASE_URL}{path}",
+            json={"i": token, **body},
+            timeout=10,
+            verify=_SSL_VERIFY,
+        )
+        if resp.status_code != 429:
+            return resp
+        time.sleep(1.5 * (attempt + 1))
+    return resp  # type: ignore[return-value]
 
 pytestmark = pytest.mark.skipif(
     not MISSKEY_ENABLED, reason="MISSKEY_ENABLED=1 でない (= Misskey stack 外)"
@@ -87,17 +113,19 @@ def test_misskey_notes_create_returns_created_note_envelope(misskey_py_client):
                 pass
 
 
-def test_misskey_notes_delete_returns_no_content(misskey_py_client):
-    """`notes/delete` の成功は 204 (= misskey-py は実装内で True を返す)。
-    Sakurasato も 204 で揃えている (= unit test
+def test_misskey_notes_delete_returns_no_content(misskey_py_client, misskey_token):
+    """`notes/delete` の成功は **204 No Content**。これを直接観測するのが本テストの
+    目的。misskey-py は 204 (= 空 body) の扱いがバージョン差で不安定なため、delete
+    は raw httpx で叩いて status を直接確認する (= meta parity の `_post_json` と
+    同じ方式)。Sakurasato も 204 で揃えている (= unit test
     `notes_delete_removes_note_and_returns_204`)。
     """
     res = misskey_py_client.notes_create(text="parity delete #160")
     note_id = res["createdNote"]["id"]
-    ok = misskey_py_client.notes_delete(note_id=note_id)
-    # misskey-py の delete は成功時 True (= 204 内部マップ) を返す慣行。
-    # 一部 fork で `{}` を返すケースもあるので両方許容。
-    assert ok is True or ok == {} or ok is None, f"unexpected delete response: {ok!r}"
+    resp = _misskey_post(misskey_token, "/api/notes/delete", {"noteId": note_id})
+    assert resp.status_code == 204, (
+        f"notes/delete must return 204 No Content; got {resp.status_code}: {resp.text[:200]}"
+    )
 
 
 # ── reactions/create + delete ────────────────────────────────────────
@@ -147,24 +175,30 @@ def test_misskey_reactions_create_local_shortcode_succeeds(misskey_py_client):
             pass
 
 
-def test_misskey_reactions_delete_succeeds_after_create(misskey_py_client):
-    """`reactions/create` → `reactions/delete` ペアが本物 Misskey で通る。
-    Sakurasato も同 pair で 204 を返す (= unit test
-    `reactions_delete_removes_my_reaction_on_note`)。
+def test_misskey_reactions_delete_succeeds_after_create(misskey_py_client, misskey_token):
+    """`reactions/create` → `reactions/delete` ペアがどちらも **204** を返す。
+    misskey-py は 204 の扱いがバージョン差で不安定なため、reaction の付与/取消は
+    raw httpx で叩いて status を直接観測する。Sakurasato も同 pair で 204
+    (= unit test `reactions_delete_removes_my_reaction_on_note`)。
     """
     res = misskey_py_client.notes_create(text="parity delete reaction #160")
     note_id = res["createdNote"]["id"]
+
     try:
-        misskey_py_client.notes_reactions_create(note_id=note_id, reaction="👍")
-        # 連合伝搬の遅延がある可能性あり ── 200ms 待つ。
-        time.sleep(0.2)
-        ok = misskey_py_client.notes_reactions_delete(note_id=note_id)
-        assert ok is True or ok == {} or ok is None
+        r_create = _misskey_post(
+            misskey_token, "/api/notes/reactions/create", {"noteId": note_id, "reaction": "👍"}
+        )
+        assert r_create.status_code == 204, (
+            f"reactions/create must be 204; got {r_create.status_code}: {r_create.text[:200]}"
+        )
+        r_delete = _misskey_post(
+            misskey_token, "/api/notes/reactions/delete", {"noteId": note_id}
+        )
+        assert r_delete.status_code == 204, (
+            f"reactions/delete must be 204; got {r_delete.status_code}: {r_delete.text[:200]}"
+        )
     finally:
-        try:
-            misskey_py_client.notes_delete(note_id=note_id)
-        except Exception:  # noqa: BLE001
-            pass
+        _misskey_post(misskey_token, "/api/notes/delete", {"noteId": note_id})
 
 
 # ── following/create + delete ────────────────────────────────────────

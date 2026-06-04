@@ -38,6 +38,8 @@ Sakurasato 自身の compat は server unit test (sqlx::test) で覆い、wire �
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from conftest import MISSKEY_ENABLED  # noqa: E402
@@ -60,7 +62,11 @@ REQUIRED_MISS_NOTE_KEYS = {
     "text",
     "cw",
     "reactions",
-    "emojis",
+    # 現行 Misskey の notes/show は **`reactionEmojis`** を返す (= reaction の
+    # name→URL マップ)。旧 `emojis` キーは廃止された。Sakurasato は互換のため
+    # `emojis` (deprecated 空 object) も emit するが、両者が確実に持つのは
+    # `reactionEmojis` なので必須キーはこちらで照合する (#201)。
+    "reactionEmojis",
 }
 
 # Misskey の MissUser が `users/show` で返す必須キー。
@@ -160,7 +166,25 @@ def test_misskey_users_show_field_types_match_sakurasato_expectations(misskey_py
             )
 
 
-# ── /api/notes/timeline ────────────────────────────────────────────────
+def _own_notes(client, *, limit: int = 20, until_id=None, since_id=None) -> list:
+    """admin (= 自分) の note 一覧を `users/notes` で取得する。
+
+    home timeline (`notes/timeline`) は **fresh single-user instance** では
+    FanoutTimeline (Redis) への自投稿の反映に依存して空になりがちで観測が
+    不安定。`users/notes` は follow グラフ非依存で著者本人の note を確実に返し、
+    `sinceId` / `untilId` の **排他** ページネーション意味論は home timeline と
+    共通なので、wire 観測 (= MissNote shape + 境界排他) の代替として等価。
+    """
+    me = client.i()
+    params: dict = {"user_id": me["id"], "limit": limit}
+    if until_id is not None:
+        params["until_id"] = until_id
+    if since_id is not None:
+        params["since_id"] = since_id
+    return client.users_notes(**params)
+
+
+# ── /api/notes/timeline (= users/notes で観測) ──────────────────────────
 
 def test_misskey_notes_create_then_timeline_returns_required_keys(misskey_py_client):
     """**本物 Misskey** で投稿 → `notes/home-timeline` 取得 → 必須キーが揃う。
@@ -180,12 +204,20 @@ def test_misskey_notes_create_then_timeline_returns_required_keys(misskey_py_cli
         created = note.get("createdNote") if isinstance(note, dict) else None
         assert created is not None, f"notes_create returned unexpected shape: {note!r}"
 
-        tl = misskey_py_client.notes_timeline(limit=10)
-        assert isinstance(tl, list)
+        # 著者本人の note 一覧 (= users/notes) で観測する。投稿直後は反映に
+        # わずかな遅延があり得るので「見えたら抜ける」ポーリング (速い環境では即抜け)。
+        ids: set = set()
+        tl: list = []
+        for _ in range(20):
+            tl = _own_notes(misskey_py_client, limit=20)
+            assert isinstance(tl, list)
+            ids = {n.get("id") for n in tl}
+            if created["id"] in ids:
+                break
+            time.sleep(0.5)
         # 必ず 1 件は (= 直前に投稿したものが) 含まれる。
-        ids = {n.get("id") for n in tl}
         assert created["id"] in ids, (
-            f"created note {created['id']!r} not in timeline ids {ids!r}"
+            f"created note {created['id']!r} not in own notes ids {ids!r} after retries"
         )
 
         # 同じ note を `notes/show` で取って 必須キーが揃うか確認。
@@ -227,15 +259,21 @@ def test_misskey_notes_timeline_since_until_boundary_is_exclusive(misskey_py_cli
     created = []
     try:
         created = [n["createdNote"]["id"] for n in (n1, n2, n3)]
+        # 3 件が users/notes に出揃うまで待つ。
+        for _ in range(20):
+            all_ids = {t["id"] for t in _own_notes(misskey_py_client, limit=20)}
+            if all(c in all_ids for c in created):
+                break
+            time.sleep(0.5)
         # untilId = n3 → 排他なので n3 自身は出ない、n1, n2 が含まれる。
-        tl = misskey_py_client.notes_timeline(until_id=created[2], limit=20)
+        tl = _own_notes(misskey_py_client, until_id=created[2], limit=20)
         ids = [t["id"] for t in tl]
         assert created[2] not in ids, (
             f"untilId should be exclusive but got {created[2]!r} in {ids!r}"
         )
         # n1, n2 のうちどちらかは含まれているはず。
         assert any(c in ids for c in (created[0], created[1])), (
-            f"expected n1 or n2 in timeline, got {ids!r}"
+            f"expected n1 or n2 in own notes, got {ids!r}"
         )
     finally:
         for cid in created:
@@ -325,15 +363,21 @@ def test_misskey_notes_timeline_pagination_with_until_id(misskey_py_client):
             res = misskey_py_client.notes_create(text=f"parity pagination #170 - {i}")
             notes.append(res["createdNote"])
 
-        # 全件取って `id DESC` であることを確認。
-        tl = misskey_py_client.notes_timeline(limit=10)
-        ids = [n["id"] for n in tl]
-        assert len(ids) >= 3, f"timeline must contain at least 3 notes; got {len(ids)}"
+        # users/notes に 3 件出揃うまで待ってから `id DESC` を確認。
+        ids: list = []
+        created_ids = {n["id"] for n in notes}
+        for _ in range(20):
+            tl = _own_notes(misskey_py_client, limit=10)
+            ids = [n["id"] for n in tl]
+            if created_ids <= set(ids):
+                break
+            time.sleep(0.5)
+        assert len(ids) >= 3, f"own notes must contain at least 3 notes; got {len(ids)}"
 
         # untilId = ids[0] (= 最新の id) で叩くと、それ未満の id (= 古い note)
         # が返るはず。
         newest_id = ids[0]
-        older = misskey_py_client.notes_timeline(limit=10, until_id=newest_id)
+        older = _own_notes(misskey_py_client, limit=10, until_id=newest_id)
         older_ids = [n["id"] for n in older]
         assert newest_id not in older_ids, (
             f"untilId is exclusive upper bound; got newest_id={newest_id!r} "
