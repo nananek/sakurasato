@@ -323,7 +323,9 @@ services:
     # されない (= 該当 fixture が無く skip)。
     command:
       - "pytest"
-      - "-xvs"
+      # **#201 一時対応**: `-x` (fail-fast) を外し、初めて実 Misskey で全件
+      # 走らせて残りの parity 不整合を 1 run で洗い出す。緑化したら `-xvs` に戻す。
+      - "-vs"
       - "--tb=short"
       - "test_misskey_smoke.py"
       - "test_miauth_flow_parity.py"

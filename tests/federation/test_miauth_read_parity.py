@@ -38,6 +38,8 @@ Sakurasato 自身の compat は server unit test (sqlx::test) で覆い、wire �
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from conftest import MISSKEY_ENABLED  # noqa: E402
@@ -180,12 +182,22 @@ def test_misskey_notes_create_then_timeline_returns_required_keys(misskey_py_cli
         created = note.get("createdNote") if isinstance(note, dict) else None
         assert created is not None, f"notes_create returned unexpected shape: {note!r}"
 
-        tl = misskey_py_client.notes_timeline(limit=10)
-        assert isinstance(tl, list)
+        # Misskey の home timeline は note 作成後の fanout (queue worker 経由) が
+        # **非同期** なので、投稿直後は空 / 未反映のことがある。数秒リトライして
+        # 反映を待つ (= eventual consistency)。固定 sleep ではなく「見えたら抜ける」
+        # ポーリングにして、速い環境では即抜ける。
+        ids: set = set()
+        tl: list = []
+        for _ in range(20):
+            tl = misskey_py_client.notes_timeline(limit=20)
+            assert isinstance(tl, list)
+            ids = {n.get("id") for n in tl}
+            if created["id"] in ids:
+                break
+            time.sleep(0.5)
         # 必ず 1 件は (= 直前に投稿したものが) 含まれる。
-        ids = {n.get("id") for n in tl}
         assert created["id"] in ids, (
-            f"created note {created['id']!r} not in timeline ids {ids!r}"
+            f"created note {created['id']!r} not in timeline ids {ids!r} after retries"
         )
 
         # 同じ note を `notes/show` で取って 必須キーが揃うか確認。
