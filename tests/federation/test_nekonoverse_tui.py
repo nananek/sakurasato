@@ -1120,7 +1120,7 @@ def test_bob_move_to_bob_new_propagates_to_sks_following(
             actor = entry.get("actor") or {}
             host = (actor.get("host") or "").lower()
             name = (actor.get("preferred_username") or "").lower()
-            if name == creds["username"].lower() and host == NEKONOVERSE_DOMAIN.lower():
+            if name == BOB_NEW_LOCAL.lower() and host == NEKONOVERSE_DOMAIN.lower():
                 return True
         return False
 
@@ -1129,7 +1129,7 @@ def test_bob_move_to_bob_new_propagates_to_sks_following(
         timeout=180,
         interval=3,
         desc=(
-            f"sks following includes bob_new ({creds['username']}@{NEKONOVERSE_DOMAIN}) "
+            f"sks following includes bob_new ({BOB_NEW_ACCT}) "
             "after nkv→sks Move propagation"
         ),
     )
