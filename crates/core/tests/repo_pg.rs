@@ -744,6 +744,146 @@ async fn reaction_count_by_note_groups_by_content(pool: PgPool) -> sqlx::Result<
     Ok(())
 }
 
+/// migration `0021_normalize_reaction_content` の本体 SQL。`include_str!` で原本を
+/// 読むのでテストと migration が drift しない (= migration は per-test の空 DB に既に
+/// 適用済みなので、stale 行を seed したあと同じ SQL を再実行して consolidation を
+/// 検証する)。
+const CONSOLIDATE_REACTION_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0021_normalize_reaction_content.sql"
+));
+
+/// PR #183/#187 以前の stale 行 (`:foo@host:` / `:foo@.:`) が migration 0021 で
+/// `:foo:` に畳まれ、Aria のリアクション絵文字「増殖」が解消されることを固定する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn reaction_content_consolidation_collapses_host_suffix_dups(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let author = repo::actor::insert(&pool, sample_local_actor("rcn1")).await?;
+    let reactor = repo::actor::insert(&pool, sample_local_actor("rcn2")).await?;
+    let other = repo::actor::insert(&pool, sample_local_actor("rcn3")).await?;
+    let note = repo::note::insert(
+        &pool,
+        repo::note::NewNote {
+            ap_id: "https://example.test/notes/rcn".into(),
+            actor_id: author.id,
+            content: "hi".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: true,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await?;
+    // local emoji `foo` を 1 件。:foo: 行にだけ emoji_id を持たせ、survivor が
+    // emoji_id 保持側に選ばれること (= 画像参照を失わない) を検証する。
+    let emoji = repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "foo".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/foo.webp".into(),
+            media_type: "image/webp".into(),
+        },
+    )
+    .await?;
+
+    // 同じ reactor が同じ note に :foo: / :foo@.: / :foo@<ourhost>: の 3 変種で
+    // 反応した stale 状態を再現 (= 増殖の元)。insert は content を正規化しない。
+    repo::reaction::insert(
+        &pool,
+        "https://x.test/r/1",
+        note.id,
+        reactor.id,
+        ":foo@.:",
+        None,
+    )
+    .await?;
+    repo::reaction::insert(
+        &pool,
+        "https://x.test/r/2",
+        note.id,
+        reactor.id,
+        ":foo:",
+        Some(emoji.id),
+    )
+    .await?;
+    repo::reaction::insert(
+        &pool,
+        "https://x.test/r/3",
+        note.id,
+        reactor.id,
+        ":foo@oursakurasato.test:",
+        None,
+    )
+    .await?;
+    // Unicode は不変。別 actor の remote 風 :bar@remote: も host 非依存 strip で :bar:。
+    repo::reaction::insert(&pool, "https://x.test/r/4", note.id, reactor.id, "👍", None).await?;
+    repo::reaction::insert(
+        &pool,
+        "https://x.test/r/5",
+        note.id,
+        other.id,
+        ":bar@remote.example:",
+        None,
+    )
+    .await?;
+
+    // migration 0021 と同一 SQL で consolidation。
+    sqlx::raw_sql(CONSOLIDATE_REACTION_SQL)
+        .execute(&pool)
+        .await?;
+
+    let counts = repo::reaction::count_by_note(&pool, note.id).await?;
+    let map: std::collections::BTreeMap<&str, i64> = counts
+        .iter()
+        .map(|c| (c.content.as_str(), c.count))
+        .collect();
+    assert_eq!(
+        map.get(":foo:"),
+        Some(&1),
+        "3 変種が 1 本の :foo: に畳まれる; got {map:?}"
+    );
+    assert_eq!(map.get("👍"), Some(&1), "Unicode は不変");
+    assert_eq!(
+        map.get(":bar:"),
+        Some(&1),
+        ":bar@remote.example: → :bar:; got {map:?}"
+    );
+    assert!(!map.contains_key(":foo@.:"), "suffix 付きキーは残らない");
+    assert!(!map.contains_key(":foo@oursakurasato.test:"));
+    assert_eq!(
+        map.len(),
+        3,
+        "残るキーは :foo: / 👍 / :bar: の 3 つだけ; got {map:?}"
+    );
+
+    // survivor は emoji_id を持つ行 (= reactionEmojis の画像を失わない)。
+    let foo_emoji: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT emoji_id FROM reaction WHERE note_id = $1 AND content = ':foo:'"#,
+        note.id
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        foo_emoji,
+        Some(emoji.id),
+        "emoji_id を持つ行が survivor に選ばれる"
+    );
+
+    Ok(())
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn emoji_upsert_remote_is_idempotent_by_ap_id(pool: PgPool) -> sqlx::Result<()> {
     // Issue #135 で `image_key` を `Option<String>` に倒し、Issue #192 で
