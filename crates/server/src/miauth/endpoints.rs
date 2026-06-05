@@ -84,6 +84,9 @@ const SUPPORTED_ENDPOINTS: &[&str] = &[
     "notes/reactions/delete",
     "following/create",
     "following/delete",
+    "drive/files/create",
+    "drive/files",
+    "drive/files/show",
 ];
 
 /// `POST /api/endpoints` handler。**認証不要** (= Misskey 本家も anonymous で

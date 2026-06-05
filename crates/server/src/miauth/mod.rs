@@ -35,6 +35,7 @@ use crate::state::AppState;
 pub mod auth;
 pub mod check;
 pub mod conv;
+pub mod drive;
 pub mod emojis;
 pub mod endpoints;
 pub mod error;
@@ -75,6 +76,11 @@ async fn healthz() -> &'static str {
 /// `emojis` / `users/show`, write endpoints: `notes/create` / `reactions/*` /
 /// `following/*`) は #159 / #160 で追加される。
 pub fn router(state: AppState) -> Router {
+    // drive/files/create は media-proxy.max_bytes 近くの大きい multipart を受ける。
+    // local_api の upload route と同じく axum 既定 (2 MiB) ではなく max_bytes に
+    // 揃える ── でないと大きい画像が size チェック前に axum で弾かれ、local_api と
+    // 挙動が非対称になる (#218 review)。
+    let upload_max = usize::try_from(state.config().media_proxy.max_bytes).unwrap_or(usize::MAX);
     Router::new()
         .route("/healthz", get(healthz))
         // M14 #168 ── instance probe (= client が login URL を入れた瞬間に叩く)
@@ -110,6 +116,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/notes/reactions/delete", post(reactions::delete))
         .route("/api/following/create", post(following::create))
         .route("/api/following/delete", post(following::delete))
+        // drive (= Aria の添付アップロード / ドライブ閲覧)
+        .route(
+            "/api/drive/files/create",
+            post(drive::create).layer(axum::extract::DefaultBodyLimit::max(upload_max)),
+        )
+        .route("/api/drive/files", post(drive::list))
+        .route("/api/drive/files/show", post(drive::show))
         // M14 #170 ── /streaming WebSocket stub (Aria UI の「接続中…」hang 回避)
         .route("/streaming", get(streaming::handle))
         .layer(TraceLayer::new_for_http())

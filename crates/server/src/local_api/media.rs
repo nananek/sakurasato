@@ -145,43 +145,74 @@ pub async fn upload(
     Query(q): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    let kind = q.kind.as_str();
+    match upload_media_core(&state, &q.kind, q.alt.as_deref(), body).await {
+        Ok((row, created)) => {
+            // dedupe ヒット (= 同一バイト列の既存行) は 200、新規 INSERT は 201。
+            let status = if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(MediaResponse::from_row(&row, host_of(&state)))).into_response()
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// 画像アップロードの共通コア。raw body (`local_api`) / multipart (`MiAuth` drive)
+/// のどちらの face からも呼べるよう、入力を **再エンコード前バイト列** +
+/// `kind` + `alt` に統一する。media-proxy サニタイズ → R2 PUT → `media` 行
+/// INSERT まで行い `(行, 新規作成か)` を返す。`created = false` は dedupe ヒット
+/// (= 同一 `storage_key` の既存行を再利用)。エラーは face 非依存の `Response`。
+#[allow(
+    clippy::too_many_lines,
+    reason = "validate → media-proxy → dedupe → R2 PUT → INSERT を 1 本のパイプラインに収める"
+)]
+pub(crate) async fn upload_media_core(
+    state: &AppState,
+    kind: &str,
+    alt: Option<&str>,
+    body: Bytes,
+) -> Result<(MediaRow, bool), Response> {
     let Some(variant) = variant_for(kind) else {
-        return bad_request("kind must be one of avatar/header/attachment");
+        return Err(bad_request("kind must be one of avatar/header/attachment"));
     };
-    if let Some(alt) = q.alt.as_ref()
+    if let Some(alt) = alt
         && alt.chars().count() > ALT_MAX
     {
-        return bad_request("alt text exceeds the 1500-character limit");
+        return Err(bad_request("alt text exceeds the 1500-character limit"));
     }
     if body.is_empty() {
-        return bad_request("request body is empty");
+        return Err(bad_request("request body is empty"));
     }
     let max_bytes = usize::try_from(state.config().media_proxy.max_bytes).unwrap_or(usize::MAX);
     if body.len() > max_bytes {
-        return error_with_body(
+        return Err(error_with_body(
             StatusCode::PAYLOAD_TOO_LARGE,
             "upload exceeds media_proxy.max_bytes",
-        );
+        ));
     }
 
-    let local_actor = match resolve_local_actor(&state).await {
-        Ok(a) => a,
-        Err(status) => return status,
-    };
+    let local_actor = resolve_local_actor(state).await?;
 
     // 1. media-proxy で再エンコード → 安全化済みバイト列
     let processed = match state.media_proxy().sanitize_image(body, variant).await {
         Ok(p) => p,
-        Err(err) => return map_proxy_error(&err),
+        Err(err) => return Err(map_proxy_error(&err)),
     };
     let Some(width) = processed.width else {
         error!("media-proxy did not return x-output-width header");
-        return error_with_body(StatusCode::BAD_GATEWAY, "media-proxy missing width");
+        return Err(error_with_body(
+            StatusCode::BAD_GATEWAY,
+            "media-proxy missing width",
+        ));
     };
     let Some(height) = processed.height else {
         error!("media-proxy did not return x-output-height header");
-        return error_with_body(StatusCode::BAD_GATEWAY, "media-proxy missing height");
+        return Err(error_with_body(
+            StatusCode::BAD_GATEWAY,
+            "media-proxy missing height",
+        ));
     };
 
     // 2. SHA-256 → storage_key (= versitygw bucket key)
@@ -209,25 +240,21 @@ pub async fn upload(
                     requested_owner = local_actor.id,
                     "media dedupe collision: existing row belongs to another actor"
                 );
-                return error_with_body(
+                return Err(error_with_body(
                     StatusCode::CONFLICT,
                     "media with the same content already exists for another actor",
-                );
+                ));
             }
             // kind / alt が違っても同じ storage_key (= 同じバイト列) なので
             // 既存行を再利用する。`kind` を上書きしない方針: アバター用に
             // 上げたものを「同じバイト列」として添付目的で再アップしても、
             // DB 上は最初に登録した kind のまま。url だけ返ればよい。
-            return (
-                StatusCode::OK,
-                Json(MediaResponse::from_row(&existing, host_of(&state))),
-            )
-                .into_response();
+            return Ok((existing, false));
         }
         Ok(None) => {}
         Err(err) => {
             error!(?err, "media dedupe lookup failed");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
     }
 
@@ -247,7 +274,10 @@ pub async fn upload(
         .await;
     if let Err(err) = put_result {
         error!(?err, storage_key, "versitygw PUT failed");
-        return error_with_body(StatusCode::BAD_GATEWAY, "object store write failed");
+        return Err(error_with_body(
+            StatusCode::BAD_GATEWAY,
+            "object store write failed",
+        ));
     }
 
     // 5. media 行 insert
@@ -258,23 +288,18 @@ pub async fn upload(
         height: i32::try_from(height).unwrap_or(i32::MAX),
         byte_size,
         kind: kind.to_string(),
-        alt_text: q
-            .alt
-            .as_ref()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
+        alt_text: alt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         owner_actor_id: local_actor.id,
     };
     let inserted = match repo::media::insert(state.pool(), new).await {
         Ok(row) => row,
         Err(err) => {
             error!(?err, "media insert failed");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
     };
 
-    let body = MediaResponse::from_row(&inserted, host_of(&state));
-    (StatusCode::CREATED, Json(body)).into_response()
+    Ok((inserted, true))
 }
 
 fn host_of(state: &AppState) -> &str {
