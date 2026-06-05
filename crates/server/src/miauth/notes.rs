@@ -40,7 +40,8 @@ use serde_json::{Value as JsonValue, json};
 use crate::local_api;
 use crate::miauth::auth;
 use crate::miauth::conv::{
-    MissNote, NoteSummary, bulk_load_note_summaries, timeline_entry_to_miss_note,
+    MissNote, NoteSummary, build_renote_miss_note, bulk_load_note_summaries, from_actor_and_counts,
+    timeline_entry_to_miss_note,
 };
 use crate::state::AppState;
 
@@ -338,13 +339,20 @@ pub async fn create(
         return auth::unauthorized("invalid or revoked token");
     };
 
-    // renote-only (= text なし + renoteId あり) の本格対応は別 PR (= 既存
-    // `/api/v1/notes/{id}/renote` の core 化が前提)。本 PR では 501 を返す。
+    // **pure renote** (= 本文なし + renoteId あり) → Announce (boost)。既存
+    // `local_api::renotes::create` (= announce 行 + 連合 Announce 配送) に通し、
+    // Misskey の renote MissNote 形にレスポンスを合成する。
     if body.text.as_deref().is_none_or(str::is_empty) && body.renote_id.is_some() {
+        return handle_renote(&state, body.renote_id.as_deref()).await;
+    }
+    // **quote renote** (= renoteId + 本文) は未対応 (= 引用は note に別 note を
+    // 参照させる別概念で core 未実装)。silent に renote 関係を落として単独 note
+    // 化しないよう、明示的に 501 を返す。
+    if body.renote_id.is_some() {
         return error_with_status(
             StatusCode::NOT_IMPLEMENTED,
-            "RENOTE_NOT_IMPLEMENTED",
-            "renote via notes/create is not implemented in this version; use /api/v1/notes/{id}/renote",
+            "QUOTE_NOT_IMPLEMENTED",
+            "quote renote (renoteId + text) is not implemented in this version",
         );
     }
 
@@ -550,15 +558,114 @@ pub async fn delete(
 ///
 /// Misskey 本体は `notes/renote` を持たず、`notes/create with renoteId` で代用する。
 /// Iceshrimp / Sharkey 系は alias として提供しているので、Sakurasato も同形で
-/// 受ける ── ただし内部実装は `notes/create with renoteId` (= Announce 経路) を
-/// 流用するため、本 PR の `create()` と同じく 501 を返す (= 別 PR で対応)。
+/// 受ける ── 内部実装は `notes/create` に forward し、`create()` 側の pure renote
+/// (= Announce) 経路を流用する。
 pub async fn renote(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Option<Json<CreateNoteBody>>,
 ) -> Response {
-    // 単に `create` に forward ── `create` 側で renoteId 未対応の 501 が走る。
     create(State(state), headers, body).await
+}
+
+/// **pure renote** (= Announce / boost) を処理する。`renoteId` の note を既存
+/// [`crate::local_api::notes`] 隣の `local_api::renotes::create` (= announce 行 +
+/// 連合 `Announce` 配送) に通し、Misskey の renote `MissNote` 形にレスポンスを
+/// 合成して返す。
+///
+/// Sakurasato は renote を `announce` テーブルで持ち独立 note 行を発行しないため、
+/// `createdNote` は announce id / `ap_id` + 元 note + renoter から
+/// [`build_renote_miss_note`] で組み立てる。
+#[allow(clippy::similar_names)] // renoter (= 行為者) / renoted (= 対象) は AP 用語
+async fn handle_renote(state: &AppState, renote_id: Option<&str>) -> Response {
+    let Some(rid) = renote_id else {
+        return error_with_status(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PARAM",
+            "renoteId is required",
+        );
+    };
+    let Ok(target_id) = rid.parse::<i64>() else {
+        return error_with_status(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PARAM",
+            "renoteId is not a valid note id",
+        );
+    };
+
+    // local_api の renote (= Announce) 経路を呼ぶ。Path(i64) で対象 note を渡す。
+    let resp =
+        local_api::renotes::create(State(state.clone()), axum::extract::Path(target_id)).await;
+    let status = resp.status();
+    let body_json = match collect_json(resp).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if !status.is_success() {
+        let message = body_json
+            .get("error")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("renote failed");
+        // 404 = note 不在、400 = visibility 不可、422 = 自己 renote、503 = DB。
+        let (code, st) = match status.as_u16() {
+            404 => ("NO_SUCH_NOTE", StatusCode::NOT_FOUND),
+            400 | 422 => ("CANNOT_RENOTE", StatusCode::BAD_REQUEST),
+            503 => ("UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE),
+            _ => ("INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR),
+        };
+        return error_with_status(st, code, message);
+    }
+
+    // AnnounceResponse { id, ap_id, note_id, queued_deliveries }。
+    let announce_id = body_json.get("id").and_then(JsonValue::as_i64).unwrap_or(0);
+    let announce_ap_id = body_json
+        .get("ap_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    // renote MissNote の合成に必要な要素を集める。
+    let Some(viewer) = resolve_self_actor_id(state).await else {
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor initialization failed",
+        );
+    };
+    let Ok(Some(local_actor)) = sakurasato_core::repo::actor::get_by_id(state.pool(), viewer).await
+    else {
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor fetch failed",
+        );
+    };
+    let Ok(Some(target_entry)) =
+        repo::note::get_timeline_entry_by_id(state.pool(), target_id).await
+    else {
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "renote target lookup failed",
+        );
+    };
+
+    let host = &state.config().server.host;
+    let summaries = bulk_load_note_summaries(state.pool(), &[target_entry.id], viewer).await;
+    let summary = summaries.remove_summary(target_entry.id);
+    let renoted = timeline_entry_to_miss_note(&target_entry, &summary, host, viewer);
+    let renoter = from_actor_and_counts(&local_actor, 0, 0, 0);
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let created_note = build_renote_miss_note(
+        announce_id,
+        &announce_ap_id,
+        &created_at,
+        renoter,
+        viewer,
+        renoted,
+    );
+    (StatusCode::OK, Json(json!({ "createdNote": created_note }))).into_response()
 }
 
 /// Misskey body → 既存 `local_api::notes::CreateNoteRequest` に翻訳する。

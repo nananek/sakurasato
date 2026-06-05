@@ -749,17 +749,92 @@ async fn following_create_without_scope_is_401(pool: PgPool) {
 
 // ─── notes/renote (Iceshrimp alias) ────────────────────────────────────
 
+/// `notes/renote { renoteId }` が remote の public note を boost (= Announce) し、
+/// `createdNote` を Misskey の renote 形 (text=null / renoteId / renote) で返す。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn notes_renote_returns_501(pool: PgPool) {
+async fn notes_renote_announces_remote_note(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let target_id = seed_remote_note(&pool, bob, "https://misskey.io/notes/xyz").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/notes/renote",
+        json!({"i": token, "renoteId": target_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    let created = &v["createdNote"];
+    // renote 形: text は null、renoteId / renote が対象 note を指す。
+    assert!(
+        created["text"].is_null(),
+        "renote text must be null: {created}"
+    );
+    assert_eq!(created["renoteId"], target_id.to_string());
+    assert_eq!(created["renote"]["id"], target_id.to_string());
+
+    // announce 行が立つ (= boost が記録される)。
+    let row = repo::announce::get_by_pair(&pool, target_id, alice)
+        .await
+        .unwrap();
+    assert!(
+        row.is_some(),
+        "an announce row must be created for the renote"
+    );
+}
+
+/// 自分の note を renote しようとすると `400 CANNOT_RENOTE` (= 自己 boost は
+/// Mastodon / Sakurasato で禁止、`local_api` の 422 を 400 にマップ)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_renote_own_note_returns_error(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
     let state = make_state(pool.clone(), "sakurasato.test", "alice");
     let app = router_for(&state);
     let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
 
-    // renoteId のみ (= 本 PR では未対応で 501)。
-    let body = json!({"i": token, "renoteId": "1"});
-    let resp = post_json(app, "/api/notes/renote", body).await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let v = read_json(
+        post_json(
+            app.clone(),
+            "/api/notes/create",
+            json!({"i": token, "text": "my own note"}),
+        )
+        .await,
+    )
+    .await;
+    let own_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let resp = post_json(
+        app,
+        "/api/notes/renote",
+        json!({"i": token, "renoteId": own_id}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let e = read_json(resp).await;
+    assert_eq!(e["error"]["code"], "CANNOT_RENOTE");
+}
+
+/// 存在しない note を renote すると `404 NO_SUCH_NOTE`。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_renote_unknown_returns_404(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/notes/renote",
+        json!({"i": token, "renoteId": "999999"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let e = read_json(resp).await;
+    assert_eq!(e["error"]["code"], "NO_SUCH_NOTE");
 }
 
 /// `replyId` 指定の `notes/create` が親 note への返信として成立する
