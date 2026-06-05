@@ -724,7 +724,12 @@ pub(crate) fn build_renote_miss_note(
     renoted: MissNote,
 ) -> MissNote {
     MissNote {
-        id: announce_id.to_string(),
+        // **id 名前空間**: announce.id と note.id は別連番なので、renote の MissNote
+        // id を素の announce_id にすると home timeline で note と衝突する
+        // (= 同じ数値 id の note/renote が混ざるとクライアントが取り違える)。
+        // `rn:` prefix で名前空間を分ける。`notes/show` も同 prefix を解す。
+        // `renote_id` (= nest した元 note の id) は素の note id のまま。
+        id: format!("rn:{announce_id}"),
         created_at: created_at.to_string(),
         text: None,
         cw: None,

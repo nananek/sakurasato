@@ -323,6 +323,73 @@ async fn timeline_returns_miss_notes_in_id_desc(pool: PgPool) {
     assert!(notes[0]["emojis"].is_object());
 }
 
+/// followee の renote (= `Announce`) が home timeline に **renote `MissNote`** と
+/// して出る (#: 報告バグ「リノートがリノートとして流れてこない」の修正)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_includes_followee_renote_as_renote(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    // alice が bob を follow している (= bob の Announce を home に取り込む)。
+    seed_accepted_follow(&pool, alice, bob).await;
+
+    // ある note を bob が boost する。boost 時刻を note より後にして先頭に来させる。
+    let note_id = seed_note(
+        &pool,
+        alice,
+        "sakurasato.test",
+        "original post",
+        Visibility::Public,
+    )
+    .await;
+    let announce = repo::announce::insert_or_get(
+        &pool,
+        "https://remote.test/users/bob/activities/announce-tl-1",
+        note_id,
+        bob,
+        chrono::Utc::now() + chrono::Duration::seconds(10),
+    )
+    .await
+    .unwrap();
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let body = json!({"i": token, "limit": 10});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/timeline")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().expect("timeline returns array");
+
+    // renote (boost 時刻が新しい) が先頭。
+    let rn = &notes[0];
+    assert_eq!(
+        rn["id"],
+        format!("rn:{}", announce.id),
+        "renote MissNote id must be namespaced rn:<announce_id>: {rn}"
+    );
+    assert!(
+        rn["text"].is_null(),
+        "renote MissNote text must be null: {rn}"
+    );
+    assert_eq!(rn["user"]["username"], "bob", "renoter must be bob: {rn}");
+    // nest した元 note は素の note id + 本文。
+    assert_eq!(rn["renoteId"], note_id.to_string());
+    assert_eq!(rn["renote"]["id"], note_id.to_string());
+    assert_eq!(rn["renote"]["text"], "original post");
+
+    // 2 件目は元 note 自体 (alice の投稿)。
+    assert_eq!(notes[1]["id"], note_id.to_string());
+    assert_eq!(notes[1]["text"], "original post");
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn timeline_since_id_filters_strictly_greater(pool: PgPool) {
     let actor_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;

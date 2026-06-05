@@ -170,6 +170,33 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<ActorRow>>
     .await
 }
 
+/// `ids` に含まれる actor をまとめて引く。home timeline に renote を混ぜる際、
+/// boost した renoter actor を一括取得するのに使う。順序は保証しないので
+/// 呼び出し側で `id -> actor` map を作って参照すること。空配列なら空を返す。
+pub async fn list_by_ids(pool: &PgPool, ids: &[i64]) -> sqlx::Result<Vec<ActorRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        ActorRow,
+        r#"
+        SELECT
+            id, ap_id, preferred_username, host, display_name, summary,
+            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
+            followers_url, following_url, public_key_id, public_key_pem,
+            private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
+            also_known_as as "also_known_as: Json<Vec<String>>",
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
+        FROM actor WHERE id = ANY($1)
+        "#,
+        ids,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// すべての local actor (= `is_local = true`) を列挙する。
 ///
 /// お一人様 server では通常 1 行だが、`init --force` で `[server].user` が
