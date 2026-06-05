@@ -358,12 +358,26 @@ pub async fn timeline(
     // renote の元 note / renoter actor を一括解決。
     let renoted_ids: Vec<i64> = renote_rows.iter().map(|r| r.renoted_note_id).collect();
     let renoter_ids: Vec<i64> = renote_rows.iter().map(|r| r.renoter_actor_id).collect();
+    // DB エラー時は renote を黙って落とす (timeline 自体は note で成立する) が、
+    // 運用で気づけるよう warn は残す (= サイレント吸収にしない、#217 review)。
     let renoted_entries = repo::note::list_timeline_entries_by_ids(state.pool(), &renoted_ids)
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                ?err,
+                "notes/timeline: renoted entries lookup failed; dropping renotes"
+            );
+            Vec::new()
+        });
     let renoter_actors = sakurasato_core::repo::actor::list_by_ids(state.pool(), &renoter_ids)
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                ?err,
+                "notes/timeline: renoter actors lookup failed; dropping renotes"
+            );
+            Vec::new()
+        });
     let entry_by_id: std::collections::HashMap<i64, &sakurasato_core::repo::note::TimelineEntry> =
         renoted_entries.iter().map(|e| (e.id, e)).collect();
     let actor_by_id: std::collections::HashMap<i64, &sakurasato_core::model::ActorRow> =
