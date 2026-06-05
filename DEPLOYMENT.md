@@ -129,6 +129,22 @@ services:
 
 `__` (アンダースコア 2 つ) がネスト区切り (`server.host` → `SAKURASATO_SERVER__HOST`)。詳細な変数名は `crates/core/src/config.rs` の `ServerConfig` / `StorageConfig` / `DatabaseConfig` / `MediaProxyConfig` を参照。
 
+#### メディア公開リダイレクト (R2 public access 等)
+
+ストレージに R2 を使い **public access を有効化**している構成では、`GET /media/<key>` を server で proxy せず公開 URL へ `302` リダイレクトさせられる:
+
+```yaml
+services:
+  server:
+    environment:
+      SAKURASATO_STORAGE__PUBLIC_BASE_URL: "https://media.example.com"  # R2 public domain / pub-xxxx.r2.dev
+```
+
+- 設定すると、認可ゲート (公開可能な key か) を通った後に `302 → <public_base_url>/<key>` を返し、バイト列は Cloudflare edge / R2 から直接配信される (server の帯域とメモリを使わない)。
+- 連合に焼き込む URL は従来どおり `https://<host>/media/<key>` のままなので、**本設定を後で切っても / R2 ドメインを変えても連合 URL は壊れない**。
+- 未設定 (既定) なら server が S3/R2 から取得して proxy 配信する (バケット非公開のままで動く)。
+- 注意: (1) R2 を public にした以上、key (SHA-256) を知る者は R2 を直叩きでき、server の認可ゲートを迂回できる (連合に出ていない下書き添付等は *URL obscurity* のみで防衛)。(2) proxy 経路で付けていた `Content-Security-Policy` / `nosniff` は R2 直配信では付かない (media-proxy の再エンコードサニタイズが担保。必要なら Cloudflare 側 Transform Rules で付与)。
+
 別案として、host 側 TOML を bind mount + `--config` で渡す方法もある:
 
 ```yaml

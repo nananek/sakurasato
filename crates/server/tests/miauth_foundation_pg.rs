@@ -62,6 +62,7 @@ mod common {
                 access_key_id: "test".into(),
                 secret_access_key: "test12345".into(),
                 secret_access_key_file: None,
+                public_base_url: None,
             },
             media_proxy: MediaProxyConfig {
                 socket: "/tmp/media.sock".into(),

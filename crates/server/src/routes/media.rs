@@ -91,6 +91,42 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
         tracing::debug!(key = %key, "media GET: refusing non-public key");
         return StatusCode::NOT_FOUND.into_response();
     }
+
+    // 公開リダイレクトモード (`storage.public_base_url` 設定時):
+    // バケットを公開 (R2 public access / CDN) にしている構成では、バイト列を
+    // server で proxy (S3 GET + 全体バッファ) せず公開 base URL へ 302 で逃がす。
+    // 上の認可ゲートを通った key だけをリダイレクトするので、orphan / 未知 key は
+    // 従来どおり 404 (ただし R2 を public にした以上、key を知る者は R2 直叩きで
+    // ゲートを迂回できる ── key は SHA-256 で未公開なので URL obscurity で防衛)。
+    // canonical URL は `<host>/media/<key>` のまま (build_media_url) なので、
+    // 本モードを切っても / R2 ドメインを変えても連合 URL は壊れない。
+    // 注: proxy 経路で付けていた CSP/nosniff は R2 直配信では付かない
+    // (= media-proxy の再エンコードサニタイズが担保するので実害は小)。
+    if let Some(base) = state.config().storage.public_base_url.as_deref() {
+        let location = format!("{}/{key}", base.trim_end_matches('/'));
+        return match HeaderValue::from_str(&location) {
+            Ok(loc) => (
+                StatusCode::FOUND,
+                [
+                    (header::LOCATION, loc),
+                    // key = SHA-256 で content-addressed なので実体は不変だが、
+                    // モードを後で切ったとき stale な 302 が残り過ぎないよう短め。
+                    // この Cache-Control で再 GET が減り、ゲートの DB lookup
+                    // (= Neon wake) 頻度も下がる。
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("public, max-age=3600"),
+                    ),
+                ],
+            )
+                .into_response(),
+            Err(err) => {
+                tracing::error!(?err, %location, "media GET: invalid redirect Location");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
+    }
+
     let bucket = state.config().storage.bucket.clone();
     let resp = match state
         .s3_client()

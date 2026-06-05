@@ -45,6 +45,7 @@ fn make_config(host: &str) -> sakurasato_core::Config {
             access_key_id: "k".into(),
             secret_access_key: "s".into(),
             secret_access_key_file: None,
+            public_base_url: None,
         },
         media_proxy: sakurasato_core::config::MediaProxyConfig {
             socket: "/tmp/x".into(),
@@ -313,6 +314,66 @@ async fn media_attachment_on_public_note_reaches_s3(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn media_public_redirect_302_for_authorized_key(pool: PgPool) {
+    // `public_base_url` 設定時、認可済 key は S3 を叩かず 302 で公開 base へ。
+    let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let note = repo::note::insert(&pool, new_note(actor.id, "redir", Visibility::Public))
+        .await
+        .unwrap();
+    let media = repo::media::insert(&pool, new_media("pub.webp", "attachment", actor.id))
+        .await
+        .unwrap();
+    repo::media::attach_to_note(&pool, &[media.id], actor.id, note.id)
+        .await
+        .unwrap();
+
+    // 末尾スラッシュ付き base を渡し、正規化 (double-slash 回避) も検証する。
+    let mut cfg = make_config("example.test");
+    cfg.storage.public_base_url = Some("https://media.example.test/".into());
+    let state = sakurasato_server::state::AppState::from_pool(pool, cfg);
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(Request::get("/media/pub.webp").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("https://media.example.test/pub.webp"),
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn media_public_redirect_still_404_for_orphan(pool: PgPool) {
+    // `public_base_url` 設定でも認可ゲートは維持: orphan attachment (note 未紐付)
+    // はリダイレクトせず 404。連合に出ていない key を公開 URL へ誘導しない。
+    let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    repo::media::insert(&pool, new_media("orphan.webp", "attachment", actor.id))
+        .await
+        .unwrap();
+
+    let mut cfg = make_config("example.test");
+    cfg.storage.public_base_url = Some("https://media.example.test".into());
+    let state = sakurasato_server::state::AppState::from_pool(pool, cfg);
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/media/orphan.webp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
