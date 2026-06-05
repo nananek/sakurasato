@@ -66,6 +66,9 @@ const SUPPORTED_ENDPOINTS: &[&str] = &[
     "stats",
     // session whoami (= #158)。
     "i",
+    // in-app 通知フィード (= #206 PR2、Aria 通知タブ)。
+    "i/notifications",
+    "notifications/mark-all-as-read",
     // read endpoints (= #159)。
     "notes/show",
     "notes/timeline",

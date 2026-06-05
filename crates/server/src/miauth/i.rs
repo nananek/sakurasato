@@ -143,7 +143,21 @@ async fn build_self_me_detailed(state: &AppState) -> Result<JsonValue, Response>
     let max_file_size_mb = max_file_size_mb_from_bytes(cfg.media_proxy.max_bytes);
     let policies = build_policies(max_file_size_mb);
 
-    Ok(from_actor_me_detailed(
-        &actor, followers, following, notes, policies,
-    ))
+    // #206 PR2: in-app 通知の未読数。Aria 等の通知バッジ用。
+    let unread = repo::notification::count_unread(state.pool(), actor.id)
+        .await
+        .unwrap_or(0);
+
+    let mut me = from_actor_me_detailed(&actor, followers, following, notes, policies);
+    if let Some(map) = me.as_object_mut() {
+        map.insert(
+            "unreadNotificationsCount".to_string(),
+            serde_json::json!(unread),
+        );
+        map.insert(
+            "hasUnreadNotification".to_string(),
+            serde_json::json!(unread > 0),
+        );
+    }
+    Ok(me)
 }

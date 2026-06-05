@@ -42,6 +42,7 @@ pub mod i;
 pub mod meta;
 pub mod nodeinfo;
 pub mod notes;
+pub mod notifications;
 pub mod reactions;
 pub mod session;
 pub mod stats;
@@ -89,6 +90,12 @@ pub fn router(state: AppState) -> Router {
         .route("/miauth/{uuid}", get(session::handle))
         .route("/api/miauth/{uuid}/check", post(check::handle))
         .route("/api/i", post(i::handle))
+        // #206 PR2 ── in-app 通知フィード (Aria 通知タブ)
+        .route("/api/i/notifications", post(notifications::list))
+        .route(
+            "/api/notifications/mark-all-as-read",
+            post(notifications::mark_all_read),
+        )
         // M14 #159 ── read endpoints
         .route("/api/notes/show", post(notes::show))
         .route("/api/notes/timeline", post(notes::timeline))

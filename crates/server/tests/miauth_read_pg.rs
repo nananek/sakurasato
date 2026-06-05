@@ -1085,3 +1085,163 @@ async fn timeline_attachment_wire_shape_matches_misskey_dart(pool: PgPool) {
     assert!(f["properties"]["orientation"].is_null());
     assert!(f["properties"]["avgColor"].is_null());
 }
+
+// ─── i/notifications (#206 PR2) ──────────────────────────────────────────
+
+async fn post(app: axum::Router, path: &str, body: serde_json::Value) -> axum::response::Response {
+    app.oneshot(
+        Request::post(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notifications_list_returns_misskey_shape(pool: PgPool) {
+    use sakurasato_core::repo::notification::{self, NewNotification};
+
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let note_id = seed_note(&pool, alice, "sakurasato.test", "hi", Visibility::Public).await;
+    let base = chrono::Utc::now();
+    // follow (note なし)。
+    notification::insert(
+        &pool,
+        NewNotification {
+            recipient_actor_id: alice,
+            event_type: "follow".into(),
+            notifier_actor_id: Some(bob),
+            note_id: None,
+            reaction: None,
+            created_at: base,
+        },
+    )
+    .await
+    .unwrap();
+    // reaction (note + reaction、より新しい)。
+    notification::insert(
+        &pool,
+        NewNotification {
+            recipient_actor_id: alice,
+            event_type: "reaction".into(),
+            notifier_actor_id: Some(bob),
+            note_id: Some(note_id),
+            reaction: Some("👍".into()),
+            created_at: base + chrono::Duration::seconds(1),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(
+        app,
+        "/api/i/notifications",
+        json!({"i": token, "limit": 10}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    let arr = v.as_array().expect("notifications is a top-level array");
+    assert_eq!(arr.len(), 2);
+
+    // id DESC ── 最新は reaction。MissUser / MissNote / reaction が乗る。
+    let first = &arr[0];
+    assert_eq!(first["type"], "reaction");
+    assert_eq!(first["reaction"], "👍");
+    assert_eq!(first["user"]["username"], "bob");
+    assert_eq!(first["note"]["id"], note_id.to_string());
+    assert_eq!(first["isRead"], false);
+
+    // follow 通知は user あり / note 無し。
+    let follow = arr.iter().find(|n| n["type"] == "follow").unwrap();
+    assert_eq!(follow["user"]["username"], "bob");
+    assert!(
+        follow.get("note").is_none() || follow["note"].is_null(),
+        "follow notification must not carry a note"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notifications_mark_all_as_read_clears_unread(pool: PgPool) {
+    use sakurasato_core::repo::notification::{self, NewNotification};
+
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    notification::insert(
+        &pool,
+        NewNotification {
+            recipient_actor_id: alice,
+            event_type: "follow".into(),
+            notifier_actor_id: Some(bob),
+            note_id: None,
+            reaction: None,
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(notification::count_unread(&pool, alice).await.unwrap(), 1);
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(
+        app,
+        "/api/notifications/mark-all-as-read",
+        json!({"i": token}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(notification::count_unread(&pool, alice).await.unwrap(), 0);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notifications_without_token_is_401(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+
+    let resp = post(app, "/api/i/notifications", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_reports_unread_notifications_count(pool: PgPool) {
+    use sakurasato_core::repo::notification::{self, NewNotification};
+
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    for _ in 0..2 {
+        notification::insert(
+            &pool,
+            NewNotification {
+                recipient_actor_id: alice,
+                event_type: "follow".into(),
+                notifier_actor_id: Some(bob),
+                note_id: None,
+                reaction: None,
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(app, "/api/i", json!({"i": token})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let me = read_json(resp).await;
+    assert_eq!(me["unreadNotificationsCount"], 2);
+    assert_eq!(me["hasUnreadNotification"], true);
+}
