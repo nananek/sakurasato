@@ -87,6 +87,8 @@ const SUPPORTED_ENDPOINTS: &[&str] = &[
     "drive/files/create",
     "drive/files",
     "drive/files/show",
+    "drive/files/update",
+    "drive/files/delete",
 ];
 
 /// `POST /api/endpoints` handler。**認証不要** (= Misskey 本家も anonymous で

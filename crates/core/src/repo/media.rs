@@ -183,6 +183,57 @@ pub async fn get_by_id_for_owner(
     .await
 }
 
+/// `MiAuth` `drive/files/update` の `comment` (= AP alt text) 更新。所有者ガード
+/// 込みで `alt_text` を `new_alt` に上書きし、更新後の行を返す。他人の file や
+/// 存在しない id は `None`。`new_alt = None` は `alt_text` を NULL にクリアする。
+pub async fn set_alt_text_for_owner(
+    pool: &PgPool,
+    id: i64,
+    owner_actor_id: i64,
+    new_alt: Option<&str>,
+) -> sqlx::Result<Option<MediaRow>> {
+    sqlx::query_as!(
+        MediaRow,
+        r#"
+        UPDATE media
+        SET alt_text = $3, updated_at = now()
+        WHERE id = $1 AND owner_actor_id = $2
+        RETURNING id, storage_key, media_type, width, height, byte_size,
+                  kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+        "#,
+        id,
+        owner_actor_id,
+        new_alt,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// `MiAuth` `drive/files/delete` ── **未添付** (`note_id IS NULL`) の自分の file を
+/// 削除する。削除できたら `true`、添付済み / 他人 / 不在は `false` (= DELETE が
+/// 0 行)。添付済みを弾くのは、`note.attachments` JSONB スナップショットが
+/// `storage_key` を握っている既存 note の画像参照を壊さないため。
+///
+/// `storage_key` は UNIQUE (= 1 オブジェクト 1 行) なので、呼び出し側はこの行が
+/// 消えたら対応する R2 オブジェクトを安全に削除できる (他行と共有しない)。
+pub async fn delete_unattached_for_owner(
+    pool: &PgPool,
+    id: i64,
+    owner_actor_id: i64,
+) -> sqlx::Result<bool> {
+    let result = sqlx::query!(
+        r#"
+        DELETE FROM media
+        WHERE id = $1 AND owner_actor_id = $2 AND note_id IS NULL
+        "#,
+        id,
+        owner_actor_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// 添付として `note_id` に紐付ける。POST /api/v1/notes が note 挿入直後の
 /// 同一 tx 内で呼ぶ。`ids` の各行が `owner_actor_id == actor_id` かつ
 /// `note_id IS NULL` であることをここで保証する (= 横取り防止)。

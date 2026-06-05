@@ -13,6 +13,11 @@
 //!   `DriveFile` (`MissFile`) を返す。`write:drive` scope。
 //! - `POST /api/drive/files` ── 自分の drive ファイル一覧。`read:drive`。
 //! - `POST /api/drive/files/show { fileId }` ── 単一 `DriveFile`。`read:drive`。
+//! - `POST /api/drive/files/update { fileId, comment? }` ── `comment` (= alt text)
+//!   を更新。`name`/`isSensitive`/`folderId` は受理するが `media` 行に対応列が
+//!   無いため永続化しない (sensitive は AP 伝搬込みの別 issue)。`write:drive`。
+//! - `POST /api/drive/files/delete { fileId }` ── **未添付** file を削除。添付済み
+//!   は 400 (note のスナップショット参照を壊さない)。`write:drive`、204 返却。
 //!
 //! ## clean-room
 //!
@@ -203,6 +208,178 @@ pub async fn show(
             internal_error("drive file lookup failed")
         }
     }
+}
+
+/// `POST /api/drive/files/update` ── `DriveFile` のメタデータ更新。Sakurasato の
+/// `media` 行は可変属性として `alt_text` しか持たないので、永続化するのは
+/// `comment` (= AP alt text) のみ。`name` / `isSensitive` / `folderId` は受理して
+/// 200 を返すが書き込まない (モデルに対応列が無い ── sensitive は AP 伝搬込みで
+/// 別 issue)。`write:drive` scope、所有者ガード。
+///
+/// `comment` の意味は Misskey 仕様に倣う ── **不在なら据え置き**、`null` か空文字
+/// なら **クリア (NULL)**、文字列なら **設定**。present / absent を区別するため body
+/// は [`serde_json::Value`] で受ける (`Option<String>` だと両者を見分けられない)。
+pub async fn update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let body = body.map_or(serde_json::Value::Null, |j| j.0);
+    let token = body.get("i").and_then(serde_json::Value::as_str);
+    if auth::require_scope(&state, &headers, token, SCOPE_WRITE_DRIVE)
+        .await
+        .is_none()
+    {
+        return auth::unauthorized("invalid or revoked token");
+    }
+    let Some(owner) = local_actor_id(&state).await else {
+        return internal_error("local actor not initialized");
+    };
+    // fileId 不在 / 非数値はどちらも「そんな file は無い」に倒す。
+    let Some(file_id) = body
+        .get("fileId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_FILE", "no such file");
+    };
+
+    // comment: None = 据え置き / Some(None) = クリア / Some(Some) = 設定。
+    let comment_change: Option<Option<String>> = match body.get("comment") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(s)) if s.is_empty() => Some(None),
+        Some(serde_json::Value::String(s)) => {
+            if s.chars().count() > COMMENT_MAX {
+                return bad_request("comment exceeds the 1500-character limit");
+            }
+            Some(Some(s.clone()))
+        }
+        Some(_) => return bad_request("comment must be a string"),
+    };
+
+    let updated = match comment_change {
+        Some(new_alt) => {
+            match repo::media::set_alt_text_for_owner(
+                state.pool(),
+                file_id,
+                owner,
+                new_alt.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_FILE", "no such file");
+                }
+                Err(err) => {
+                    tracing::error!(?err, file_id, "drive/files/update failed");
+                    return internal_error("drive file update failed");
+                }
+            }
+        }
+        // 永続化する変更なし ── 所有者ガードのうえ現在の file をそのまま返す。
+        None => match repo::media::get_by_id_for_owner(state.pool(), file_id, owner).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_FILE", "no such file"),
+            Err(err) => {
+                tracing::error!(?err, file_id, "drive/files/update lookup failed");
+                return internal_error("drive file lookup failed");
+            }
+        },
+    };
+
+    let host = &state.config().server.host;
+    Json(media_row_to_miss_file(&updated, host)).into_response()
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct DeleteBody {
+    #[serde(default)]
+    pub i: Option<String>,
+    #[serde(rename = "fileId", default)]
+    pub file_id: Option<String>,
+}
+
+/// `POST /api/drive/files/delete { fileId }` ── 自分の **未添付** file を削除する。
+/// `write:drive` scope、所有者ガード。添付済み (= どこかの note が参照) は
+/// `400` `FILE_ATTACHED` で拒否する ── `note.attachments` JSONB スナップショットが
+/// `storage_key` を握っているので、消すと既存 note の画像参照が壊れるため。添付を
+/// 消したいときは note ごと削除する。成功は **204 No Content** (Misskey 仕様)。
+pub async fn delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<DeleteBody>>,
+) -> Response {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    if auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_DRIVE)
+        .await
+        .is_none()
+    {
+        return auth::unauthorized("invalid or revoked token");
+    }
+    let Some(owner) = local_actor_id(&state).await else {
+        return internal_error("local actor not initialized");
+    };
+    let Some(file_id) = body.file_id.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_FILE", "no such file");
+    };
+
+    // storage_key 取得 + 添付チェックのため先に引く (所有者ガード込み)。
+    let row = match repo::media::get_by_id_for_owner(state.pool(), file_id, owner).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_FILE", "no such file"),
+        Err(err) => {
+            tracing::error!(?err, file_id, "drive/files/delete lookup failed");
+            return internal_error("drive file lookup failed");
+        }
+    };
+    if row.note_id.is_some() {
+        return error_resp(
+            StatusCode::BAD_REQUEST,
+            "FILE_ATTACHED",
+            "file is attached to a note; delete the note instead",
+        );
+    }
+
+    // DB 行を先に消す (= 権威)。R2 削除が失敗して行だけ残り参照先が消える事故より、
+    // R2 に orphan object が残る方がマシ (= 後で GC 可能)。
+    match repo::media::delete_unattached_for_owner(state.pool(), file_id, owner).await {
+        Ok(true) => {}
+        // get と delete の間に attach された等のレア競合。改めて添付扱いで弾く。
+        Ok(false) => {
+            return error_resp(
+                StatusCode::BAD_REQUEST,
+                "FILE_ATTACHED",
+                "file is attached to a note; delete the note instead",
+            );
+        }
+        Err(err) => {
+            tracing::error!(?err, file_id, "drive/files/delete failed");
+            return internal_error("drive file delete failed");
+        }
+    }
+
+    // R2 オブジェクトを best-effort 削除。storage_key は UNIQUE なので他行と共有
+    // せず、この削除で別 file が壊れることはない。失敗しても row は既に消えている
+    // ので 204 を返す (orphan object のみ残る)。
+    let bucket = state.config().storage.bucket.clone();
+    if let Err(err) = state
+        .s3_client()
+        .delete_object()
+        .bucket(&bucket)
+        .key(&row.storage_key)
+        .send()
+        .await
+    {
+        tracing::warn!(
+            ?err,
+            storage_key = %row.storage_key,
+            "drive/files/delete: object store delete failed (row already removed)"
+        );
+    }
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// 設定の `[server].user@host` から local actor の id を引く (drive の所有者)。
