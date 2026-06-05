@@ -85,11 +85,20 @@ pub(crate) async fn handle_announce(
         "boost recorded",
     );
 
-    // 通知発火 (fire-and-forget)。Note は既知のもの (= 我々 local もしくは
-    // 我々が引き込んだ remote note) なので、boost が自分の note でなくても
-    // 「フォロー先が誰かの何かを boost した」が webhook に流れる。煩ければ
-    // `notify_renote` 列で off にする運用。
-    notification::dispatch::notify_renote(state, signer, &note).await;
+    // 通知は **自分の note が boost された時だけ** 発火する (Misskey / Mastodon
+    // と同じ作法)。followee が第三者の note を boost したのは home timeline の
+    // 内容であって「自分への通知」ではない ── これを通知に流すと Aria の通知
+    // タブが他人同士の renote で埋まる (報告バグ)。お一人様 server では
+    // `note.is_local` が「自分 (local actor) の note」と同値。
+    if note.is_local {
+        notification::dispatch::notify_renote(state, signer, &note).await;
+    } else {
+        debug!(
+            note_id = note.id,
+            signer = %signer.ap_id,
+            "Announce: boosted note is not ours; recorded but not notified",
+        );
+    }
 
     Ok(())
 }

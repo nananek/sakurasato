@@ -1763,6 +1763,103 @@ async fn announce_from_followee_inserts_row(pool: PgPool) {
         .unwrap();
     assert_eq!(row.note_id, note.id);
     assert_eq!(row.actor_id, remote.id);
+
+    // 報告バグの回帰防止: 第三者 (alice) の note を followee (bob) が boost した
+    // だけでは「自分への通知」を作らない (home timeline の内容であって通知では
+    // ないため)。announce 行は作るが notification 行は 0。
+    let unread = sakurasato_core::repo::notification::count_unread(&pool, local.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        unread, 0,
+        "third-party note boost must not create a self-notification"
+    );
+}
+
+/// followee が **自分 (local) の note** を boost したときは通知が作られる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn announce_of_own_note_creates_notification(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let follow_ap = format!("https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-bob-own");
+    let f = repo::follow::insert_pending(&pool, &follow_ap, local.id, remote.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, f.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    // 自分 (local) の note を作る (is_local = true)。
+    let note_ap_id = format!("https://{LOCAL_HOST}/notes/own-1");
+    let note = repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: note_ap_id.clone(),
+            actor_id: local.id,
+            content: "my own note".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::Value::Array(vec![]),
+            tags: serde_json::Value::Array(vec![]),
+            is_local: true,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let announce_ap = "https://remote.test/users/bob/activities/announce-own-1";
+    let body = serde_json::json!({
+        "id": announce_ap,
+        "type": "Announce",
+        "actor": remote.ap_id,
+        "object": note_ap_id,
+        "published": "2026-05-31T13:00:00Z",
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // announce 行 + 通知 1 行 (自分の note なので)。
+    let row = sakurasato_core::repo::announce::get_by_ap_id(&pool, announce_ap)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.note_id, note.id);
+    let unread = sakurasato_core::repo::notification::count_unread(&pool, local.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        unread, 1,
+        "boost of our own note must create a notification"
+    );
 }
 
 /// 未知 Note への Announce は no-op (= 行を作らない / fetch しない)。
