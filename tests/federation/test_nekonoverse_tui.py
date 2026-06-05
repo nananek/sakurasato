@@ -628,7 +628,14 @@ def _type_compose_body_and_submit(tui, body: str) -> None:
     tui.send_keys("F2")
     # 送出成功時 status: `posted #<id> (<N> delivered)`。失敗時は
     # `post failed: ...`。前者を厳密に待つ。
-    tui.wait_until_text(r"posted #\d+", 20)
+    #
+    # 正規表現は **POSIX ERE** で書く ── `wait_until_text` は lib.sh 側で
+    # `grep -Eq` に渡す。GNU grep の ERE は `\d` を数字クラスとして解釈せず
+    # 「stray \ before d」警告付きでリテラル `d` に倒すため、`posted #\d+` は
+    # 実際の `posted #5 ...` に**一致しない** (= ubuntu runner で 20s timeout)。
+    # ローカルの ugrep / busybox grep は `\d` を数字に解釈するので開発機では
+    # 通り、CI だけ落ちる罠だった。`[0-9]+` なら 3 実装すべてで一致する。
+    tui.wait_until_text(r"posted #[0-9]+", 20)
 
 
 def _descendants_contain_marker(
