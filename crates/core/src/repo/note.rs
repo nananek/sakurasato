@@ -375,6 +375,43 @@ pub async fn get_timeline_entry_by_id(
     .await
 }
 
+/// `ids` に含まれる note の `TimelineEntry` をまとめて引く。
+///
+/// home timeline に renote (= `announce`) を混ぜる際、boost された元 note を
+/// 一括取得して `MissNote` に変換するために使う。順序は保証しないので、呼び出し
+/// 側で `id -> entry` の map を作って参照すること。空配列なら空を返す。
+pub async fn list_timeline_entries_by_ids(
+    pool: &PgPool,
+    ids: &[i64],
+) -> sqlx::Result<Vec<TimelineEntry>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        TimelineEntry,
+        r#"
+        SELECT
+            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,
+            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,
+            n.to_recipients as "to_recipients: Json<Vec<String>>",
+            n.cc_recipients as "cc_recipients: Json<Vec<String>>",
+            n.attachments as "attachments: Json<JsonValue>",
+            n.tags as "tags: Json<JsonValue>",
+            n.is_local, n.url, n.published_at, n.edited_at, n.created_at, n.updated_at,
+            a.ap_id AS actor_ap_id,
+            a.preferred_username AS actor_preferred_username,
+            a.display_name AS actor_display_name,
+            a.icon_url AS actor_icon_url
+        FROM note n
+        JOIN actor a ON a.id = n.actor_id
+        WHERE n.id = ANY($1)
+        "#,
+        ids,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> {
     sqlx::query_as!(
         NoteRow,

@@ -101,6 +101,11 @@ pub async fn show(
     let Some(note_id_str) = body.note_id else {
         return bad_request("noteId is required");
     };
+    // renote は home timeline で `rn:<announce_id>` の合成 id を持つ。tap された
+    // ときはこの分岐で announce → 元 note + renoter から renote MissNote を返す。
+    if let Some(rest) = note_id_str.strip_prefix("rn:") {
+        return show_renote(&state, rest).await;
+    }
     let Ok(note_id) = note_id_str.parse::<i64>() else {
         return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };
@@ -169,7 +174,103 @@ pub async fn show(
     Json(note).into_response()
 }
 
+/// `notes/show { noteId: "rn:<announce_id>" }` ── home timeline 由来の renote
+/// 合成 id を tap された経路。announce を引いて元 note + renoter から renote
+/// `MissNote` を組み立てて返す (timeline の renote 項目と同形)。
+#[allow(
+    clippy::similar_names,
+    reason = "renoter (=行為者) / renoted (=対象) は AP 用語"
+)]
+async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
+    let Ok(announce_id) = announce_id_str.parse::<i64>() else {
+        return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+    };
+    let Some(viewer) = resolve_self_actor_id(state).await else {
+        return error_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor initialization failed",
+        );
+    };
+    let ann = match repo::announce::get_by_id(state.pool(), announce_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+        }
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                announce_id,
+                "miauth notes/show: announce lookup failed"
+            );
+            return error_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "renote lookup failed",
+            );
+        }
+    };
+    let entry = match repo::note::get_timeline_entry_by_id(state.pool(), ann.note_id).await {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+        }
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                note_id = ann.note_id,
+                "miauth notes/show: renoted note lookup failed"
+            );
+            return error_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "renoted note lookup failed",
+            );
+        }
+    };
+    let renoter = match sakurasato_core::repo::actor::get_by_id(state.pool(), ann.actor_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+        }
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                actor_id = ann.actor_id,
+                "miauth notes/show: renoter lookup failed"
+            );
+            return error_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "renoter lookup failed",
+            );
+        }
+    };
+    let summaries = bulk_load_note_summaries(state.pool(), &[entry.id], viewer).await;
+    let summary = summaries.remove_summary(entry.id);
+    let host = &state.config().server.host;
+    let renoted = timeline_entry_to_miss_note(&entry, &summary, host, viewer);
+    let renoter_user = from_actor_and_counts(&renoter, 0, 0, 0);
+    let created_at = ann
+        .published_at
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let note = build_renote_miss_note(
+        ann.id,
+        &ann.ap_id,
+        &created_at,
+        renoter_user,
+        ann.actor_id,
+        renoted,
+    );
+    Json(note).into_response()
+}
+
 /// `POST /api/notes/timeline` handler。
+#[allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    reason = "note/renote マージ + カーソル解決で 1 ハンドラに収める。renoter/renoted は AP 用語"
+)]
 pub async fn timeline(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -194,28 +295,37 @@ pub async fn timeline(
         .limit
         .unwrap_or(TIMELINE_LIMIT_DEFAULT)
         .clamp(1, TIMELINE_LIMIT_MAX);
-    let since_id = parse_id_opt(body.since_id.as_deref());
-    let until_id = parse_id_opt(body.until_id.as_deref());
-    let since_date = body.since_date.and_then(ms_epoch_to_datetime);
-    let until_date = body.until_date.and_then(ms_epoch_to_datetime);
+    // カーソル解決: `sinceId`/`untilId` (id 文字列、renote は "rn:N") を境界
+    // **時刻** に解決し、`sinceDate`/`untilDate` と統合する。note と renote を
+    // 時刻順にマージするため、id カーソルではなく `published_at` 一本で
+    // ページングする (id カーソルは announce.id と note.id が別連番で混在
+    // できないため)。id カーソルがあればそれを優先、無ければ date を使う。
+    let until_ts = match body.until_id.as_deref() {
+        Some(s) => resolve_cursor_ts(&state, s).await,
+        None => None,
+    }
+    .or_else(|| body.until_date.and_then(ms_epoch_to_datetime));
+    let since_ts = match body.since_id.as_deref() {
+        Some(s) => resolve_cursor_ts(&state, s).await,
+        None => None,
+    }
+    .or_else(|| body.since_date.and_then(ms_epoch_to_datetime));
 
-    let entries = match repo::note::list_home_timeline_window(
+    // note window (時刻 bound)。
+    let note_entries = match repo::note::list_home_timeline_window(
         state.pool(),
         viewer,
-        since_id,
-        until_id,
-        since_date,
-        until_date,
+        None,
+        None,
+        since_ts,
+        until_ts,
         limit,
     )
     .await
     {
         Ok(v) => v,
         Err(err) => {
-            tracing::error!(
-                ?err,
-                "miauth notes/timeline: list_home_timeline_window failed"
-            );
+            tracing::error!(?err, "miauth notes/timeline: note window failed");
             return error_with_status(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -224,21 +334,130 @@ pub async fn timeline(
         }
     };
 
-    let note_ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
-    let mut summaries = bulk_load_note_summaries(state.pool(), &note_ids, viewer).await;
+    // renote window (= 自分 / followee の Announce、時刻 bound)。
+    let renote_rows = match repo::announce::list_home_renote_window(
+        state.pool(),
+        viewer,
+        since_ts,
+        until_ts,
+        limit,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(?err, "miauth notes/timeline: renote window failed");
+            return error_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "timeline query failed",
+            );
+        }
+    };
+
+    // renote の元 note / renoter actor を一括解決。
+    let renoted_ids: Vec<i64> = renote_rows.iter().map(|r| r.renoted_note_id).collect();
+    let renoter_ids: Vec<i64> = renote_rows.iter().map(|r| r.renoter_actor_id).collect();
+    // DB エラー時は renote を黙って落とす (timeline 自体は note で成立する) が、
+    // 運用で気づけるよう warn は残す (= サイレント吸収にしない、#217 review)。
+    let renoted_entries = repo::note::list_timeline_entries_by_ids(state.pool(), &renoted_ids)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                ?err,
+                "notes/timeline: renoted entries lookup failed; dropping renotes"
+            );
+            Vec::new()
+        });
+    let renoter_actors = sakurasato_core::repo::actor::list_by_ids(state.pool(), &renoter_ids)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                ?err,
+                "notes/timeline: renoter actors lookup failed; dropping renotes"
+            );
+            Vec::new()
+        });
+    let entry_by_id: std::collections::HashMap<i64, &sakurasato_core::repo::note::TimelineEntry> =
+        renoted_entries.iter().map(|e| (e.id, e)).collect();
+    let actor_by_id: std::collections::HashMap<i64, &sakurasato_core::model::ActorRow> =
+        renoter_actors.iter().map(|a| (a.id, a)).collect();
+
+    // summaries: note window + renote の元 note の全 id (nest した renote.renote
+    // にも reaction / count を載せるため両方)。
+    let mut all_note_ids: Vec<i64> = note_entries.iter().map(|e| e.id).collect();
+    all_note_ids.extend(renoted_ids.iter().copied());
+    let summaries = bulk_load_note_summaries(state.pool(), &all_note_ids, viewer).await;
+    let empty = NoteSummary {
+        reactions: Vec::new(),
+        announce: None,
+    };
 
     let host = &state.config().server.host;
-    let notes: Vec<MissNote> = entries
-        .iter()
-        .map(|e| {
-            let summary = summaries.remove(&e.id).unwrap_or(NoteSummary {
-                reactions: Vec::new(),
-                announce: None,
-            });
-            timeline_entry_to_miss_note(e, &summary, host, viewer)
-        })
-        .collect();
+
+    // note と renote を (sort_ts, MissNote) で 1 本に統合する。
+    let mut items: Vec<(chrono::DateTime<chrono::Utc>, MissNote)> =
+        Vec::with_capacity(note_entries.len() + renote_rows.len());
+    for e in &note_entries {
+        let summary = summaries.get(&e.id).unwrap_or(&empty);
+        items.push((
+            e.published_at,
+            timeline_entry_to_miss_note(e, summary, host, viewer),
+        ));
+    }
+    for r in &renote_rows {
+        // 元 note / renoter が引けない renote は黙ってスキップ (FK 上は起きない)。
+        let (Some(entry), Some(actor)) = (
+            entry_by_id.get(&r.renoted_note_id),
+            actor_by_id.get(&r.renoter_actor_id),
+        ) else {
+            continue;
+        };
+        let summary = summaries.get(&entry.id).unwrap_or(&empty);
+        let renoted = timeline_entry_to_miss_note(entry, summary, host, viewer);
+        let renoter = from_actor_and_counts(actor, 0, 0, 0);
+        let created_at = r
+            .announce_published_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let renote = build_renote_miss_note(
+            r.announce_id,
+            &r.announce_ap_id,
+            &created_at,
+            renoter,
+            r.renoter_actor_id,
+            renoted,
+        );
+        items.push((r.announce_published_at, renote));
+    }
+
+    // 時刻降順。同時刻の決定的順序のため id (string) を tiebreak に。limit へ切る。
+    items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
+    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let notes: Vec<MissNote> = items.into_iter().map(|(_, n)| n).collect();
     Json(notes).into_response()
+}
+
+/// home timeline のカーソル id 文字列を境界 `published_at` に解決する。
+///
+/// `"rn:<announce_id>"` なら announce、それ以外は note id として扱う。混合
+/// タイムラインを時刻でページングするための境界時刻 ── 解決できなければ
+/// `None` (= 境界無し扱いで先頭から)。
+async fn resolve_cursor_ts(state: &AppState, id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Some(rest) = id.strip_prefix("rn:") {
+        let announce_id = rest.parse::<i64>().ok()?;
+        repo::announce::get_by_id(state.pool(), announce_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|a| a.published_at)
+    } else {
+        let note_id = id.parse::<i64>().ok()?;
+        repo::note::get_timeline_entry_by_id(state.pool(), note_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.published_at)
+    }
 }
 
 /// local actor の id を引く。お一人様サーバ前提で 1 件しかない。
@@ -261,13 +480,6 @@ async fn viewer_ap_id(state: &AppState) -> Option<String> {
         .ok()
         .flatten()
         .map(|a| a.ap_id)
-}
-
-/// Misskey は noteId / userId を **string** で渡すが、Sakurasato は内部で
-/// `i64` なので parse 必須。失敗時は `None` を返し、handler で
-/// `404 NO_SUCH_NOTE` 等に倒す ── Misskey 慣行で「無効な ID は 404」相当。
-fn parse_id_opt(s: Option<&str>) -> Option<i64> {
-    s.and_then(|t| t.parse::<i64>().ok())
 }
 
 /// `sinceDate`/`untilDate` は **ms epoch** で渡される (Misskey 仕様)。
@@ -841,15 +1053,6 @@ impl SummariesExt for std::collections::HashMap<i64, NoteSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_id_opt_handles_missing_and_invalid() {
-        assert_eq!(parse_id_opt(None), None);
-        assert_eq!(parse_id_opt(Some("")), None);
-        assert_eq!(parse_id_opt(Some("abc")), None);
-        assert_eq!(parse_id_opt(Some("42")), Some(42));
-        assert_eq!(parse_id_opt(Some("-1")), Some(-1));
-    }
 
     #[test]
     fn ms_epoch_round_trip() {

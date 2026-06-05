@@ -1,0 +1,79 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            ann.id AS announce_id,\n            ann.ap_id AS announce_ap_id,\n            ann.published_at AS announce_published_at,\n            ann.actor_id AS renoter_actor_id,\n            ann.note_id AS renoted_note_id\n        FROM announce ann\n        JOIN note n ON n.id = ann.note_id\n        WHERE\n            n.visibility <> 'direct'\n            AND (\n                ann.actor_id = $1\n                OR ann.actor_id IN (\n                    SELECT followed_actor_id\n                    FROM follow\n                    WHERE follower_actor_id = $1 AND state = 'accepted'\n                )\n            )\n            AND ($2::TIMESTAMPTZ IS NULL OR ann.published_at > $2)\n            AND ($3::TIMESTAMPTZ IS NULL OR ann.published_at < $3)\n        ORDER BY ann.published_at DESC\n        LIMIT $4\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "announce_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "announce",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "announce_ap_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "announce",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "announce_published_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "announce",
+            "name": "published_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "renoter_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "announce",
+            "name": "actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "renoted_note_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "announce",
+            "name": "note_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Timestamptz",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "dde4d38a3f2452c7844cfd89dab93a7369ca510dd63e8a63d8e95bfd56d68983"
+}

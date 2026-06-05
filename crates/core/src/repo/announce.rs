@@ -54,6 +54,21 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Ann
     .await
 }
 
+/// announce 行を内部 `id` で引く。home timeline の `rn:<announce_id>` カーソル
+/// 解決 / `notes/show` の renote 参照に使う。
+pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<AnnounceRow>> {
+    sqlx::query_as!(
+        AnnounceRow,
+        r#"
+        SELECT id, ap_id, note_id, actor_id, published_at, created_at
+        FROM announce WHERE id = $1
+        "#,
+        id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// Delete an announce row by AP id. Returns the number of rows deleted
 /// (0 if the announce was never recorded — used by `Undo` for the
 /// "we never had it" no-op case).
@@ -125,4 +140,68 @@ pub struct AnnounceSummaryRow {
     pub note_id: i64,
     pub count: i64,
     pub viewer_renoted: bool,
+}
+
+/// `list_home_renote_window` の戻り行 (= home timeline に混ぜる renote 1 件)。
+///
+/// 元 note (`renoted_note_id`) と renoter (`renoter_actor_id`) は呼び出し側が
+/// `note::list_timeline_entries_by_ids` / `actor::list_by_ids` で一括 fetch して
+/// 解決する (本クエリは軽量に保つ)。並び・カーソルは `announce_published_at`
+/// (= boost した時刻) 基準。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RenoteWindowRow {
+    pub announce_id: i64,
+    pub announce_ap_id: String,
+    pub announce_published_at: DateTime<Utc>,
+    pub renoter_actor_id: i64,
+    pub renoted_note_id: i64,
+}
+
+/// home timeline に混ぜる renote (= 自分 or followee による `Announce`) を、
+/// `announce.published_at` 降順・時刻カーソル付きで引く。
+///
+/// 対象: `actor_id` が viewer 自身 or viewer が `accepted` で follow している
+/// actor。元 note の `visibility = direct` は除外 (note timeline と対称)。
+/// `since_ts` / `until_ts` は **排他** (`>` / `<`) で、混合タイムラインの時刻
+/// カーソルに使う (呼び出し側が `note` 側と同じ境界時刻を渡す)。
+pub async fn list_home_renote_window(
+    pool: &PgPool,
+    viewer_actor_id: i64,
+    since_ts: Option<DateTime<Utc>>,
+    until_ts: Option<DateTime<Utc>>,
+    limit: i64,
+) -> sqlx::Result<Vec<RenoteWindowRow>> {
+    sqlx::query_as!(
+        RenoteWindowRow,
+        r#"
+        SELECT
+            ann.id AS announce_id,
+            ann.ap_id AS announce_ap_id,
+            ann.published_at AS announce_published_at,
+            ann.actor_id AS renoter_actor_id,
+            ann.note_id AS renoted_note_id
+        FROM announce ann
+        JOIN note n ON n.id = ann.note_id
+        WHERE
+            n.visibility <> 'direct'
+            AND (
+                ann.actor_id = $1
+                OR ann.actor_id IN (
+                    SELECT followed_actor_id
+                    FROM follow
+                    WHERE follower_actor_id = $1 AND state = 'accepted'
+                )
+            )
+            AND ($2::TIMESTAMPTZ IS NULL OR ann.published_at > $2)
+            AND ($3::TIMESTAMPTZ IS NULL OR ann.published_at < $3)
+        ORDER BY ann.published_at DESC
+        LIMIT $4
+        "#,
+        viewer_actor_id,
+        since_ts,
+        until_ts,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
 }
