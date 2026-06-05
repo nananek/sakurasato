@@ -34,12 +34,12 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::local_api::reactions::{
     ReactionCoreError, create_reaction_core, delete_my_reaction_on_note_core,
 };
 use crate::miauth::auth;
+use crate::miauth::error::error_resp;
 use crate::state::AppState;
 
 const SCOPE_WRITE_REACTIONS: &str = "write:reactions";
@@ -153,17 +153,4 @@ fn map_reaction_core_err(err: &ReactionCoreError) -> Response {
             "reaction operation failed; check server logs",
         ),
     }
-}
-
-fn error_resp(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(json!({
-            "error": {
-                "code": code,
-                "message": message,
-            },
-        })),
-    )
-        .into_response()
 }

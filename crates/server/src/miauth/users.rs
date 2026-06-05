@@ -31,6 +31,7 @@ use serde_json::json;
 
 use crate::miauth::auth;
 use crate::miauth::conv::from_actor_detailed;
+use crate::miauth::error::{bad_request, internal_error};
 use crate::state::AppState;
 
 const SCOPE_READ_ACCOUNT: &str = "read:account";
@@ -72,7 +73,7 @@ pub async fn handle(
             Ok(None) => return not_found("no such user"),
             Err(err) => {
                 tracing::error!(?err, user_id = uid, "miauth users/show: get_by_id failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return internal_error("failed to look up user");
             }
         }
     } else if let Some(username) = body.username.as_deref() {
@@ -94,7 +95,7 @@ pub async fn handle(
                     username,
                     "miauth users/show: get_by_username_host failed"
                 );
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return internal_error("failed to look up user");
             }
         }
     } else {
@@ -134,19 +135,6 @@ fn not_found(message: &str) -> Response {
         Json(json!({
             "error": {
                 "code": "NO_SUCH_USER",
-                "message": message,
-            },
-        })),
-    )
-        .into_response()
-}
-
-fn bad_request(message: &str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({
-            "error": {
-                "code": "INVALID_PARAM",
                 "message": message,
             },
         })),

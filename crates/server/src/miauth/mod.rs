@@ -37,6 +37,7 @@ pub mod check;
 pub mod conv;
 pub mod emojis;
 pub mod endpoints;
+pub mod error;
 pub mod following;
 pub mod i;
 pub mod meta;

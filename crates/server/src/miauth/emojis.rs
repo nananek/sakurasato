@@ -30,13 +30,13 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use sakurasato_core::repo;
 use serde::{Deserialize, Serialize};
 
 use crate::local_api::media::build_media_url;
 use crate::miauth::conv::MissEmoji;
+use crate::miauth::error::internal_error;
 use crate::state::AppState;
 
 /// `MiAuth` listener が `/api/emojis` で返す件数上限 (= local 絵文字一覧 + 既存
@@ -68,7 +68,7 @@ pub async fn handle(State(state): State<AppState>, body: Option<Json<EmojisBody>
         Ok(v) => v,
         Err(err) => {
             tracing::error!(?err, "miauth /api/emojis: list_local_by_prefix failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return internal_error("failed to list custom emojis");
         }
     };
 

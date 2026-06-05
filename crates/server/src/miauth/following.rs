@@ -37,6 +37,7 @@ use crate::follow::{
 };
 use crate::miauth::auth;
 use crate::miauth::conv::from_actor_detailed;
+use crate::miauth::error::error_resp;
 use crate::state::AppState;
 
 const SCOPE_WRITE_FOLLOWING: &str = "write:following";
@@ -221,17 +222,4 @@ fn map_follow_error(err: &FollowError, op: &str) -> Response {
             )
         }
     }
-}
-
-fn error_resp(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(json!({
-            "error": {
-                "code": code,
-                "message": message,
-            },
-        })),
-    )
-        .into_response()
 }

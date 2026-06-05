@@ -247,7 +247,7 @@ pub async fn handle(
         Ok(None) => { /* fall through to INSERT */ }
         Err(err) => {
             tracing::error!(?err, %uuid, "miauth_session lookup failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return landing_error("failed to load the MiAuth session");
         }
     }
 
@@ -291,7 +291,7 @@ pub async fn handle(
                 .into_response();
         }
         tracing::error!(?err, %uuid, "miauth_session insert failed");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return landing_error("failed to create the MiAuth session");
     }
 
     let body = render_landing(uuid, &app_name, callback_url.as_deref(), &permissions);
@@ -299,6 +299,24 @@ pub async fn handle(
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         body,
+    )
+        .into_response()
+}
+
+/// `MiAuth` landing でのサーバ内部エラーを `text/html` で返す。
+///
+/// landing 自体がブラウザ (Misskey クライアントの webview) 向けなので、JSON の
+/// Misskey エラー envelope ではなく最小の HTML で「どの操作が失敗したか」を
+/// 見せる ── bare 500 だと webview に空ページが出て原因が分からない。
+/// `message` は本 module 内の静的文字列のみを渡す契約 (= HTML エスケープ不要)。
+fn landing_error(message: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>MiAuth error</title>\
+             <p>MiAuth: {message}</p>"
+        ),
     )
         .into_response()
 }
