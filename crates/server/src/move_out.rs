@@ -251,19 +251,23 @@ async fn enqueue_to_followers(
             return 0;
         }
     };
-    let mut queued = 0_usize;
-    for inbox in &inboxes {
-        match delivery::enqueue_activity(state.pool(), local_actor.id, inbox, activity).await {
-            Ok(_) => queued += 1,
-            Err(err) => warn!(?err, %inbox, "enqueue failed"),
+    // 往復削減のため 1 INSERT に畳む (note 作成と同じ `enqueue_activities`)。
+    // Move もフォロワー全員に配るので、ループ版は N 往復になっていた。
+    match delivery::enqueue_activities(state.pool(), local_actor.id, &inboxes, activity).await {
+        Ok(n) => {
+            let queued = usize::try_from(n).unwrap_or(usize::MAX);
+            // CLI (move-out) 経路ではワーカ未稼働なので permit が貯まるだけ
+            // (= 次回 serve 起動時の pick_due が拾う)。serve 経路なら即配送。
+            if queued > 0 {
+                state.wake_delivery();
+            }
+            queued
+        }
+        Err(err) => {
+            warn!(?err, "move-out: batch enqueue failed");
+            0
         }
     }
-    // CLI (move-out) 経路ではワーカ未稼働なので permit が貯まるだけ (= 次回
-    // serve 起動時の pick_due が拾う)。serve 経路なら即配送される。
-    if queued > 0 {
-        state.wake_delivery();
-    }
-    queued
 }
 
 #[cfg(test)]
