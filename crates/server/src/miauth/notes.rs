@@ -348,20 +348,46 @@ pub async fn create(
         );
     }
 
-    // **PR #166 review 軽微 1**: `replyId` 指定の reply 経路はまだ実装していない
-    // (= `noteId → ap_id` 解決の async ステップが追加で必要)。silent ignore して
-    // 普通の note として投稿してしまうと、client は 200 OK を受け取るが返信
-    // 関係が切れる ── client 側で気付きにくい実害ありなので、`renoteId` と
-    // 同じく **501** で明示拒否する。
-    if body.reply_id.is_some() {
-        return error_with_status(
-            StatusCode::NOT_IMPLEMENTED,
-            "REPLY_NOT_IMPLEMENTED",
-            "reply via notes/create replyId is not implemented in this version; use /api/v1/notes with in_reply_to_ap_id",
-        );
-    }
+    // **replyId** (= Aria 等が返信投稿で送ってくる MissNote.id = Sakurasato note の
+    // i64 id stringify) を親 note の `ap_id` に解決し、`local_api::notes::create` の
+    // `in_reply_to_ap_id` 経路に接続する。親作者の mention / 配送先解決は
+    // local_api 側 [`crate::local_api::notes`] の `resolve_reply_parent` が担当 (#64)。
+    let in_reply_to_ap_id = match body.reply_id.as_deref() {
+        None => None,
+        Some(rid) => {
+            let Ok(reply_note_id) = rid.parse::<i64>() else {
+                return error_with_status(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_PARAM",
+                    "replyId is not a valid note id",
+                );
+            };
+            match repo::note::get_by_id(state.pool(), reply_note_id).await {
+                Ok(Some(parent)) => Some(parent.ap_id),
+                Ok(None) => {
+                    return error_with_status(
+                        StatusCode::BAD_REQUEST,
+                        "NO_SUCH_REPLY_TARGET",
+                        "no such reply target",
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        reply_note_id,
+                        "miauth notes/create: reply target lookup failed"
+                    );
+                    return error_with_status(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "INTERNAL_ERROR",
+                        "reply target lookup failed",
+                    );
+                }
+            }
+        }
+    };
 
-    let internal_req = match translate_create_body(&body, &state) {
+    let internal_req = match translate_create_body(&body, in_reply_to_ap_id) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -545,7 +571,7 @@ pub async fn renote(
 )]
 fn translate_create_body(
     body: &CreateNoteBody,
-    _state: &AppState,
+    in_reply_to_ap_id: Option<String>,
 ) -> Result<local_api::notes::CreateNoteRequest, Response> {
     let text = body.text.clone().unwrap_or_default();
     if text.trim().is_empty() {
@@ -572,15 +598,8 @@ fn translate_create_body(
         }
     };
 
-    // `replyId` は handler 側 (= `create()`) が 501 で先に弾いている。本翻訳に
-    // 到達した時点で `body.reply_id` は `None` 確定なので翻訳しない。Misskey
-    // 仕様の `noteId → ap_id` 解決の async ステップは後続 PR で `in_reply_to_ap_id`
-    // 経路に接続する。
-    debug_assert!(
-        body.reply_id.is_none(),
-        "replyId must be rejected by create() before reaching translate_create_body"
-    );
-    let in_reply_to_ap_id: Option<String> = None;
+    // `in_reply_to_ap_id` は呼び出し側 (= `create()`) が `replyId` → 親 note の
+    // `ap_id` に解決済み (= async な note lookup を handler で済ませる)。
 
     // **PR #166 review item 3**: parse 失敗を silent drop せず `400 INVALID_PARAM`
     // で弾く。黙って捨てると client は「添付付きで投稿した」つもりが添付無し

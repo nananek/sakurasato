@@ -762,20 +762,61 @@ async fn notes_renote_returns_501(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
-/// **PR #166 review 軽微 1 fix**: `replyId` 指定の `notes/create` は silent
-/// ignore せず **501** で明示拒否する。`renoteId` 未対応経路と同じ流儀。
-/// silent ignore してしまうと client は 200 OK を受け取って「返信した」と
-/// 認識するが、サーバ側では返信関係が切れて単独 note として残るため。
+/// `replyId` 指定の `notes/create` が親 note への返信として成立する
+/// (= #166 で deferred だった reply 実装、Aria 実機検証で必要と判明)。
+/// `createdNote.replyId` が親の id を指す。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn notes_create_with_reply_id_returns_501(pool: PgPool) {
+async fn notes_create_reply_links_parent(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
     let state = make_state(pool.clone(), "sakurasato.test", "alice");
     let app = router_for(&state);
     let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
 
-    let body = json!({"i": token, "text": "reply attempt", "replyId": "1"});
-    let resp = post_json(app, "/api/notes/create", body).await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    // 親 note を投稿。
+    let parent = read_json(
+        post_json(
+            app.clone(),
+            "/api/notes/create",
+            json!({"i": token, "text": "parent note"}),
+        )
+        .await,
+    )
+    .await;
+    let parent_id = parent["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // その note に自己返信。
+    let resp = post_json(
+        app,
+        "/api/notes/create",
+        json!({"i": token, "text": "a reply", "replyId": parent_id}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
     let v = read_json(resp).await;
-    assert_eq!(v["error"]["code"], "REPLY_NOT_IMPLEMENTED");
+    assert_eq!(v["createdNote"]["text"], "a reply");
+    // 返信関係が張られている (= replyId が親 id を指す)。
+    assert_eq!(
+        v["createdNote"]["replyId"], parent_id,
+        "createdNote.replyId must point at the parent note"
+    );
+}
+
+/// `replyId` が存在しない note を指すと `400 NO_SUCH_REPLY_TARGET` (= silent に
+/// 単独 note 化せず明示エラー)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_create_reply_to_unknown_returns_error(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/notes/create",
+        json!({"i": token, "text": "reply to ghost", "replyId": "999999"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "NO_SUCH_REPLY_TARGET");
 }
