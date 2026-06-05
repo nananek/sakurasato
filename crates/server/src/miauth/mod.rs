@@ -35,6 +35,7 @@ use crate::state::AppState;
 pub mod auth;
 pub mod check;
 pub mod conv;
+pub mod drive;
 pub mod emojis;
 pub mod endpoints;
 pub mod error;
@@ -110,6 +111,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/notes/reactions/delete", post(reactions::delete))
         .route("/api/following/create", post(following::create))
         .route("/api/following/delete", post(following::delete))
+        // drive (= Aria の添付アップロード / ドライブ閲覧)
+        .route("/api/drive/files/create", post(drive::create))
+        .route("/api/drive/files", post(drive::list))
+        .route("/api/drive/files/show", post(drive::show))
         // M14 #170 ── /streaming WebSocket stub (Aria UI の「接続中…」hang 回避)
         .route("/streaming", get(streaming::handle))
         .layer(TraceLayer::new_for_http())

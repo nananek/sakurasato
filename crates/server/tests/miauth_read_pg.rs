@@ -1313,3 +1313,115 @@ async fn i_reports_unread_notifications_count(pool: PgPool) {
     assert_eq!(me["unreadNotificationsCount"], 2);
     assert_eq!(me["hasUnreadNotification"], true);
 }
+
+// ─── drive/files (= Aria の添付アップロード / ドライブ閲覧) ──────────────────
+
+async fn seed_media(pool: &PgPool, owner: i64, key: &str, alt: Option<&str>) -> i64 {
+    repo::media::insert(
+        pool,
+        repo::media::NewMedia {
+            storage_key: key.into(),
+            media_type: "image/webp".into(),
+            width: 320,
+            height: 240,
+            byte_size: 4096,
+            kind: "attachment".into(),
+            alt_text: alt.map(str::to_string),
+            owner_actor_id: owner,
+        },
+    )
+    .await
+    .expect("seed media")
+    .id
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn drive_files_list_and_show_return_drive_file(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let _f1 = seed_media(&pool, alice, "aaaa.webp", None).await;
+    let f2 = seed_media(&pool, alice, "bbbb.webp", Some("a cat")).await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:drive"]).await;
+
+    // list: id 降順なので f2 が先頭。DriveFile schema を検証。
+    let body = json!({"i": token, "limit": 10});
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/drive/files")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let files = arr.as_array().expect("drive/files returns array");
+    assert_eq!(files.len(), 2);
+    // id は media 行 id (= notes/create の fileIds が parse する数値)。
+    assert_eq!(files[0]["id"], f2.to_string());
+    assert_eq!(files[0]["type"], "image/webp");
+    assert_eq!(files[0]["comment"], "a cat");
+    assert_eq!(files[0]["properties"]["width"], 320);
+    assert!(
+        files[0]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/media/bbbb.webp")
+    );
+    assert!(files[0]["name"].is_string(), "DriveFile.name は non-null");
+
+    // show: 自分の file。
+    let body = json!({"i": token, "fileId": f2.to_string()});
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/drive/files/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let f = read_json(resp).await;
+    assert_eq!(f["id"], f2.to_string());
+
+    // show: 存在しない file は 404 NO_SUCH_FILE。
+    let body = json!({"i": token, "fileId": "999999"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/drive/files/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let err = read_json(resp).await;
+    assert_eq!(err["error"]["code"], "NO_SUCH_FILE");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn drive_files_requires_read_scope(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    // write:notes だけのトークンでは read:drive が無く 401。
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+    let body = json!({"i": token});
+    let resp = app
+        .oneshot(
+            Request::post("/api/drive/files")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

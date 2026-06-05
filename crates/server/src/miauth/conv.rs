@@ -577,6 +577,42 @@ fn build_miss_file(raw: &JsonValue, created_at: &str, sensitive: bool) -> Option
     })
 }
 
+/// `MediaRow` (= 自鯖が R2 に持つ media) を Misskey `DriveFile` (`MissFile`) に
+/// 変換する。MiAuth `drive/files/*` で使う。
+///
+/// **`id` は media 行 id** (= `notes/create` の `fileIds` が parse する数値) に
+/// 揃える ── [`build_miss_file`] の url-hash id とは別物 (あちらは `MissNote.files`
+/// の表示用)。media は media-proxy で webp 化済みなので常に画像 = `thumbnailUrl`
+/// も同一 URL。`isSensitive` は media 行に持たないので `false` 固定 (Sakurasato は
+/// 添付の sensitive を note 側で持つ)。
+pub(crate) fn media_row_to_miss_file(
+    row: &sakurasato_core::model::MediaRow,
+    host: &str,
+) -> MissFile {
+    let url = format!("https://{host}/media/{}", row.storage_key);
+    let name = miss_file_name_from_url(&url);
+    MissFile {
+        id: row.id.to_string(),
+        created_at: row
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        name,
+        mime_type: row.media_type.clone(),
+        md5: String::new(),
+        size: row.byte_size,
+        url: url.clone(),
+        thumbnail_url: Some(url),
+        comment: row.alt_text.clone(),
+        is_sensitive: false,
+        properties: MissFileProperties {
+            width: Some(i64::from(row.width)),
+            height: Some(i64::from(row.height)),
+            orientation: None,
+            avg_color: None,
+        },
+    }
+}
+
 /// URL の最後の path segment (= basename) を取り出す。
 ///
 /// `https://host/media/abc.webp` → `abc.webp`

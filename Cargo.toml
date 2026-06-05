@@ -53,8 +53,10 @@ url = "2"
 unicode-width = "0.2"
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "macros", "chrono", "uuid", "json", "derive", "migrate"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
-# `ws` feature を有効化 ── M14 #170 で `/streaming` WebSocket stub を追加するため。
-axum = { version = "0.8", features = ["ws"] }
+# `ws` feature ── M14 #170 で `/streaming` WebSocket stub を追加するため。
+# `multipart` ── MiAuth `drive/files/create` (Aria の添付アップロード) が
+# multipart/form-data を受けるため (`axum::extract::Multipart`)。
+axum = { version = "0.8", features = ["ws", "multipart"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 clap = { version = "4", features = ["derive", "env"] }

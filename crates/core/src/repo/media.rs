@@ -130,6 +130,59 @@ pub async fn list_by_note(pool: &PgPool, note_id: i64) -> sqlx::Result<Vec<Media
     .await
 }
 
+/// `owner_actor_id` が所有する media を **id 降順** で引く。`MiAuth` の
+/// `drive/files` 一覧 (= Aria のドライブ閲覧) 用。`since_id`/`until_id` は
+/// Misskey 仕様の **排他** カーソル (`> sinceId` / `< untilId`)。
+pub async fn list_by_owner_window(
+    pool: &PgPool,
+    owner_actor_id: i64,
+    since_id: Option<i64>,
+    until_id: Option<i64>,
+    limit: i64,
+) -> sqlx::Result<Vec<MediaRow>> {
+    sqlx::query_as!(
+        MediaRow,
+        r#"
+        SELECT id, storage_key, media_type, width, height, byte_size,
+               kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+        FROM media
+        WHERE owner_actor_id = $1
+          AND ($2::BIGINT IS NULL OR id > $2)
+          AND ($3::BIGINT IS NULL OR id < $3)
+        ORDER BY id DESC
+        LIMIT $4
+        "#,
+        owner_actor_id,
+        since_id,
+        until_id,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// `owner_actor_id` が所有する単一 media を id で引く (`MiAuth` `drive/files/show`
+/// の所有者ガード込み)。他人の media id を指定しても `None` を返す。
+pub async fn get_by_id_for_owner(
+    pool: &PgPool,
+    id: i64,
+    owner_actor_id: i64,
+) -> sqlx::Result<Option<MediaRow>> {
+    sqlx::query_as!(
+        MediaRow,
+        r#"
+        SELECT id, storage_key, media_type, width, height, byte_size,
+               kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+        FROM media
+        WHERE id = $1 AND owner_actor_id = $2
+        "#,
+        id,
+        owner_actor_id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// 添付として `note_id` に紐付ける。POST /api/v1/notes が note 挿入直後の
 /// 同一 tx 内で呼ぶ。`ids` の各行が `owner_actor_id == actor_id` かつ
 /// `note_id IS NULL` であることをここで保証する (= 横取り防止)。
