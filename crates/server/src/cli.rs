@@ -113,8 +113,10 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct PruneArgs {
     /// 何日より前のリモートノートを削除対象にするか (`created_at` 基準)。
-    /// 既定 7 日。
-    #[arg(long, default_value_t = 7)]
+    /// 既定 7 日。**最小 1** ── `--older-than 0` だと `now() - 0d = now()` で
+    /// interaction 無しの全リモートノートを消してしまうので、誤操作ガードとして
+    /// `value_parser` で `0` を弾く。
+    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..))]
     pub older_than: u32,
     /// 削除せず、削除対象の件数だけ表示する。
     #[arg(long, default_value_t = false)]

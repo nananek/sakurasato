@@ -20,8 +20,10 @@ use crate::state::AppState;
 /// `prune-remote-notes` サブコマンドの実体。
 pub async fn run(config: sakurasato_core::Config, args: PruneArgs) -> anyhow::Result<()> {
     let state = AppState::from_config(config).await?;
-    // clap は `u32` で受けるので非負。`make_interval(days => ...)` は i32 を取る
-    // ので変換する (実運用の保持日数で i32 を溢れさせることはない)。
+    // clap は `u32` (最小 1) で受ける。`make_interval(days => ...)` は i32 を取る
+    // ので変換する。`u32::MAX` は `i32::MAX` を超え得るが、その帯の値 (≈ 589 万年
+    // 以上) は事実上「消さない」なので `i32::MAX` にクランプして panic を避ける
+    // (`as i32` の wrap を避けるための `try_from`)。
     let older_than_days = i32::try_from(args.older_than).unwrap_or(i32::MAX);
 
     let count = repo::note::prune_remote_notes(state.pool(), older_than_days, args.dry_run).await?;
