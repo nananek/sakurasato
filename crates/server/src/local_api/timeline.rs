@@ -520,6 +520,11 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
     // `remove` ではなく `get(...).cloned()` で複数回引けるようにする。
     let mut all_note_ids: Vec<i64> = note_entries.iter().map(|e| e.id).collect();
     all_note_ids.extend(renoted_ids.iter().copied());
+    // note エントリと renote 元が同一 note を指すと id が重複する。`counts_for_notes`
+    // は `GROUP BY` + `= ANY()` 意味論で二重計上はされないが、配列を最小化して
+    // 集計クエリを軽くし将来の脆さも断つため dedup する (#224 review)。
+    all_note_ids.sort_unstable();
+    all_note_ids.dedup();
     let mut by_note: HashMap<i64, Vec<ReactionSummaryDto>> = HashMap::new();
     match repo::reaction::counts_for_notes(state.pool(), &all_note_ids).await {
         Ok(rows) => {
