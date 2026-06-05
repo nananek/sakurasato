@@ -39,6 +39,8 @@ mod tests {
         //   表現するため image_key 列を NULL 許容化)
         // 0019 emoji_last_failed_at (= Issue #192: fetch 失敗 row への backoff
         //   と旧 URL row の regression 回避用に last_failed_at TIMESTAMPTZ NULL を追加)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 19);
+        // 0020 notification (= #206 PR1: in-app 通知フィード本体テーブル。
+        //   webhook 宛先の notification_channel とは別物、TUI / MiAuth が一覧する)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 20);
     }
 }

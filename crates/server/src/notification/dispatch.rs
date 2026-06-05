@@ -40,6 +40,17 @@ pub(crate) async fn notify(
     event: NotificationEvent,
     ctx: &NotificationContext<'_>,
 ) {
+    // recipient (= local user) を解決。お一人様サーバなので常に同一。失敗時は
+    // 全通知を諦める (本層は best-effort で AP dispatch を巻き込まない)。
+    let Some(local_actor_id) = resolve_local_actor_id(state).await else {
+        return;
+    };
+
+    // **in-app 通知フィード** (`notification` テーブル) に 1 行貯める ── webhook
+    // channel の有無に関わらず常に。TUI / MiAuth (Aria) がここから一覧する。
+    record_in_app(state, event, ctx, local_actor_id).await;
+
+    // **webhook 通知** (既存) ── enabled な channel にのみ enqueue。
     let channels =
         match repo::notification_channel::list_enabled_for_event(state.pool(), event).await {
             Ok(rows) => rows,
@@ -57,12 +68,6 @@ pub(crate) async fn notify(
         return;
     }
 
-    // local actor の id を sender_actor_id に埋めるため 1 回だけ lookup する。
-    // 失敗時は全 channel の enqueue を諦める (本層は best-effort)。
-    let Some(local_actor_id) = resolve_local_actor_id(state).await else {
-        return;
-    };
-
     for channel in channels {
         if let Err(err) = enqueue_for_channel(state, &channel, event, ctx, local_actor_id).await {
             warn!(
@@ -72,6 +77,32 @@ pub(crate) async fn notify(
                 "notification: enqueue failed",
             );
         }
+    }
+}
+
+/// in-app 通知フィード (`notification` テーブル) に 1 行 insert する。best-effort
+/// (失敗は `warn!` のみで AP dispatch / webhook を巻き込まない)。`NotificationContext`
+/// の notifier actor / 対象 note / reaction をそのまま列に落とす。
+async fn record_in_app(
+    state: &AppState,
+    event: NotificationEvent,
+    ctx: &NotificationContext<'_>,
+    recipient_actor_id: i64,
+) {
+    let new = repo::notification::NewNotification {
+        recipient_actor_id,
+        event_type: event.as_str().to_string(),
+        notifier_actor_id: Some(ctx.actor.id),
+        note_id: ctx.note.map(|n| n.id),
+        reaction: ctx.reaction_content.map(str::to_string),
+        created_at: ctx.occurred_at,
+    };
+    if let Err(err) = repo::notification::insert(state.pool(), new).await {
+        warn!(
+            ?err,
+            event = event.as_str(),
+            "notification: in-app insert failed"
+        );
     }
 }
 

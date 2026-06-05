@@ -356,6 +356,25 @@ pub struct NotificationChannelRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// `notification` テーブル (migration 0020) 1 行 ── in-app 通知フィードの本体。
+/// `notification_channel` (= webhook 宛先) とは別物で、TUI / `MiAuth` が一覧表示する。
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct NotificationRow {
+    pub id: i64,
+    /// 受信者 (= local user)。
+    pub recipient_actor_id: i64,
+    /// `NotificationEvent::as_str()` と一致する種別文字列。
+    pub event_type: String,
+    /// 通知を起こした相手 actor。purge 済みなら `None`。
+    pub notifier_actor_id: Option<i64>,
+    /// 関連 note (reaction/renote/quote/mention/direct の対象)。follow 系は `None`。
+    pub note_id: Option<i64>,
+    /// reaction の内容 (`reaction` event のみ非 `None`)。
+    pub reaction: Option<String>,
+    pub is_read: bool,
+    pub created_at: DateTime<Utc>,
+}
+
 /// 通知イベント種別。`notification_channel.notify_<event>` 列と 1:1 対応し、
 /// `delivery_queue.activity` JSONB の `"event"` フィールドに `as_str` の値で
 /// 埋め込む。
