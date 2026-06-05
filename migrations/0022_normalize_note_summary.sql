@@ -1,6 +1,6 @@
 -- 0022: 既存 note の空 summary (`''` / 空白のみ) を NULL に畳む一回限りの backfill。
 --
--- Pleroma は CW 無しのノートでも `summary: ""` を送ってくるが、PR (#???) 以前の
+-- Pleroma は CW 無しのノートでも `summary: ""` を送ってくるが、PR #222 以前の
 -- inbound Create/Update 受信はこれを `Some("")` のまま保存していた。Misskey 系
 -- クライアント (Aria 等) は `cw` が非 null = 「CW あり」と解釈するため、Pleroma の
 -- 全ノートが「警告文の無い CW」に見える症状になっていた。inbound を
