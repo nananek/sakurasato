@@ -45,6 +45,7 @@ fn make_config() -> Config {
             access_key_id: "k".into(),
             secret_access_key: "s".into(),
             secret_access_key_file: None,
+            public_base_url: None,
         },
         media_proxy: MediaProxyConfig {
             socket: "/tmp/media.sock".into(),

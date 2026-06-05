@@ -87,6 +87,7 @@ fn make_config(host: &str, media_socket: &str) -> sakurasato_core::Config {
             access_key_id: "k".into(),
             secret_access_key: "s".into(),
             secret_access_key_file: None,
+            public_base_url: None,
         },
         media_proxy: sakurasato_core::config::MediaProxyConfig {
             socket: media_socket.into(),

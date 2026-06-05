@@ -410,6 +410,21 @@ pub struct StorageConfig {
     /// [`Self::secret_access_key`].
     #[serde(default)]
     pub secret_access_key_file: Option<PathBuf>,
+    /// 公開メディア配信のリダイレクト先 base URL (例: `https://media.example.com`
+    /// や R2 の `https://pub-xxxx.r2.dev`)。
+    ///
+    /// 設定すると `GET /media/{key}` は、認可ゲート (公開可能な key か) を通った
+    /// 後に **`302` でこの base 配下 (`{public_base_url}/{key}`) へリダイレクト**
+    /// し、バイト列を server で proxy せず公開ストレージ (R2 public access / CDN)
+    /// に直接取りに行かせる。連合に焼き込む canonical URL は従来どおり
+    /// `https://<host>/media/<key>` のままなので、本設定を切っても連合 URL は
+    /// 壊れない。
+    ///
+    /// 未設定 (default) なら従来どおり server が S3/R2 から取得して proxy 配信
+    /// する (= バケット非公開のままで動く)。本設定を使うには R2 等の public
+    /// access を別途有効化すること。末尾 `/` は呼び出し側で除去される。
+    #[serde(default)]
+    pub public_base_url: Option<String>,
 }
 
 impl StorageConfig {
@@ -440,6 +455,7 @@ impl std::fmt::Debug for StorageConfig {
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"<redacted>")
             .field("secret_access_key_file", &self.secret_access_key_file)
+            .field("public_base_url", &self.public_base_url)
             .finish()
     }
 }
