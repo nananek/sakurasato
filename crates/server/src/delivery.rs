@@ -113,6 +113,47 @@ where
         .map_err(Into::into)
 }
 
+/// 同一 activity を複数 inbox 宛てに **1 INSERT で** enqueue する一括版。
+///
+/// 各 inbox を [`enqueue_activity`] と同じ基準 (http/https スキーム + host 必須)
+/// で検証し、通った分だけを [`repo::delivery_queue::enqueue_batch`] に渡す。
+/// 検証で弾いた inbox は `warn` を残してスキップする ── 1 件不正でも残りは
+/// 配送する、単発版を for で回したときと同じ挙動。違いは DB 往復が inbox 数に
+/// 比例せず常に 1 回で済む点 ([`repo::delivery_queue::enqueue_batch`] 参照)。
+///
+/// 返り値は実際に enqueue した行数。検証で全部弾かれた / 入力が空なら 0。
+pub async fn enqueue_activities<'e, E>(
+    executor: E,
+    sender_actor_id: i64,
+    inbox_urls: &[String],
+    activity: &JsonValue,
+) -> anyhow::Result<u64>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let valid: Vec<String> = inbox_urls
+        .iter()
+        .filter(|inbox| match reqwest::Url::parse(inbox) {
+            Ok(url) => {
+                let ok =
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some();
+                if !ok {
+                    warn!(%inbox, "enqueue_activities: skipping inbox (non-http(s) scheme or no host)");
+                }
+                ok
+            }
+            Err(err) => {
+                warn!(%inbox, ?err, "enqueue_activities: skipping unparseable inbox_url");
+                false
+            }
+        })
+        .cloned()
+        .collect();
+    repo::delivery_queue::enqueue_batch(executor, &valid, activity, sender_actor_id)
+        .await
+        .map_err(Into::into)
+}
+
 /// 指定 queue id を 1 回試行する。
 ///
 /// 終端状態 (`delivered` / `dead`) に到達済みの行は **何もせず**

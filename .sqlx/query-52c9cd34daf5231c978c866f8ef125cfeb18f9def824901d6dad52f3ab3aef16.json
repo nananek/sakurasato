@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO delivery_queue (inbox_url, activity, sender_actor_id)\n        SELECT u, $2, $3\n        FROM unnest($1::text[]) AS u\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Jsonb",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "52c9cd34daf5231c978c866f8ef125cfeb18f9def824901d6dad52f3ab3aef16"
+}

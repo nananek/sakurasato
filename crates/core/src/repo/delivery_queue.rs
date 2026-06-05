@@ -48,6 +48,43 @@ where
     .await
 }
 
+/// 同一 activity を複数 inbox 宛てに **1 文で** 一括 enqueue する。
+///
+/// [`enqueue`] を inbox ごとに呼ぶと N 回の INSERT を直列に await することになり、
+/// お一人様 server でもリモートフォロワーが増えると 1 投稿あたりの
+/// `delivery_queue` 書き込みが N 往復に膨らむ。managed Postgres (Neon 等、
+/// 1 query = 1 ネットワーク往復) では投稿レスポンスの体感遅延に直結する。
+/// `unnest` で N 行を 1 INSERT に畳んで往復を 1 に抑える。
+///
+/// `inbox_urls` は呼び出し側で重複除去・URL 検証済みであること (本関数は
+/// 素通しで INSERT する)。返り値は実際に挿入された行数。空配列なら 0。
+pub async fn enqueue_batch<'e, E>(
+    executor: E,
+    inbox_urls: &[String],
+    activity: &JsonValue,
+    sender_actor_id: i64,
+) -> sqlx::Result<u64>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if inbox_urls.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO delivery_queue (inbox_url, activity, sender_actor_id)
+        SELECT u, $2, $3
+        FROM unnest($1::text[]) AS u
+        "#,
+        inbox_urls,
+        activity,
+        sender_actor_id,
+    )
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Pick up to `limit` due rows from the queue.
 ///
 /// "Due" means `state IN ('pending', 'failed')` and `next_attempt_at <= now()`.

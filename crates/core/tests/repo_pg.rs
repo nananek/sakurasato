@@ -302,6 +302,35 @@ async fn delivery_queue_next_due_at_reports_earliest_pending(pool: PgPool) -> sq
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delivery_queue_enqueue_batch_inserts_all_rows(pool: PgPool) -> sqlx::Result<()> {
+    let sender = repo::actor::insert(&pool, sample_local_actor("batch")).await?;
+    let payload = serde_json::json!({"type": "Create", "actor": sender.ap_id});
+    let inboxes = vec![
+        "https://a.example/inbox".to_string(),
+        "https://b.example/inbox".to_string(),
+        "https://c.example/inbox".to_string(),
+    ];
+
+    // 1 INSERT で 3 行入る。返り値は挿入行数。
+    let inserted =
+        repo::delivery_queue::enqueue_batch(&pool, &inboxes, &payload, sender.id).await?;
+    assert_eq!(inserted, 3);
+
+    // 全行 pending で取り出せ、inbox_url が渡したものと一致する。
+    let due = repo::delivery_queue::pick_due(&pool, 100).await?;
+    assert_eq!(due.len(), 3);
+    let mut got: Vec<String> = due.iter().map(|r| r.inbox_url.clone()).collect();
+    got.sort();
+    assert_eq!(got, inboxes);
+    assert!(due.iter().all(|r| r.state == "pending" && r.attempts == 0));
+
+    // 空配列なら 1 行も入れず 0 を返す (DB 往復ゼロの早期 return)。
+    let none = repo::delivery_queue::enqueue_batch(&pool, &[], &payload, sender.id).await?;
+    assert_eq!(none, 0);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn delivery_queue_transitions_to_dead_at_max_attempts(pool: PgPool) -> sqlx::Result<()> {
     let sender = repo::actor::insert(&pool, sample_local_actor("dead")).await?;
     let row = repo::delivery_queue::enqueue(

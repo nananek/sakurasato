@@ -11,7 +11,8 @@
 //!
 //! プロフィール更新後は **Update Activity** をフォロワー全員に配送する。
 //! 配送先 inbox 集合は `repo::follow::list_accepted_inboxes` で取り、
-//! `delivery::enqueue_activity` で 1 行ずつ enqueue する (note と同じ作法)。
+//! `delivery::enqueue_activities` で 1 INSERT に畳んで enqueue する
+//! (note 作成と同じ作法 / 往復削減)。
 
 use axum::Json;
 use axum::extract::State;
@@ -305,17 +306,22 @@ async fn enqueue_to_followers(
             return 0;
         }
     };
-    let mut queued = 0_usize;
-    for inbox in &inboxes {
-        match delivery::enqueue_activity(state.pool(), local_actor.id, inbox, activity).await {
-            Ok(_row) => queued += 1,
-            Err(err) => warn!(?err, %inbox, "PATCH profile: enqueue failed"),
+    // 往復削減のため inbox ごとの enqueue ではなく 1 INSERT に畳む
+    // (note 作成と同じ `enqueue_activities`)。actor Update はフォロワー全員に
+    // 配るので、フォロワーが多いとループ版は N 往復になっていた。
+    match delivery::enqueue_activities(state.pool(), local_actor.id, &inboxes, activity).await {
+        Ok(n) => {
+            let queued = usize::try_from(n).unwrap_or(usize::MAX);
+            if queued > 0 {
+                state.wake_delivery();
+            }
+            queued
+        }
+        Err(err) => {
+            warn!(?err, "PATCH profile: batch enqueue failed");
+            0
         }
     }
-    if queued > 0 {
-        state.wake_delivery();
-    }
-    queued
 }
 
 fn bad_request(reason: &'static str) -> Response {

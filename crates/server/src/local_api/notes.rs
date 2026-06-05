@@ -7,8 +7,9 @@
 //!    BIGSERIAL の `id` 採番後に `ap_id` と `url` を canonical URL に書き戻す。
 //! 3. visibility に応じて to/cc を組み立て、Create Activity を生成する。
 //! 4. `repo::follow::list_accepted_inboxes` で配送先 inbox 集合を取り、
-//!    inbox ごとに `delivery::enqueue_activity` で 1 行 push する。常駐
-//!    worker が後で実配送する。
+//!    `delivery::enqueue_activities` で `delivery_queue` に **1 INSERT で**
+//!    一括 push する (フォロワー数に比例した往復を避ける)。常駐 worker が
+//!    後で実配送する。
 //! 5. broadcast channel に `note.created` を publish する。SSE 接続中の
 //!    TUI が即時受け取れるようにする。
 //! 6. 201 Created + Location ヘッダ + 作成後の JSON サマリを返す。
@@ -1083,20 +1084,24 @@ async fn enqueue_deliveries(
             inboxes.push(extra.clone());
         }
     }
-    let mut queued = 0_usize;
-    for inbox in &inboxes {
-        match delivery::enqueue_activity(state.pool(), local_actor.id, inbox, activity).await {
-            Ok(_row) => queued += 1,
-            Err(err) => {
-                warn!(?err, %inbox, "POST /api/v1/notes: enqueue failed");
+    // 以前は inbox ごとに `enqueue_activity` を直列 await していたが、フォロワー
+    // 数 N に比例して `delivery_queue` INSERT が N 往復になり、managed Postgres
+    // (Neon 等) では投稿レスポンスが目に見えて延びていた。`enqueue_activities`
+    // が同一 activity を 1 INSERT (unnest) に畳むので往復は常に 1 回。
+    match delivery::enqueue_activities(state.pool(), local_actor.id, &inboxes, activity).await {
+        Ok(n) => {
+            let queued = usize::try_from(n).unwrap_or(usize::MAX);
+            // 行を入れたら配送ワーカを即起こす (空ポーリング廃止に伴う wake, #211)。
+            if queued > 0 {
+                state.wake_delivery();
             }
+            queued
+        }
+        Err(err) => {
+            warn!(?err, "POST /api/v1/notes: batch enqueue failed");
+            0
         }
     }
-    // 行を入れたら配送ワーカを即起こす (空ポーリング廃止に伴う wake)。
-    if queued > 0 {
-        state.wake_delivery();
-    }
-    queued
 }
 
 fn validate_request(req: &CreateNoteRequest) -> Result<(), &'static str> {
