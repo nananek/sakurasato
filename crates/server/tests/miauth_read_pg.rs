@@ -1425,3 +1425,185 @@ async fn drive_files_requires_read_scope(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// `drive/files/update` で `comment` (= alt text) を設定 → クリアできること。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn drive_files_update_sets_and_clears_comment(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let f = seed_media(&pool, alice, "upd.webp", None).await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:drive"]).await;
+
+    // 設定: comment を付ける → 200 + 反映。
+    let body = json!({"i": token, "fileId": f.to_string(), "comment": "a sleepy cat"});
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/drive/files/update")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let file = read_json(resp).await;
+    assert_eq!(file["id"], f.to_string());
+    assert_eq!(file["comment"], "a sleepy cat");
+
+    // 永続化を確認: 別 query (read:drive show) で読み直しても comment が残る。
+    let read_token = issue_token_with_scopes(&pool, &["read:drive"]).await;
+    let body = json!({"i": read_token, "fileId": f.to_string()});
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/drive/files/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_json(resp).await["comment"], "a sleepy cat");
+
+    // クリア: comment を null → comment が消える (= MissFile では None なので
+    // フィールド欠落 or null)。
+    let body = json!({"i": token, "fileId": f.to_string(), "comment": null});
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/drive/files/update")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let file = read_json(resp).await;
+    assert!(
+        file["comment"].is_null(),
+        "comment cleared → null, got {:?}",
+        file["comment"]
+    );
+
+    // 他人の file は更新できない (= NO_SUCH_FILE 404)。
+    let body = json!({"i": token, "fileId": "999999", "comment": "x"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/drive/files/update")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `drive/files/update` は `write:drive` scope を要求する (read:drive では 401)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn drive_files_update_requires_write_scope(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let f = seed_media(&pool, alice, "wo.webp", None).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:drive"]).await;
+    let body = json!({"i": token, "fileId": f.to_string(), "comment": "x"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/drive/files/update")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `drive/files/delete` ── 未添付 file は 204 で消え、再 show は 404。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn drive_files_delete_removes_unattached(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let f = seed_media(&pool, alice, "del.webp", None).await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:drive"]).await;
+
+    let body = json!({"i": token, "fileId": f.to_string()});
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/drive/files/delete")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // 消えたので show は 404。
+    let read_token = issue_token_with_scopes(&pool, &["read:drive"]).await;
+    let body = json!({"i": read_token, "fileId": f.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/drive/files/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `drive/files/delete` ── 添付済み file は 400 `FILE_ATTACHED` で拒否し、行は残る
+/// (= note のスナップショット参照を壊さない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn drive_files_delete_rejects_attached(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let f = seed_media(&pool, alice, "att.webp", None).await;
+    let note = seed_note(
+        &pool,
+        alice,
+        "sakurasato.test",
+        "with image",
+        Visibility::Public,
+    )
+    .await;
+    repo::media::attach_to_note(&pool, &[f], alice, note)
+        .await
+        .expect("attach media");
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:drive"]).await;
+
+    let body = json!({"i": token, "fileId": f.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/drive/files/delete")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = read_json(resp).await;
+    assert_eq!(err["error"]["code"], "FILE_ATTACHED");
+
+    // 行は残っている (= まだ owner ガード経由で引ける)。
+    assert!(
+        repo::media::get_by_id_for_owner(&pool, f, alice)
+            .await
+            .unwrap()
+            .is_some(),
+        "attached file must survive a rejected delete"
+    );
+}
