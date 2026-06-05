@@ -218,7 +218,15 @@ services:
     command: ["serve"]
     environment:
       <<: *sakurasato_new_env
-      SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot-new/local.sock
+      # 書き込み側 (server-new / token-issuer-new) は volume を image に実在する
+      # `/home/nonroot` (= distroless の nonroot user home, nonroot 所有) に mount
+      # する。fresh named volume は mount 先 image dir の所有権を継承するため
+      # ここなら nonroot が socket / token を書ける。`/home/nonroot-new` のような
+      # image に無いパスに mount すると Docker が root 所有で空 dir を作り、
+      # token issue の raw token 書き出しが Permission denied (os error 13) で
+      # 落ちる (#201 で実ログ確認)。pytest 側は同 volume を別 mountpoint
+      # `/home/nonroot-new:ro` で読むので old (`sakurasato_local_api`) と衝突しない。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
       SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
     depends_on:
       sakurasato-init-new:
@@ -229,7 +237,7 @@ services:
         condition: service_started
     volumes:
       - certs:/certs:ro
-      - sakurasato_local_api_new:/home/nonroot-new
+      - sakurasato_local_api_new:/home/nonroot
       - media_sock_new:/run/sakurasato
     networks:
       - nekonoverse-fed
@@ -386,7 +394,8 @@ services:
 
   sakurasato-token-issuer-new:
     image: sakurasato/server:dev
-    command: ["token", "issue", "--name", "pytest", "--out", "/home/nonroot-new/pytest.token"]
+    # --out は image 実在の nonroot 所有 dir 配下へ (server-new の volume 注釈参照)。
+    command: ["token", "issue", "--name", "pytest", "--out", "/home/nonroot/pytest.token"]
     environment:
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks-new:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato-new
@@ -397,7 +406,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - certs:/certs:ro
-      - sakurasato_local_api_new:/home/nonroot-new
+      - sakurasato_local_api_new:/home/nonroot
     networks:
       - nekonoverse-fed
     profiles: [pytest]

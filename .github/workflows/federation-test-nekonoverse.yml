@@ -81,6 +81,18 @@ jobs:
           echo "==> pytest logs"
           docker compose -p "$project" -f "$compose_file" \
             --profile pytest logs --no-color --tail=500 pytest || true
+          # #201: 失敗時に sks 側 DB の note / delivery_queue / follow state を
+          # 直接覗く。「TUI 経由の投稿/返信が server に届いて note 化されたか」を
+          # ログの有無 (server は成功時 INFO を出さない) ではなく行の実在で
+          # 判定できる ── reply シナリオの「posted # が出ない」系を切り分ける。
+          echo "==> sks DB: note rows"
+          docker compose -p "$project" -f "$compose_file" --profile pytest \
+            exec -T postgres-sks psql -U sakurasato -d sakurasato -c \
+            "SELECT id, left(content,40) AS content, in_reply_to_ap_id IS NOT NULL AS is_reply, is_local FROM note ORDER BY id;" || true
+          echo "==> sks DB: delivery_queue rows"
+          docker compose -p "$project" -f "$compose_file" --profile pytest \
+            exec -T postgres-sks psql -U sakurasato -d sakurasato -c \
+            "SELECT id, activity->>'type' AS type, state, left(inbox_url,50) AS inbox FROM delivery_queue ORDER BY id;" || true
 
       - name: Tear down on failure
         if: always()
