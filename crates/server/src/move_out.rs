@@ -258,6 +258,11 @@ async fn enqueue_to_followers(
             Err(err) => warn!(?err, %inbox, "enqueue failed"),
         }
     }
+    // CLI (move-out) 経路ではワーカ未稼働なので permit が貯まるだけ (= 次回
+    // serve 起動時の pick_due が拾う)。serve 経路なら即配送される。
+    if queued > 0 {
+        state.wake_delivery();
+    }
     queued
 }
 

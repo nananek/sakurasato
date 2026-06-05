@@ -273,6 +273,8 @@ async fn mutate(
     tx.commit()
         .await
         .map_err(|e| MutateError::Infra(e.into()))?;
+    // commit 後に wake (tx 内 enqueue 行は commit まで他コネクションに見えない)。
+    state.wake_delivery();
 
     info!(
         follow_id = row.id,

@@ -258,6 +258,50 @@ async fn delivery_queue_enqueue_and_fail(pool: PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn delivery_queue_next_due_at_reports_earliest_pending(pool: PgPool) -> sqlx::Result<()> {
+    let sender = repo::actor::insert(&pool, sample_local_actor("nextdue")).await?;
+    let payload = serde_json::json!({"type": "Create", "actor": sender.ap_id});
+
+    // 1. 空なら None ── ワーカはこのとき通知/安全網まで眠れる (DB 無アクセス)。
+    assert!(repo::delivery_queue::next_due_at(&pool).await?.is_none());
+
+    // 2. 2 行入れ、片方を未来 (now+5min) にリスケジュール。
+    let soon = repo::delivery_queue::enqueue(&pool, "https://a.example/inbox", &payload, sender.id)
+        .await?;
+    let later =
+        repo::delivery_queue::enqueue(&pool, "https://b.example/inbox", &payload, sender.id)
+            .await?;
+    let future = chrono::Utc::now() + chrono::Duration::minutes(5);
+    repo::delivery_queue::mark_failed(
+        &pool,
+        later.id,
+        "temporary",
+        future,
+        repo::delivery_queue::DEFAULT_MAX_ATTEMPTS,
+    )
+    .await?;
+
+    // next_due_at は最も早い next_attempt_at (= soon の即時値) を返す。
+    // DB 値同士で比較する ── Rust の `future` は ns 精度だが Postgres
+    // timestamptz は µs に切り詰めるので、`future` 直接比較は精度差で落ちる。
+    let next = repo::delivery_queue::next_due_at(&pool).await?.unwrap();
+    let soon_row = repo::delivery_queue::get_by_id(&pool, soon.id)
+        .await?
+        .unwrap();
+    let later_row = repo::delivery_queue::get_by_id(&pool, later.id)
+        .await?
+        .unwrap();
+    assert_eq!(next, soon_row.next_attempt_at);
+    assert!(next < later_row.next_attempt_at);
+
+    // 3. soon を delivered に倒すと、残りは future の later のみ。
+    repo::delivery_queue::mark_delivered(&pool, soon.id).await?;
+    let next2 = repo::delivery_queue::next_due_at(&pool).await?.unwrap();
+    assert_eq!(next2, later_row.next_attempt_at);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn delivery_queue_transitions_to_dead_at_max_attempts(pool: PgPool) -> sqlx::Result<()> {
     let sender = repo::actor::insert(&pool, sample_local_actor("dead")).await?;
     let row = repo::delivery_queue::enqueue(

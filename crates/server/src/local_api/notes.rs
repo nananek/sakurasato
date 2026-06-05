@@ -1092,6 +1092,10 @@ async fn enqueue_deliveries(
             }
         }
     }
+    // 行を入れたら配送ワーカを即起こす (空ポーリング廃止に伴う wake)。
+    if queued > 0 {
+        state.wake_delivery();
+    }
     queued
 }
 

@@ -312,6 +312,9 @@ async fn enqueue_to_followers(
             Err(err) => warn!(?err, %inbox, "PATCH profile: enqueue failed"),
         }
     }
+    if queued > 0 {
+        state.wake_delivery();
+    }
     queued
 }
 

@@ -78,6 +78,26 @@ pub async fn pick_due(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<DeliveryQue
     .await
 }
 
+/// まだ配送しきっていない行 (`state IN ('pending','failed')`) のうち、**最も早い**
+/// `next_attempt_at` を返す。1 件も無ければ `None`。
+///
+/// 配送ワーカが「空ポーリング」をやめてアイドルに眠る際、次にリトライが
+/// due になる時刻を 1 回だけ引くために使う。`None` のときは未配送行ゼロ
+/// なので、ワーカは通知 (`AppState::wake_delivery`) が来るまで DB を一切
+/// 叩かずに眠れる ── これが serverless Postgres の autosuspend を可能にする。
+pub async fn next_due_at(pool: &PgPool) -> sqlx::Result<Option<DateTime<Utc>>> {
+    let row = sqlx::query_scalar!(
+        r#"
+        SELECT min(next_attempt_at) AS "next: DateTime<Utc>"
+        FROM delivery_queue
+        WHERE state IN ('pending', 'failed')
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
 pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<DeliveryQueueRow>> {
     sqlx::query_as!(
         DeliveryQueueRow,

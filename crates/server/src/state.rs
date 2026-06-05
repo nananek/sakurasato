@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use aws_credential_types::Credentials;
@@ -8,7 +9,7 @@ use reqwest::Client;
 use sakurasato_core::Config;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use crate::http_client;
 use crate::local_api::stream::{TIMELINE_CHANNEL_CAPACITY, TimelineEvent};
@@ -61,6 +62,19 @@ struct Inner {
     /// テスト経路 (`from_pool`) でも構築する ── socket が無くてもクライアント
     /// 構築自体は通る (= 初回 fetch で接続エラー)。
     media_proxy: MediaProxyClient,
+    /// 配送ワーカを叩き起こすための in-process 通知。
+    ///
+    /// ローカル発の enqueue (投稿 / リアクション / フォロー / Accept / Move /
+    /// プロフィール更新等) は **同一プロセス内**で `delivery_queue` に行を
+    /// 入れるので、INSERT 後に [`AppState::wake_delivery`] でワーカを即起こす。
+    /// これにより配送ワーカは「空でも 5 秒ごとにポーリング」をやめ、通知か
+    /// 次回リトライ時刻まで眠れる ── アイドル中に DB を一切叩かなくなり、
+    /// Neon 等の serverless Postgres が scale-to-zero (autosuspend) に入れる。
+    ///
+    /// Postgres `LISTEN/NOTIFY` ではなく in-process 通知なのは、Neon が
+    /// autosuspend で接続を切ると LISTEN 中の通知を取りこぼすため (= アプリ
+    /// メモリ上の `Notify` なら suspend をまたいでも消えない)。
+    delivery_notify: Arc<Notify>,
 }
 
 impl AppState {
@@ -71,8 +85,18 @@ impl AppState {
             .database
             .resolved_url()
             .context("resolve database URL")?;
+        // serverless Postgres (Neon 等) 対応:
+        // - `min_connections(0)`: アイドル時にプールを 0 本まで畳ませる
+        //   (= 接続を握りっぱなしにしない)。
+        // - `idle_timeout`: autosuspend (既定 5 分) より十分短くして、Neon が
+        //   接続を切る前に sqlx 側で idle 接続を閉じる ── 復帰後の
+        //   "connection reset" を避ける。
+        // - `max_lifetime`: 長寿命接続が suspend をまたいで stale 化するのを防ぐ。
         let pool = PgPoolOptions::new()
             .max_connections(8)
+            .min_connections(0)
+            .idle_timeout(Duration::from_mins(1))
+            .max_lifetime(Duration::from_mins(30))
             .connect(&url)
             .await
             .context("connect to PostgreSQL")?;
@@ -89,6 +113,7 @@ impl AppState {
             allow_internal_inbox: false,
             enable_remote_fetch: true,
             media_proxy,
+            delivery_notify: Arc::new(Notify::new()),
         })))
     }
 
@@ -114,6 +139,7 @@ impl AppState {
             allow_internal_inbox: true,
             enable_remote_fetch: false,
             media_proxy,
+            delivery_notify: Arc::new(Notify::new()),
         }))
     }
 
@@ -123,6 +149,22 @@ impl AppState {
 
     pub fn pool(&self) -> &PgPool {
         &self.0.pool
+    }
+
+    /// 配送ワーカを即起こす。ローカル発の enqueue 後 (= `delivery_queue` に
+    /// 行を入れた直後、tx 経路なら **commit 後**) に呼ぶ。空ポーリングを
+    /// やめたワーカはこの通知で起きて即配送する ([`Inner::delivery_notify`])。
+    ///
+    /// `notify_one` は待機中のワーカが居なければ permit を 1 つ貯めるので、
+    /// ワーカが次に `notified().await` した時点で取りこぼさず起きる
+    /// (= enqueue とワーカ起床のレースで通知が消えない)。
+    pub fn wake_delivery(&self) {
+        self.0.delivery_notify.notify_one();
+    }
+
+    /// 配送ワーカが待機に使う `Notify` の共有ハンドル。
+    pub fn delivery_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.0.delivery_notify)
     }
 
     /// Shared outbound HTTP client. Cloning is cheap (the inner state is

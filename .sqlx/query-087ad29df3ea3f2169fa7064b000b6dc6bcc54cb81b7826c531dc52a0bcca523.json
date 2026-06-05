@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT min(next_attempt_at) AS \"next: DateTime<Utc>\"\n        FROM delivery_queue\n        WHERE state IN ('pending', 'failed')\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "next: DateTime<Utc>",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "087ad29df3ea3f2169fa7064b000b6dc6bcc54cb81b7826c531dc52a0bcca523"
+}

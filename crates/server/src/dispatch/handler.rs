@@ -198,6 +198,9 @@ pub(crate) async fn handle_follow(
     let queued = delivery::enqueue_activity(state.pool(), followed.id, inbox_url, &accept_activity)
         .await
         .context("enqueue Accept activity")?;
+    // Accept を入れたら即配送ワーカを起こす (inbound Follow への応答遅延を
+    // 増やさない ── 空ポーリング廃止に伴う wake)。
+    state.wake_delivery();
 
     // お一人様 + 自動承認設計なので、Accept を queue した時点で follow 行を
     // accepted に倒す。これをやらないと `repo::follow::list_accepted_inboxes`
