@@ -264,10 +264,7 @@ async fn build_remote_note(
         ));
     }
 
-    let summary = obj
-        .get("summary")
-        .and_then(JsonValue::as_str)
-        .map(str::to_string);
+    let summary = normalize_summary(obj.get("summary").and_then(JsonValue::as_str));
     if let Some(s) = summary.as_deref()
         && s.chars().count() > SUMMARY_MAX
     {
@@ -339,6 +336,18 @@ async fn build_remote_note(
         url,
         published_at,
     })
+}
+
+/// AP Note の `summary` (= CW / spoiler) を正規化する。空文字や空白のみは
+/// `None` (= CW なし) に倒し、非空はそのまま返す (remote 著者の CW テキストは
+/// 勝手に trim しない)。
+///
+/// Pleroma は CW 無しのノートでも `summary: ""` を送ってくるため、これを通さないと
+/// `Some("")` が DB に入り、Misskey 系クライアント (Aria 等) が「`cw` が非 null =
+/// CW あり」と解釈して全ノートが「警告文の無い CW」に見える。local 投稿側
+/// (`local_api::notes`) の空 summary → `None` 正規化と対称。`Update` 受信も共有する。
+pub(crate) fn normalize_summary(raw: Option<&str>) -> Option<String> {
+    raw.filter(|s| !s.trim().is_empty()).map(str::to_string)
 }
 
 /// `to` / `cc` などの string array 抽出。文字列以外の要素は無視。
@@ -458,6 +467,21 @@ mod tests {
     fn extract_string_array_handles_missing() {
         assert!(extract_string_array(None).is_empty());
         assert!(extract_string_array(Some(&JsonValue::Null)).is_empty());
+    }
+
+    #[test]
+    fn normalize_summary_drops_empty_and_whitespace() {
+        // Pleroma は CW 無しでも `summary: ""` を送る → None (= CW なし) に倒す。
+        assert_eq!(normalize_summary(None), None);
+        assert_eq!(normalize_summary(Some("")), None);
+        assert_eq!(normalize_summary(Some("   ")), None);
+        assert_eq!(normalize_summary(Some("\t\n")), None);
+        // 非空はそのまま (remote の CW テキストは trim しない)。
+        assert_eq!(normalize_summary(Some("spoiler")), Some("spoiler".into()));
+        assert_eq!(
+            normalize_summary(Some("  keep inner  ")),
+            Some("  keep inner  ".into())
+        );
     }
 
     #[test]

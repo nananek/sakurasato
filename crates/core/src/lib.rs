@@ -44,6 +44,9 @@ mod tests {
         // 0021 normalize_reaction_content (= reaction shortcode mismatch 修正:
         //   PR #183/#187 以前に書かれた `:foo@host:` stale 行を `:foo:` に畳む
         //   backfill。Aria でのリアクション絵文字「増殖」を解消)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 21);
+        // 0022 normalize_note_summary (= Pleroma の `summary: ""` を保存した
+        //   stale 行の空 summary を NULL に畳む backfill。Aria で全ノートが
+        //   「警告文の無い CW」に見える症状を解消)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 22);
     }
 }
