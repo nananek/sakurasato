@@ -56,7 +56,12 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Run pytest stack
-        run: ./scripts/federation-test/pytest.sh nekonoverse
+        # DEBUG_KEEP=1: pytest.sh の `trap cleanup EXIT` (= down -v) を抑止し、
+        # 失敗時にコンテナを残して下の "Collect logs on failure" を実働させる
+        # (#201 と同根 ── 従来は script 側 teardown が log 収集より先に走り
+        # sakurasato-server 等のログが空振りしていた)。後始末は末尾の
+        # "Tear down on failure" (if: always()) が行う。
+        run: DEBUG_KEEP=1 ./scripts/federation-test/pytest.sh nekonoverse
 
       - name: Collect logs on failure
         if: failure()
@@ -76,6 +81,18 @@ jobs:
           echo "==> pytest logs"
           docker compose -p "$project" -f "$compose_file" \
             --profile pytest logs --no-color --tail=500 pytest || true
+          # #201: 失敗時に sks 側 DB の note / delivery_queue / follow state を
+          # 直接覗く。「TUI 経由の投稿/返信が server に届いて note 化されたか」を
+          # ログの有無 (server は成功時 INFO を出さない) ではなく行の実在で
+          # 判定できる ── reply シナリオの「posted # が出ない」系を切り分ける。
+          echo "==> sks DB: note rows"
+          docker compose -p "$project" -f "$compose_file" --profile pytest \
+            exec -T postgres-sks psql -U sakurasato -d sakurasato -c \
+            "SELECT id, left(content,40) AS content, in_reply_to_ap_id IS NOT NULL AS is_reply, is_local FROM note ORDER BY id;" || true
+          echo "==> sks DB: delivery_queue rows"
+          docker compose -p "$project" -f "$compose_file" --profile pytest \
+            exec -T postgres-sks psql -U sakurasato -d sakurasato -c \
+            "SELECT id, activity->>'type' AS type, state, left(inbox_url,50) AS inbox FROM delivery_queue ORDER BY id;" || true
 
       - name: Tear down on failure
         if: always()

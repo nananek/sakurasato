@@ -55,7 +55,11 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Run pytest stack
-        run: ./scripts/federation-test/pytest.sh nekonoverse-2sks
+        # DEBUG_KEEP=1: pytest.sh の `trap cleanup EXIT` (= down -v) を抑止し、
+        # 失敗時にコンテナを残して下の "Collect logs on failure" を実働させる
+        # (#201 と同根)。`sakurasato-token-issuer-new` の exit 1 原因等を取る。
+        # 後始末は末尾の "Tear down on failure" (if: always()) が行う。
+        run: DEBUG_KEEP=1 ./scripts/federation-test/pytest.sh nekonoverse-2sks
 
       - name: Collect logs on failure
         if: failure()

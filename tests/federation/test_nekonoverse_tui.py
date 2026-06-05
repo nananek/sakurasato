@@ -111,6 +111,11 @@ from conftest import (
 BOB_LOCAL = "bob"
 BOB_ACCT = f"{BOB_LOCAL}@{NEKONOVERSE_DOMAIN}"
 SKS_ACCT = f"me@{SAKURASATO_DOMAIN}"
+# #140 Scenario B の Move target。`nekonoverse-bob-new-issuer` (compose) が
+# 固定 username `bobnew` で登録 + oauth_tokens 直 seed しておく ── ここの値は
+# compose の `BOB_USERNAME: bobnew` と一致させること。
+BOB_NEW_LOCAL = "bobnew"
+BOB_NEW_ACCT = f"{BOB_NEW_LOCAL}@{NEKONOVERSE_DOMAIN}"
 
 
 # ── 共有 setup helpers (PR2b で追加) ──────────────────────────
@@ -628,7 +633,14 @@ def _type_compose_body_and_submit(tui, body: str) -> None:
     tui.send_keys("F2")
     # 送出成功時 status: `posted #<id> (<N> delivered)`。失敗時は
     # `post failed: ...`。前者を厳密に待つ。
-    tui.wait_until_text(r"posted #\d+", 20)
+    #
+    # 正規表現は **POSIX ERE** で書く ── `wait_until_text` は lib.sh 側で
+    # `grep -Eq` に渡す。GNU grep の ERE は `\d` を数字クラスとして解釈せず
+    # 「stray \ before d」警告付きでリテラル `d` に倒すため、`posted #\d+` は
+    # 実際の `posted #5 ...` に**一致しない** (= ubuntu runner で 20s timeout)。
+    # ローカルの ugrep / busybox grep は `\d` を数字に解釈するので開発機では
+    # 通り、CI だけ落ちる罠だった。`[0-9]+` なら 3 実装すべてで一致する。
+    tui.wait_until_text(r"posted #[0-9]+", 20)
 
 
 def _descendants_contain_marker(
@@ -987,39 +999,23 @@ def test_sks_tui_avatar_upload_updates_actor_icon(
 # (b) auto re-follow が delivery + accept まで成立、の両方が必要。
 
 
-def _next_bob_new_credentials() -> dict[str, str]:
-    """bob_new 用に **テストごとに固有の username/email** を作る。
-
-    Mastodon の `/api/v1/accounts` は同じ username/email を 422 で弾くため、
-    過去 stack 上で 1 度成立すると同 stack の再 run では新規 alias に倒さない
-    と取れない。固有性を担保しつつ、Nekonoverse の email validator (Pydantic
-    `EmailStr`) が syntactic に弾く `.test` / `.example` / `.invalid` /
-    `.local` 等の RFC 6761 予約 TLD を避け、Google 登録の実在 gTLD である
-    `.dev` をベースに uuid を貼る (= DNS 不要、deliverability check は既定
-    無効)。パスワードは固定で十分 (= 本テストでは login しない、token は
-    registration で返る Bearer をそのまま使う)。
-    """
-    suffix = uuid.uuid4().hex[:10]
-    return {
-        "username": f"bobnew{suffix}",
-        "email": f"bobnew{suffix}@bobnew.nekonoverse.dev",
-        "password": "bobnewpass1234",
-    }
-
-
 @pytest.mark.timeout(360)
 def test_bob_move_to_bob_new_propagates_to_sks_following(
     bob_followed_by_sks,
     sakurasato: SakurasatoClient,
     nekonoverse: NekonoverseClient,
+    nekonoverse_bob_new_token: str,
 ) -> None:
     """nkv → sks Move (Scenario B): bob が bob_new に引っ越すと alice の
     follow が bob_new に追従する (= sks `handle_move` + auto re-follow)。
 
     フェーズ:
       1. `bob_followed_by_sks` fixture で alice@sks → bob@nkv accepted を確保。
-      2. bob_new (= 2nd nkv user) を `/api/v1/apps` → `/api/v1/accounts` 経路で
-         登録する (= Mastodon 互換 Token 直返しなので OAuth 完走不要)。
+      2. Move target `bobnew` (= 2nd nkv user) は `nekonoverse-bob-new-issuer`
+         が起動時に登録 + oauth_tokens 直 seed 済み。Nekonoverse は
+         `/api/v1/accounts` が token を返さない (seed-bob.sh 参照) ので、
+         bob と同じく専用 issuer が DB-seed した Bearer を fixture
+         (`nekonoverse_bob_new_token`) 経由でファイル受領する。
       3. bob_new として `PATCH /accounts/update_credentials` で
          `also_known_as=[bob_ap_id]` を立てる (= sks 側 `handle_move` の
          双方向同意チェックで必須)。
@@ -1043,22 +1039,14 @@ def test_bob_move_to_bob_new_propagates_to_sks_following(
     )
     assert bob_ap_id, f"WebFinger did not return self link with AP type: {wf}"
 
-    # 2. bob_new を nkv に新規登録する。
-    creds = _next_bob_new_credentials()
-    app = nekonoverse.register_app(client_name=f"sakurasato-move-e2e-{creds['username']}")
-    bob_new_token_resp = nekonoverse.register_account(
-        app_token=app["access_token"],
-        username=creds["username"],
-        email=creds["email"],
-        password=creds["password"],
-    )
-    bob_new_token = bob_new_token_resp.get("access_token")
-    assert bob_new_token, f"register_account did not return access_token: {bob_new_token_resp}"
+    # 2. Move target `bobnew` は issuer コンテナが登録 + token seed 済み。
+    #    Bearer は fixture (= 共有 volume の `bob_new.token`) から受け取る。
+    bob_new_token = nekonoverse_bob_new_token
 
     # bob_new の AP id を WebFinger 経由で引く (= 登録 → AP actor URI の確立を
     # 待つ意味も兼ねる)。Nekonoverse の AP URI 形は `https://nekonoverse/users/<id>`
     # 系なので、文字列構築より WebFinger に任せた方が安全。
-    bob_new_acct = f"{creds['username']}@{NEKONOVERSE_DOMAIN}"
+    bob_new_acct = BOB_NEW_ACCT
 
     def bob_new_webfinger_resolves() -> str | None:
         try:
@@ -1132,7 +1120,7 @@ def test_bob_move_to_bob_new_propagates_to_sks_following(
             actor = entry.get("actor") or {}
             host = (actor.get("host") or "").lower()
             name = (actor.get("preferred_username") or "").lower()
-            if name == creds["username"].lower() and host == NEKONOVERSE_DOMAIN.lower():
+            if name == BOB_NEW_LOCAL.lower() and host == NEKONOVERSE_DOMAIN.lower():
                 return True
         return False
 
@@ -1141,7 +1129,7 @@ def test_bob_move_to_bob_new_propagates_to_sks_following(
         timeout=180,
         interval=3,
         desc=(
-            f"sks following includes bob_new ({creds['username']}@{NEKONOVERSE_DOMAIN}) "
+            f"sks following includes bob_new ({BOB_NEW_ACCT}) "
             "after nkv→sks Move propagation"
         ),
     )

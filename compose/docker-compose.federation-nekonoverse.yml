@@ -322,6 +322,51 @@ services:
     profiles: [pytest]
     restart: "no"
 
+  # #140 Scenario B (nkv→sks Move) 用の 2nd nkv user `bobnew` を headless 登録 +
+  # oauth_tokens 直 seed する 1-shot service。`nekonoverse-bob-issuer` と同じ
+  # seed-bob.sh を **BOB_USERNAME=bobnew** で再利用するだけ (= Nekonoverse は
+  # 登録で token を返さないため、Move target も bob と同じ DB-seed 経路でしか
+  # Bearer を得られない)。raw token は `/nkv-tokens/bob_new.token` に出力し、
+  # pytest は read-only で読む (= pytest コンテナを DB-free に保つ既存不変条件を
+  # 維持。動的登録だと pytest に DB 認証情報が要るのを避ける)。
+  nekonoverse-bob-new-issuer:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache curl jq ca-certificates postgresql-client >/dev/null &&
+             cp /certs/ca.crt /usr/local/share/ca-certificates/test-ca.crt &&
+             update-ca-certificates >/dev/null &&
+             /seed-bob.sh"
+    environment:
+      NKV_BASE: https://nekonoverse
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      NKV_DB_HOST: postgres-neko
+      NKV_DB_PORT: "5432"
+      NKV_DB_USER: nekonoverse
+      NKV_DB_NAME: nekonoverse
+      NKV_DB_PASSWORD: testpass
+      # bob とは別 user。固定 username (stack ごとに DB が down -v されるので
+      # 衝突しない。同 stack 再 run は seed-bob.sh の 422 idempotent 経路が拾う)。
+      BOB_USERNAME: bobnew
+      BOB_EMAIL: bobnew@bobnew.nekonoverse.dev
+      NKV_TOKEN_OUT: /nkv-tokens/bob_new.token
+    depends_on:
+      nekonoverse-app:
+        condition: service_healthy
+      nginx-neko:
+        condition: service_started
+      certs:
+        condition: service_completed_successfully
+      postgres-neko:
+        condition: service_healthy
+    volumes:
+      - certs:/certs:ro
+      - ./federation-test/nekonoverse-federation/seed-bob.sh:/seed-bob.sh:ro
+      - nekonoverse_tokens:/nkv-tokens
+    networks:
+      - nekonoverse-fed
+    profiles: [pytest]
+    restart: "no"
+
   # Sakurasato 側にテスト用カスタム絵文字 `:sakurasato_test:` を **import** する
   # 1-shot service (#58 / #120 PR2c)。`reaction_custom_emoji` シナリオで TUI が
   # `:sakurasato_test:` を発火するために、import 前に local emoji 行が DB に
@@ -400,6 +445,8 @@ services:
       # bob 用 OAuth Bearer (PR2b で DB 直 seed)。`nekonoverse-bob-issuer` が
       # 書き出した raw token をここで読む。
       NEKONOVERSE_TOKEN_FILE: /nkv-tokens/bob.token
+      # #140 Scenario B: Move target `bobnew` の Bearer (bob-new-issuer が seed)。
+      NEKONOVERSE_BOB_NEW_TOKEN_FILE: /nkv-tokens/bob_new.token
       # PR2c で seed する custom emoji の shortcode。test 側 fixture と
       # 揃えるため env で渡しておく (= seed と test の不整合を避ける)。
       SAKURASATO_SEED_EMOJI_SHORTCODE: sakurasato_test
@@ -420,6 +467,8 @@ services:
       sakurasato-emoji-import:
         condition: service_completed_successfully
       nekonoverse-bob-issuer:
+        condition: service_completed_successfully
+      nekonoverse-bob-new-issuer:
         condition: service_completed_successfully
       nekonoverse-worker:
         condition: service_started
