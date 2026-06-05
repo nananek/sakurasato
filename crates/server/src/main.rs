@@ -7,7 +7,7 @@ use clap::Parser;
 use sakurasato_core::Config;
 use sakurasato_server::{
     actor_admin, cli, delivery, emoji_import, follow, follow_request, init, miauth_cli,
-    move_accept, move_out, notification, serve, token,
+    move_accept, move_out, notification, prune, serve, token,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -44,5 +44,6 @@ async fn main() -> anyhow::Result<()> {
             notification::cli_runner::run(config, args).await
         }
         cli::Command::Miauth(args) => miauth_cli::run(config, args).await,
+        cli::Command::PruneRemoteNotes(args) => prune::run(config, args).await,
     }
 }

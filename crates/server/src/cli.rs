@@ -96,6 +96,31 @@ pub enum Command {
     /// 1 回だけ stdout に出す (`--out` でファイル直書きも可)。詳細は
     /// `miauth --help` 参照。
     Miauth(crate::miauth_cli::MiAuthArgs),
+    /// 古いリモートノートを削除する GC ジョブ (= 連合タイムラインの蓄積掃除)。
+    ///
+    /// `is_local = FALSE` かつ `created_at` が `--older-than` 日より前のノートの
+    /// うち、**自分が interaction していないもの** を削除する。残すのは:
+    /// 自分が reaction / renote (announce) / 返信したリモートノート (= 消すと
+    /// `ON DELETE CASCADE` で自分の interaction 記録や会話文脈が失われるため)。
+    /// 自分の投稿 (local note) は当然対象外。
+    ///
+    /// 検索用途を持たないお一人様サーバ向けに、host の cron / systemd-timer から
+    /// 定期実行する想定 (= 常駐ポーラを増やさず Neon scale-to-zero を妨げない)。
+    /// `--dry-run` で削除せず件数だけ確認できる。
+    PruneRemoteNotes(PruneArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PruneArgs {
+    /// 何日より前のリモートノートを削除対象にするか (`created_at` 基準)。
+    /// 既定 7 日。**最小 1** ── `--older-than 0` だと `now() - 0d = now()` で
+    /// interaction 無しの全リモートノートを消してしまうので、誤操作ガードとして
+    /// `value_parser` で `0` を弾く。
+    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..))]
+    pub older_than: u32,
+    /// 削除せず、削除対象の件数だけ表示する。
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

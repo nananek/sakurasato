@@ -945,6 +945,121 @@ async fn note_summary_empty_or_blank_normalized_to_null(pool: PgPool) -> sqlx::R
     Ok(())
 }
 
+/// `prune_remote_notes` ── 古い remote ノートを削除しつつ、(1) local ノート、
+/// (2) reaction / announce / 返信先として自分が interaction した remote ノート、
+/// (3) 新しい remote ノート を保護することを固定する。dry-run は削除しない。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn prune_remote_notes_keeps_local_and_interacted(pool: PgPool) -> sqlx::Result<()> {
+    let local = repo::actor::insert(&pool, sample_local_actor("prl")).await?;
+    let mut remote_new = sample_local_actor("prr");
+    remote_new.is_local = false;
+    remote_new.host = "remote.example".into();
+    remote_new.ap_id = "https://remote.example/users/bob".into();
+    remote_new.preferred_username = "bob".into();
+    remote_new.public_key_id = "https://remote.example/users/bob#main-key".into();
+    remote_new.inbox_url = "https://remote.example/users/bob/inbox".into();
+    remote_new.private_key_pem = None;
+    remote_new.ed25519_public_key_id = None;
+    remote_new.ed25519_public_key_pem = None;
+    remote_new.ed25519_private_key_pem = None;
+    remote_new.also_known_as = vec![];
+    let remote = repo::actor::insert(&pool, remote_new).await?;
+
+    let mk =
+        |suffix: &str, author: i64, is_local: bool, in_reply_to: Option<i64>| repo::note::NewNote {
+            ap_id: format!("https://x.test/notes/{suffix}"),
+            actor_id: author,
+            content: "n".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: in_reply_to,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local,
+            url: None,
+            published_at: chrono::Utc::now(),
+        };
+
+    let local_note = repo::note::insert(&pool, mk("prune-local", local.id, true, None)).await?;
+    let lone = repo::note::insert(&pool, mk("prune-lone", remote.id, false, None)).await?;
+    let reacted = repo::note::insert(&pool, mk("prune-reacted", remote.id, false, None)).await?;
+    let announced =
+        repo::note::insert(&pool, mk("prune-announced", remote.id, false, None)).await?;
+    let parent = repo::note::insert(&pool, mk("prune-parent", remote.id, false, None)).await?;
+    let recent = repo::note::insert(&pool, mk("prune-recent", remote.id, false, None)).await?;
+
+    // 自分 (local actor) の interaction。
+    repo::reaction::insert(
+        &pool,
+        "https://x.test/r/pr",
+        reacted.id,
+        local.id,
+        "👍",
+        None,
+    )
+    .await?;
+    repo::announce::insert_or_get(
+        &pool,
+        "https://x.test/a/pr",
+        announced.id,
+        local.id,
+        chrono::Utc::now(),
+    )
+    .await?;
+    // local note が parent に返信 → parent は保護される。
+    let _reply =
+        repo::note::insert(&pool, mk("prune-reply", local.id, true, Some(parent.id))).await?;
+
+    // recent 以外を 30 日前に backdate (recent は now() のまま = 新しい)。
+    for id in [local_note.id, lone.id, reacted.id, announced.id, parent.id] {
+        sqlx::query!(
+            "UPDATE note SET created_at = now() - make_interval(days => 30) WHERE id = $1",
+            id
+        )
+        .execute(&pool)
+        .await?;
+    }
+
+    // dry-run: 削除対象は孤立した古い remote (lone) のみ。実 DB は不変。
+    assert_eq!(repo::note::prune_remote_notes(&pool, 7, true).await?, 1);
+    assert!(
+        repo::note::get_by_id(&pool, lone.id).await?.is_some(),
+        "dry-run は削除しない"
+    );
+
+    // 本実行: lone だけ消える。
+    assert_eq!(repo::note::prune_remote_notes(&pool, 7, false).await?, 1);
+    assert!(repo::note::get_by_id(&pool, lone.id).await?.is_none());
+
+    // 保護されるもの。
+    assert!(
+        repo::note::get_by_id(&pool, local_note.id).await?.is_some(),
+        "local note は古くても保護"
+    );
+    assert!(
+        repo::note::get_by_id(&pool, reacted.id).await?.is_some(),
+        "reaction 済みは保護"
+    );
+    assert!(
+        repo::note::get_by_id(&pool, announced.id).await?.is_some(),
+        "announce 済みは保護"
+    );
+    assert!(
+        repo::note::get_by_id(&pool, parent.id).await?.is_some(),
+        "自分の返信先は保護"
+    );
+    assert!(
+        repo::note::get_by_id(&pool, recent.id).await?.is_some(),
+        "新しい remote は保護"
+    );
+    Ok(())
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn emoji_upsert_remote_is_idempotent_by_ap_id(pool: PgPool) -> sqlx::Result<()> {
     // Issue #135 で `image_key` を `Option<String>` に倒し、Issue #192 で
