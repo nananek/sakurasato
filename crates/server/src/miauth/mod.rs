@@ -125,6 +125,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/drive/files/show", post(drive::show))
         .route("/api/drive/files/update", post(drive::update))
         .route("/api/drive/files/delete", post(drive::delete))
+        // ドライブ閲覧 UI (= Aria のドライブタブ)。usage バー + フォルダ一覧 (空)。
+        .route("/api/drive", post(drive::usage))
+        .route("/api/drive/folders", post(drive::folders))
         // M14 #170 ── /streaming WebSocket stub (Aria UI の「接続中…」hang 回避)
         .route("/streaming", get(streaming::handle))
         .layer(TraceLayer::new_for_http())

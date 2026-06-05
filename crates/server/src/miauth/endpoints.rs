@@ -89,6 +89,9 @@ const SUPPORTED_ENDPOINTS: &[&str] = &[
     "drive/files/show",
     "drive/files/update",
     "drive/files/delete",
+    // ドライブ閲覧 UI (= Aria のドライブタブ): usage バー + フォルダ一覧 (空)。
+    "drive",
+    "drive/folders",
 ];
 
 /// `POST /api/endpoints` handler。**認証不要** (= Misskey 本家も anonymous で

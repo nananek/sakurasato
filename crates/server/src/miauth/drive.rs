@@ -18,6 +18,11 @@
 //!   無いため永続化しない (sensitive は AP 伝搬込みの別 issue)。`write:drive`。
 //! - `POST /api/drive/files/delete { fileId }` ── **未添付** file を削除。添付済み
 //!   は 400 (note のスナップショット参照を壊さない)。`write:drive`、204 返却。
+//! - `POST /api/drive` ── `DriveUsage` `{ capacity, usage }` (bytes)。Aria のドライブ
+//!   タブヘッダ用。`capacity = 0` (= 容量無制限、meta の `driveCapacityMb: 0` と
+//!   整合)、`usage` は自分の media の合計サイズ。`read:drive`。
+//! - `POST /api/drive/folders` ── フォルダ一覧。Sakurasato は Misskey の "フォルダ"
+//!   概念を持たない (= 添付は note に紐付くだけ) ので **常に空配列**。`read:drive`。
 //!
 //! ## clean-room
 //!
@@ -32,7 +37,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use sakurasato_core::repo;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::local_api;
 use crate::miauth::auth;
@@ -380,6 +385,68 @@ pub async fn delete(
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `i` (token) だけを取る body。`drive` (usage) / `drive/folders` が共有する。
+#[derive(Debug, Deserialize, Default)]
+pub struct TokenOnlyBody {
+    #[serde(default)]
+    pub i: Option<String>,
+}
+
+/// Misskey `DriveUsage` ── `{ capacity, usage }` (bytes)。
+#[derive(Debug, Serialize)]
+struct DriveUsage {
+    capacity: i64,
+    usage: i64,
+}
+
+/// `POST /api/drive` ── ドライブ使用量 `{ capacity, usage }` (bytes)。Aria の
+/// ドライブタブヘッダの使用量バー用。`capacity = 0` は meta の `driveCapacityMb: 0`
+/// と揃えた「容量無制限」(= R2 backed のお一人様で per-user quota を課さない)。
+/// `usage` は自分の media の `byte_size` 合計。`read:drive` scope。
+pub async fn usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<TokenOnlyBody>>,
+) -> Response {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    if auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_DRIVE)
+        .await
+        .is_none()
+    {
+        return auth::unauthorized("invalid or revoked token");
+    }
+    let Some(owner) = local_actor_id(&state).await else {
+        return internal_error("local actor not initialized");
+    };
+    match repo::media::total_byte_size_for_owner(state.pool(), owner).await {
+        // capacity 0 = 無制限 (meta の driveCapacityMb: 0 と整合)。
+        Ok(usage) => Json(DriveUsage { capacity: 0, usage }).into_response(),
+        Err(err) => {
+            tracing::error!(?err, "drive usage aggregate failed");
+            internal_error("drive usage failed")
+        }
+    }
+}
+
+/// `POST /api/drive/folders` ── フォルダ一覧。Sakurasato は Misskey の "フォルダ"
+/// 概念を持たない (= 添付は note に紐付くだけ) ので **常に空配列** を返す。Aria の
+/// ドライブタブはこれで「フォルダ無し」を表示して開ける。`folderId` / `limit` 等の
+/// param は受理しても無視 (空配列なので意味を持たない)。`read:drive` scope。
+pub async fn folders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<TokenOnlyBody>>,
+) -> Response {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    if auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_DRIVE)
+        .await
+        .is_none()
+    {
+        return auth::unauthorized("invalid or revoked token");
+    }
+    Json(Vec::<serde_json::Value>::new()).into_response()
 }
 
 /// 設定の `[server].user@host` から local actor の id を引く (drive の所有者)。
