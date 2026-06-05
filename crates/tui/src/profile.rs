@@ -199,6 +199,7 @@ mod tests {
             emojis: Vec::new(),
             announce_count: 0,
             viewer_renoted: false,
+            renote: None,
         }
     }
 

@@ -133,7 +133,7 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
     // 初回タイムライン取得。
     match api.timeline_home(None, options.page_size).await {
         Ok(resp) => {
-            app.replace_timeline(resp.notes, resp.next_before_id);
+            app.replace_timeline(resp.notes, resp.next_before_ts_ms);
         }
         Err(err) => {
             warn!(?err, "initial timeline fetch failed");
@@ -345,7 +345,7 @@ async fn apply_action(
             match api.timeline_home(None, page_size).await {
                 Ok(resp) => {
                     let n = resp.notes.len();
-                    app.replace_timeline(resp.notes, resp.next_before_id);
+                    app.replace_timeline(resp.notes, resp.next_before_ts_ms);
                     app.set_status(
                         format!("refreshed: {n} notes"),
                         StatusKind::Success,
@@ -371,12 +371,12 @@ async fn apply_action(
                 );
                 return;
             }
-            let before = app.next_before_id;
+            let before = app.next_before_ts_ms;
             let _g = InFlightGuard::new(app.in_flight.clone());
             match api.timeline_home(before, page_size).await {
                 Ok(resp) => {
                     let added = resp.notes.len();
-                    app.append_older(resp.notes, resp.next_before_id);
+                    app.append_older(resp.notes, resp.next_before_ts_ms);
                     app.set_status(
                         format!("loaded {added} older"),
                         StatusKind::Info,
@@ -824,7 +824,7 @@ async fn push_profile_for_actor_id(app: &mut App, api: &LocalApi, actor_id: i64,
                 StatusKind::Warning,
                 Some(Duration::from_secs(5)),
             );
-            crate::client::TimelineResponse {
+            crate::client::AuthorNotesResponse {
                 notes: Vec::new(),
                 next_before_id: None,
             }
@@ -1084,7 +1084,7 @@ async fn undo_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
                 Some(Duration::from_secs(3)),
             );
             if let Ok(resp) = api.timeline_home(None, page_size).await {
-                app.replace_timeline(resp.notes, resp.next_before_id);
+                app.replace_timeline(resp.notes, resp.next_before_ts_ms);
             }
         }
         Err(err) => {
@@ -1218,7 +1218,7 @@ async fn send_renote(app: &mut App, api: &LocalApi, page_size: i64) {
                 Some(Duration::from_secs(3)),
             );
             if let Ok(resp) = api.timeline_home(None, page_size).await {
-                app.replace_timeline(resp.notes, resp.next_before_id);
+                app.replace_timeline(resp.notes, resp.next_before_ts_ms);
             }
         }
         Err(err) => {
@@ -1255,7 +1255,7 @@ async fn undo_renote(app: &mut App, api: &LocalApi, page_size: i64) {
                 Some(Duration::from_secs(3)),
             );
             if let Ok(resp) = api.timeline_home(None, page_size).await {
-                app.replace_timeline(resp.notes, resp.next_before_id);
+                app.replace_timeline(resp.notes, resp.next_before_ts_ms);
             }
         }
         Err(err) => {
@@ -1288,7 +1288,7 @@ async fn send_reaction(app: &mut App, api: &LocalApi, note_id: i64, content: &st
             );
             // 成功 → タイムラインを取り直して reaction count を反映。
             if let Ok(resp) = api.timeline_home(None, page_size).await {
-                app.replace_timeline(resp.notes, resp.next_before_id);
+                app.replace_timeline(resp.notes, resp.next_before_ts_ms);
             }
         }
         Err(err) => {
@@ -1864,7 +1864,7 @@ async fn push_profile_from_lookup(
                 ?err,
                 actor_id, "actor notes fetch failed; opening with empty"
             );
-            crate::client::TimelineResponse {
+            crate::client::AuthorNotesResponse {
                 notes: Vec::new(),
                 next_before_id: None,
             }

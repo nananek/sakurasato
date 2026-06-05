@@ -177,6 +177,7 @@ mod tests {
             emojis: vec![],
             announce_count: 0,
             viewer_renoted: false,
+            renote: None,
         }
     }
 

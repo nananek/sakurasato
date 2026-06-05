@@ -149,8 +149,10 @@ pub struct App {
     pub selected: usize,
     /// 表示開始 index。スクロール時に動かす。
     pub top: usize,
-    /// `before_id` ベースのカーソル。次ページ取得に使う。
-    pub next_before_id: Option<i64>,
+    /// home timeline の次ページカーソル (= 最後のエントリの並び時刻、epoch
+    /// ミリ秒)。note + renote を `published_at` で混在ページングするため id では
+    /// なく時刻カーソルを使う。
+    pub next_before_ts_ms: Option<i64>,
     /// 追加読み込みが終わったかどうか (= サーバから空配列が返ったら true)。
     pub timeline_exhausted: bool,
     pub focus: Focus,
@@ -252,7 +254,7 @@ impl App {
             notes: Vec::new(),
             selected: 0,
             top: 0,
-            next_before_id: None,
+            next_before_ts_ms: None,
             timeline_exhausted: false,
             focus: Focus::Timeline,
             compose: Compose::new(),
@@ -301,22 +303,22 @@ impl App {
     }
 
     /// 初回 / 手動更新で取ったタイムラインで上書きする。
-    pub fn replace_timeline(&mut self, notes: Vec<TimelineNote>, next_before_id: Option<i64>) {
+    pub fn replace_timeline(&mut self, notes: Vec<TimelineNote>, next_before_ts_ms: Option<i64>) {
         self.timeline_exhausted = notes.is_empty();
         self.notes = notes;
-        self.next_before_id = next_before_id;
+        self.next_before_ts_ms = next_before_ts_ms;
         self.selected = 0;
         self.top = 0;
     }
 
     /// 続きページを末尾に追記する。
-    pub fn append_older(&mut self, mut more: Vec<TimelineNote>, next_before_id: Option<i64>) {
+    pub fn append_older(&mut self, mut more: Vec<TimelineNote>, next_before_ts_ms: Option<i64>) {
         if more.is_empty() {
             self.timeline_exhausted = true;
             return;
         }
         self.notes.append(&mut more);
-        self.next_before_id = next_before_id;
+        self.next_before_ts_ms = next_before_ts_ms;
     }
 
     /// SSE からの `note.created` を反映する。重複 (= 自分の POST が SSE で返って
@@ -327,8 +329,14 @@ impl App {
         if note.actor_ap_id == self.whoami.ap_id {
             note.is_local = true;
         }
-        // 既にある note の更新は無視 (= timeline は append-only)。
-        if self.notes.iter().any(|n| n.id == note.id) {
+        // 既にある **通常 note** の更新は無視 (= timeline は append-only)。renote
+        // エントリは元 note と同じ id を持つので dedupe 対象から除外する ──
+        // でないと「元 note の renote が既にある」と新着 note を取りこぼす。
+        if self
+            .notes
+            .iter()
+            .any(|n| n.id == note.id && n.renote.is_none())
+        {
             return;
         }
         // 先頭挿入。selected を 0 に保ちたいので何もしないと自動で「いま選択中の
@@ -442,6 +450,7 @@ mod tests {
             emojis: Vec::new(),
             announce_count: 0,
             viewer_renoted: false,
+            renote: None,
         }
     }
 

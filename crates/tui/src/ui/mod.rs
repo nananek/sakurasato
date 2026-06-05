@@ -658,7 +658,18 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
             && visible_height >= 1
             && let Some(url) = note.actor_icon_url.as_deref()
         {
-            avatar_overlays.push((visible_top, url));
+            // renote エントリは先頭に「🔁 …」注記行があるので、アバターは
+            // author 行 (= 注記行の次) に重ねる。注記行の高さぶん下げ、author
+            // 行が viewport 外にクリップされる場合は描かない。
+            let avatar_offset = if note.renote.is_some() {
+                line_heights.first().copied().unwrap_or(0)
+            } else {
+                0
+            };
+            let avatar_top = visible_top.saturating_add(avatar_offset);
+            if avatar_top < inner.y.saturating_add(inner.height) {
+                avatar_overlays.push((avatar_top, url));
+            }
         }
 
         for (l, h) in block_lines.into_iter().zip(line_heights) {
@@ -1437,6 +1448,12 @@ fn render_avatar(frame: &mut Frame<'_>, app: &App, x: u16, y: u16, url: &str) {
     frame.render_widget(widget, rect);
 }
 
+// header / CW / body / reactions / renote 各行を 1 関数で組み立てる都合上 100 行を
+// 超える。各ブロックは独立しており分割しても可読性が上がらないため allow する。
+#[allow(
+    clippy::too_many_lines,
+    reason = "1 note の各表示ブロックを順に積むため。分割しても読みやすくならない"
+)]
 fn note_lines(
     note: &TimelineNote,
     palette: &Palette,
@@ -1454,6 +1471,27 @@ fn note_lines(
     };
     let marker = if selected { "▍ " } else { "  " };
     let pad = " ".repeat(avatar_indent as usize);
+
+    // renote として流れてきたエントリは先頭に「🔁 <renoter> がリノート」注記を
+    // 出す。本体フィールド (author / content / reactions …) は **元 note** なので、
+    // 続く通常描画がそのまま元 note を表す。選択マーカーは下の author 行に残す。
+    if let Some(r) = &note.renote {
+        let who = r
+            .renoter_display_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(r.renoter_preferred_username.as_str());
+        out.push(Line::from(vec![
+            Span::raw(pad.clone()),
+            Span::raw("  "),
+            Span::styled(
+                format!("🔁 {who} がリノート"),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
 
     let local_published = note.published_at.with_timezone(&Local);
     let time = local_published.format("%H:%M").to_string();
