@@ -884,6 +884,67 @@ async fn reaction_content_consolidation_collapses_host_suffix_dups(
     Ok(())
 }
 
+/// migration `0022_normalize_note_summary` の本体 SQL (`include_str!` で drift 防止)。
+const NORMALIZE_NOTE_SUMMARY_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0022_normalize_note_summary.sql"
+));
+
+/// Pleroma の `summary: ""` を保存した stale 行 (空 / 空白のみ) が migration 0022 で
+/// `NULL` に畳まれ、実 CW テキストは温存されることを固定する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn note_summary_empty_or_blank_normalized_to_null(pool: PgPool) -> sqlx::Result<()> {
+    let author = repo::actor::insert(&pool, sample_local_actor("nsum1")).await?;
+    let mk = |suffix: &str, summary: Option<&str>| repo::note::NewNote {
+        ap_id: format!("https://example.test/notes/{suffix}"),
+        actor_id: author.id,
+        content: "body".into(),
+        language: None,
+        in_reply_to_ap_id: None,
+        in_reply_to_note_id: None,
+        summary: summary.map(str::to_string),
+        visibility: Visibility::Public,
+        sensitive: false,
+        to_recipients: vec![],
+        cc_recipients: vec![],
+        attachments: serde_json::json!([]),
+        tags: serde_json::json!([]),
+        is_local: false,
+        url: None,
+        published_at: chrono::Utc::now(),
+    };
+    let empty = repo::note::insert(&pool, mk("nsum-empty", Some(""))).await?;
+    let blank = repo::note::insert(&pool, mk("nsum-blank", Some("   "))).await?;
+    let real = repo::note::insert(&pool, mk("nsum-real", Some("spoiler"))).await?;
+    let keep = repo::note::insert(&pool, mk("nsum-keep", Some("  inner kept  "))).await?;
+
+    sqlx::raw_sql(NORMALIZE_NOTE_SUMMARY_SQL)
+        .execute(&pool)
+        .await?;
+
+    let summary_of = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar!(r#"SELECT summary FROM note WHERE id = $1"#, id)
+                .fetch_one(&pool)
+                .await
+        }
+    };
+    assert_eq!(summary_of(empty.id).await?, None, "'' → NULL");
+    assert_eq!(summary_of(blank.id).await?, None, "空白のみ → NULL");
+    assert_eq!(
+        summary_of(real.id).await?,
+        Some("spoiler".into()),
+        "実 CW は温存"
+    );
+    assert_eq!(
+        summary_of(keep.id).await?,
+        Some("  inner kept  ".into()),
+        "非空は trim せず温存"
+    );
+    Ok(())
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn emoji_upsert_remote_is_idempotent_by_ap_id(pool: PgPool) -> sqlx::Result<()> {
     // Issue #135 で `image_key` を `Option<String>` に倒し、Issue #192 で

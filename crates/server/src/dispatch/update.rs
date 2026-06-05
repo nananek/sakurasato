@@ -150,10 +150,11 @@ async fn update_note(
         .and_then(JsonValue::as_str)
         .unwrap_or(&note.content)
         .to_string();
-    let new_summary = obj
-        .get("summary")
-        .and_then(JsonValue::as_str)
-        .map(str::to_string);
+    // 空文字 / 空白のみ summary は CW なし (`None`) に正規化する ── Pleroma の
+    // `summary: ""` が「空 CW あり」扱いにならないよう、Create 受信 (note.rs) と
+    // 同じ [`super::note::normalize_summary`] を共有する。
+    let new_summary =
+        super::note::normalize_summary(obj.get("summary").and_then(JsonValue::as_str));
 
     // 長すぎる content / summary は弾く ── reaction と同じく DB 肥大対策。
     // local 投稿側の上限 (`local_api::notes`) と同じ 5000 / 200 char 上限を
