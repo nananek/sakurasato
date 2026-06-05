@@ -183,6 +183,23 @@ pub async fn get_by_id_for_owner(
     .await
 }
 
+/// `owner_actor_id` が所有する media の `byte_size` 合計 (= ドライブ使用量、bytes)。
+/// `MiAuth` `POST /api/drive` (`DriveUsage`) 用。媒体が無ければ 0。お一人様なので
+/// 1 ユーザー分の集計しか走らず軽い。
+pub async fn total_byte_size_for_owner(pool: &PgPool, owner_actor_id: i64) -> sqlx::Result<i64> {
+    let rec = sqlx::query!(
+        r#"
+        SELECT COALESCE(SUM(byte_size), 0)::BIGINT AS "total!"
+        FROM media
+        WHERE owner_actor_id = $1
+        "#,
+        owner_actor_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(rec.total)
+}
+
 /// `MiAuth` `drive/files/update` の `comment` (= AP alt text) 更新。所有者ガード
 /// 込みで `alt_text` を `new_alt` に上書きし、更新後の行を返す。他人の file や
 /// 存在しない id は `None`。`new_alt = None` は `alt_text` を NULL にクリアする。

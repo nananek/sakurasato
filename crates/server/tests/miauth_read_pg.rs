@@ -1607,3 +1607,74 @@ async fn drive_files_delete_rejects_attached(pool: PgPool) {
         "attached file must survive a rejected delete"
     );
 }
+
+/// `POST /api/drive` ── capacity 0 (無制限) + 自分の media の `byte_size` 合計。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn drive_usage_returns_capacity_and_summed_usage(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    // seed_media は byte_size=4096 固定。2 件 → usage=8192。
+    let _ = seed_media(&pool, alice, "u1.webp", None).await;
+    let _ = seed_media(&pool, alice, "u2.webp", None).await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:drive"]).await;
+
+    let body = json!({"i": token});
+    let resp = app
+        .oneshot(
+            Request::post("/api/drive")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["capacity"], 0, "capacity 0 = unlimited (meta と整合)");
+    assert_eq!(v["usage"], 8192, "2 media * 4096 bytes");
+}
+
+/// `POST /api/drive/folders` ── フォルダ概念が無いので常に空配列。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn drive_folders_returns_empty_array(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:drive"]).await;
+
+    let body = json!({"i": token});
+    let resp = app
+        .oneshot(
+            Request::post("/api/drive/folders")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v.as_array().expect("folders is array").len(), 0);
+}
+
+/// `POST /api/drive` は `read:drive` を要求する (scope 無しトークンは 401)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn drive_usage_requires_read_scope(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+    let body = json!({"i": token});
+    let resp = app
+        .oneshot(
+            Request::post("/api/drive")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
