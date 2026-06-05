@@ -58,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build ${{ matrix.name }} (no push)
         uses: docker/build-push-action@v6
@@ -90,7 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # 本番 compose は secrets/{postgres_password,s3_secret_key}.txt を bind
       # mount する設計 (CLAUDE.md §7.1 / §8)。CI では一過性の値を生成する ──

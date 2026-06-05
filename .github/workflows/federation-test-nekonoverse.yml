@@ -53,7 +53,7 @@ jobs:
 
       # BuildKit cache を効かせる: tui-builder stage の cargo target を再利用。
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Run pytest stack
         # DEBUG_KEEP=1: pytest.sh の `trap cleanup EXIT` (= down -v) を抑止し、
