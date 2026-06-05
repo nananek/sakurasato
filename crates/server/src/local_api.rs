@@ -63,6 +63,7 @@ pub mod follow_request;
 pub mod media;
 pub mod media_proxy;
 pub mod notes;
+pub mod notifications;
 pub mod profile;
 pub mod reactions;
 pub mod renotes;
@@ -145,6 +146,12 @@ pub fn router(state: AppState) -> Router {
         // `DELETE` は本人の follow のみ削除可能 (= 403 ガード)。
         .route("/api/v1/follow", post(follow::create))
         .route("/api/v1/follow/{id}", axum::routing::delete(follow::delete))
+        // #206 PR3: in-app 通知フィードの TUI 一覧 + 一括既読。
+        .route("/api/v1/notifications", get(notifications::list))
+        .route(
+            "/api/v1/notifications/mark-all-read",
+            post(notifications::mark_all_read),
+        )
         // 全 `/api/v1/*` に Bearer 認証を要求する。`from_fn_with_state` で
         // middleware に `AppState` を渡し、`api_token` lookup に使う。
         .layer(axum::middleware::from_fn_with_state(

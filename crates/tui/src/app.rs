@@ -128,6 +128,9 @@ pub enum Focus {
     /// M12 (Issue #66): 鍵アカ運用の承認待ち follow 一覧画面。
     /// `:requests` で開く。`App::follow_requests` が `Some` のときのみ取りうる。
     Requests,
+    /// #206 PR3: in-app 通知一覧画面。`:notifications` / `n` で開く。
+    /// `App::notifications` が `Some` のときのみ取りうる。Esc / q で閉じる。
+    Notifications,
     /// Issue #118 (Issue #101 後継): 絵文字検索モーダル。Timeline `e` で「選択
     /// 中 Note への即リアクション」モード、Compose `Ctrl-E` で「本文への
     /// 挿入」モードとして起動。`App::emoji_suggest` が `Some` のときのみ
@@ -203,6 +206,9 @@ pub struct App {
     /// M12 (Issue #66): 承認待ち follow 一覧画面の state。`:requests` で開く。
     /// `Focus::Requests` のあいだだけ `Some`。
     pub follow_requests: Option<crate::follow_requests::FollowRequestsScreen>,
+    /// #206 PR3: in-app 通知一覧画面の state。`:notifications` / `n` で開く。
+    /// `Focus::Notifications` のあいだだけ `Some`。
+    pub notifications: Option<crate::notifications::NotificationsScreen>,
     /// Issue #118 (Issue #101 後継): 絵文字検索モーダルの state。Timeline `e`
     /// では `Mode::ReactToNote(note_id)`、Compose `Ctrl-E` では
     /// `Mode::InsertIntoCompose` で開く。閉じたときの戻り先 Focus は
@@ -266,6 +272,7 @@ impl App {
             follow_list: None,
             command: None,
             follow_requests: None,
+            notifications: None,
             emoji_suggest: None,
             note_detail: None,
             help_state: HelpState::default(),

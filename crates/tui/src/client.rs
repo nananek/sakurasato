@@ -465,6 +465,26 @@ impl LocalApi {
             .await
     }
 
+    /// `GET /api/v1/notifications` ── in-app 通知一覧 (#206 PR3)。
+    pub async fn list_notifications(&self) -> Result<NotificationsResponse, ApiError> {
+        self.get_json("/api/v1/notifications").await
+    }
+
+    /// `POST /api/v1/notifications/mark-all-read` ── 全件既読化 (204 No Content)。
+    pub async fn mark_all_notifications_read(&self) -> Result<(), ApiError> {
+        let request = self
+            .request_builder(Method::POST, "/api/v1/notifications/mark-all-read")?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body_string(resp.into_body()).await.unwrap_or_default();
+            return Err(ApiError::Status { status, body });
+        }
+        Ok(())
+    }
+
     /// `DELETE /api/v1/reactions/{id}` ── 自分のリアクションを取り消す (M8 PR3)。
     pub async fn delete_reaction(&self, reaction_id: i64) -> Result<(), ApiError> {
         let path = format!("/api/v1/reactions/{reaction_id}");
@@ -1014,6 +1034,32 @@ pub struct FollowRequestList {
 pub struct FollowRequestMutateResponse {
     pub id: i64,
     pub new_state: String,
+}
+
+/// `GET /api/v1/notifications` の各要素。
+/// `server::local_api::notifications::NotificationItem` と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotificationItem {
+    pub id: i64,
+    /// `reaction` / `follow` / `mention` / `direct` / `quote` / `renote` /
+    /// `follow_request`。
+    pub event_type: String,
+    pub is_read: bool,
+    pub created_at: String,
+    /// 通知を起こした相手 (`user` or `user@host`)。
+    pub notifier_acct: Option<String>,
+    pub notifier_display_name: Option<String>,
+    pub note_id: Option<i64>,
+    /// 対象 note 本文の plain text プレビュー。
+    pub note_preview: Option<String>,
+    pub reaction: Option<String>,
+}
+
+/// `GET /api/v1/notifications` のレスポンス全体。
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotificationsResponse {
+    pub items: Vec<NotificationItem>,
+    pub unread_count: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -206,6 +206,11 @@ async fn main_loop(
             let viewport = last_rects.follow_requests.height as usize;
             fr.ensure_visible(viewport);
         }
+        // #206 PR3: 通知一覧画面のスクロール追従 (1 件 1 行)。
+        if let Some(n) = app.notifications.as_mut() {
+            let viewport = last_rects.notifications.height as usize;
+            n.ensure_visible(viewport);
+        }
         // Issue #115: FollowList 画面のスクロール追従。avatar 表示時は 1 件 2 行、
         // 抑制時は 1 件 1 行 (= render_follow_list_screen と同じ row_step 計算)。
         // `last_rects.follow_list` は直前フレームで確定した一覧領域の Rect。
@@ -441,10 +446,10 @@ async fn apply_action(
                 | Focus::EmojiSearch
                 | Focus::AltPrompt
                 | Focus::Command
-                | Focus::Requests => {
-                    // overlay 中は背後 Timeline を動かさない。`Requests`
-                    // (= follow request 承認画面) も同じく overlay 風だが
-                    // round-4 で漏れていた (= round-6 review F7)。
+                | Focus::Requests
+                | Focus::Notifications => {
+                    // overlay 中は背後 Timeline を動かさない。`Requests` /
+                    // `Notifications` (= 一覧画面) も同じく overlay 風。
                 }
                 _ => {
                     if delta > 0 {
@@ -687,6 +692,20 @@ async fn apply_action(
         Action::RequestsRejectSelected => requests_mutate_selected(app, api, false).await,
         Action::RequestsRefresh => requests_refresh(app, api).await,
         Action::RequestsClose => requests_close(app),
+        Action::OpenNotifications => command_open_notifications(app, api).await,
+        Action::NotificationsSelectNext => {
+            if let Some(s) = app.notifications.as_mut() {
+                s.select_next();
+            }
+        }
+        Action::NotificationsSelectPrev => {
+            if let Some(s) = app.notifications.as_mut() {
+                s.select_prev();
+            }
+        }
+        Action::NotificationsMarkAllRead => notifications_mark_all_read(app, api).await,
+        Action::NotificationsRefresh => notifications_refresh(app, api).await,
+        Action::NotificationsClose => notifications_close(app),
         Action::OpenNoteDetail => open_note_detail(app),
         Action::NoteDetailClose => close_note_detail(app),
         Action::NoteDetailScrollDown => {
@@ -1758,6 +1777,7 @@ async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
         Command::Lock => command_actor_lock(app, api, true).await,
         Command::Unlock => command_actor_lock(app, api, false).await,
         Command::OpenRequests => command_open_requests(app, api).await,
+        Command::OpenNotifications => command_open_notifications(app, api).await,
         Command::Renote => send_renote(app, api, page_size).await,
         Command::Unrenote => undo_renote(app, api, page_size).await,
         Command::Invalid { reason } => {
@@ -2093,6 +2113,86 @@ async fn requests_refresh(app: &mut App, api: &LocalApi) {
 /// 込みで `:requests` を再実行する流れ)。
 fn requests_close(app: &mut App) {
     app.follow_requests = None;
+    app.focus = Focus::Timeline;
+}
+
+// ─── #206 PR3: 通知一覧画面 ──────────────────────────────────────────────
+
+async fn command_open_notifications(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let mut screen = crate::notifications::NotificationsScreen::new();
+    screen.fetching = true;
+    app.notifications = Some(screen);
+    app.focus = Focus::Notifications;
+    match api.list_notifications().await {
+        Ok(resp) => {
+            if let Some(s) = app.notifications.as_mut() {
+                s.replace(resp.items, resp.unread_count);
+            }
+        }
+        Err(err) => {
+            if let Some(s) = app.notifications.as_mut() {
+                s.fetching = false;
+            }
+            app.set_status(
+                format!(":notifications fetch failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+async fn notifications_refresh(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(screen) = app.notifications.as_mut() else {
+        return;
+    };
+    screen.fetching = true;
+    match api.list_notifications().await {
+        Ok(resp) => {
+            if let Some(s) = app.notifications.as_mut() {
+                s.replace(resp.items, resp.unread_count);
+            }
+        }
+        Err(err) => {
+            if let Some(s) = app.notifications.as_mut() {
+                s.fetching = false;
+            }
+            app.set_status(
+                format!("refresh failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+async fn notifications_mark_all_read(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    match api.mark_all_notifications_read().await {
+        Ok(()) => {
+            if let Some(s) = app.notifications.as_mut() {
+                s.mark_all_read_local();
+            }
+            app.set_status(
+                "通知を全件既読にしました".to_string(),
+                StatusKind::Info,
+                Some(Duration::from_secs(3)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("mark-all-read failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+fn notifications_close(app: &mut App) {
+    app.notifications = None;
     app.focus = Focus::Timeline;
 }
 
