@@ -148,17 +148,19 @@ impl LocalApi {
     }
 
     /// `GET /api/v1/timeline/home`
+    ///
+    /// `before_ts_ms` は前ページ応答の `next_before_ts_ms` (= epoch ミリ秒)。
+    /// home timeline は note + renote を `published_at` で混在ページングする。
     pub async fn timeline_home(
         &self,
-        before_id: Option<i64>,
+        before_ts_ms: Option<i64>,
         limit: i64,
     ) -> Result<TimelineResponse, ApiError> {
         use std::fmt::Write as _;
         let mut path = format!("/api/v1/timeline/home?limit={limit}");
-        if let Some(b) = before_id {
-            // i64 は format 上 ASCII 安全。クエリ正書法でいう "key=value"。
-            // write! は String への書き込みで失敗しないので unwrap して OK。
-            write!(&mut path, "&before_id={b}").expect("write to String");
+        if let Some(b) = before_ts_ms {
+            // i64 は format 上 ASCII 安全 (= クエリエンコード不要)。
+            write!(&mut path, "&before_ts_ms={b}").expect("write to String");
         }
         self.get_json(&path).await
     }
@@ -372,7 +374,7 @@ impl LocalApi {
         actor_id: i64,
         before_id: Option<i64>,
         limit: i64,
-    ) -> Result<TimelineResponse, ApiError> {
+    ) -> Result<AuthorNotesResponse, ApiError> {
         use std::fmt::Write as _;
         let mut path = format!("/api/v1/actor/{actor_id}/notes?limit={limit}");
         if let Some(b) = before_id {
@@ -682,6 +684,18 @@ pub struct Whoami {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TimelineResponse {
     pub notes: Vec<TimelineNote>,
+    /// 次ページのカーソル (= 最後のエントリの並び時刻、epoch ミリ秒)。home
+    /// timeline は note と renote を `published_at` で混在ページングするため、
+    /// id ではなく時刻カーソルを使う。`timeline_home` にそのまま渡す。
+    #[serde(default)]
+    pub next_before_ts_ms: Option<i64>,
+}
+
+/// プロフィール画面の note 一覧レスポンス。home timeline と違い renote は
+/// 混ざらず id 降順なので、カーソルは従来どおり `before_id` (note id)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthorNotesResponse {
+    pub notes: Vec<TimelineNote>,
     #[serde(default)]
     pub next_before_id: Option<i64>,
 }
@@ -735,6 +749,28 @@ pub struct TimelineNote {
     /// 「↻ you renoted」マーカーに使う。
     #[serde(default)]
     pub viewer_renoted: bool,
+    /// このエントリが **renote (boost) として流れてきた** 場合の renoter 情報。
+    /// `Some` のとき本体フィールド (author / content …) は **元 note** を表し、
+    /// 描画時に「🔁 <renoter> がリノート」ヘッダを出して元 note を描く。通常の
+    /// note では `None`。
+    #[serde(default)]
+    pub renote: Option<RenoteMeta>,
+}
+
+/// renote として流れてきたエントリの「誰がいつ renote したか」。
+/// `server::local_api::timeline::RenoteMeta` と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RenoteMeta {
+    pub announce_id: i64,
+    pub announce_ap_id: String,
+    pub renoter_actor_id: i64,
+    pub renoter_ap_id: String,
+    pub renoter_preferred_username: String,
+    #[serde(default)]
+    pub renoter_display_name: Option<String>,
+    #[serde(default)]
+    pub renoter_icon_url: Option<String>,
+    pub renoted_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// `TimelineNote.attachments` の 1 要素。`server::local_api::timeline::AttachmentDto`
@@ -1253,6 +1289,8 @@ impl NoteCreatedPayload {
             // 新規 Note は初期状態 boost 0 / 自分も renote していない。
             announce_count: 0,
             viewer_renoted: false,
+            // SSE の note.created は常に通常 note (= renote ではない)。
+            renote: None,
         }
     }
 }
@@ -1284,12 +1322,55 @@ mod tests {
                     "is_local": true
                 }
             ],
-            "next_before_id": 7
+            "next_before_ts_ms": 1748608496000
         }"#;
         let parsed: TimelineResponse = serde_json::from_str(src).unwrap();
         assert_eq!(parsed.notes.len(), 1);
-        assert_eq!(parsed.next_before_id, Some(7));
+        assert_eq!(parsed.next_before_ts_ms, Some(1_748_608_496_000));
         assert_eq!(parsed.notes[0].content, "hello");
+        // 通常 note は renote メタを持たない。
+        assert!(parsed.notes[0].renote.is_none());
+    }
+
+    #[test]
+    fn timeline_response_parses_renote_entry() {
+        // renote として流れてきたエントリ: 本体は元 note、`renote` に renoter。
+        let src = r#"{
+            "notes": [
+                {
+                    "id": 42,
+                    "ap_id": "https://x.test/notes/42",
+                    "actor_id": 9,
+                    "actor_ap_id": "https://remote.test/users/author",
+                    "actor_preferred_username": "author",
+                    "content": "boosted body",
+                    "visibility": "public",
+                    "sensitive": false,
+                    "published_at": "2026-05-30T10:00:00Z",
+                    "is_local": false,
+                    "renote": {
+                        "announce_id": 5,
+                        "announce_ap_id": "https://remote.test/announces/5",
+                        "renoter_actor_id": 3,
+                        "renoter_ap_id": "https://x.test/users/me",
+                        "renoter_preferred_username": "me",
+                        "renoter_display_name": "Me",
+                        "renoted_at": "2026-05-30T12:00:00Z"
+                    }
+                }
+            ],
+            "next_before_ts_ms": 1748602800000
+        }"#;
+        let parsed: TimelineResponse = serde_json::from_str(src).unwrap();
+        let r = parsed.notes[0]
+            .renote
+            .as_ref()
+            .expect("renote meta present");
+        assert_eq!(r.announce_id, 5);
+        assert_eq!(r.renoter_preferred_username, "me");
+        // 本体は元 note (= author の投稿)。
+        assert_eq!(parsed.notes[0].content, "boosted body");
+        assert_eq!(parsed.notes[0].actor_preferred_username, "author");
     }
 
     #[test]

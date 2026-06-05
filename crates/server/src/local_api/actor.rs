@@ -41,9 +41,7 @@ use sakurasato_core::repo;
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
-use crate::local_api::timeline::{
-    self as timeline_api, ReactionSummaryDto, TimelineNote, TimelineResponse,
-};
+use crate::local_api::timeline::{self as timeline_api, ReactionSummaryDto, TimelineNote};
 use crate::media_proxy_client::MediaProxyError;
 use crate::remote_actor::{self, FetchError};
 use crate::state::AppState;
@@ -181,6 +179,15 @@ pub struct NotesQuery {
     pub before_id: Option<i64>,
 }
 
+/// プロフィール画面の note 一覧レスポンス。home timeline (`TimelineResponse`) と
+/// 違い、特定 author の note を **id 降順** で並べるだけで renote は混ざらない
+/// ため、カーソルは従来どおり `before_id` (note id) のまま据え置く。
+#[derive(Debug, Serialize)]
+pub struct AuthorNotesResponse {
+    pub notes: Vec<TimelineNote>,
+    pub next_before_id: Option<i64>,
+}
+
 /// `GET /api/v1/actor/{id}/notes?limit=&before_id=`
 ///
 /// 当該 actor が author の Note を visibility filter 経由で列挙する。
@@ -270,11 +277,12 @@ pub async fn list_notes(
         .map(|e| {
             let reactions = by_note.remove(&e.id).unwrap_or_default();
             let announce = announce_by_note.get(&e.id);
-            TimelineNote::from_entry_with_aggregates(e, reactions, announce, host)
+            // プロフィールは author の note のみ (renote 混在なし) なので None。
+            TimelineNote::from_entry_with_aggregates(&e, reactions, announce, host, None)
         })
         .collect();
 
-    Json(TimelineResponse {
+    Json(AuthorNotesResponse {
         notes,
         next_before_id,
     })

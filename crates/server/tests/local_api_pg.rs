@@ -423,6 +423,76 @@ async fn timeline_home_includes_reaction_counts(pool: PgPool) {
     assert_eq!(reactions[1]["emoji_is_local"], serde_json::json!(true));
 }
 
+/// followee の renote (Announce) が home timeline に **renote エントリ** として
+/// 流れること。本体は元 note、`renote` に renoter 情報が載る。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_home_includes_followee_renote(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+
+    // alice -> bob accepted (= bob の Announce を home に取り込む)。
+    let follow_ap = format!("{}/follows/bob-by-alice", me.ap_id);
+    let row = repo::follow::upsert_pending(&pool, &follow_ap, me.id, bob.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    // alice の note を bob が boost (boost 時刻を後ろにして renote を先頭に)。
+    let note_id = insert_local_note(&pool, me.id, "example.test", "orig", "original post").await;
+    let announce = repo::announce::insert_or_get(
+        &pool,
+        "https://remote.test/users/bob/activities/announce-1",
+        note_id,
+        bob.id,
+        chrono::Utc::now() + chrono::Duration::seconds(10),
+    )
+    .await
+    .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/timeline/home")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let notes = json["notes"].as_array().unwrap();
+
+    // renote エントリ (= `renote` が object) を 1 件含む。
+    let rn = notes
+        .iter()
+        .find(|n| n["renote"].is_object())
+        .expect("renote entry must be present");
+    assert_eq!(rn["id"].as_i64(), Some(note_id), "本体は元 note");
+    assert_eq!(rn["content"], "original post");
+    assert_eq!(rn["renote"]["announce_id"].as_i64(), Some(announce.id));
+    assert_eq!(rn["renote"]["renoter_preferred_username"], "bob");
+    // boost 時刻が新しいので renote が先頭。
+    assert!(notes[0]["renote"].is_object(), "renote が先頭: {notes:?}");
+    // 元 note 自体 (alice の投稿、renote 無し) も別エントリで存在する。
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["id"].as_i64() == Some(note_id) && n["renote"].is_null()),
+        "原 note エントリも存在: {notes:?}"
+    );
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn create_note_persists_and_enqueues(pool: PgPool) {
     let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))

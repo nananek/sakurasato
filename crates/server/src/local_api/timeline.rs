@@ -1,13 +1,17 @@
 //! `GET /api/v1/timeline/home` ── ホームタイムライン取得。
 //!
-//! 自分の投稿 + accepted follow している remote actor の投稿を、
-//! `note.id` 降順 (= 新しい順) で返す。
+//! 自分の投稿 + accepted follow している remote actor の投稿を、`published_at`
+//! 降順 (= 新しい順) で返す。
+//!
+//! 自分 / followee の note に加え、自分 / followee の **renote (boost)** を
+//! `published_at` で混ぜて返す (= renote エントリは元 note + renoter 情報を持つ)。
 //!
 //! ## クエリパラメータ
 //!
 //! - `limit` (任意、既定 40、上限 80) ── 1 回で返す件数。
-//! - `before_id` (任意) ── 与えると `id < before_id` の行だけ返す。
-//!   TUI が「もっと読む」を実装するための単純カーソル。
+//! - `before_ts_ms` (任意) ── epoch ミリ秒。これより前の note / renote を返す。
+//!   note と renote は id 連番が別々なので時刻カーソルで混在ページングする。
+//!   `TimelineResponse.next_before_ts_ms` をそのまま渡す。
 //!
 //! ## エラー
 //!
@@ -21,6 +25,8 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, TimeZone, Utc};
+use sakurasato_core::model::ActorRow;
 use sakurasato_core::repo;
 use sakurasato_core::repo::note::TimelineEntry;
 use sakurasato_core::repo::reaction::ReactionSummaryRow;
@@ -38,8 +44,14 @@ pub(crate) const LIMIT_MAX: i64 = 80;
 pub struct TimelineQuery {
     #[serde(default)]
     pub limit: Option<i64>,
+    /// 次ページのカーソル。**epoch ミリ秒**で、これより前
+    /// (`published_at` がこの時刻より小さい) の note / renote を返す。note と
+    /// renote は id 連番が別々なので、id カーソルではなく `published_at` 一本で
+    /// 混在ページングする (= `MiAuth` タイムラインと同じ方式)。整数なのでクエリ
+    /// エンコードの曖昧さが無い。`TimelineResponse.next_before_ts_ms` をそのまま
+    /// 渡せばよい。
     #[serde(default)]
-    pub before_id: Option<i64>,
+    pub before_ts_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +98,29 @@ pub struct TimelineNote {
     /// renoted」マーカー表示に使う。
     #[serde(default)]
     pub viewer_renoted: bool,
+    /// このエントリが **renote (boost) として流れてきた** 場合の付帯情報。
+    /// `Some` のとき、本 `TimelineNote` の本体フィールド (author / content /
+    /// reactions …) は **元 note** を表し、`renote` が「誰がいつ renote したか」
+    /// を持つ。TUI は `renote.is_some()` で「🔁 <renoter> がリノート」ヘッダを
+    /// 出して元 note を描画する。通常の note では `None` (= 省略)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renote: Option<RenoteMeta>,
+}
+
+/// renote (boost / announce) として流れてきたエントリの「誰が renote したか」。
+/// 本体の `TimelineNote` は元 note を表し、こちらが renoter と announce を指す。
+#[derive(Debug, Clone, Serialize)]
+pub struct RenoteMeta {
+    /// `announce` 行 id (= renote の取り消し等で参照)。
+    pub announce_id: i64,
+    pub announce_ap_id: String,
+    pub renoter_actor_id: i64,
+    pub renoter_ap_id: String,
+    pub renoter_preferred_username: String,
+    pub renoter_display_name: Option<String>,
+    pub renoter_icon_url: Option<String>,
+    /// renote した時刻 (= timeline 上の並び位置)。
+    pub renoted_at: DateTime<Utc>,
 }
 
 /// Note 添付の TUI 向け正規化形式。AP `Document` / `Image` のフィールドの
@@ -135,7 +170,7 @@ pub struct EmojiDto {
 /// `/media/emoji/local/...` の絶対 URL、remote emoji の場合は連合先サーバ
 /// の URL がそのまま入る (TUI は `media/proxy?url=...&variant=emoji` 経由で
 /// fetch する想定)。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReactionSummaryDto {
     pub content: String,
     pub count: i64,
@@ -154,11 +189,16 @@ impl TimelineNote {
     /// 組み立てる。`announce` が `None` のときは「集計取得に失敗」 or
     /// 「該当 row 無し」のどちらでも安全側に `count = 0, viewer_renoted = false`
     /// で返す ── タイムライン本体は表示し続けたい。
+    /// `e` は **元 note** (renote エントリでは renote 元、通常エントリでは note
+    /// 本体)。`renote` が `Some` のとき「これは renote として流れてきた」を表す。
+    /// note window と renote window で同じ note を別エントリとして 2 度出すこと
+    /// があるので `&TimelineEntry` を借用で受け、フィールドは clone する。
     pub(crate) fn from_entry_with_aggregates(
-        e: TimelineEntry,
+        e: &TimelineEntry,
         reactions: Vec<ReactionSummaryDto>,
         announce: Option<&sakurasato_core::repo::announce::AnnounceSummaryRow>,
         host: &str,
+        renote: Option<RenoteMeta>,
     ) -> Self {
         let attachments = parse_attachments(&e.attachments);
         let emojis = parse_emojis(&e.tags, host);
@@ -166,19 +206,19 @@ impl TimelineNote {
             announce.map_or((0, false), |a| (a.count, a.viewer_renoted));
         Self {
             id: e.id,
-            ap_id: e.ap_id,
-            url: e.url,
+            ap_id: e.ap_id.clone(),
+            url: e.url.clone(),
             actor_id: e.actor_id,
-            actor_ap_id: e.actor_ap_id,
-            actor_preferred_username: e.actor_preferred_username,
-            actor_display_name: e.actor_display_name,
-            actor_icon_url: e.actor_icon_url,
-            content: e.content,
-            summary: e.summary,
-            language: e.language,
-            visibility: e.visibility,
+            actor_ap_id: e.actor_ap_id.clone(),
+            actor_preferred_username: e.actor_preferred_username.clone(),
+            actor_display_name: e.actor_display_name.clone(),
+            actor_icon_url: e.actor_icon_url.clone(),
+            content: e.content.clone(),
+            summary: e.summary.clone(),
+            language: e.language.clone(),
+            visibility: e.visibility.clone(),
             sensitive: e.sensitive,
-            in_reply_to_ap_id: e.in_reply_to_ap_id,
+            in_reply_to_ap_id: e.in_reply_to_ap_id.clone(),
             in_reply_to_note_id: e.in_reply_to_note_id,
             published_at: e.published_at,
             is_local: e.is_local,
@@ -187,6 +227,7 @@ impl TimelineNote {
             emojis,
             announce_count,
             viewer_renoted,
+            renote,
         }
     }
 }
@@ -375,11 +416,20 @@ pub(crate) fn row_to_dto(host: &str, row: ReactionSummaryRow) -> ReactionSummary
 #[derive(Debug, Serialize)]
 pub struct TimelineResponse {
     pub notes: Vec<TimelineNote>,
-    /// 次ページを取るときに使う `before_id` (= 最後の note の id)。
-    /// `notes` が空のときは `None`。
-    pub next_before_id: Option<i64>,
+    /// 次ページを取るときに渡す `before_ts_ms` (= 最後のエントリの並び時刻を
+    /// epoch ミリ秒にしたもの。note なら `published_at`、renote なら renote 時刻)。
+    /// `notes` が空のとき `None`。`TimelineQuery.before_ts_ms` にそのまま渡す。
+    pub next_before_ts_ms: Option<i64>,
 }
 
+// note window + renote window の取得・解決・merge を 1 関数で行うため 100 行を
+// 超える。`renoted_*` / `renoter_*` は AP 用語 (= renote された側 / renote した側)
+// で意図的に似せている。
+#[allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    reason = "timeline merge を 1 関数で組む / renoted・renoter は AP 用語"
+)]
 pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>) -> Response {
     let host = &state.config().server.host;
     let user = &state.config().server.user;
@@ -399,23 +449,79 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
     };
 
     let limit = clamp_limit(q.limit);
-    let entries =
-        match repo::note::list_home_timeline(state.pool(), actor.id, q.before_id, limit).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                error!(?err, "timeline/home: list_home_timeline failed");
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-        };
+    // before_ts_ms (epoch ミリ秒) を DateTime に。範囲外は無視 (= カーソル無し)。
+    let until_ts: Option<DateTime<Utc>> = q
+        .before_ts_ms
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single());
 
-    let next_before_id = entries.last().map(|e| e.id);
+    // note window (時刻 bound) + renote window を別々に取り、`published_at` で
+    // 1 本に merge する (#151 / MiAuth タイムラインと同じ方式)。
+    let note_entries = match repo::note::list_home_timeline_window(
+        state.pool(),
+        actor.id,
+        None,
+        None,
+        None,
+        until_ts,
+        limit,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            error!(?err, "timeline/home: list_home_timeline_window failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let renote_rows = match repo::announce::list_home_renote_window(
+        state.pool(),
+        actor.id,
+        None,
+        until_ts,
+        limit,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            error!(?err, "timeline/home: list_home_renote_window failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
 
-    // M8 PR3: 当ページの note 全件のリアクションを 1 クエリで集計する。
-    // failure は warn でログに残し、空の集計で続行 ── タイムライン本体を
-    // 失敗させたくない。#151 で announce 集計も同じ要領で追加。
-    let note_ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
+    // renote の元 note / renoter actor を一括解決。引けない場合は warn を残して
+    // その renote を黙って落とす (= タイムライン本体は note で成立する)。
+    let renoted_ids: Vec<i64> = renote_rows.iter().map(|r| r.renoted_note_id).collect();
+    let renoter_ids: Vec<i64> = renote_rows.iter().map(|r| r.renoter_actor_id).collect();
+    let renoted_entries = repo::note::list_timeline_entries_by_ids(state.pool(), &renoted_ids)
+        .await
+        .unwrap_or_else(|err| {
+            warn!(
+                ?err,
+                "timeline/home: renoted entries lookup failed; dropping renotes"
+            );
+            Vec::new()
+        });
+    let renoter_actors = repo::actor::list_by_ids(state.pool(), &renoter_ids)
+        .await
+        .unwrap_or_else(|err| {
+            warn!(
+                ?err,
+                "timeline/home: renoter actors lookup failed; dropping renotes"
+            );
+            Vec::new()
+        });
+    let entry_by_id: HashMap<i64, &TimelineEntry> =
+        renoted_entries.iter().map(|e| (e.id, e)).collect();
+    let actor_by_id: HashMap<i64, &ActorRow> = renoter_actors.iter().map(|a| (a.id, a)).collect();
+
+    // note window + renote 元 note の全 id でリアクション / announce 集計。
+    // 同じ note が note エントリと renote エントリの両方に出ることがあるので
+    // `remove` ではなく `get(...).cloned()` で複数回引けるようにする。
+    let mut all_note_ids: Vec<i64> = note_entries.iter().map(|e| e.id).collect();
+    all_note_ids.extend(renoted_ids.iter().copied());
     let mut by_note: HashMap<i64, Vec<ReactionSummaryDto>> = HashMap::new();
-    match repo::reaction::counts_for_notes(state.pool(), &note_ids).await {
+    match repo::reaction::counts_for_notes(state.pool(), &all_note_ids).await {
         Ok(rows) => {
             for row in rows {
                 by_note
@@ -424,35 +530,66 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
                     .push(row_to_dto(host, row));
             }
         }
-        Err(err) => {
-            warn!(?err, "timeline/home: reaction counts_for_notes failed");
-        }
+        Err(err) => warn!(?err, "timeline/home: reaction counts_for_notes failed"),
     }
     let mut announce_by_note: HashMap<i64, sakurasato_core::repo::announce::AnnounceSummaryRow> =
         HashMap::new();
-    match repo::announce::counts_for_notes(state.pool(), &note_ids, actor.id).await {
+    match repo::announce::counts_for_notes(state.pool(), &all_note_ids, actor.id).await {
         Ok(rows) => {
             for row in rows {
                 announce_by_note.insert(row.note_id, row);
             }
         }
-        Err(err) => {
-            warn!(?err, "timeline/home: announce counts_for_notes failed");
-        }
+        Err(err) => warn!(?err, "timeline/home: announce counts_for_notes failed"),
     }
 
-    let notes: Vec<TimelineNote> = entries
-        .into_iter()
-        .map(|e| {
-            let reactions = by_note.remove(&e.id).unwrap_or_default();
-            let announce = announce_by_note.get(&e.id);
-            TimelineNote::from_entry_with_aggregates(e, reactions, announce, host)
-        })
-        .collect();
+    // (sort_ts, TimelineNote) で merge。note は published_at、renote は renote 時刻。
+    let mut items: Vec<(DateTime<Utc>, TimelineNote)> =
+        Vec::with_capacity(note_entries.len() + renote_rows.len());
+    for e in &note_entries {
+        let reactions = by_note.get(&e.id).cloned().unwrap_or_default();
+        let announce = announce_by_note.get(&e.id);
+        items.push((
+            e.published_at,
+            TimelineNote::from_entry_with_aggregates(e, reactions, announce, host, None),
+        ));
+    }
+    for r in &renote_rows {
+        // 元 note / renoter が引けない renote はスキップ (FK 上は起きない)。
+        let (Some(entry), Some(actor)) = (
+            entry_by_id.get(&r.renoted_note_id),
+            actor_by_id.get(&r.renoter_actor_id),
+        ) else {
+            continue;
+        };
+        let reactions = by_note.get(&entry.id).cloned().unwrap_or_default();
+        let announce = announce_by_note.get(&entry.id);
+        let meta = RenoteMeta {
+            announce_id: r.announce_id,
+            announce_ap_id: r.announce_ap_id.clone(),
+            renoter_actor_id: actor.id,
+            renoter_ap_id: actor.ap_id.clone(),
+            renoter_preferred_username: actor.preferred_username.clone(),
+            renoter_display_name: actor.display_name.clone(),
+            renoter_icon_url: actor.icon_url.clone(),
+            renoted_at: r.announce_published_at,
+        };
+        items.push((
+            r.announce_published_at,
+            TimelineNote::from_entry_with_aggregates(entry, reactions, announce, host, Some(meta)),
+        ));
+    }
+
+    // 時刻降順。同時刻は note id 降順を tiebreak に。limit へ切る。
+    items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
+    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+
+    let next_before_ts_ms = items.last().map(|(ts, _)| ts.timestamp_millis());
+    let notes: Vec<TimelineNote> = items.into_iter().map(|(_, n)| n).collect();
 
     Json(TimelineResponse {
         notes,
-        next_before_id,
+        next_before_ts_ms,
     })
     .into_response()
 }
