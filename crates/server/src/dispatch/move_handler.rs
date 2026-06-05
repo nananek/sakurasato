@@ -242,6 +242,7 @@ async fn enqueue_auto_refollow(
     delivery::enqueue_activity(state.pool(), local.id, inbox, &activity)
         .await
         .with_context(|| format!("enqueue auto-Follow to {inbox}"))?;
+    state.wake_delivery();
     info!(
         local = %local.ap_id,
         target = %target.ap_id,

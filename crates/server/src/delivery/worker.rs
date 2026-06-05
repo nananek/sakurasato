@@ -18,10 +18,16 @@
 //!   ループ自体を止めるのは shutdown と pool 異常 (`pick_due` の DB エラー)
 //!   のみ。DB エラーは 1 秒待って再試行 (Postgres が瞬間的に詰まることを
 //!   想定)。
-//! - **ティック間隔**: アイドル時 `IDLE_TICK`、行が有るときは
-//!   バッチ完走後にすぐ次のバッチ。次の `next_attempt_at` まで待つ最適化は
-//!   M3b-3 のスコープ外 (queue が空になればすぐ idle で sleep するので
-//!   無駄ループは起きない)。
+//! - **起床方式 (serverless Postgres 対応)**: アイドル時に固定間隔で
+//!   ポーリングすると `delivery_queue` への SELECT が一定間隔で飛び続け、
+//!   Neon 等の autosuspend (scale-to-zero) が永久に発火しない。そこで
+//!   queue が空になったら **(a) ローカル発の enqueue 通知 (`AppState::
+//!   delivery_notify`)** か **(b) 次にリトライが due になる時刻
+//!   (`repo::delivery_queue::next_due_at`)** まで眠り、未配送行が 1 件も
+//!   無いアイドル時は DB を一切叩かない。`IDLE_FALLBACK` は通知取りこぼしや
+//!   時計ずれに対する安全網で、これ以上は必ず一度目を覚ます。これにより
+//!   アイドル中はクエリ 0 回 → Neon が suspend できる。ローカル投稿は通知で
+//!   即配送されるので配送遅延は増えない。
 //!
 //! ## 互換性
 //!
@@ -37,8 +43,13 @@ use tracing::{info, warn};
 use super::try_deliver_one;
 use crate::state::AppState;
 
-/// アイドル時のポーリング間隔。queue が空のときはこの間隔で目を覚ます。
-const IDLE_TICK: Duration = Duration::from_secs(5);
+/// アイドル時の **安全網** 上限。queue が空 + リトライ予定も無いときは、
+/// 本来は通知 (`AppState::wake_delivery`) が来るまで眠るが、通知取りこぼし /
+/// 時計ずれに備えて遅くともこの間隔で必ず一度起きて queue を確認する。
+///
+/// Neon の autosuspend (既定 5 分) より十分長くして、アイドル中はこの間隔
+/// 以外で DB を叩かない ── 結果として大半の時間 compute が suspend できる。
+const IDLE_FALLBACK: Duration = Duration::from_hours(1);
 
 /// DB エラー時の back-off 秒数。Postgres の瞬間的な詰まりを想定して短く。
 const DB_BACKOFF: Duration = Duration::from_secs(1);
@@ -60,10 +71,11 @@ const TICK_BATCH: i64 = 50;
 /// なかった場合に同じ activity を二重配送するのを避けるため。
 pub async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
     info!(
-        idle_tick_secs = IDLE_TICK.as_secs(),
+        idle_fallback_secs = IDLE_FALLBACK.as_secs(),
         batch = TICK_BATCH,
         "delivery worker starting",
     );
+    let notify = state.delivery_notify();
     loop {
         // 1. shutdown 確認 (バッチ間で都度チェック)。
         if *shutdown.borrow() {
@@ -71,11 +83,33 @@ pub async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) -> anyhow
             break;
         }
 
-        // 2. 1 バッチ拾って配送。空ならアイドル sleep へ。
+        // 通知の取りこぼし防止: pick_due / next_due_at の **前** に notified
+        // future を作る。クエリ中に enqueue + `wake_delivery` が来ても、この
+        // future が permit を受け取るので下の select で即起きる
+        // (= 「空を確認 → 眠る」の隙間に届いた通知を落とさない)。
+        let notified = notify.notified();
+        tokio::pin!(notified);
+
+        // 2. 1 バッチ拾って配送。空ならアイドル待機へ。
         match repo::delivery_queue::pick_due(state.pool(), TICK_BATCH).await {
             Ok(rows) if rows.is_empty() => {
+                // due 行が無い。次にリトライが due になる時刻まで眠る
+                // (未配送ゼロなら通知/安全網まで)。固定間隔ポーリングは
+                // しないので、アイドル中は DB を叩かず Neon が suspend できる。
+                let sleep_for = match repo::delivery_queue::next_due_at(state.pool()).await {
+                    Ok(Some(next)) => (next - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or(Duration::ZERO)
+                        .min(IDLE_FALLBACK),
+                    Ok(None) => IDLE_FALLBACK,
+                    Err(err) => {
+                        warn!(error = %err, "delivery worker: next_due_at failed; backing off");
+                        DB_BACKOFF
+                    }
+                };
                 tokio::select! {
-                    () = tokio::time::sleep(IDLE_TICK) => {}
+                    () = &mut notified => {}
+                    () = tokio::time::sleep(sleep_for) => {}
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
                             info!("delivery worker: shutdown received during idle");

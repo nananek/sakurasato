@@ -288,6 +288,7 @@ pub async fn create_follow_core(
     let queued = delivery::enqueue_activity(state.pool(), local.id, &inbox, &activity)
         .await
         .map_err(|e| FollowError::Internal(e.context(format!("enqueue Follow to {inbox}"))))?;
+    state.wake_delivery();
 
     Ok(FollowOutcome {
         follow: row,
@@ -360,6 +361,9 @@ pub async fn delete_follow_core(
     tx.commit().await.map_err(|e| {
         FollowError::Internal(anyhow::Error::new(e).context("commit unfollow transaction"))
     })?;
+    // commit 後に wake する ── tx 内 enqueue した行は commit 前は他コネクション
+    // から見えないので、ワーカを早く起こしても pick_due が拾えず空振りになる。
+    state.wake_delivery();
 
     info!(
         follow_id = row.id,

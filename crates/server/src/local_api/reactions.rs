@@ -546,6 +546,9 @@ async fn enqueue_reaction_delivery(
             Err(err) => warn!(?err, %inbox, "enqueue_activity failed"),
         }
     }
+    if queued > 0 {
+        state.wake_delivery();
+    }
     queued
 }
 

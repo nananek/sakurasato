@@ -540,6 +540,9 @@ pub async fn delete(
             Err(err) => tracing::warn!(?err, %inbox, "miauth notes/delete: enqueue failed"),
         }
     }
+    if queued > 0 {
+        state.wake_delivery();
+    }
     let _ = queued; // queued は wire には載せない (Misskey wire は 204)。
 
     // DB から削除 (= note 本体)。reaction / announce は FK CASCADE で外れる前提。

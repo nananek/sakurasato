@@ -307,6 +307,8 @@ async fn run_test(state: &AppState, args: NotificationChannelIdArgs) -> anyhow::
     let queued = delivery::enqueue_activity(state.pool(), actor.id, &channel.url, &activity)
         .await
         .context("enqueue test webhook activity")?;
+    // CLI 経路なのでワーカは未稼働 (permit が貯まり次回 serve で配送される)。
+    state.wake_delivery();
     println!(
         "enqueued test notification: channel_id={} queue_id={}",
         channel.id, queued.id,

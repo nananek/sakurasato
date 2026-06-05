@@ -129,6 +129,7 @@ async fn enqueue_for_channel(
         "payload": payload,
     });
     delivery::enqueue_activity(state.pool(), local_actor_id, &channel.url, &activity).await?;
+    state.wake_delivery();
     Ok(())
 }
 

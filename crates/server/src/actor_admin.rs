@@ -150,6 +150,9 @@ async fn enqueue_to_followers(
             }
         }
     }
+    if queued > 0 {
+        state.wake_delivery();
+    }
     info!(
         actor = %local_actor.ap_id,
         queued,
