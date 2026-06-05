@@ -2494,3 +2494,95 @@ async fn actor_notes_requires_auth(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ─── #206 PR3: in-app 通知の local API 一覧 + 一括既読 ──────────────────────
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notifications_list_and_mark_all_read(pool: PgPool) {
+    use sakurasato_core::repo::notification::{self, NewNotification};
+
+    let alice = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, common::sample_local_actor("bob", "remote.test"))
+        .await
+        .unwrap();
+    notification::insert(
+        &pool,
+        NewNotification {
+            recipient_actor_id: alice.id,
+            event_type: "follow".into(),
+            notifier_actor_id: Some(bob.id),
+            note_id: None,
+            reaction: None,
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    // list → unread 1、shape 確認。
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/notifications")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["unread_count"], 1);
+    assert_eq!(json["items"][0]["event_type"], "follow");
+    assert_eq!(json["items"][0]["is_read"], false);
+    assert!(json["items"][0]["notifier_acct"].is_string());
+
+    // mark-all-read → 204。
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/notifications/mark-all-read")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // list again → unread 0、既読化。
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/notifications")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = read_json(resp).await;
+    assert_eq!(json["unread_count"], 0);
+    assert_eq!(json["items"][0]["is_read"], true);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notifications_requires_token(pool: PgPool) {
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/notifications")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

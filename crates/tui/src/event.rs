@@ -187,6 +187,18 @@ pub enum Action {
     RequestsRefresh,
     /// M12 (#66): 一覧画面で `Esc` / `q` ── 画面を閉じる。
     RequestsClose,
+    /// #206 PR3: `:notifications` / `n` ── in-app 通知一覧画面を push。
+    OpenNotifications,
+    /// #206 PR3: 通知一覧でカーソル下移動。
+    NotificationsSelectNext,
+    /// #206 PR3: 通知一覧でカーソル上移動。
+    NotificationsSelectPrev,
+    /// #206 PR3: 通知一覧で `m` ── 全件既読化。
+    NotificationsMarkAllRead,
+    /// #206 PR3: 通知一覧で `r` ── 再取得。
+    NotificationsRefresh,
+    /// #206 PR3: 通知一覧で `Esc` / `q` ── 画面を閉じる。
+    NotificationsClose,
     /// Issue #133 (3): Timeline で選択中の Note の詳細モーダルを開く。
     OpenNoteDetail,
     /// Issue #133 (3): 詳細モーダルを閉じる (Esc / q)。
@@ -236,6 +248,7 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::FollowList => translate_follow_list_key(k),
         Focus::Command => translate_command_key(k),
         Focus::Requests => translate_requests_key(k),
+        Focus::Notifications => translate_notifications_key(k),
         Focus::EmojiSearch => translate_emoji_search_key(k),
         Focus::NoteDetail => translate_note_detail_key(k),
     }
@@ -287,6 +300,19 @@ fn translate_requests_key(k: KeyEvent) -> Action {
         (KeyCode::Char('a'), m) if m.is_empty() => Action::RequestsApproveSelected,
         (KeyCode::Char('x'), m) if m.is_empty() => Action::RequestsRejectSelected,
         (KeyCode::Char('r'), m) if m.is_empty() => Action::RequestsRefresh,
+        _ => Action::Noop,
+    }
+}
+
+/// #206 PR3: 通知一覧画面のキー操作。
+fn translate_notifications_key(k: KeyEvent) -> Action {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => Action::NotificationsClose,
+        (KeyCode::Char('q'), m) if m.is_empty() => Action::NotificationsClose,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::NotificationsSelectNext,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::NotificationsSelectPrev,
+        (KeyCode::Char('m'), m) if m.is_empty() => Action::NotificationsMarkAllRead,
+        (KeyCode::Char('r'), m) if m.is_empty() => Action::NotificationsRefresh,
         _ => Action::Noop,
     }
 }
@@ -348,6 +374,8 @@ fn translate_timeline_key(k: KeyEvent) -> Action {
         (KeyCode::Char('r'), m) if m.is_empty() => Action::RefreshTimeline,
         (KeyCode::Char('o'), m) if m.is_empty() => Action::LoadMore,
         (KeyCode::Char('n'), m) if m.is_empty() => Action::EnterCompose,
+        // #206 PR3: `N` で通知一覧を開く (`n` は compose なので大文字)。
+        (KeyCode::Char('N'), _) => Action::OpenNotifications,
         (KeyCode::Char('t'), m) if m.is_empty() => Action::CycleTheme,
         // M7: A = avatar, H = header, ; = attachment ─ いずれもファイル
         // ピッカを当該モードで開く。小文字キーは timeline ナビと衝突

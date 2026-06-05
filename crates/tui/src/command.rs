@@ -54,6 +54,7 @@ pub const COMMAND_HEADS: &[&str] = &[
     "lock",
     "lookup",
     "me",
+    "notifications",
     "open",
     "q",
     "quit",
@@ -184,6 +185,8 @@ pub enum Command {
     Unlock,
     /// M12 (#66): 承認待ち follow 一覧画面を開く。`a` で approve / `x` で reject。
     OpenRequests,
+    /// #206 PR3: in-app 通知一覧画面を開く。`m` で全件既読 / `r` で再取得。
+    OpenNotifications,
     /// #151: 選択中の Note を renote (boost) する。`b` キーと同じ動作。
     Renote,
     /// #151: 選択中の Note への自分の renote を取り消し。`B` キーと同じ動作。
@@ -223,6 +226,7 @@ pub fn parse(raw: &str) -> Command {
         "lock" => no_arg(&rest, Command::Lock, "lock"),
         "unlock" => no_arg(&rest, Command::Unlock, "unlock"),
         "requests" => no_arg(&rest, Command::OpenRequests, "requests"),
+        "notifications" => no_arg(&rest, Command::OpenNotifications, "notifications"),
         "renote" => no_arg(&rest, Command::Renote, "renote"),
         "unrenote" => no_arg(&rest, Command::Unrenote, "unrenote"),
         "help" | "?" => Command::Help,

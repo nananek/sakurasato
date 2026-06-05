@@ -63,6 +63,8 @@ pub struct PanelRects {
     /// M12 (#66): Follow Requests 画面の一覧領域 (= `ensure_visible` 用)。
     /// 非表示時は zero rect。
     pub follow_requests: Rect,
+    /// #206 PR3: 通知一覧画面の一覧領域 (= `ensure_visible` 用)。非表示時は zero rect。
+    pub notifications: Rect,
     /// Issue #115: `FollowList` 画面の一覧領域 (= `ensure_visible` / `PageDown` 用)。
     /// 非表示時は zero rect。
     pub follow_list: Rect,
@@ -98,6 +100,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
     // 占有する画面として描く。
     let mut profile_notes_rect = Rect::default();
     let mut follow_requests_rect = Rect::default();
+    let mut notifications_rect = Rect::default();
     let mut follow_list_rect = Rect::default();
     let rows = if matches!(app.focus, Focus::Profile)
         && let Some(profile) = app.current_profile()
@@ -113,6 +116,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
         && let Some(fr) = app.follow_requests.as_ref()
     {
         follow_requests_rect = render_follow_requests_screen(frame, timeline_area, app, fr);
+        ScrollHits::default()
+    } else if matches!(app.focus, Focus::Notifications)
+        && let Some(n) = app.notifications.as_ref()
+    {
+        notifications_rect = render_notifications_screen(frame, timeline_area, app, n);
         ScrollHits::default()
     } else {
         render_timeline(frame, timeline_area, app)
@@ -177,6 +185,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
         picker_list,
         profile_notes: profile_notes_rect,
         follow_requests: follow_requests_rect,
+        notifications: notifications_rect,
         follow_list: follow_list_rect,
     }
 }
@@ -1256,6 +1265,143 @@ fn render_follow_requests_screen(
     list_rect
 }
 
+/// #206 PR3: 通知一覧画面。1 件 1 行 (= wrap しない、`ensure_visible` の viewport
+/// = 行数前提)。各行は「カーソル ▶ / 未読 ● / 種別 glyph / notifier / 動詞 /
+/// reaction / 本文プレビュー」。色は全て theme palette 経由。
+///
+/// 戻り値は `list_rect` ── main loop が次フレームの
+/// [`crate::notifications::NotificationsScreen::ensure_visible`] にこの高さを渡す。
+fn render_notifications_screen(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    n: &crate::notifications::NotificationsScreen,
+) -> Rect {
+    let palette = &app.theme.palette;
+    let title = if n.unread_count > 0 {
+        format!(
+            "  notifications — {} unread / {} total  ",
+            n.unread_count,
+            n.items.len()
+        )
+    } else {
+        format!("  notifications — {} total  ", n.items.len())
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style(palette, app.focus == Focus::Notifications))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let header = Line::from(vec![Span::styled(
+        "  [j/k=move  m=mark all read  r=refresh  Esc=back]",
+        Style::default().fg(palette.muted),
+    )]);
+    let header_rect = Rect::new(inner.x, inner.y, inner.width, 1.min(inner.height));
+    frame.render_widget(Paragraph::new(vec![header]), header_rect);
+
+    let list_top = inner.y + header_rect.height;
+    let list_height = inner.height.saturating_sub(header_rect.height);
+    let list_rect = Rect::new(inner.x, list_top, inner.width, list_height);
+    if list_rect.height == 0 {
+        return list_rect;
+    }
+
+    if n.items.is_empty() {
+        let msg = if n.fetching {
+            "  loading…"
+        } else {
+            "  (no notifications)"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg.to_string(),
+                Style::default().fg(palette.muted),
+            ))),
+            list_rect,
+        );
+        return list_rect;
+    }
+
+    let visible = list_rect.height as usize;
+    let top = n.top.min(n.items.len().saturating_sub(1));
+    let lines: Vec<Line<'static>> = n
+        .items
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(visible)
+        .map(|(idx, item)| notification_line(item, idx == n.cursor, palette))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), list_rect);
+    list_rect
+}
+
+/// 通知 1 件を 1 行に組む (= `render_notifications_screen` のヘルパ)。
+fn notification_line(
+    item: &crate::client::NotificationItem,
+    selected: bool,
+    palette: &crate::theme::Palette,
+) -> Line<'static> {
+    let marker = if selected { "▶ " } else { "  " };
+    let marker_style = if selected {
+        Style::default()
+            .fg(palette.accent_strong)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    // 未読は ● (accent)、既読は空白。
+    let unread = if item.is_read { "  " } else { "● " };
+    let (glyph, verb) = crate::notifications::event_glyph_label(&item.event_type);
+    let who = item
+        .notifier_display_name
+        .clone()
+        .or_else(|| item.notifier_acct.clone())
+        .unwrap_or_else(|| "someone".to_string());
+    let mut spans = vec![
+        Span::styled(marker.to_string(), marker_style),
+        Span::styled(
+            unread.to_string(),
+            Style::default().fg(palette.accent_strong),
+        ),
+        Span::styled(format!("{glyph} "), Style::default().fg(palette.accent)),
+        Span::styled(
+            who,
+            Style::default()
+                .fg(palette.foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {verb}"), Style::default().fg(palette.muted)),
+    ];
+    if let Some(reaction) = &item.reaction {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            reaction.clone(),
+            Style::default().fg(palette.warning),
+        ));
+    }
+    if let Some(preview) = &item.note_preview {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("“{preview}”"),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn tab_label(mode: FollowListMode, active: bool) -> String {
     if active {
         format!("[{}]", mode.label())
@@ -2052,6 +2198,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::FollowList => "follow-list",
         Focus::Command => "cmd",
         Focus::Requests => "requests",
+        Focus::Notifications => "notif",
         Focus::EmojiSearch => "emoji",
         Focus::NoteDetail => "note",
     };
