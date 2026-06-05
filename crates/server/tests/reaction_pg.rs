@@ -247,6 +247,17 @@ async fn inbound_like_records_reaction(pool: PgPool) {
     // content 無し Like は空文字。
     assert_eq!(row.content, "");
     assert!(row.emoji_id.is_none());
+
+    // **in-app 通知** (migration 0020) も 1 件立つ ── dispatch handler が
+    // `notify(Reaction)` を呼び、webhook と並行して notification 行を insert する。
+    let notifs = repo::notification::list(&pool, local.id, 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(notifs.len(), 1, "reaction で in-app 通知が 1 件立つ");
+    assert_eq!(notifs[0].event_type, "reaction");
+    assert_eq!(notifs[0].notifier_actor_id, Some(remote.id));
+    assert_eq!(notifs[0].note_id, Some(note_id));
+    assert!(!notifs[0].is_read, "新規通知は未読");
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

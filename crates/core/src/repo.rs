@@ -17,5 +17,6 @@ pub mod follow;
 pub mod media;
 pub mod miauth;
 pub mod note;
+pub mod notification;
 pub mod notification_channel;
 pub mod reaction;

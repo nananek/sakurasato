@@ -888,3 +888,80 @@ async fn emoji_upsert_remote_rejects_empty_host(pool: PgPool) -> sqlx::Result<()
     assert!(format!("{err}").contains("host"));
     Ok(())
 }
+
+/// in-app 通知フィード (`notification` テーブル / migration 0020) の CRUD +
+/// ページング + 既読管理 round trip。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notification_feed_round_trip(pool: PgPool) -> sqlx::Result<()> {
+    use sakurasato_core::repo::notification::{self, NewNotification};
+
+    let me = repo::actor::insert(&pool, sample_local_actor("recip")).await?;
+    let them = repo::actor::insert(&pool, sample_local_actor("notif")).await?;
+    let base = chrono::Utc::now();
+
+    let n1 = notification::insert(
+        &pool,
+        NewNotification {
+            recipient_actor_id: me.id,
+            event_type: "follow".into(),
+            notifier_actor_id: Some(them.id),
+            note_id: None,
+            reaction: None,
+            created_at: base,
+        },
+    )
+    .await?;
+    let n2 = notification::insert(
+        &pool,
+        NewNotification {
+            recipient_actor_id: me.id,
+            event_type: "reaction".into(),
+            notifier_actor_id: Some(them.id),
+            note_id: None,
+            reaction: Some("👍".into()),
+            created_at: base + chrono::Duration::seconds(1),
+        },
+    )
+    .await?;
+    let _n3 = notification::insert(
+        &pool,
+        NewNotification {
+            recipient_actor_id: me.id,
+            event_type: "mention".into(),
+            notifier_actor_id: Some(them.id),
+            note_id: None,
+            reaction: None,
+            created_at: base + chrono::Duration::seconds(2),
+        },
+    )
+    .await?;
+
+    // list は id DESC (= 新しい順)。reaction 内容が round-trip する。
+    let all = notification::list(&pool, me.id, 10, None, None).await?;
+    assert_eq!(all.len(), 3);
+    assert!(all[0].id > all[1].id, "id DESC order");
+    assert_eq!(all[0].event_type, "mention");
+    let react = all.iter().find(|n| n.event_type == "reaction").unwrap();
+    assert_eq!(react.reaction.as_deref(), Some("👍"));
+
+    // untilId 排他 ── n2 を untilId にすると n1 (より古い) のみ。
+    let older = notification::list(&pool, me.id, 10, None, Some(n2.id)).await?;
+    assert_eq!(older.len(), 1);
+    assert_eq!(older[0].id, n1.id);
+
+    // 既読管理。
+    assert_eq!(notification::count_unread(&pool, me.id).await?, 3);
+    assert!(notification::mark_read(&pool, me.id, n1.id).await?);
+    assert!(
+        !notification::mark_read(&pool, me.id, n1.id).await?,
+        "二重既読は false"
+    );
+    // 他人 recipient では既読化できない (= IDOR ガード)。
+    assert!(!notification::mark_read(&pool, them.id, n2.id).await?);
+    assert_eq!(notification::count_unread(&pool, me.id).await?, 2);
+
+    let marked = notification::mark_all_read(&pool, me.id).await?;
+    assert_eq!(marked, 2, "残り未読 2 件を既読化");
+    assert_eq!(notification::count_unread(&pool, me.id).await?, 0);
+    Ok(())
+}

@@ -1,0 +1,117 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO notification\n            (recipient_actor_id, event_type, notifier_actor_id, note_id, reaction, created_at)\n        VALUES ($1, $2, $3, $4, $5, $6)\n        RETURNING\n            id, recipient_actor_id, event_type, notifier_actor_id, note_id, reaction,\n            is_read, created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "notification",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "recipient_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "notification",
+            "name": "recipient_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "event_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "notification",
+            "name": "event_type"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "notifier_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "notification",
+            "name": "notifier_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "note_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "notification",
+            "name": "note_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "reaction",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "notification",
+            "name": "reaction"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "is_read",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "notification",
+            "name": "is_read"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "notification",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8",
+        "Int8",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "94d0daa6edc160d9fffc942da37632ae7a3d6e51f9e10bca5c146a96e451163a"
+}
