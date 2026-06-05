@@ -41,6 +41,7 @@ use crate::miauth::auth;
 use crate::miauth::conv::{
     NoteSummary, bulk_load_note_summaries, from_actor_and_counts, timeline_entry_to_miss_note,
 };
+use crate::miauth::error::error_resp;
 use crate::state::AppState;
 
 /// 読み取り権限。`/api/i` と同じく `read:account` を要求する (= 通知は account
@@ -234,13 +235,4 @@ async fn resolve_self_actor_id(state: &AppState) -> Option<i64> {
 /// Misskey は id を **string** で渡すので i64 に parse。失敗は `None` (= 無視)。
 fn parse_id_opt(s: Option<&str>) -> Option<i64> {
     s.and_then(|t| t.parse::<i64>().ok())
-}
-
-/// `error.code` / `error.message` 形式の Misskey 互換エラーレスポンス。
-fn error_resp(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(json!({ "error": { "code": code, "message": message } })),
-    )
-        .into_response()
 }

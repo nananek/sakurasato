@@ -40,6 +40,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::miauth::conv::{MissUser, from_actor_and_counts};
+use crate::miauth::error::internal_error;
 use crate::state::AppState;
 
 /// `POST /api/miauth/{uuid}/check` のレスポンス body。
@@ -69,7 +70,7 @@ pub async fn handle(State(state): State<AppState>, Path(uuid_str): Path<String>)
         Ok(None) => return not_found("session not found"),
         Err(err) => {
             tracing::error!(?err, %uuid, "miauth_session get failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return internal_error("failed to load the MiAuth session");
         }
     };
 
@@ -110,7 +111,7 @@ async fn handle_approved(state: &AppState, session: &MiAuthSessionRow) -> Respon
         Ok(row) => row,
         Err(err) => {
             tracing::error!(?err, uuid = %session.uuid, "miauth_token INSERT failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return internal_error("failed to issue the MiAuth token");
         }
     };
 
@@ -125,7 +126,7 @@ async fn handle_approved(state: &AppState, session: &MiAuthSessionRow) -> Respon
         Ok(n) => n,
         Err(err) => {
             tracing::error!(?err, uuid = %session.uuid, "mark_session_consumed_with_raw failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return internal_error("failed to finalize the MiAuth session");
         }
     };
 
@@ -144,7 +145,7 @@ async fn handle_approved(state: &AppState, session: &MiAuthSessionRow) -> Respon
         }
         return match repo::miauth::get_session(state.pool(), session.uuid).await {
             Ok(Some(row)) => handle_consumed(state, &row).await,
-            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            _ => internal_error("failed to reload the MiAuth session"),
         };
     }
 
@@ -204,11 +205,13 @@ async fn build_miss_user(state: &AppState) -> Result<MissUser, Response> {
             Ok(Some(row)) if row.is_local => row,
             Ok(_) => {
                 tracing::error!(host, user, "local actor not found for /api/miauth/check");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                return Err(internal_error(
+                    "local actor not initialized; run `sakurasato init`",
+                ));
             }
             Err(err) => {
                 tracing::error!(?err, "local actor lookup failed for /api/miauth/check");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                return Err(internal_error("failed to look up local actor"));
             }
         };
     let followers = sakurasato_core::repo::follow::count_followers(state.pool(), actor.id)

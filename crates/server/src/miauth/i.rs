@@ -30,7 +30,7 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use sakurasato_core::repo;
 use serde::Deserialize;
@@ -120,11 +120,15 @@ async fn build_self_me_detailed(state: &AppState) -> Result<JsonValue, Response>
         Ok(Some(row)) if row.is_local => row,
         Ok(_) => {
             tracing::error!(host, user, "local actor not found for /api/i");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err(crate::miauth::error::internal_error(
+                "local actor not initialized; run `sakurasato init`",
+            ));
         }
         Err(err) => {
             tracing::error!(?err, "local actor lookup failed for /api/i");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err(crate::miauth::error::internal_error(
+                "failed to look up local actor",
+            ));
         }
     };
     let followers = repo::follow::count_followers(state.pool(), actor.id)
