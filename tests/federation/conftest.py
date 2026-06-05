@@ -67,6 +67,17 @@ NEKONOVERSE_USERNAME = os.environ.get("NEKONOVERSE_USERNAME", "bob")
 NEKONOVERSE_TOKEN_FILE = os.environ.get(
     "NEKONOVERSE_TOKEN_FILE", "/nkv-tokens/bob.token"
 )
+# #140 Scenario B (nkv→sks Move): Move の target となる 2nd nkv user `bobnew`
+# の Bearer。Nekonoverse は `POST /api/v1/accounts` が **token を返さない**
+# (= seed-bob.sh の通り oauth_tokens 直 seed が必須) ので、bob と同じく専用
+# issuer コンテナ `nekonoverse-bob-new-issuer` が固定 username で登録 +
+# oauth_tokens 直 seed して共有 volume にファイル出力する。pytest は読むだけ。
+NEKONOVERSE_BOB_NEW_TOKEN_FILE = os.environ.get(
+    "NEKONOVERSE_BOB_NEW_TOKEN_FILE", "/nkv-tokens/bob_new.token"
+)
+NEKONOVERSE_BOB_NEW_USERNAME = os.environ.get(
+    "NEKONOVERSE_BOB_NEW_USERNAME", "bobnew"
+)
 
 # どの counterpart instance を待つかを env でゲートする。compose 側で
 # 該当しないターゲットを `"0"` に倒すことで、Mastodon stack で立ってない
@@ -788,74 +799,10 @@ class NekonoverseClient:
         return resp.json()
 
     # ── Move (#140 PR1 / Scenario B) ─────────────────────────
-    def register_app(
-        self,
-        *,
-        client_name: str = "sakurasato-e2e",
-        scopes: str = "read write follow",
-    ) -> dict:
-        """``POST /api/v1/apps`` → ``POST /oauth/token`` (client_credentials)
-        の 2 段を 1 関数で済ませる。返り値は ``{client_id, client_secret,
-        access_token}`` 形式の dict ── `register_account` への `app_token`
-        として ``access_token`` を渡す経路。
-        """
-        app_resp = self.http.post(
-            "/api/v1/apps",
-            json={
-                "client_name": client_name,
-                "redirect_uris": "urn:ietf:wg:oauth:2.0:oob",
-                "scopes": scopes,
-            },
-        )
-        app_resp.raise_for_status()
-        app = app_resp.json()
-        token_resp = self.http.post(
-            "/oauth/token",
-            json={
-                "grant_type": "client_credentials",
-                "client_id": app["client_id"],
-                "client_secret": app["client_secret"],
-                "scope": scopes,
-            },
-        )
-        token_resp.raise_for_status()
-        return {
-            "client_id": app["client_id"],
-            "client_secret": app["client_secret"],
-            "access_token": token_resp.json()["access_token"],
-        }
-
-    def register_account(
-        self,
-        *,
-        app_token: str,
-        username: str,
-        email: str,
-        password: str,
-    ) -> dict:
-        """``POST /api/v1/accounts`` ── 新規アカウントを Mastodon 互換で登録。
-
-        2nd 用 OAuth app を別途立てる手間を省くため、呼び出し側で
-        `register_app` で取った `app_token` を渡してもらう。返り値は
-        Mastodon 仕様の Token (`{access_token, token_type, scope, ...}`)
-        ── このアカウントとして login 済の Bearer として直後の auth 操作
-        (= `update_credentials_also_known_as`) に使える。
-        """
-        payload = {
-            "username": username,
-            "email": email,
-            "password": password,
-            "agreement": True,
-            "locale": "en",
-        }
-        resp = self.http.post(
-            "/api/v1/accounts",
-            json=payload,
-            headers={"Authorization": f"Bearer {app_token}"},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
+    # 補足: Move target の登録 + token 発行は `nekonoverse-bob-new-issuer`
+    # (compose, seed-bob.sh 再利用) が担う。Nekonoverse は `/api/v1/accounts`
+    # が token を返さない (= oauth_tokens 直 seed が必須) ため、pytest 側で
+    # API 登録する経路は持たない (= pytest コンテナを DB-free に保つ)。
     def update_credentials_also_known_as(
         self, *, token: str, also_known_as: list[str]
     ) -> dict:
@@ -935,6 +882,16 @@ class NekonoverseClient:
 @pytest.fixture(scope="session")
 def nekonoverse_token() -> str:
     return _read_token_file(NEKONOVERSE_TOKEN_FILE, label="nekonoverse")
+
+
+@pytest.fixture(scope="session")
+def nekonoverse_bob_new_token() -> str:
+    """#140 Scenario B: `bobnew` (Move target) の Bearer。
+
+    `nekonoverse-bob-new-issuer` が seed-bob.sh を `BOB_USERNAME=bobnew` で
+    再利用して oauth_tokens に直 seed → `/nkv-tokens/bob_new.token` に書く。
+    """
+    return _read_token_file(NEKONOVERSE_BOB_NEW_TOKEN_FILE, label="nekonoverse-bob-new")
 
 
 @pytest.fixture(scope="session")
