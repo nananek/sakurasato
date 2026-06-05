@@ -51,6 +51,17 @@ use crate::state::AppState;
 /// 以外で DB を叩かない ── 結果として大半の時間 compute が suspend できる。
 const IDLE_FALLBACK: Duration = Duration::from_hours(1);
 
+/// アイドル待機の **下限**。`next_due_at` までの残り時間は app 側 clock で
+/// 計算する一方、`pick_due` の due 判定は DB 側 clock で行う。app↔DB に
+/// クロックスキューがある構成 (= リモート Neon + 別ホスト app) では、retry
+/// 行の `next_attempt_at` 付近で「app から見ると過去 (残り負) だが DB から
+/// 見るとまだ未来」になり、残り時間が 0 のまま `pick_due` + `next_due_at` を
+/// 遅延ゼロで回し続ける tight-loop に陥りうる (= Neon にクエリ flood して
+/// autosuspend を妨げ、本対応の目的を部分的に潰す)。下限を入れて最悪でも
+/// この間隔の確認に落とす。ローカル発は `wake_delivery` 通知で別途即起床する
+/// ので、この下限が配送遅延を増やすのは「skew 窓近傍の retry」だけ。
+const MIN_IDLE_SLEEP: Duration = Duration::from_secs(1);
+
 /// DB エラー時の back-off 秒数。Postgres の瞬間的な詰まりを想定して短く。
 const DB_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -97,10 +108,14 @@ pub async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) -> anyhow
                 // (未配送ゼロなら通知/安全網まで)。固定間隔ポーリングは
                 // しないので、アイドル中は DB を叩かず Neon が suspend できる。
                 let sleep_for = match repo::delivery_queue::next_due_at(state.pool()).await {
+                    // app↔DB クロックスキュー下での tight-loop を避けるため下限で
+                    // クランプする (`MIN_IDLE_SLEEP` 参照)。due が近い/負でも最低
+                    // この間隔は眠る ── ローカル発は wake 通知で即起床するので
+                    // この下限で増える遅延は skew 窓近傍の retry に限られる。
                     Ok(Some(next)) => (next - chrono::Utc::now())
                         .to_std()
                         .unwrap_or(Duration::ZERO)
-                        .min(IDLE_FALLBACK),
+                        .clamp(MIN_IDLE_SLEEP, IDLE_FALLBACK),
                     Ok(None) => IDLE_FALLBACK,
                     Err(err) => {
                         warn!(error = %err, "delivery worker: next_due_at failed; backing off");
