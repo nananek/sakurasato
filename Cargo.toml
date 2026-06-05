@@ -83,7 +83,7 @@ sha2 = { version = "0.10", features = ["oid"] }
 subtle = "2"
 # M7: SHA-256 → 小文字 hex 文字列化。`format!("{x:x}")` は配列に Display
 # impl が無いため使えない。`base16ct` は no_std で動く軽量実装。
-base16ct = { version = "0.2", default-features = false }
+base16ct = { version = "1.0", default-features = false }
 # M3b-2 PR2 アウトバウンド配送で使う HTTP クライアント。
 # rustls-tls-native-roots: OpenSSL を引かず distroless で動かすため rustls + OS の root store。
 # json: serde_json::Value をボディに使える .json() を有効化。
