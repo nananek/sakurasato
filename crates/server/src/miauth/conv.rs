@@ -549,6 +549,8 @@ fn build_miss_file(raw: &JsonValue, created_at: &str, sensitive: bool) -> Option
     // 双方の連合は width/height を Document level に書く) は伝搬する。
     let width = raw.get("width").and_then(JsonValue::as_i64);
     let height = raw.get("height").and_then(JsonValue::as_i64);
+    // `mime_type` は下の struct field に move するので、画像判定は先に取る。
+    let is_image = mime_type.starts_with("image/");
     Some(MissFile {
         id,
         created_at: created_at.to_string(),
@@ -557,7 +559,13 @@ fn build_miss_file(raw: &JsonValue, created_at: &str, sensitive: bool) -> Option
         md5: String::new(),
         size: 0,
         url: url.to_string(),
-        thumbnail_url: None,
+        // Aria 等の Misskey クライアントはタイムラインのインラインサムネイルに
+        // `thumbnailUrl` を使う。null だとサムネイルが出ず、タップ時の `url`
+        // (= フル画像) しか開けない (Aria 実機検証で判明)。Sakurasato は添付を
+        // `preview` variant (≤1280px webp) 1 枚で保存し別サムネイルを持たないので、
+        // **画像なら `url` をそのまま thumbnail にも使う** (= 既に十分小さい)。
+        // 動画/音声等の非画像は画像サムネイルが無いので `null` のまま。
+        thumbnail_url: is_image.then(|| url.to_string()),
         comment: alt_text,
         is_sensitive: sensitive,
         properties: MissFileProperties {
@@ -1148,6 +1156,39 @@ mod tests {
         // AP には orientation / avg_color が無いので null。
         assert!(f.properties.orientation.is_none());
         assert!(f.properties.avg_color.is_none());
+    }
+
+    #[test]
+    fn build_miss_file_sets_thumbnail_url_for_images() {
+        // 画像は `thumbnailUrl` に `url` をそのまま入れる ── Aria 等が
+        // タイムラインのインラインサムネイル表示に使う。null だとサムネイルが
+        // 出ず、タップ時の url (フル画像) しか開けない。
+        let raw = json!({
+            "url": "https://example.test/media/abc.webp",
+            "mediaType": "image/webp",
+        });
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).unwrap();
+        assert_eq!(
+            f.thumbnail_url.as_deref(),
+            Some("https://example.test/media/abc.webp"),
+            "image attachments must carry a non-null thumbnailUrl"
+        );
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["thumbnailUrl"], "https://example.test/media/abc.webp");
+    }
+
+    #[test]
+    fn build_miss_file_thumbnail_url_null_for_non_images() {
+        // 動画 / 音声は画像サムネイルを持たないので `thumbnailUrl` は null。
+        let raw = json!({
+            "url": "https://example.test/media/clip.mp4",
+            "mediaType": "video/mp4",
+        });
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).unwrap();
+        assert!(
+            f.thumbnail_url.is_none(),
+            "non-image attachments must keep thumbnailUrl null"
+        );
     }
 
     #[test]
