@@ -41,6 +41,9 @@ mod tests {
         //   と旧 URL row の regression 回避用に last_failed_at TIMESTAMPTZ NULL を追加)
         // 0020 notification (= #206 PR1: in-app 通知フィード本体テーブル。
         //   webhook 宛先の notification_channel とは別物、TUI / MiAuth が一覧する)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 20);
+        // 0021 normalize_reaction_content (= reaction shortcode mismatch 修正:
+        //   PR #183/#187 以前に書かれた `:foo@host:` stale 行を `:foo:` に畳む
+        //   backfill。Aria でのリアクション絵文字「増殖」を解消)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 21);
     }
 }
