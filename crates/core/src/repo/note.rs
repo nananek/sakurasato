@@ -136,6 +136,62 @@ where
         .map(|r| r.rows_affected())
 }
 
+/// 古いリモートノートを GC する。`is_local = FALSE` かつ `created_at` が
+/// `older_than_days` 日より前のノートのうち、**ローカル actor が interaction
+/// していないもの** を削除する。返り値は (削除した | dry-run なら削除予定の) 件数。
+///
+/// 保存 (= 削除しない) 条件 ── 次のいずれかに該当するリモートノートは残す:
+/// - ローカル actor が **reaction** した (`reaction`)。
+/// - ローカル actor が **announce (boost / renote)** した (`announce`)。
+/// - ローカルノートの **返信先** になっている (`note.in_reply_to_note_id`)。
+///
+/// これらは `note` への FK が `ON DELETE CASCADE` (`reaction` / `announce`) ない
+/// し `SET NULL` (`in_reply_to_note_id`) なので、消すと自分の interaction 記録や
+/// 会話文脈が失われる。ローカルノート (= 自分の投稿) は `is_local = FALSE` 条件で
+/// 当然対象外。
+///
+/// `dry_run = true` のときは同じ `DELETE` をトランザクション内で実行して件数だけ
+/// 数え、**rollback** する ── 件数集計と実削除で WHERE 句が乖離しないようにする
+/// ため、SELECT COUNT を別に持たず DELETE 1 本を真実とする。
+pub async fn prune_remote_notes(
+    pool: &PgPool,
+    older_than_days: i32,
+    dry_run: bool,
+) -> sqlx::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let result = sqlx::query!(
+        r#"
+        DELETE FROM note n
+        WHERE n.is_local = FALSE
+          AND n.created_at < now() - make_interval(days => $1)
+          AND NOT EXISTS (
+              SELECT 1 FROM note rep
+              WHERE rep.is_local = TRUE AND rep.in_reply_to_note_id = n.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM reaction r
+              JOIN actor a ON a.id = r.actor_id
+              WHERE r.note_id = n.id AND a.is_local = TRUE
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM announce an
+              JOIN actor a ON a.id = an.actor_id
+              WHERE an.note_id = n.id AND a.is_local = TRUE
+          )
+        "#,
+        older_than_days,
+    )
+    .execute(&mut *tx)
+    .await?;
+    let count = result.rows_affected();
+    if dry_run {
+        tx.rollback().await?;
+    } else {
+        tx.commit().await?;
+    }
+    Ok(count)
+}
+
 /// Insert 後に `ap_id` と `url` を「実 id を埋めた canonical URL」に書き
 /// 直すヘルパ。POST /api/v1/notes で `note.id` 採番後にしか canonical URL
 /// が決まらない (= `https://<host>/notes/{id}`) ため、insert → update の

@@ -30,6 +30,7 @@ pub mod move_out;
 pub mod multikey;
 pub(crate) mod net_guard;
 pub mod notification;
+pub mod prune;
 pub mod remote_actor;
 pub mod routes;
 pub mod serve;

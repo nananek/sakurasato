@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM note n\n        WHERE n.is_local = FALSE\n          AND n.created_at < now() - make_interval(days => $1)\n          AND NOT EXISTS (\n              SELECT 1 FROM note rep\n              WHERE rep.is_local = TRUE AND rep.in_reply_to_note_id = n.id\n          )\n          AND NOT EXISTS (\n              SELECT 1 FROM reaction r\n              JOIN actor a ON a.id = r.actor_id\n              WHERE r.note_id = n.id AND a.is_local = TRUE\n          )\n          AND NOT EXISTS (\n              SELECT 1 FROM announce an\n              JOIN actor a ON a.id = an.actor_id\n              WHERE an.note_id = n.id AND a.is_local = TRUE\n          )\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "993b3423ff318797f07650bf72d0b2bc473aa45bd66d88a2a31445d045319e5e"
+}
