@@ -707,6 +707,52 @@ pub(crate) fn timeline_entry_to_miss_note(
     }
 }
 
+/// 自分の renote (= Announce / boost) を Misskey の renote `MissNote` 形に合成する。
+///
+/// Sakurasato は renote を `announce` テーブルで持ち **独立した note 行を発行しない**
+/// ため、`notes/create { renoteId }` のレスポンス (= `createdNote`) は
+/// announce の id / `ap_id` + 元 note (`renoted`) + renoter から組み立てる。Misskey の
+/// renote 形に揃えて `text` は `null`、元 note を `renote` に nest し、`renoteId`
+/// で参照する。`reply` / 添付 / reaction は renote 自体には付かないので空。
+#[allow(clippy::similar_names)] // renoter (= 行為者) / renoted (= 対象) は AP 用語
+pub(crate) fn build_renote_miss_note(
+    announce_id: i64,
+    announce_ap_id: &str,
+    created_at: &str,
+    renoter: MissUser,
+    renoter_actor_id: i64,
+    renoted: MissNote,
+) -> MissNote {
+    MissNote {
+        id: announce_id.to_string(),
+        created_at: created_at.to_string(),
+        text: None,
+        cw: None,
+        user_id: renoter_actor_id.to_string(),
+        user: renoter,
+        reply_id: None,
+        reply: None,
+        renote_id: Some(renoted.id.clone()),
+        renote: Some(Box::new(renoted)),
+        // renote 可能なのは public / unlisted のみ (= local_api renote が enforce)。
+        // renote 自体の visibility は public で返す。
+        visibility: "public".to_string(),
+        mentions: Vec::new(),
+        file_ids: Vec::new(),
+        files: Vec::new(),
+        reactions: BTreeMap::new(),
+        reaction_emojis: BTreeMap::new(),
+        emojis: BTreeMap::new(),
+        tags: Vec::new(),
+        uri: if announce_ap_id.is_empty() {
+            None
+        } else {
+            Some(announce_ap_id.to_string())
+        },
+        url: None,
+    }
+}
+
 /// `actor_uri` のホストが `local_host` (= サーバ設定の `server.host`、port 付き
 /// 可) と同一かを判定する。
 ///
