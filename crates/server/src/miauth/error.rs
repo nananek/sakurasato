@@ -43,12 +43,8 @@ pub fn bad_request(message: &str) -> Response {
     error_resp(StatusCode::BAD_REQUEST, "INVALID_PARAM", message)
 }
 
-/// 404 Not Found。`code = "NOT_FOUND"`。
-pub fn not_found(message: &str) -> Response {
-    error_resp(StatusCode::NOT_FOUND, "NOT_FOUND", message)
-}
-
-/// 401 Unauthorized。`code = "AUTHENTICATION_FAILED"`。
-pub fn unauthorized(message: &str) -> Response {
-    error_resp(StatusCode::UNAUTHORIZED, "AUTHENTICATION_FAILED", message)
-}
+// NOTE: 汎用 404 / 401 helper は意図的に置かない。404 は各 endpoint が
+// `error_resp(NOT_FOUND, "<NO_SUCH_*>", ..)` で **固有 code** (`NO_SUCH_USER` /
+// `NO_SUCH_NOTE` / `NO_SUCH_FILE` 等) を明示し、401 は `WWW-Authenticate` ヘッダ
+// 付きの [`crate::miauth::auth::unauthorized`] に集約する。generic な
+// not_found/unauthorized を置くと固有 code を握り潰す誤用を招くため (#197)。
