@@ -148,7 +148,7 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 # default-features を保ち、PNG / JPEG / WebP / GIF を対応にする (最低限のフォーマット)。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 # LRU は実用十分な小さい実装。`lru` crate は put/get が O(1)。
-lru = "0.16"
+lru = "0.18"
 
 # ── M6 media-proxy ─────────────────────────────────────────────────
 # media-proxy は本体 server とは別バイナリ (= 別プロセス + 別 docker container)
