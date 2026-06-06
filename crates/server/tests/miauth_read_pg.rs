@@ -707,6 +707,11 @@ async fn users_show_by_user_id_returns_detailed(pool: PgPool) {
     assert_eq!(v["isCat"], false);
     assert_eq!(v["description"], "hello");
     assert!(v["createdAt"].is_string());
+    // misskey-dart `UserDetailedNotMe` の required bool ── 欠けると Aria が
+    // `MisskeyUsers.show` の deserialize で crash する。
+    assert_eq!(v["isSilenced"], false);
+    assert_eq!(v["isSuspended"], false);
+    assert_eq!(v["publicReactions"], true);
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
