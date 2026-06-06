@@ -884,6 +884,144 @@ async fn reaction_content_consolidation_collapses_host_suffix_dups(
     Ok(())
 }
 
+/// migration `0023_restore_remote_reaction_host` の本体 SQL (`include_str!` で drift 防止)。
+const RESTORE_REMOTE_REACTION_HOST_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0023_restore_remote_reaction_host.sql"
+));
+
+/// Issue #242: migration 0021 が host を剥がしてしまった remote custom emoji の
+/// reaction content を、emoji.host から `:shortcode@host:` に復元する。一方で
+/// local emoji (`is_local=true`) / Unicode / `emoji_id` NULL の行は触らないことを固定。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn migration_0023_restores_host_for_remote_reaction_content(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let author = repo::actor::insert(&pool, sample_local_actor("rrh1")).await?;
+    let reactor = repo::actor::insert(&pool, sample_local_actor("rrh2")).await?;
+    let note = repo::note::insert(
+        &pool,
+        repo::note::NewNote {
+            ap_id: "https://example.test/notes/rrh".into(),
+            actor_id: author.id,
+            content: "hi".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: true,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await?;
+
+    // remote emoji `blob@misskey.io` (is_local=false)。0021 後の世界を再現するため
+    // reaction content は host を剥がした `:blob:` で seed する。
+    let remote = repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "blob".into(),
+            ap_id: "https://misskey.io/emojis/blob".into(),
+            host: "misskey.io".into(),
+            image_key: Some("emoji/remote/misskey.io/blob.webp".into()),
+            media_type: "image/webp".into(),
+            last_failed_at: None,
+        },
+    )
+    .await?;
+    // local emoji `foo` (is_local=true) は復元対象外 (= host を付けない)。
+    let local = repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "foo".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/foo.webp".into(),
+            media_type: "image/webp".into(),
+        },
+    )
+    .await?;
+
+    // remote emoji reaction (host strip 済): 復元される。
+    repo::reaction::insert(
+        &pool,
+        "https://x.test/r/1",
+        note.id,
+        reactor.id,
+        ":blob:",
+        Some(remote.id),
+    )
+    .await?;
+    // local emoji reaction: そのまま :foo:。
+    repo::reaction::insert(
+        &pool,
+        "https://x.test/r/2",
+        note.id,
+        reactor.id,
+        ":foo:",
+        Some(local.id),
+    )
+    .await?;
+    // Unicode: 不変。
+    repo::reaction::insert(&pool, "https://x.test/r/3", note.id, reactor.id, "👍", None).await?;
+    // 学習不能 (emoji_id NULL) の custom emoji: host を復元しようにも host が無いので
+    // :baz: のまま。
+    repo::reaction::insert(
+        &pool,
+        "https://x.test/r/4",
+        note.id,
+        reactor.id,
+        ":baz:",
+        None,
+    )
+    .await?;
+
+    sqlx::raw_sql(RESTORE_REMOTE_REACTION_HOST_SQL)
+        .execute(&pool)
+        .await?;
+
+    let counts = repo::reaction::count_by_note(&pool, note.id).await?;
+    let map: std::collections::BTreeMap<&str, i64> = counts
+        .iter()
+        .map(|c| (c.content.as_str(), c.count))
+        .collect();
+    assert_eq!(
+        map.get(":blob@misskey.io:"),
+        Some(&1),
+        "remote emoji は emoji.host から host が復元される; got {map:?}"
+    );
+    assert!(
+        !map.contains_key(":blob:"),
+        "host 無しの remote reaction は残らない; got {map:?}"
+    );
+    assert_eq!(map.get(":foo:"), Some(&1), "local emoji は :foo: のまま");
+    assert_eq!(map.get("👍"), Some(&1), "Unicode は不変");
+    assert_eq!(
+        map.get(":baz:"),
+        Some(&1),
+        "emoji_id NULL の行は触らない (host が引けない)"
+    );
+    assert_eq!(map.len(), 4, "キーは 4 つ; got {map:?}");
+
+    // 復元行が emoji_id を失っていないこと (= reactionEmojis 画像参照を保つ)。
+    let blob_emoji: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT emoji_id FROM reaction WHERE note_id = $1 AND content = ':blob@misskey.io:'"#,
+        note.id
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(blob_emoji, Some(remote.id), "復元後も emoji_id を保持");
+
+    Ok(())
+}
+
 /// migration `0022_normalize_note_summary` の本体 SQL (`include_str!` で drift 防止)。
 const NORMALIZE_NOTE_SUMMARY_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),

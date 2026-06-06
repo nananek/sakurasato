@@ -47,6 +47,10 @@ mod tests {
         // 0022 normalize_note_summary (= Pleroma の `summary: ""` を保存した
         //   stale 行の空 summary を NULL に畳む backfill。Aria で全ノートが
         //   「警告文の無い CW」に見える症状を解消)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 22);
+        // 0023 restore_remote_reaction_host (= Issue #242: remote custom emoji の
+        //   reaction content に `@host` を復元する backfill。0021 が真リモート絵文字
+        //   まで `:foo:` に畳んで Aria でローカル非保有 shortcode が描画できなくなった
+        //   のを is_local=FALSE 行に限り `:shortcode@host:` へ戻す)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 23);
     }
 }
