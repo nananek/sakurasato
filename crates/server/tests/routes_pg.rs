@@ -445,3 +445,214 @@ async fn inbox_rejects_unsigned_post_with_400(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ─── 絵文字 discovery エンドポイント (他サーバからの import 参照点) ──────────
+
+/// ローカル emoji を 1 件 seed する (`image_key` = `emoji/local/<sc>.webp`)。
+async fn seed_local_emoji(
+    pool: &PgPool,
+    shortcode: &str,
+    category: Option<&str>,
+    aliases: &[&str],
+) {
+    repo::emoji::upsert_local(
+        pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: shortcode.into(),
+            category: category.map(str::to_string),
+            aliases: aliases.iter().map(|s| (*s).to_string()).collect(),
+            image_key: format!("emoji/local/{shortcode}.webp"),
+            media_type: "image/webp".into(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// remote emoji を 1 件 seed する (= ローカル列挙から除外されることの検証用)。
+async fn seed_remote_emoji(pool: &PgPool, shortcode: &str, host: &str) {
+    repo::emoji::upsert_remote(
+        pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: shortcode.into(),
+            ap_id: format!("https://{host}/emojis/{shortcode}"),
+            host: host.into(),
+            image_key: Some(format!("emoji/remote/{host}/{shortcode}.webp")),
+            media_type: "image/webp".into(),
+            last_failed_at: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Mastodon `GET /api/v1/custom_emojis` ── 無認証で bare array を返す。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn custom_emojis_public_no_auth_returns_array(pool: PgPool) {
+    seed_local_emoji(&pool, "sakura", Some("flowers"), &["cherryblossom"]).await;
+    seed_local_emoji(&pool, "blob", None, &[]).await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    // Authorization ヘッダ無しで叩く (= 公開連合からの参照を模す)。
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/custom_emojis")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let arr = json
+        .as_array()
+        .expect("Mastodon custom_emojis は bare array");
+    assert_eq!(arr.len(), 2);
+}
+
+/// `CustomEmoji` の field 形 ── `shortcode` / `url` / `static_url` /
+/// `visible_in_picker` / `aliases`、`category` は `None` のとき key 省略。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn custom_emojis_shape_and_url(pool: PgPool) {
+    seed_local_emoji(&pool, "sakura", Some("flowers"), &["cherryblossom"]).await;
+    seed_local_emoji(&pool, "blob", None, &[]).await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/custom_emojis")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = read_json(resp).await;
+    let arr = json.as_array().unwrap();
+    let sakura = arr
+        .iter()
+        .find(|e| e["shortcode"] == "sakura")
+        .expect("sakura present");
+    assert_eq!(
+        sakura["url"],
+        "https://example.test/media/emoji/local/sakura.webp"
+    );
+    assert_eq!(sakura["static_url"], sakura["url"], "static_url == url");
+    assert_eq!(sakura["visible_in_picker"], true);
+    assert_eq!(sakura["category"], "flowers");
+    assert_eq!(sakura["aliases"][0], "cherryblossom");
+
+    let blob = arr.iter().find(|e| e["shortcode"] == "blob").unwrap();
+    // category=None は key 自体を省く (Mastodon 流)。
+    assert!(
+        blob.get("category").is_none(),
+        "category None の要素は key を省く; got {blob:?}"
+    );
+    // aliases は空でも [] で常に出す。
+    assert_eq!(blob["aliases"].as_array().unwrap().len(), 0);
+}
+
+/// remote emoji は `custom_emojis` に出さない (`host IS NULL` のみ)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn custom_emojis_only_local(pool: PgPool) {
+    seed_local_emoji(&pool, "sakura", None, &[]).await;
+    seed_remote_emoji(&pool, "blobcat", "remote.test").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/custom_emojis")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = read_json(resp).await;
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["shortcode"], "sakura");
+}
+
+/// `image_key` が NULL のローカル row は公開 URL を作れないので除外 (Issue #135)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn custom_emojis_skips_null_image_key(pool: PgPool) {
+    seed_local_emoji(&pool, "sakura", None, &[]).await;
+    seed_local_emoji(&pool, "ghost", None, &[]).await;
+    // ghost の image_key を NULL に落とす (runtime query ── .sqlx 非依存)。
+    sqlx::query("UPDATE emoji SET image_key = NULL WHERE shortcode = $1 AND host IS NULL")
+        .bind("ghost")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/custom_emojis")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = read_json(resp).await;
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "image_key NULL の ghost は除外される");
+    assert_eq!(arr[0]["shortcode"], "sakura");
+}
+
+/// Misskey `GET /api/emojis` ── `{emojis: EmojiSimple[]}`、name は colon 無し、
+/// category は null 保持、isSensitive/localOnly は camelCase の bool。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn misskey_emojis_misskey_shape(pool: PgPool) {
+    seed_local_emoji(&pool, "sakura", Some("flowers"), &["cherryblossom"]).await;
+    seed_local_emoji(&pool, "blob", None, &[]).await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(Request::get("/api/emojis").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let arr = json["emojis"].as_array().expect("emojis 配列");
+    assert_eq!(arr.len(), 2);
+    let sakura = arr
+        .iter()
+        .find(|e| e["name"] == "sakura")
+        .expect("name = colon 無し shortcode");
+    assert_eq!(
+        sakura["url"],
+        "https://example.test/media/emoji/local/sakura.webp"
+    );
+    assert_eq!(sakura["category"], "flowers");
+    assert_eq!(sakura["isSensitive"], false);
+    assert_eq!(sakura["localOnly"], false);
+    assert_eq!(sakura["aliases"][0], "cherryblossom");
+    // category=None は null を保持 (Misskey 流、key 省略しない)。
+    let blob = arr.iter().find(|e| e["name"] == "blob").unwrap();
+    assert!(blob["category"].is_null());
+    assert!(
+        blob.get("category").is_some(),
+        "Misskey は category key を常に出す"
+    );
+}
+
+/// `POST /api/emojis` も受ける (Misskey は GET/POST 両対応)。空 emoji でも
+/// `{emojis: []}` で 404 にしない。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn misskey_emojis_accepts_post_and_empty(pool: PgPool) {
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(
+            Request::post("/api/emojis")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["emojis"].as_array().unwrap().len(), 0);
+}

@@ -9,6 +9,8 @@ use tower_http::trace::TraceLayer;
 use crate::state::AppState;
 
 pub mod actor;
+pub mod emoji;
+pub mod emojis;
 pub mod inbox;
 pub mod media;
 pub mod nodeinfo;
@@ -27,6 +29,15 @@ pub fn router(state: AppState) -> Router {
         .route("/inbox", post(inbox::shared_inbox))
         // M4 PR1 — 最小 Web。permalink は AP JSON 兼用化を M4 PR2 で行う。
         .route("/notes/{id}", get(permalink::handle))
+        // 絵文字 discovery (= 他サーバが我々のローカル絵文字を import するときの参照点)。
+        // いずれも無認証・ローカル絵文字のみ。
+        .route("/api/v1/custom_emojis", get(emojis::custom_emojis))
+        .route(
+            "/api/emojis",
+            get(emojis::misskey_emojis).post(emojis::misskey_emojis),
+        )
+        // inline tag で発行している Emoji.id を dereferenceable に (FEP-9098)。
+        .route("/emojis/{shortcode}", get(emoji::handle))
         // `{*key}` で `/media/path/to/object.png` のスラッシュ入りキーを 1 つの
         // `String` にキャプチャする (axum 0.8 ワイルドカード)。
         .route("/media/{*key}", get(media::handle))
