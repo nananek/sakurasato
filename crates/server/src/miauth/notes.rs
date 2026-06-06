@@ -138,34 +138,8 @@ pub async fn show(
         );
     };
 
-    // direct visibility は本人 or audience 含まれている時のみ見える。
-    // ここでは「お一人様 server で `direct` 受信は自分宛のみ」という現状を
-    // 利用し、`actor_id == viewer` または `viewer` の ap_id が to/cc に含まれる
-    // ときに通す。
-    if entry.visibility == "direct" {
-        let viewer_uri = viewer_ap_id(&state).await;
-        let allowed = entry.actor_id == viewer
-            || viewer_uri.as_ref().is_some_and(|uri| {
-                entry
-                    .to_recipients
-                    .0
-                    .iter()
-                    .chain(entry.cc_recipients.0.iter())
-                    .any(|r| r == uri)
-            });
-        if !allowed {
-            return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
-        }
-    }
-    if entry.visibility == "followers" && entry.actor_id != viewer {
-        // viewer が author を accepted で follow しているか確認。
-        let follows = match repo::follow::get_by_pair(state.pool(), viewer, entry.actor_id).await {
-            Ok(Some(f)) => f.state == "accepted",
-            _ => false,
-        };
-        if !follows {
-            return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
-        }
+    if !viewer_can_view_entry(&state, &entry, viewer).await {
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     }
 
     let summaries = bulk_load_note_summaries(state.pool(), &[entry.id], viewer).await;
@@ -461,8 +435,47 @@ async fn resolve_cursor_ts(state: &AppState, id: &str) -> Option<chrono::DateTim
     }
 }
 
+/// viewer が `entry` を閲覧できるか (= `direct` / `followers` visibility のゲート)。
+/// `notes/show` と `notes/reactions` ([`crate::miauth::reactions::list`]) で共有する
+/// ── reaction 一覧で「見えない note の reaction」を漏らさないため。
+///
+/// - `direct`: 本人 (`actor_id == viewer`) か、viewer の `ap_id` が to/cc audience に
+///   含まれるときのみ可。お一人様 server で `direct` 受信は自分宛のみという前提。
+/// - `followers`: 本人か、viewer が author を `accepted` で follow しているとき可。
+/// - それ以外 (`public` / `home` / `unlisted`): 常に可。
+pub(crate) async fn viewer_can_view_entry(
+    state: &AppState,
+    entry: &sakurasato_core::repo::note::TimelineEntry,
+    viewer: i64,
+) -> bool {
+    match entry.visibility.as_str() {
+        "direct" => {
+            if entry.actor_id == viewer {
+                return true;
+            }
+            let viewer_uri = viewer_ap_id(state).await;
+            viewer_uri.as_ref().is_some_and(|uri| {
+                entry
+                    .to_recipients
+                    .0
+                    .iter()
+                    .chain(entry.cc_recipients.0.iter())
+                    .any(|r| r == uri)
+            })
+        }
+        "followers" => {
+            entry.actor_id == viewer
+                || matches!(
+                    repo::follow::get_by_pair(state.pool(), viewer, entry.actor_id).await,
+                    Ok(Some(f)) if f.state == "accepted"
+                )
+        }
+        _ => true,
+    }
+}
+
 /// local actor の id を引く。お一人様サーバ前提で 1 件しかない。
-async fn resolve_self_actor_id(state: &AppState) -> Option<i64> {
+pub(crate) async fn resolve_self_actor_id(state: &AppState) -> Option<i64> {
     let host = &state.config().server.host;
     let user = &state.config().server.user;
     match repo::actor::get_by_username_host(state.pool(), user, host).await {
