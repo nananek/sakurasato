@@ -1935,3 +1935,171 @@ async fn notes_reactions_hidden_for_invisible_direct_note(pool: PgPool) {
         "見えない direct note の reaction は 404"
     );
 }
+
+// ─── myReaction (リアクション増殖 fix) ───────────────────────────────────
+
+/// viewer 自身が反応した note は `notes/show` で `myReaction` にその content を返し、
+/// `reactions` map の同じ key と一致すること (= Aria が自分の反応を特定する不変条件)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_show_returns_my_reaction_when_viewer_reacted(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let note_id = seed_note(&pool, alice, "sakurasato.test", "hi", Visibility::Public).await;
+    repo::reaction::insert(
+        &pool,
+        "https://sakurasato.test/users/alice/r/1",
+        note_id,
+        alice,
+        "👍",
+        None,
+    )
+    .await
+    .unwrap();
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(
+        app,
+        "/api/notes/show",
+        json!({"i": token, "noteId": note_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let note = read_json(resp).await;
+    assert_eq!(note["myReaction"], "👍");
+    assert!(
+        note["reactions"]["👍"].is_number(),
+        "myReaction は reactions map の key と一致する; got {:?}",
+        note["reactions"]
+    );
+}
+
+/// 反応していない note では `myReaction` は **present かつ null** (always-emit 担保)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_show_my_reaction_null_when_not_reacted(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let note_id = seed_note(&pool, alice, "sakurasato.test", "hi", Visibility::Public).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(
+        app,
+        "/api/notes/show",
+        json!({"i": token, "noteId": note_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let note = read_json(resp).await;
+    assert!(
+        note.get("myReaction").is_some(),
+        "myReaction field は常に present (null 含む)"
+    );
+    assert!(note["myReaction"].is_null(), "反応していないので null");
+}
+
+/// ローカル custom emoji 反応は `myReaction == ":foo:"` で `reactions` key と一致。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_show_my_reaction_local_custom_emoji(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let note_id = seed_note(&pool, alice, "sakurasato.test", "hi", Visibility::Public).await;
+    let emoji = repo::emoji::upsert_local(
+        &pool,
+        NewLocalEmoji {
+            shortcode: "foo".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/foo.webp".into(),
+            media_type: "image/webp".into(),
+        },
+    )
+    .await
+    .expect("seed local emoji");
+    repo::reaction::insert(
+        &pool,
+        "https://sakurasato.test/users/alice/r/1",
+        note_id,
+        alice,
+        ":foo:",
+        Some(emoji.id),
+    )
+    .await
+    .unwrap();
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(
+        app,
+        "/api/notes/show",
+        json!({"i": token, "noteId": note_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let note = read_json(resp).await;
+    assert_eq!(note["myReaction"], ":foo:");
+    assert!(note["reactions"][":foo:"].is_number());
+}
+
+/// home timeline でも viewer 自身の反応が `myReaction` に乗る。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_returns_my_reaction_for_viewer_reaction(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let note_id = seed_note(&pool, alice, "sakurasato.test", "hi", Visibility::Public).await;
+    repo::reaction::insert(
+        &pool,
+        "https://sakurasato.test/users/alice/r/1",
+        note_id,
+        alice,
+        "👍",
+        None,
+    )
+    .await
+    .unwrap();
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(app, "/api/notes/timeline", json!({"i": token, "limit": 10})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().expect("timeline array");
+    let want_id = note_id.to_string();
+    let n = notes
+        .iter()
+        .find(|n| n["id"] == want_id)
+        .expect("note present in timeline");
+    assert_eq!(n["myReaction"], "👍");
+}
+
+/// **viewer-scope の証明**: 別 actor だけが反応した note は viewer の `myReaction`
+/// が null のまま (= 他人の反応を「自分の」と取り違えない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_my_reaction_null_for_other_users_reaction_only(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    let note_id = seed_note(&pool, alice, "sakurasato.test", "hi", Visibility::Public).await;
+    // bob (= viewer ではない) だけが反応。
+    repo::reaction::insert(&pool, "https://remote.test/r/1", note_id, bob, "👍", None)
+        .await
+        .unwrap();
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(app, "/api/notes/timeline", json!({"i": token, "limit": 10})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().expect("timeline array");
+    let want_id = note_id.to_string();
+    let n = notes
+        .iter()
+        .find(|n| n["id"] == want_id)
+        .expect("note present in timeline");
+    assert!(
+        n["myReaction"].is_null(),
+        "他人の反応は viewer の myReaction にならない; got {:?}",
+        n["myReaction"]
+    );
+    assert_eq!(n["reactions"]["👍"], 1);
+}

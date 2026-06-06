@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT ON (note_id)\n            note_id as \"note_id!\",\n            content as \"content!\"\n        FROM reaction\n        WHERE note_id = ANY($1) AND actor_id = $2\n        ORDER BY note_id, id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "note_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "reaction",
+            "name": "note_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "content!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "reaction",
+            "name": "content"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "4b17499d2183d8df71c0ade4e2a95353bb497f924e4bcec9b996db140aefee5b"
+}

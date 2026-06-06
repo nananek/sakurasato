@@ -229,6 +229,12 @@ pub struct MissNote {
     /// `{ "shortcode": "url" }` ── `reactions` の `:shortcode:` key に対応する
     /// 画像 URL マップ。Unicode reaction には対応 entry を持たない。
     pub reaction_emojis: BTreeMap<String, String>,
+    /// Misskey `Note.myReaction` ── 認証 viewer 自身がこの note に付けた reaction の
+    /// content (`:foo:` / `👍`)、無ければ `null`。`reactions` map の key と一致する。
+    /// これが無いと Aria 等は viewer 自身の reaction を別物として重複表示する。
+    /// Misskey wire は常にこの field を出す (null 含む) ので `skip_serializing_if`
+    /// は付けない。
+    pub my_reaction: Option<String>,
     /// Misskey は `emojis` フィールドを返す (= 本文 `:foo:` の画像マップ)。
     /// 新仕様 (= `reactionEmojis` 統合) で deprecated 扱いだが、Milktea/
     /// `MissRirica` は `emojis` を読み続けているので両方出す。
@@ -341,15 +347,19 @@ pub struct MissEmoji {
 pub(crate) struct NoteSummary {
     pub reactions: Vec<ReactionSummaryRow>,
     pub announce: Option<AnnounceSummaryRow>,
+    /// viewer 自身がこの note に付けた reaction content (= `Note.myReaction`)。
+    /// 反応していなければ `None`。
+    pub my_reaction: Option<String>,
 }
 
-/// `note_ids` 全件分の reaction + announce 集計を **2 query** で取る。
+/// `note_ids` 全件分の reaction + announce + `myReaction` 集計を **3 query** で取る。
 ///
 /// - `reaction`: 1 query (= `repo::reaction::counts_for_notes`)
 /// - `announce`: 1 query (= `repo::announce::counts_for_notes`)
+/// - `myReaction`: 1 query (= `repo::reaction::my_reactions_for_notes`、viewer-scope)
 ///
-/// 失敗時は空マップを返し、handler 側で「reactions: {}」「announce 無し」で
-/// 描画継続する ── timeline 本体を 500 にしない。
+/// 失敗時は空マップを返し、handler 側で「reactions: {}」「announce 無し」
+/// 「`myReaction`: null」で描画継続する ── timeline 本体を 500 にしない。
 pub(crate) async fn bulk_load_note_summaries(
     pool: &sqlx::PgPool,
     note_ids: &[i64],
@@ -363,6 +373,7 @@ pub(crate) async fn bulk_load_note_summaries(
             NoteSummary {
                 reactions: Vec::new(),
                 announce: None,
+                my_reaction: None,
             },
         );
     }
@@ -372,6 +383,7 @@ pub(crate) async fn bulk_load_note_summaries(
                 let entry = out.entry(row.note_id).or_insert(NoteSummary {
                     reactions: Vec::new(),
                     announce: None,
+                    my_reaction: None,
                 });
                 entry.reactions.push(row);
             }
@@ -390,6 +402,20 @@ pub(crate) async fn bulk_load_note_summaries(
         }
         Err(err) => {
             tracing::warn!(?err, "miauth bulk announces failed");
+        }
+    }
+    match sakurasato_core::repo::reaction::my_reactions_for_notes(pool, note_ids, viewer_actor_id)
+        .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                if let Some(entry) = out.get_mut(&row.note_id) {
+                    entry.my_reaction = Some(row.content);
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(?err, "miauth bulk my_reactions failed");
         }
     }
     out
@@ -655,7 +681,6 @@ pub(crate) fn timeline_entry_to_miss_note(
     entry: &TimelineEntry,
     summary: &NoteSummary,
     host: &str,
-    self_actor_id: i64,
 ) -> MissNote {
     // **PR #165 round-2 fix**: `actor.is_local` を `entry.actor_ap_id` の host が
     // 自インスタンス (`host`) と一致するかで判定する。`entry_to_actor_lite` は
@@ -673,7 +698,6 @@ pub(crate) fn timeline_entry_to_miss_note(
     let mut actor = entry_to_actor_lite(entry);
     actor.is_local = is_same_host(&entry.actor_ap_id, host);
     let user = from_actor_and_counts(&actor, 0, 0, 0);
-    let _ = self_actor_id; // future use: user の count を埋める場合に
 
     let created_at = entry
         .published_at
@@ -736,6 +760,7 @@ pub(crate) fn timeline_entry_to_miss_note(
         files,
         reactions,
         reaction_emojis,
+        my_reaction: summary.my_reaction.clone(),
         emojis: emojis_in_text,
         tags,
         uri,
@@ -783,6 +808,8 @@ pub(crate) fn build_renote_miss_note(
         files: Vec::new(),
         reactions: BTreeMap::new(),
         reaction_emojis: BTreeMap::new(),
+        // renote wrapper 自体は reaction を持たない (= nested `renoted` が持つ)。
+        my_reaction: None,
         emojis: BTreeMap::new(),
         tags: Vec::new(),
         uri: if announce_ap_id.is_empty() {
@@ -1466,6 +1493,7 @@ mod tests {
         NoteSummary {
             reactions: Vec::new(),
             announce: None,
+            my_reaction: None,
         }
     }
 
@@ -1514,7 +1542,7 @@ mod tests {
     fn timeline_entry_for_local_actor_emits_user_host_null() {
         let entry = fake_timeline_entry("https://sakurasato.test/users/alice");
         let summary = empty_summary();
-        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test", 1);
+        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test");
         let json = serde_json::to_value(&note).unwrap();
         assert!(
             json["user"]["host"].is_null(),
@@ -1529,7 +1557,7 @@ mod tests {
     fn timeline_entry_for_remote_actor_emits_user_host_some() {
         let entry = fake_timeline_entry("https://misskey.io/users/bob");
         let summary = empty_summary();
-        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test", 1);
+        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test");
         let json = serde_json::to_value(&note).unwrap();
         assert_eq!(
             json["user"]["host"], "misskey.io",
@@ -1543,7 +1571,7 @@ mod tests {
     fn timeline_entry_local_host_with_port_still_emits_null() {
         let entry = fake_timeline_entry("https://example.com/users/alice");
         let summary = empty_summary();
-        let note = timeline_entry_to_miss_note(&entry, &summary, "example.com:8443", 1);
+        let note = timeline_entry_to_miss_note(&entry, &summary, "example.com:8443");
         let json = serde_json::to_value(&note).unwrap();
         assert!(
             json["user"]["host"].is_null(),

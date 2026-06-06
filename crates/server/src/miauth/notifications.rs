@@ -115,9 +115,7 @@ pub async fn list(
     let mut actor_cache: HashMap<i64, JsonValue> = HashMap::new();
     let mut out: Vec<JsonValue> = Vec::with_capacity(rows.len());
     for row in &rows {
-        out.push(
-            build_notification(&state, row, recipient, &host, &summaries, &mut actor_cache).await,
-        );
+        out.push(build_notification(&state, row, &host, &summaries, &mut actor_cache).await);
     }
     Json(out).into_response()
 }
@@ -156,7 +154,6 @@ pub async fn mark_all_read(
 async fn build_notification(
     state: &AppState,
     row: &NotificationRow,
-    recipient: i64,
     host: &str,
     summaries: &HashMap<i64, NoteSummary>,
     actor_cache: &mut HashMap<i64, JsonValue>,
@@ -194,9 +191,10 @@ async fn build_notification(
         let empty = NoteSummary {
             reactions: Vec::new(),
             announce: None,
+            my_reaction: None,
         };
         let summary = summaries.get(&note_id).unwrap_or(&empty);
-        let note = timeline_entry_to_miss_note(&entry, summary, host, recipient);
+        let note = timeline_entry_to_miss_note(&entry, summary, host);
         obj["note"] = serde_json::to_value(&note).unwrap_or(JsonValue::Null);
     }
 
