@@ -29,20 +29,32 @@
 //! - create: **`write:reactions`** scope
 //! - delete: **`write:reactions`** scope (= Misskey 仕様で create/delete 同じ)
 
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use sakurasato_core::repo;
 use serde::Deserialize;
+use serde_json::{Value as JsonValue, json};
 
 use crate::local_api::reactions::{
     ReactionCoreError, create_reaction_core, delete_my_reaction_on_note_core,
 };
 use crate::miauth::auth;
+use crate::miauth::conv::from_actor_and_counts;
 use crate::miauth::error::error_resp;
+use crate::miauth::notes::{resolve_self_actor_id, viewer_can_view_entry};
 use crate::state::AppState;
 
 const SCOPE_WRITE_REACTIONS: &str = "write:reactions";
+/// `notes/reactions` (read) は `read:account` scope。`notes/show` と揃える。
+const SCOPE_READ_ACCOUNT: &str = "read:account";
+
+/// `notes/reactions` の limit 既定/上限 (Misskey 既定は 10)。
+const LIST_LIMIT_DEFAULT: i64 = 10;
+const LIST_LIMIT_MAX: i64 = 100;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct CreateReactionBody {
@@ -116,6 +128,134 @@ pub async fn delete(
         Ok(_outcome) => (StatusCode::NO_CONTENT, ()).into_response(),
         Err(err) => map_reaction_core_err(&err),
     }
+}
+
+/// `POST /api/notes/reactions` body (= reaction 一覧、Misskey `notes/reactions`)。
+///
+/// wire: <https://api-doc.misskey.io/api/endpoints/notes/reactions>
+/// `{ i, noteId(必須), type?, limit?, offset?, sinceId?, untilId? }`。
+#[derive(Debug, Deserialize, Default)]
+pub struct ListReactionsBody {
+    #[serde(default)]
+    pub i: Option<String>,
+    #[serde(rename = "noteId", default)]
+    pub note_id: Option<String>,
+    /// reaction 種別フィルタ (= content 完全一致)。`:foo:` / `:foo@host:` / Unicode。
+    #[serde(rename = "type", default)]
+    pub type_: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+    #[serde(rename = "sinceId", default)]
+    pub since_id: Option<String>,
+    #[serde(rename = "untilId", default)]
+    pub until_id: Option<String>,
+}
+
+/// `POST /api/notes/reactions` handler ── note 1 件の個別 reaction を
+/// `NoteReaction[]` (`{id, createdAt, user, type}`) で返す (Aria の reaction 詳細)。
+pub async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<ListReactionsBody>>,
+) -> Response {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    let Some(_token) =
+        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
+    else {
+        return auth::unauthorized("invalid or revoked token");
+    };
+    let Some(note_id) = body.note_id.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+    };
+
+    // note の存在 + 可視性チェック (= 見えない note の reaction を漏らさない)。
+    let entry = match repo::note::get_timeline_entry_by_id(state.pool(), note_id).await {
+        Ok(Some(e)) => e,
+        Ok(None) => return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note"),
+        Err(err) => {
+            tracing::error!(?err, note_id, "miauth notes/reactions: note lookup failed");
+            return error_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "note lookup failed",
+            );
+        }
+    };
+    let Some(viewer) = resolve_self_actor_id(&state).await else {
+        return error_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor initialization failed",
+        );
+    };
+    if !viewer_can_view_entry(&state, &entry, viewer).await {
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+    }
+
+    let limit = body
+        .limit
+        .unwrap_or(LIST_LIMIT_DEFAULT)
+        .clamp(1, LIST_LIMIT_MAX);
+    let offset = body.offset.unwrap_or(0).max(0);
+    let type_filter = body.type_.as_deref().filter(|s| !s.is_empty());
+    let since_id = body.since_id.as_deref().and_then(|s| s.parse::<i64>().ok());
+    let until_id = body.until_id.as_deref().and_then(|s| s.parse::<i64>().ok());
+
+    let rows = match repo::reaction::list_for_note(
+        state.pool(),
+        note_id,
+        type_filter,
+        since_id,
+        until_id,
+        offset,
+        limit,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(?err, note_id, "miauth notes/reactions: list failed");
+            return error_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "reaction list query failed",
+            );
+        }
+    };
+
+    // reactor の MissUser を組み立てる。同一 actor の連投を引き直さないよう cache。
+    let mut user_cache: HashMap<i64, JsonValue> = HashMap::new();
+    let mut out: Vec<JsonValue> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let user = if let Some(cached) = user_cache.get(&row.actor_id) {
+            cached.clone()
+        } else {
+            let built = match repo::actor::get_by_id(state.pool(), row.actor_id).await {
+                Ok(Some(actor)) => serde_json::to_value(from_actor_and_counts(&actor, 0, 0, 0))
+                    .unwrap_or(JsonValue::Null),
+                _ => JsonValue::Null,
+            };
+            user_cache.insert(row.actor_id, built.clone());
+            built
+        };
+        // reactor を引けなかった行は wire 仕様上 `user` 必須なので落とす
+        // (= NoteReaction.user は non-null。null を返すと Dart 側 parse 例外)。
+        if user.is_null() {
+            continue;
+        }
+        out.push(json!({
+            "id": row.id.to_string(),
+            "createdAt": row.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "user": user,
+            // type は DB 保存形そのまま (= `:foo@host:` 形は #242 で note の
+            // reactionEmojis key と一致するので Aria が解決できる)。
+            "type": row.content,
+        }));
+    }
+
+    Json(out).into_response()
 }
 
 /// `ReactionCoreError` を Misskey 互換 error response にマップする。

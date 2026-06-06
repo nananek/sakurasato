@@ -1764,3 +1764,174 @@ async fn drive_usage_requires_read_scope(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ─── notes/reactions (#244 follow-up: reactor 一覧) ──────────────────────
+
+/// `notes/reactions` が note 1 件の個別 reaction を `{id, createdAt, user, type}`
+/// の配列で `id DESC` に返すこと。Unicode と remote custom emoji の両方を含める。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_reactions_returns_reactor_list(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    let carol = seed_remote_actor(&pool, "remote.test", "carol").await;
+    let note_id = seed_note(&pool, alice, "sakurasato.test", "hi", Visibility::Public).await;
+
+    // bob: Unicode 👍 (先に挿入 → id 小)。
+    repo::reaction::insert(&pool, "https://remote.test/r/1", note_id, bob, "👍", None)
+        .await
+        .expect("seed unicode reaction");
+    // carol: remote custom emoji :foo@remote.test: (後 → id 大 → DESC で先頭)。
+    let emoji = repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "foo".into(),
+            ap_id: "https://remote.test/emojis/foo".into(),
+            host: "remote.test".into(),
+            image_key: Some("emoji/remote/remote.test/foo.webp".into()),
+            media_type: "image/webp".into(),
+            last_failed_at: None,
+        },
+    )
+    .await
+    .expect("seed remote emoji");
+    repo::reaction::insert(
+        &pool,
+        "https://remote.test/r/2",
+        note_id,
+        carol,
+        ":foo@remote.test:",
+        Some(emoji.id),
+    )
+    .await
+    .expect("seed custom reaction");
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(
+        app,
+        "/api/notes/reactions",
+        json!({"i": token, "noteId": note_id.to_string(), "limit": 20}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    let arr = v.as_array().expect("top-level array");
+    assert_eq!(arr.len(), 2, "two reactors; got {arr:?}");
+
+    // id DESC ── carol (custom emoji) が先頭。
+    assert_eq!(arr[0]["type"], ":foo@remote.test:");
+    assert_eq!(arr[0]["user"]["username"], "carol");
+    assert!(arr[0]["id"].is_string(), "id は string");
+    assert!(
+        arr[0]["createdAt"].as_str().is_some(),
+        "createdAt は ISO8601 string"
+    );
+    // user (UserLite) は non-null かつ必須フィールドを持つ。
+    assert!(arr[0]["user"]["id"].is_string());
+
+    assert_eq!(arr[1]["type"], "👍");
+    assert_eq!(arr[1]["user"]["username"], "bob");
+}
+
+/// `type` フィルタが content 完全一致で効くこと。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_reactions_type_filter(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    let carol = seed_remote_actor(&pool, "remote.test", "carol").await;
+    let note_id = seed_note(&pool, alice, "sakurasato.test", "hi", Visibility::Public).await;
+    repo::reaction::insert(&pool, "https://remote.test/r/1", note_id, bob, "👍", None)
+        .await
+        .unwrap();
+    repo::reaction::insert(&pool, "https://remote.test/r/2", note_id, carol, "❤", None)
+        .await
+        .unwrap();
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(
+        app,
+        "/api/notes/reactions",
+        json!({"i": token, "noteId": note_id.to_string(), "type": "👍"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr.len(), 1, "type filter で 1 件; got {arr:?}");
+    assert_eq!(arr[0]["type"], "👍");
+    assert_eq!(arr[0]["user"]["username"], "bob");
+}
+
+/// 存在しない note は 404 `NO_SUCH_NOTE`。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_reactions_unknown_note_404(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let resp = post(
+        app,
+        "/api/notes/reactions",
+        json!({"i": token, "noteId": "999999"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// token 無しは 401。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_reactions_without_token_401(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let note_id = seed_note(&pool, alice, "sakurasato.test", "hi", Visibility::Public).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let resp = post(
+        app,
+        "/api/notes/reactions",
+        json!({"noteId": note_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `direct` visibility の他人 note の reaction は viewer に漏らさない (404)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_reactions_hidden_for_invisible_direct_note(pool: PgPool) {
+    // local actor は resolve_self_actor_id のために必要だが id は使わない。
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    // bob の direct note (alice 宛でない = audience 空)。
+    let note_id = seed_note_with_audience(
+        &pool,
+        bob,
+        "remote.test",
+        "secret",
+        Visibility::Direct,
+        vec![],
+        vec![],
+    )
+    .await;
+    repo::reaction::insert(&pool, "https://remote.test/r/1", note_id, bob, "👍", None)
+        .await
+        .unwrap();
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let resp = post(
+        app,
+        "/api/notes/reactions",
+        json!({"i": token, "noteId": note_id.to_string()}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "見えない direct note の reaction は 404"
+    );
+}

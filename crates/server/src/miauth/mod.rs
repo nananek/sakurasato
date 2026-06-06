@@ -112,6 +112,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/notes/create", post(notes::create))
         .route("/api/notes/delete", post(notes::delete))
         .route("/api/notes/renote", post(notes::renote))
+        // #244 follow-up: notes/reactions (read = reactor 一覧)。create/delete より
+        // 前に置いて exact path `/api/notes/reactions` を確実に拾わせる。
+        .route("/api/notes/reactions", post(reactions::list))
         .route("/api/notes/reactions/create", post(reactions::create))
         .route("/api/notes/reactions/delete", post(reactions::delete))
         .route("/api/following/create", post(following::create))

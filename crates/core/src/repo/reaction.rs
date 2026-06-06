@@ -204,3 +204,55 @@ pub struct ReactionSummaryRow {
     /// `MIN(created_at)`。並び替えにだけ使い、API には出さない。
     pub first_at: chrono::DateTime<chrono::Utc>,
 }
+
+/// Note 1 件への **個別** reaction 行を `id DESC` で返す (Misskey `notes/reactions`)。
+///
+/// `counts_for_notes` が `(content)` 単位の **集計** なのに対し、こちらは reactor
+/// ごとの 1 行 (= 誰がいつどの絵文字でリアクションしたか) を返す。Misskey の
+/// reaction 詳細 (= タップで reactor 一覧) に使う。
+///
+/// - `type_filter`: `Some` なら content 完全一致で絞る (Misskey の `type` 引数)。
+/// - `since_id` / `until_id`: 排他境界 (`id > since` / `id < until`)。
+/// - `offset`: `OFFSET`。Misskey は `offset` も受けるので一応対応 (`0` で無効)。
+/// - `limit`: `LIMIT`。
+pub async fn list_for_note(
+    pool: &PgPool,
+    note_id: i64,
+    type_filter: Option<&str>,
+    since_id: Option<i64>,
+    until_id: Option<i64>,
+    offset: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<ReactionWithActor>> {
+    sqlx::query_as!(
+        ReactionWithActor,
+        r#"
+        SELECT r.id, r.content, r.actor_id, r.created_at
+        FROM reaction r
+        WHERE r.note_id = $1
+          AND ($2::text IS NULL OR r.content = $2)
+          AND ($3::bigint IS NULL OR r.id > $3)
+          AND ($4::bigint IS NULL OR r.id < $4)
+        ORDER BY r.id DESC
+        OFFSET $5
+        LIMIT $6
+        "#,
+        note_id,
+        type_filter,
+        since_id,
+        until_id,
+        offset,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// `list_for_note` の戻り行 (= 個別 reaction + reactor)。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReactionWithActor {
+    pub id: i64,
+    pub content: String,
+    pub actor_id: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
