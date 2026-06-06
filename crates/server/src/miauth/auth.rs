@@ -97,11 +97,16 @@ pub fn has_scope(token: &MiAuthTokenRow, required: &str) -> bool {
 /// 401 レスポンス (= 認証情報が無い / 不正)。`WWW-Authenticate` ヘッダで
 /// `MiAuth` scheme を案内する (= Misskey クライアントは Bearer と body `i` の
 /// 両方を試すので、scheme 名は将来の拡張用 informational に近い)。
+///
+/// body は Misskey wire の **nested** 形 `{"error":{"code","message"}}` で返す
+/// (#197) ── `forbidden` (`PERMISSION_DENIED`) や各 endpoint の 404/500 と shape を
+/// 揃え、クライアントが 401 から `code`/`message` を取り出せるようにする。code は
+/// `AUTHENTICATION_FAILED` (= Misskey が無効トークンに返す wire code)。
 pub fn unauthorized(reason: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, r#"Bearer realm="sakurasato""#)],
-        Json(json!({"error": reason})),
+        Json(json!({"error": {"code": "AUTHENTICATION_FAILED", "message": reason}})),
     )
         .into_response()
 }

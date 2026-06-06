@@ -27,11 +27,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use sakurasato_core::repo;
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::miauth::auth;
 use crate::miauth::conv::from_actor_detailed;
-use crate::miauth::error::{bad_request, internal_error};
+use crate::miauth::error::{bad_request, error_resp, internal_error};
 use crate::state::AppState;
 
 const SCOPE_READ_ACCOUNT: &str = "read:account";
@@ -66,11 +65,11 @@ pub async fn handle(
     // 1. userId 直接指定経路。
     let actor = if let Some(uid) = body.user_id.as_deref() {
         let Ok(id) = uid.parse::<i64>() else {
-            return not_found("no such user");
+            return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_USER", "no such user");
         };
         match repo::actor::get_by_id(state.pool(), id).await {
             Ok(Some(a)) => a,
-            Ok(None) => return not_found("no such user"),
+            Ok(None) => return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_USER", "no such user"),
             Err(err) => {
                 tracing::error!(?err, user_id = uid, "miauth users/show: get_by_id failed");
                 return internal_error("failed to look up user");
@@ -88,7 +87,7 @@ pub async fn handle(
             .map_or(local_host, str::to_ascii_lowercase);
         match repo::actor::get_by_username_host(state.pool(), &user_lc, &host_lc).await {
             Ok(Some(a)) => a,
-            Ok(None) => return not_found("no such user"),
+            Ok(None) => return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_USER", "no such user"),
             Err(err) => {
                 tracing::error!(
                     ?err,
@@ -127,17 +126,4 @@ pub async fn handle(
     // (= `conv::timeline_entry_to_miss_note` のような上書きは不要)。
     let detailed = from_actor_detailed(&actor, followers, following, notes);
     Json(detailed).into_response()
-}
-
-fn not_found(message: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": {
-                "code": "NO_SUCH_USER",
-                "message": message,
-            },
-        })),
-    )
-        .into_response()
 }

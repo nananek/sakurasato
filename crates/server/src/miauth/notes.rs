@@ -43,6 +43,7 @@ use crate::miauth::conv::{
     MissNote, NoteSummary, build_renote_miss_note, bulk_load_note_summaries, from_actor_and_counts,
     timeline_entry_to_miss_note,
 };
+use crate::miauth::error::{bad_request, error_resp};
 use crate::state::AppState;
 
 /// `read:account` scope (= Misskey 仕様で `notes/timeline` / `notes/show` /
@@ -107,13 +108,13 @@ pub async fn show(
         return show_renote(&state, rest).await;
     }
     let Ok(note_id) = note_id_str.parse::<i64>() else {
-        return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };
 
     let entry = match repo::note::get_timeline_entry_by_id(state.pool(), note_id).await {
         Ok(Some(e)) => e,
         Ok(None) => {
-            return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+            return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
         }
         Err(err) => {
             tracing::error!(
@@ -121,7 +122,7 @@ pub async fn show(
                 note_id,
                 "miauth notes/show: get_timeline_entry_by_id failed"
             );
-            return error_with_status(
+            return error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "note lookup failed",
@@ -130,7 +131,7 @@ pub async fn show(
     };
 
     let Some(viewer) = resolve_self_actor_id(&state).await else {
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "local actor initialization failed",
@@ -153,7 +154,7 @@ pub async fn show(
                     .any(|r| r == uri)
             });
         if !allowed {
-            return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+            return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
         }
     }
     if entry.visibility == "followers" && entry.actor_id != viewer {
@@ -163,7 +164,7 @@ pub async fn show(
             _ => false,
         };
         if !follows {
-            return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+            return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
         }
     }
 
@@ -183,10 +184,10 @@ pub async fn show(
 )]
 async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
     let Ok(announce_id) = announce_id_str.parse::<i64>() else {
-        return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };
     let Some(viewer) = resolve_self_actor_id(state).await else {
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "local actor initialization failed",
@@ -195,7 +196,7 @@ async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
     let ann = match repo::announce::get_by_id(state.pool(), announce_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
-            return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+            return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
         }
         Err(err) => {
             tracing::error!(
@@ -203,7 +204,7 @@ async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
                 announce_id,
                 "miauth notes/show: announce lookup failed"
             );
-            return error_with_status(
+            return error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "renote lookup failed",
@@ -213,7 +214,7 @@ async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
     let entry = match repo::note::get_timeline_entry_by_id(state.pool(), ann.note_id).await {
         Ok(Some(e)) => e,
         Ok(None) => {
-            return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+            return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
         }
         Err(err) => {
             tracing::error!(
@@ -221,7 +222,7 @@ async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
                 note_id = ann.note_id,
                 "miauth notes/show: renoted note lookup failed"
             );
-            return error_with_status(
+            return error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "renoted note lookup failed",
@@ -231,7 +232,7 @@ async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
     let renoter = match sakurasato_core::repo::actor::get_by_id(state.pool(), ann.actor_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
-            return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+            return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
         }
         Err(err) => {
             tracing::error!(
@@ -239,7 +240,7 @@ async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
                 actor_id = ann.actor_id,
                 "miauth notes/show: renoter lookup failed"
             );
-            return error_with_status(
+            return error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "renoter lookup failed",
@@ -284,7 +285,7 @@ pub async fn timeline(
     };
 
     let Some(viewer) = resolve_self_actor_id(&state).await else {
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "local actor initialization failed",
@@ -326,7 +327,7 @@ pub async fn timeline(
         Ok(v) => v,
         Err(err) => {
             tracing::error!(?err, "miauth notes/timeline: note window failed");
-            return error_with_status(
+            return error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "timeline query failed",
@@ -347,7 +348,7 @@ pub async fn timeline(
         Ok(v) => v,
         Err(err) => {
             tracing::error!(?err, "miauth notes/timeline: renote window failed");
-            return error_with_status(
+            return error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "timeline query failed",
@@ -488,24 +489,6 @@ fn ms_epoch_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms).single()
 }
 
-/// `error.code` / `error.message` 形式の Misskey 互換エラーレスポンス。
-fn error_with_status(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(json!({
-            "error": {
-                "code": code,
-                "message": message,
-            },
-        })),
-    )
-        .into_response()
-}
-
-fn bad_request(message: &str) -> Response {
-    error_with_status(StatusCode::BAD_REQUEST, "INVALID_PARAM", message)
-}
-
 // ─── #160: write endpoints (notes/create, notes/delete, notes/renote) ───────
 
 /// Misskey `notes/create` body。
@@ -561,7 +544,7 @@ pub async fn create(
     // 参照させる別概念で core 未実装)。silent に renote 関係を落として単独 note
     // 化しないよう、明示的に 501 を返す。
     if body.renote_id.is_some() {
-        return error_with_status(
+        return error_resp(
             StatusCode::NOT_IMPLEMENTED,
             "QUOTE_NOT_IMPLEMENTED",
             "quote renote (renoteId + text) is not implemented in this version",
@@ -576,7 +559,7 @@ pub async fn create(
         None => None,
         Some(rid) => {
             let Ok(reply_note_id) = rid.parse::<i64>() else {
-                return error_with_status(
+                return error_resp(
                     StatusCode::BAD_REQUEST,
                     "INVALID_PARAM",
                     "replyId is not a valid note id",
@@ -585,7 +568,7 @@ pub async fn create(
             match repo::note::get_by_id(state.pool(), reply_note_id).await {
                 Ok(Some(parent)) => Some(parent.ap_id),
                 Ok(None) => {
-                    return error_with_status(
+                    return error_resp(
                         StatusCode::BAD_REQUEST,
                         "NO_SUCH_REPLY_TARGET",
                         "no such reply target",
@@ -597,7 +580,7 @@ pub async fn create(
                         reply_note_id,
                         "miauth notes/create: reply target lookup failed"
                     );
-                    return error_with_status(
+                    return error_resp(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "INTERNAL_ERROR",
                         "reply target lookup failed",
@@ -629,7 +612,7 @@ pub async fn create(
             ?body_json,
             "miauth notes/create: missing id in inner response"
         );
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "note creation failed; missing id",
@@ -641,14 +624,14 @@ pub async fn create(
             note_id,
             "miauth notes/create: get_timeline_entry_by_id failed after create"
         );
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "note lookup failed after creation",
         );
     };
     let Some(viewer) = resolve_self_actor_id(&state).await else {
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "local actor initialization failed",
@@ -686,11 +669,11 @@ pub async fn delete(
         return auth::unauthorized("invalid or revoked token");
     };
     let Some(note_id) = body.note_id.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
-        return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };
 
     let Some(viewer) = resolve_self_actor_id(&state).await else {
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "local actor initialization failed",
@@ -699,11 +682,11 @@ pub async fn delete(
     let note = match repo::note::get_by_id(state.pool(), note_id).await {
         Ok(Some(n)) => n,
         Ok(None) => {
-            return error_with_status(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+            return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
         }
         Err(err) => {
             tracing::error!(?err, note_id, "miauth notes/delete: lookup failed");
-            return error_with_status(
+            return error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "note lookup failed",
@@ -711,7 +694,7 @@ pub async fn delete(
         }
     };
     if note.actor_id != viewer {
-        return error_with_status(
+        return error_resp(
             StatusCode::FORBIDDEN,
             "PERMISSION_DENIED",
             "note not owned by you",
@@ -719,7 +702,7 @@ pub async fn delete(
     }
     if !note.is_local {
         // remote note を local が削除しようとしても AP 上は無意味 (= 相手側の note)。
-        return error_with_status(
+        return error_resp(
             StatusCode::FORBIDDEN,
             "PERMISSION_DENIED",
             "cannot delete a remote note",
@@ -736,7 +719,7 @@ pub async fn delete(
     };
     let Ok(Some(local_actor)) = sakurasato_core::repo::actor::get_by_id(state.pool(), viewer).await
     else {
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "local actor fetch failed",
@@ -794,14 +777,14 @@ pub async fn renote(
 #[allow(clippy::similar_names)] // renoter (= 行為者) / renoted (= 対象) は AP 用語
 async fn handle_renote(state: &AppState, renote_id: Option<&str>) -> Response {
     let Some(rid) = renote_id else {
-        return error_with_status(
+        return error_resp(
             StatusCode::BAD_REQUEST,
             "INVALID_PARAM",
             "renoteId is required",
         );
     };
     let Ok(target_id) = rid.parse::<i64>() else {
-        return error_with_status(
+        return error_resp(
             StatusCode::BAD_REQUEST,
             "INVALID_PARAM",
             "renoteId is not a valid note id",
@@ -828,7 +811,7 @@ async fn handle_renote(state: &AppState, renote_id: Option<&str>) -> Response {
             503 => ("UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE),
             _ => ("INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR),
         };
-        return error_with_status(st, code, message);
+        return error_resp(st, code, message);
     }
 
     // AnnounceResponse { id, ap_id, note_id, queued_deliveries }。
@@ -841,7 +824,7 @@ async fn handle_renote(state: &AppState, renote_id: Option<&str>) -> Response {
 
     // renote MissNote の合成に必要な要素を集める。
     let Some(viewer) = resolve_self_actor_id(state).await else {
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "local actor initialization failed",
@@ -849,7 +832,7 @@ async fn handle_renote(state: &AppState, renote_id: Option<&str>) -> Response {
     };
     let Ok(Some(local_actor)) = sakurasato_core::repo::actor::get_by_id(state.pool(), viewer).await
     else {
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "local actor fetch failed",
@@ -858,7 +841,7 @@ async fn handle_renote(state: &AppState, renote_id: Option<&str>) -> Response {
     let Ok(Some(target_entry)) =
         repo::note::get_timeline_entry_by_id(state.pool(), target_id).await
     else {
-        return error_with_status(
+        return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "renote target lookup failed",
@@ -897,7 +880,7 @@ fn translate_create_body(
 ) -> Result<local_api::notes::CreateNoteRequest, Response> {
     let text = body.text.clone().unwrap_or_default();
     if text.trim().is_empty() {
-        return Err(error_with_status(
+        return Err(error_resp(
             StatusCode::BAD_REQUEST,
             "INVALID_PARAM",
             "text must not be empty",
@@ -912,7 +895,7 @@ fn translate_create_body(
         Some("followers") => Some("followers".to_string()),
         Some("specified") => Some("direct".to_string()),
         Some(other) => {
-            return Err(error_with_status(
+            return Err(error_resp(
                 StatusCode::BAD_REQUEST,
                 "INVALID_PARAM",
                 &format!("unknown visibility: {other:?}"),
@@ -931,7 +914,7 @@ fn translate_create_body(
         .iter()
         .map(|s| {
             s.parse::<i64>().map_err(|_| {
-                error_with_status(
+                error_resp(
                     StatusCode::BAD_REQUEST,
                     "INVALID_PARAM",
                     "fileIds contains a non-numeric id",
@@ -973,7 +956,7 @@ fn translate_local_error_to_misskey(status: StatusCode, body: &JsonValue) -> Res
         503 => "UNAVAILABLE",
         _ => "INTERNAL_ERROR",
     };
-    error_with_status(status, code, message)
+    error_resp(status, code, message)
 }
 
 /// Delete activity を組み立てる。`object` には note の `ap_id` を URI 参照で
@@ -1015,7 +998,7 @@ async fn collect_json(resp: Response) -> Result<JsonValue, Response> {
         Ok(b) => b.to_bytes(),
         Err(err) => {
             tracing::error!(?err, "collect_json: body collect failed");
-            return Err(error_with_status(
+            return Err(error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "response parsing failed",
@@ -1027,7 +1010,7 @@ async fn collect_json(resp: Response) -> Result<JsonValue, Response> {
     }
     serde_json::from_slice(&bytes).map_err(|err| {
         tracing::error!(?err, "collect_json: JSON parse failed");
-        error_with_status(
+        error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "response parsing failed",

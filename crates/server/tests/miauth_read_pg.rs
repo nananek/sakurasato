@@ -501,6 +501,10 @@ async fn timeline_without_scope_returns_401(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // #197: 401 も nested body `{"error":{"code":"AUTHENTICATION_FAILED",...}}` で
+    // 返す (= forbidden / 404 / 500 と shape を揃え、client が code を拾える)。
+    let err = read_json(resp).await;
+    assert_eq!(err["error"]["code"], "AUTHENTICATION_FAILED");
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
@@ -743,6 +747,10 @@ async fn users_show_unknown_returns_404(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // #197: users/show の 404 は Misskey wire の固有 code `NO_SUCH_USER` を
+    // nested body で返す (= helper 集約後もこの code を保持することを lock)。
+    let err = read_json(resp).await;
+    assert_eq!(err["error"]["code"], "NO_SUCH_USER");
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
