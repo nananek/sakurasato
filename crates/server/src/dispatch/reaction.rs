@@ -16,8 +16,11 @@
 //!   通過済み。ここでは signer を「`object` の author 本人」とみなしてよい。
 //! - `object` (= 対象 Note URI) はこちらの local note を指していなければ
 //!   silently skip (= 連合相手の retry ループに乗らないよう 202)。
-//! - `Emoji.id` の host と `Emoji.icon.url` の host は signer host と一致する
-//!   ことを要求する ── 他インスタンスの絵文字 ID を spoofing 学習させない。
+//! - `Emoji.id` の host は signer host と一致することを要求する ── 他インスタンス
+//!   の絵文字 ID を spoofing 学習させない (identity 境界)。
+//! - `Emoji.icon.url` の host は signer と異なってよい (Issue #239: Misskey は
+//!   drive/画像を別ドメインで配信する)。画像取得は media-proxy が SSRF 境界を担い、
+//!   client へは自鯖キャッシュ URL を返すため任意 host を許容できる。
 
 use std::time::Duration;
 
@@ -281,8 +284,9 @@ fn extract_content(activity: &JsonValue, kind: ReactionKind) -> Result<String, D
 /// Activity の `tag: [Emoji]` から remote 絵文字を学習する。
 ///
 /// `content` に該当する `Emoji.name` が見つかればその id を返す。複数 tag が
-/// あっても content と name (`:foo:`) が一致するものだけ採用する。signer の
-/// host と異なる host の Emoji は無視する (spoofing 防止)。
+/// あっても content と name (`:foo:`) が一致するものだけ採用する。`Emoji.id` の
+/// host が signer host と異なる場合は無視する (spoofing 防止)。`Emoji.icon.url`
+/// の host は signer と異なってよい (Issue #239、別ドメイン drive 対応)。
 ///
 /// 学習自体は best-effort。失敗しても reaction の記録は続行する。
 #[allow(
@@ -372,20 +376,29 @@ async fn learn_emoji_tag(
         if image_url.is_empty() {
             continue;
         }
-        // image_url の host も signer host と一致することを要求する。Misskey の
-        // 実装では media.misskey.io 等の CDN ホストを使う場合があり、本検査を
-        // 厳格にしすぎると正常データを弾く ── 本 PR では同 host 一致のみを
-        // 許容し、CDN 経由は M9 で再評価する。
-        let url_ok = Url::parse(image_url).is_ok_and(|u| {
-            u.host_str()
-                .is_some_and(|h| h.eq_ignore_ascii_case(&signer_host))
-        });
-        if !url_ok {
+        // Issue #239: icon.url の host == signer host 検査は撤廃する。Misskey は
+        // emoji メタデータ (mi.example.com) と drive/画像 (drive-mi.example.com) を
+        // 別ドメインで配信するのが一般的で、同 host 一致を強制すると正規の絵文字を
+        // 学習できなかった。同 host 強制を外しても安全な根拠:
+        //   - 画像取得は `fetch_and_cache_remote_emoji` → media-proxy
+        //     `/v1/image/fetch` 経由のみ。media-proxy が `net_guard::host_blocked`
+        //     + redirect 再検証 + max_bytes で SSRF egress 境界を担うので、icon
+        //     host を緩めても SSRF 面は広がらない。
+        //   - client へは raw icon.url ではなく自鯖キャッシュ URL
+        //     (`emoji/remote/<host>/<shortcode>.webp` → `https://<our_host>/media/...`)
+        //     を返す (conv.rs::build_reactions / local_api timeline)。任意 URL を
+        //     広告させない。
+        //   - note 本文 emoji (conv.rs::build_text_emojis) は既に icon.url を host
+        //     検査なしで透過しており、本変更で reaction emoji をそれに揃える。
+        //   - なりすまし/identity 境界は上の Emoji.id host==signer 検査が担う。
+        // ここでは media-proxy に渡す前の最低限の well-formedness のみ要求する:
+        // http/https かつ host を持つ URL であること (file:// / data: 等を弾く)。
+        let url_well_formed = Url::parse(image_url)
+            .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some());
+        if !url_well_formed {
             warn!(
                 emoji_id = ap_id,
-                signer_host = %signer_host,
-                image_url,
-                "Emoji.icon.url host mismatch with signer; refusing to learn"
+                image_url, "Emoji.icon.url is not a well-formed http(s) URL; refusing to learn"
             );
             continue;
         }

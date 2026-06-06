@@ -321,11 +321,84 @@ async fn inbound_emoji_react_learns_remote_emoji(pool: PgPool) {
     assert_eq!(row.emoji_id, Some(emoji.id));
 }
 
+/// Issue #239: signer = `remote.test`, `Emoji.id` = `remote.test` (一致) だが、
+/// `icon.url` は `drive-remote.test` (別ドメイン drive)。Misskey の典型構成で、
+/// `icon.url` host 検査を撤廃したので emoji は学習される。
+///
+/// 注: テスト環境の media-proxy は dead socket (`make_config` の `/tmp/x`) なので
+/// 画像 fetch は失敗し `image_key=None` + `last_failed_at=Some` になるが、emoji ROW と
+/// `reaction.emoji_id` は書かれる (fetch 失敗は upsert を妨げない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn inbound_emoji_react_learns_emoji_with_separate_drive_host(pool: PgPool) {
+    let (_, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(&pool, remote_actor("remote.test", "bob", &remote_pub))
+        .await
+        .unwrap();
+    let (_, note_ap_id) = seed_local_note(&pool, local.id).await;
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let emoji_ap_id = "https://remote.test/emojis/blobcat";
+    let activity_id = "https://remote.test/users/bob/activities/react-drive".to_string();
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": activity_id,
+        "type": "EmojiReact",
+        "actor": remote.ap_id,
+        "object": note_ap_id,
+        "content": ":blobcat:",
+        "tag": [{
+            "type": "Emoji",
+            "id": emoji_ap_id,
+            "name": ":blobcat:",
+            "icon": {
+                "type": "Image",
+                "mediaType": "image/webp",
+                // 別ドメイン drive。Emoji.id (remote.test) とは host が異なる。
+                "url": "https://drive-remote.test/files/blobcat.webp"
+            }
+        }]
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // 別ドメイン drive の emoji でも学習される (= #239 の本丸)。
+    let emoji = repo::emoji::get_by_ap_id(&pool, emoji_ap_id)
+        .await
+        .unwrap()
+        .expect("separate-drive-host emoji should be learned");
+    assert_eq!(emoji.shortcode, "blobcat");
+    assert_eq!(emoji.host.as_deref(), Some("remote.test")); // host は signer 由来
+    assert!(!emoji.is_local);
+    // dead-socket media-proxy のため画像は焼けていない (fetch 失敗 backoff)。
+    assert!(emoji.image_key.is_none());
+    assert!(emoji.last_failed_at.is_some());
+
+    // reaction 行が学習した emoji_id を参照している。
+    let row = repo::reaction::get_by_ap_id(&pool, &activity_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.content, ":blobcat:");
+    assert_eq!(row.emoji_id, Some(emoji.id));
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn inbound_emoji_react_rejects_cross_host_emoji_tag(pool: PgPool) {
     // signer は remote.test だが、tag の Emoji.id は other.test を指す ──
     // 他インスタンスの emoji ID を spoofing 学習しないこと。reaction は記録
     // されるが emoji_id は None。
+    // Issue #239: 拒否は **Emoji.id** host 不一致による (icon.url の host 検査は
+    // 撤廃済み)。icon.url が other.test でも、reject は Emoji.id が担う。
     let (_, local_pub) = fresh_rsa();
     let (remote_priv, remote_pub) = fresh_rsa();
     let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
