@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO emoji (shortcode, host, category, aliases, image_key, media_type, is_local)\n        VALUES ($1, NULL, $2, $3, $4, $5, TRUE)\n        ON CONFLICT (shortcode, host) DO UPDATE SET\n            category = EXCLUDED.category,\n            aliases = EXCLUDED.aliases,\n            image_key = EXCLUDED.image_key,\n            media_type = EXCLUDED.media_type,\n            updated_at = now()\n        RETURNING\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at\n        ",
+  "query": "\n        SELECT\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at\n        FROM emoji\n        WHERE host IS NULL\n          AND lower(shortcode) LIKE $1\n        ORDER BY shortcode ASC\n        LIMIT $2\n        ",
   "describe": {
     "columns": [
       {
@@ -104,6 +104,28 @@
       },
       {
         "ordinal": 9,
+        "name": "license",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "emoji",
+            "name": "license"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "is_sensitive",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "emoji",
+            "name": "is_sensitive"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -114,7 +136,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -125,7 +147,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "last_failed_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -139,10 +161,7 @@
     "parameters": {
       "Left": [
         "Text",
-        "Text",
-        "Jsonb",
-        "Text",
-        "Text"
+        "Int8"
       ]
     },
     "nullable": [
@@ -155,10 +174,12 @@
       false,
       true,
       false,
+      true,
+      false,
       false,
       false,
       true
     ]
   },
-  "hash": "b9ef89363bf23d82ace4502f57367f94aa3b1aeafe32304b4130ae96d0c7c2b3"
+  "hash": "4c92f8d144b14f30f3cddffbb470f0c315831468f990c2368afe4423d6895087"
 }

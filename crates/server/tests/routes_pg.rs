@@ -463,6 +463,8 @@ async fn seed_local_emoji(
             aliases: aliases.iter().map(|s| (*s).to_string()).collect(),
             image_key: format!("emoji/local/{shortcode}.webp"),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await
@@ -598,6 +600,36 @@ async fn custom_emojis_skips_null_image_key(pool: PgPool) {
     let arr = json.as_array().unwrap();
     assert_eq!(arr.len(), 1, "image_key NULL の ghost は除外される");
     assert_eq!(arr[0]["shortcode"], "sakura");
+}
+
+/// Misskey `/api/emojis` の `isSensitive` が emoji 行の `is_sensitive` を反映する
+/// (migration 0024)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn misskey_emojis_reflects_sensitive_column(pool: PgPool) {
+    repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "spicy".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/spicy.webp".into(),
+            media_type: "image/webp".into(),
+            license: Some("CC0".into()),
+            is_sensitive: true,
+        },
+    )
+    .await
+    .unwrap();
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+    let resp = app
+        .oneshot(Request::get("/api/emojis").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let json = read_json(resp).await;
+    let e = &json["emojis"][0];
+    assert_eq!(e["name"], "spicy");
+    assert_eq!(e["isSensitive"], true);
 }
 
 /// Misskey `GET /api/emojis` ── `{emojis: EmojiSimple[]}`、name は colon 無し、

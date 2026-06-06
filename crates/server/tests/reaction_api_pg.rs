@@ -198,6 +198,8 @@ async fn create_reaction_local_shortcode_resolves_emoji(pool: PgPool) {
             aliases: vec![],
             image_key: "emoji/local/blob_party.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await
@@ -248,6 +250,8 @@ async fn create_reaction_with_host_suffix_normalizes_to_local_shortcode(pool: Pg
             aliases: vec![],
             image_key: "emoji/local/blob_party.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await
@@ -659,6 +663,8 @@ async fn create_emoji_reaction_includes_misskey_reaction_and_tag(pool: PgPool) {
             aliases: vec![],
             image_key: "emoji/local/blob_party.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await
@@ -815,6 +821,8 @@ async fn delete_emoji_reaction_undo_preserves_misskey_reaction(pool: PgPool) {
             aliases: vec![],
             image_key: "emoji/local/blob_party.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await
@@ -925,6 +933,8 @@ async fn create_emoji_reaction_on_remote_note_targets_author(pool: PgPool) {
             aliases: vec![],
             image_key: "emoji/local/blob_party.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await

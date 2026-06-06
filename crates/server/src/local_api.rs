@@ -56,6 +56,7 @@ use crate::state::AppState;
 pub mod actor;
 pub mod actor_admin;
 pub mod auth;
+pub mod emoji_tag;
 pub mod emojis;
 pub mod follow;
 pub mod follow_list;

@@ -59,6 +59,8 @@ async fn seed_local_emoji(pool: &PgPool, shortcode: &str) {
             aliases: vec!["cat".into()],
             image_key: format!("emoji/local/{shortcode}.webp"),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await

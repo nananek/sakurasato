@@ -51,6 +51,8 @@ mod tests {
         //   reaction content に `@host` を復元する backfill。0021 が真リモート絵文字
         //   まで `:foo:` に畳んで Aria でローカル非保有 shortcode が描画できなくなった
         //   のを is_local=FALSE 行に限り `:shortcode@host:` へ戻す)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 23);
+        // 0024 emoji_license_sensitive (= 絵文字 metadata の round-trip export 用に
+        //   emoji.license TEXT + emoji.is_sensitive BOOLEAN を追加)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 24);
     }
 }

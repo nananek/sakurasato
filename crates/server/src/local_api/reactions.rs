@@ -38,7 +38,6 @@ use std::collections::BTreeSet;
 use tracing::{error, warn};
 
 use crate::delivery;
-use crate::local_api::media::build_media_url;
 use crate::state::AppState;
 
 /// `content` の最大文字数。inbound の `EmojiReact` 検査 (256) と同値。
@@ -563,34 +562,15 @@ fn build_reaction_activity(
 ) -> JsonValue {
     let published = published.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    let (activity_type, tag) = if let Some(emoji) = emoji
-        && let Some(image_key) = emoji.image_key.as_deref()
-    {
-        // Misskey 互換: EmojiReact + tag に Emoji オブジェクト。
-        // Issue #135 で `image_key` が nullable 化。Local emoji は import 時に
-        // 必ず入っているのが期待値だが、None で来た場合は連合相手に画像 URL
-        // を含む Emoji tag を出せないので Like (テキスト) で送る安全側挙動。
-        let url = build_media_url(&state.config().server.host, image_key);
-        let emoji_ap_id = format!(
-            "https://{host}/emojis/{shortcode}",
-            host = state.config().server.host,
-            shortcode = emoji.shortcode,
-        );
-        let tag = json!([{
-            "type": "Emoji",
-            "id": emoji_ap_id,
-            "name": format!(":{}:", emoji.shortcode),
-            "updated": emoji.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "icon": {
-                "type": "Image",
-                "mediaType": emoji.media_type,
-                "url": url,
-            },
-        }]);
-        ("EmojiReact", Some(tag))
-    } else {
-        // Unicode (空文字 / 1 文字以上の絵文字) は Like で送る。Mastodon 互換性。
-        ("Like", None)
+    // Misskey 互換: EmojiReact + tag に Emoji オブジェクト。
+    // Issue #135 で `image_key` が nullable 化。Local emoji は import 時に必ず
+    // 入っているのが期待値だが、None のときは連合相手に画像 URL を含む Emoji tag を
+    // 出せないので Like (テキスト) で送る安全側挙動 ([`build_emoji_tag`] が `None`)。
+    let emoji_tag = emoji
+        .and_then(|e| crate::local_api::emoji_tag::build_emoji_tag(&state.config().server.host, e));
+    let (activity_type, tag) = match emoji_tag {
+        Some(t) => ("EmojiReact", Some(json!([t]))),
+        None => ("Like", None),
     };
 
     let mut activity = json!({

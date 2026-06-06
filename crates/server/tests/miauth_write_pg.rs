@@ -509,6 +509,8 @@ async fn reactions_create_local_emoji_returns_204(pool: PgPool) {
             aliases: vec![],
             image_key: "emoji/local/sakura.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await

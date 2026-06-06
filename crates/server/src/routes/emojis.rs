@@ -25,9 +25,6 @@ use serde::Serialize;
 use crate::local_api::media::build_media_url;
 use crate::state::AppState;
 
-/// 1 度に列挙する最大件数 ([`crate::miauth::emojis`] の `EMOJIS_FETCH_LIMIT` と同値)。
-const FETCH_LIMIT: i64 = 10_000;
-
 /// Mastodon `CustomEmoji` (+ `aliases` 拡張)。**`snake_case` wire** なので
 /// `rename_all` は付けない (Mastodon の `custom_emojis` は `static_url` /
 /// `visible_in_picker` のような `snake_case`)。
@@ -49,16 +46,20 @@ pub struct CustomEmoji {
 
 /// `GET /api/v1/custom_emojis` ── Mastodon 互換 (bare array)。
 pub async fn custom_emojis(State(state): State<AppState>) -> Response {
-    let rows = match repo::emoji::list_local_by_prefix(state.pool(), "", FETCH_LIMIT).await {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::error!(
-                ?err,
-                "GET /api/v1/custom_emojis: list_local_by_prefix failed"
-            );
-            return (StatusCode::SERVICE_UNAVAILABLE, "emoji listing unavailable").into_response();
-        }
-    };
+    let rows =
+        match repo::emoji::list_local_by_prefix(state.pool(), "", repo::emoji::LIST_FETCH_LIMIT)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    "GET /api/v1/custom_emojis: list_local_by_prefix failed"
+                );
+                return (StatusCode::SERVICE_UNAVAILABLE, "emoji listing unavailable")
+                    .into_response();
+            }
+        };
     let host = &state.config().server.host;
     let items: Vec<CustomEmoji> = rows
         .into_iter()
@@ -88,8 +89,9 @@ pub struct PublicEmojiSimple {
     /// Misskey は `category` を nullable で **常に出す** (`None` → `null`、省略しない)。
     pub category: Option<String>,
     pub url: String,
-    /// 現状 emoji テーブルに sensitive 列が無いので一律 `false` (PR2 で実値化予定)。
+    /// emoji テーブルの `is_sensitive` 列 (migration 0024)。
     pub is_sensitive: bool,
+    /// お一人様サーバはローカル限定 emoji の概念を持たないので一律 `false`。
     pub local_only: bool,
 }
 
@@ -101,13 +103,17 @@ pub struct EmojisResponse {
 /// `GET`/`POST /api/emojis` ── Misskey 互換 discovery。Misskey は GET/POST 両対応
 /// なので両方受ける (body は無視 = anonymous-public)。
 pub async fn misskey_emojis(State(state): State<AppState>) -> Response {
-    let rows = match repo::emoji::list_local_by_prefix(state.pool(), "", FETCH_LIMIT).await {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::error!(?err, "GET /api/emojis: list_local_by_prefix failed");
-            return (StatusCode::SERVICE_UNAVAILABLE, "emoji listing unavailable").into_response();
-        }
-    };
+    let rows =
+        match repo::emoji::list_local_by_prefix(state.pool(), "", repo::emoji::LIST_FETCH_LIMIT)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(?err, "GET /api/emojis: list_local_by_prefix failed");
+                return (StatusCode::SERVICE_UNAVAILABLE, "emoji listing unavailable")
+                    .into_response();
+            }
+        };
     let host = &state.config().server.host;
     let emojis: Vec<PublicEmojiSimple> = rows
         .into_iter()
@@ -118,7 +124,7 @@ pub async fn misskey_emojis(State(state): State<AppState>) -> Response {
                 name: row.shortcode,
                 category: row.category,
                 url: build_media_url(host, image_key),
-                is_sensitive: false,
+                is_sensitive: row.is_sensitive,
                 local_only: false,
             })
         })

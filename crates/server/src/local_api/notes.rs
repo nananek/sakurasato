@@ -55,7 +55,7 @@ use serde_json::{Value as JsonValue, json};
 use tracing::{error, warn};
 
 use crate::delivery;
-use crate::local_api::media::{attachment_document, build_media_url};
+use crate::local_api::media::attachment_document;
 use crate::local_api::stream::{NoteCreatedPayload, TimelineEvent};
 use crate::media_proxy_client::MediaProxyError;
 use crate::remote_actor::{self, FetchError};
@@ -594,26 +594,14 @@ async fn resolve_emoji_tags(state: &AppState, content: &str) -> Vec<JsonValue> {
     for sc in shortcodes {
         match repo::emoji::get_local_by_shortcode(state.pool(), &sc).await {
             Ok(Some(row)) => {
-                // Issue #135 で nullable 化: local emoji は import 時に必ず
-                // 入っているはずだが、何らかの原因で None だった場合は
-                // 配信側で `:foo:` テキストに倒すため tag を drop する。
-                let Some(image_key) = row.image_key.as_deref() else {
+                // Issue #135 で nullable 化: local emoji は import 時に必ず入って
+                // いるはずだが、None だった場合は配信側で `:foo:` テキストに倒すため
+                // tag を drop する ([`build_emoji_tag`] が `None` を返す)。
+                if let Some(tag) = crate::local_api::emoji_tag::build_emoji_tag(&host, &row) {
+                    out.push(tag);
+                } else {
                     warn!(shortcode = %sc, "local emoji image_key is NULL; dropping tag");
-                    continue;
-                };
-                let url = build_media_url(&host, image_key);
-                let emoji_ap_id = format!("https://{host}/emojis/{sc}");
-                out.push(json!({
-                    "type": "Emoji",
-                    "id": emoji_ap_id,
-                    "name": format!(":{sc}:"),
-                    "updated": row.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    "icon": {
-                        "type": "Image",
-                        "mediaType": row.media_type,
-                        "url": url,
-                    },
-                }));
+                }
             }
             Ok(None) => {
                 // shortcode が DB に無い ── テキストとしてそのまま残す。

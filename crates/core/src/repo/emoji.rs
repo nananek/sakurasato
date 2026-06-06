@@ -8,6 +8,11 @@ use sqlx::types::Json;
 
 use crate::model::EmojiRow;
 
+/// ローカル emoji を一覧する API (公開 `/api/emojis` / `/api/v1/custom_emojis`、
+/// `MiAuth` `/api/emojis`) が 1 度に取る最大件数。お一人様サーバの emoji 数を十分
+/// 上回る値。複数 endpoint で重複定義しないよう core に置く。
+pub const LIST_FETCH_LIMIT: i64 = 10_000;
+
 /// True if `shortcode` is safe to use as an emoji identifier and as a
 /// component of the versitygw object key (e.g. `emoji/local/<shortcode>.webp`).
 ///
@@ -37,6 +42,10 @@ pub struct NewLocalEmoji {
     pub aliases: Vec<String>,
     pub image_key: String,
     pub media_type: String,
+    /// AP `_misskey_license.freeText` 相当。Misskey zip import で取り込む。`None` 可。
+    pub license: Option<String>,
+    /// Misskey `isSensitive`。
+    pub is_sensitive: bool,
 }
 
 /// Insert a local custom emoji, overwriting any prior entry with the same
@@ -53,24 +62,28 @@ pub async fn upsert_local(pool: &PgPool, new: NewLocalEmoji) -> sqlx::Result<Emo
     sqlx::query_as!(
         EmojiRow,
         r#"
-        INSERT INTO emoji (shortcode, host, category, aliases, image_key, media_type, is_local)
-        VALUES ($1, NULL, $2, $3, $4, $5, TRUE)
+        INSERT INTO emoji (shortcode, host, category, aliases, image_key, media_type, is_local, license, is_sensitive)
+        VALUES ($1, NULL, $2, $3, $4, $5, TRUE, $6, $7)
         ON CONFLICT (shortcode, host) DO UPDATE SET
             category = EXCLUDED.category,
             aliases = EXCLUDED.aliases,
             image_key = EXCLUDED.image_key,
             media_type = EXCLUDED.media_type,
+            license = EXCLUDED.license,
+            is_sensitive = EXCLUDED.is_sensitive,
             updated_at = now()
         RETURNING
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
+            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at
         "#,
         new.shortcode,
         new.category,
         aliases_json,
         new.image_key,
         new.media_type,
+        new.license,
+        new.is_sensitive,
     )
     .fetch_one(pool)
     .await
@@ -86,7 +99,7 @@ pub async fn get_local_by_shortcode(
         SELECT
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
+            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at
         FROM emoji WHERE shortcode = $1 AND host IS NULL
         "#,
         shortcode,
@@ -113,7 +126,7 @@ pub async fn list_local_by_prefix(
         SELECT
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
+            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at
         FROM emoji
         WHERE host IS NULL
           AND lower(shortcode) LIKE $1
@@ -170,7 +183,7 @@ pub async fn search_local_by_substring(
         SELECT
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
+            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at
         FROM emoji
         WHERE host IS NULL
           AND (
@@ -261,7 +274,7 @@ pub async fn upsert_remote(pool: &PgPool, new: NewRemoteEmoji) -> sqlx::Result<E
         RETURNING
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
+            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at
         "#,
         new.shortcode,
         new.host,
@@ -283,7 +296,7 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<EmojiRow>>
         SELECT
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
+            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at
         FROM emoji WHERE id = $1
         "#,
         id,
@@ -300,7 +313,7 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Emo
         SELECT
             id, shortcode, host, category,
             aliases as "aliases: Json<Vec<String>>",
-            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at
+            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at
         FROM emoji WHERE ap_id = $1
         "#,
         ap_id,
