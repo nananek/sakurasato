@@ -256,3 +256,44 @@ pub struct ReactionWithActor {
     pub actor_id: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
+
+/// viewer 自身が `note_ids` の各 note に付けた reaction の `content` を 1 query で
+/// 引く (= Misskey `Note.myReaction`)。`note_id -> content` の行を返す。
+///
+/// お一人様サーバなので viewer は常に local actor だが、`announce::counts_for_notes`
+/// と対称に `viewer_actor_id` で明示スコープする (correctness + test 安定性)。
+///
+/// `UNIQUE (note_id, actor_id, content)` 制約上、同じ viewer が 1 note に複数 content
+/// で reaction し得るが、Misskey 仕様は note あたり 1 reaction。`DISTINCT ON
+/// (note_id)` + `ORDER BY note_id, id` で最古 (= `id` 最小) の 1 件を決定的に選ぶ。
+pub async fn my_reactions_for_notes(
+    pool: &PgPool,
+    note_ids: &[i64],
+    viewer_actor_id: i64,
+) -> sqlx::Result<Vec<MyReactionRow>> {
+    if note_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        MyReactionRow,
+        r#"
+        SELECT DISTINCT ON (note_id)
+            note_id as "note_id!",
+            content as "content!"
+        FROM reaction
+        WHERE note_id = ANY($1) AND actor_id = $2
+        ORDER BY note_id, id
+        "#,
+        note_ids,
+        viewer_actor_id,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// `my_reactions_for_notes` の戻り行 (= viewer 自身の reaction content)。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MyReactionRow {
+    pub note_id: i64,
+    pub content: String,
+}

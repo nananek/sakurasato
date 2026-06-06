@@ -145,7 +145,7 @@ pub async fn show(
     let summaries = bulk_load_note_summaries(state.pool(), &[entry.id], viewer).await;
     let summary = summaries.remove_summary(entry.id);
     let host = &state.config().server.host;
-    let note = timeline_entry_to_miss_note(&entry, &summary, host, viewer);
+    let note = timeline_entry_to_miss_note(&entry, &summary, host);
     Json(note).into_response()
 }
 
@@ -224,7 +224,7 @@ async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
     let summaries = bulk_load_note_summaries(state.pool(), &[entry.id], viewer).await;
     let summary = summaries.remove_summary(entry.id);
     let host = &state.config().server.host;
-    let renoted = timeline_entry_to_miss_note(&entry, &summary, host, viewer);
+    let renoted = timeline_entry_to_miss_note(&entry, &summary, host);
     let renoter_user = from_actor_and_counts(&renoter, 0, 0, 0);
     let created_at = ann
         .published_at
@@ -366,6 +366,7 @@ pub async fn timeline(
     let empty = NoteSummary {
         reactions: Vec::new(),
         announce: None,
+        my_reaction: None,
     };
 
     let host = &state.config().server.host;
@@ -377,7 +378,7 @@ pub async fn timeline(
         let summary = summaries.get(&e.id).unwrap_or(&empty);
         items.push((
             e.published_at,
-            timeline_entry_to_miss_note(e, summary, host, viewer),
+            timeline_entry_to_miss_note(e, summary, host),
         ));
     }
     for r in &renote_rows {
@@ -389,7 +390,7 @@ pub async fn timeline(
             continue;
         };
         let summary = summaries.get(&entry.id).unwrap_or(&empty);
-        let renoted = timeline_entry_to_miss_note(entry, summary, host, viewer);
+        let renoted = timeline_entry_to_miss_note(entry, summary, host);
         let renoter = from_actor_and_counts(actor, 0, 0, 0);
         let created_at = r
             .announce_published_at
@@ -653,7 +654,7 @@ pub async fn create(
     let summaries = bulk_load_note_summaries(state.pool(), &[entry.id], viewer).await;
     let summary = summaries.remove_summary(entry.id);
     let host = &state.config().server.host;
-    let note = timeline_entry_to_miss_note(&entry, &summary, host, viewer);
+    let note = timeline_entry_to_miss_note(&entry, &summary, host);
 
     // Misskey wire は `{ createdNote: MissNote }` を返す。
     (StatusCode::OK, Json(json!({ "createdNote": note }))).into_response()
@@ -864,7 +865,7 @@ async fn handle_renote(state: &AppState, renote_id: Option<&str>) -> Response {
     let host = &state.config().server.host;
     let summaries = bulk_load_note_summaries(state.pool(), &[target_entry.id], viewer).await;
     let summary = summaries.remove_summary(target_entry.id);
-    let renoted = timeline_entry_to_miss_note(&target_entry, &summary, host, viewer);
+    let renoted = timeline_entry_to_miss_note(&target_entry, &summary, host);
     let renoter = from_actor_and_counts(&local_actor, 0, 0, 0);
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
@@ -1042,6 +1043,7 @@ impl SummariesExt for std::collections::HashMap<i64, NoteSummary> {
         self.remove(&note_id).unwrap_or(NoteSummary {
             reactions: Vec::new(),
             announce: None,
+            my_reaction: None,
         })
     }
 }
