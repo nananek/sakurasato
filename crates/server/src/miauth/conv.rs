@@ -930,6 +930,21 @@ pub fn from_actor_detailed(
         let is_bot = matches!(actor.actor_type.as_str(), "Service" | "Application" | "Bot");
         map.insert("isBot".to_string(), JsonValue::Bool(is_bot));
         map.insert("isCat".to_string(), JsonValue::Bool(false));
+
+        // misskey-dart の `UserDetailedNotMe` で **required bool** (= 非 null,
+        // default 無し) なのに `/api/users/show` / `/api/users/{following,
+        // followers}` で emit していなかった 3 件。漏れていると Aria の
+        // `_$UserDetailedNotMeFromJson` が Dart sound null-safety で例外を投げ、
+        // `MisskeyUsers.show` → `UserDetailed.fromJson` ごと crash する (= #174
+        // と同型のバグだが MeDetailed ではなく UserDetailed 側)。`from_actor_me_detailed`
+        // (= `/api/i`) は元から emit していたため `/api/i` だけ通っていた。
+        // いずれも UserDetailed 共有 field (= Me / NotMe 両方に存在) なので
+        // 基底のここに置く。`isSilenced`/`isSuspended` は per-actor moderation
+        // 状態を Sakurasato が持たないため常に false、`publicReactions` は
+        // リアクションが公開である我々の前提で true。
+        map.insert("isSilenced".to_string(), JsonValue::Bool(false));
+        map.insert("isSuspended".to_string(), JsonValue::Bool(false));
+        map.insert("publicReactions".to_string(), JsonValue::Bool(true));
     }
     v
 }
@@ -939,11 +954,13 @@ pub fn from_actor_detailed(
 ///
 /// Me 専用フィールド (Misskey 仕様、お一人様前提のデフォルト):
 ///
-/// - 認証 / 権限: `isAdmin` / `isModerator` / `isSilenced` / `isSuspended` ──
-///   いずれも `false`。お一人様 server なので「自分はオーナー = 全部できる」
-///   だが Misskey 側の `isAdmin`/`isModerator` は instance moderation role の
-///   ことなので true を返しても client UI 上は変な挙動になりうる。`false` で
-///   問題なし (= 全ての操作は通常 user として通る)。
+/// - 認証 / 権限: `isAdmin` / `isModerator` ── いずれも `false`。お一人様
+///   server なので「自分はオーナー = 全部できる」だが Misskey 側の
+///   `isAdmin`/`isModerator` は instance moderation role のことなので true を
+///   返しても client UI 上は変な挙動になりうる。`false` で問題なし (= 全ての
+///   操作は通常 user として通る)。`isSilenced` / `isSuspended` /
+///   `publicReactions` は Me 専用ではなく `UserDetailed` 共有 field なので
+///   [`from_actor_detailed`] で挿入済み (= ここでは触らない)。
 /// - `roles: []` ── role 機能を持たないため空配列。
 /// - `policies: {...}` ── `/api/meta.policies` と同じ shape。client は self の
 ///   permission チェックに使う。
@@ -982,16 +999,16 @@ pub fn from_actor_me_detailed(
     }
     if let JsonValue::Object(ref mut map) = v {
         // Me-only flags (= 自分にしか出ないフィールド)。
+        // `isSilenced` / `isSuspended` / `publicReactions` は UserDetailed 共有
+        // field なので [`from_actor_detailed`] (基底) で挿入済み ── ここで重複
+        // させない。
         map.insert("isAdmin".to_string(), JsonValue::Bool(false));
         map.insert("isModerator".to_string(), JsonValue::Bool(false));
-        map.insert("isSilenced".to_string(), JsonValue::Bool(false));
-        map.insert("isSuspended".to_string(), JsonValue::Bool(false));
         map.insert("isExplorable".to_string(), JsonValue::Bool(true));
         map.insert("mfmEnabled".to_string(), JsonValue::Bool(true));
         map.insert("noindex".to_string(), JsonValue::Bool(false));
         map.insert("alwaysMarkNsfw".to_string(), JsonValue::Bool(false));
         map.insert("autoAcceptFollowed".to_string(), JsonValue::Bool(false));
-        map.insert("publicReactions".to_string(), JsonValue::Bool(true));
         map.insert("hideOnlineStatus".to_string(), JsonValue::Bool(false));
         map.insert(
             "onlineStatus".to_string(),
@@ -1454,6 +1471,47 @@ mod tests {
             v["createdAt"].as_str().unwrap().ends_with('Z'),
             "createdAt must be UTC RFC3339 with Z suffix"
         );
+        // misskey-dart `UserDetailedNotMe` の required bool 3 件。
+        assert_eq!(v["isSilenced"], false);
+        assert_eq!(v["isSuspended"], false);
+        assert_eq!(v["publicReactions"], true);
+    }
+
+    /// misskey-dart `_$UserDetailedNotMeFromJson` で **非 null / default 無し**
+    /// に読まれる field が一つでも欠けると Aria が `MisskeyUsers.show` で crash
+    /// する。`/api/users/show` / `/api/users/{following,followers}` が共有する
+    /// [`from_actor_detailed`] の出力に、それら required field が漏れなく載って
+    /// いることを固定する回帰テスト (= #174 の `UserDetailed` 版)。
+    #[test]
+    fn from_actor_detailed_emits_all_required_userdetailednotme_fields() {
+        // remote actor (icon_url 無し) でも avatarUrl が non-null になる経路。
+        let actor = fake_actor(false, "remote.test", false);
+        let v = from_actor_detailed(&actor, 0, 0, 0);
+        // string / number で `as String` / `as num` 直読みされ、null だと throw。
+        assert!(v["id"].is_string(), "id must be a string");
+        assert!(v["username"].is_string(), "username must be a string");
+        assert!(
+            v["avatarUrl"].as_str().is_some_and(|s| !s.is_empty()),
+            "avatarUrl must be a non-null string (identicon fallback)"
+        );
+        assert!(v["createdAt"].is_string(), "createdAt must be a string");
+        assert!(v["followersCount"].is_number());
+        assert!(v["followingCount"].is_number());
+        assert!(v["notesCount"].is_number());
+        // `as bool` 直読みされる required bool 群。
+        for key in [
+            "isBot",
+            "isCat",
+            "isLocked",
+            "isSilenced",
+            "isSuspended",
+            "publicReactions",
+        ] {
+            assert!(
+                v[key].is_boolean(),
+                "required bool `{key}` must be present and boolean"
+            );
+        }
     }
 
     // ── #165 round-2 fix: MissNote.user.host が local actor で null になる ──
