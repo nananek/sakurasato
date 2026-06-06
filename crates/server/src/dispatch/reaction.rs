@@ -796,6 +796,8 @@ mod tests {
             media_type: "image/webp".into(),
             ap_id: Some("https://remote.test/emojis/blob".into()),
             is_local: false,
+            license: None,
+            is_sensitive: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             last_failed_at,

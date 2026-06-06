@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO emoji (shortcode, host, category, aliases, image_key, media_type, ap_id, is_local, last_failed_at)\n        VALUES ($1, $2, NULL, '[]'::jsonb, $3, $4, $5, FALSE, $6)\n        ON CONFLICT (ap_id) DO UPDATE SET\n            shortcode = EXCLUDED.shortcode,\n            host = EXCLUDED.host,\n            image_key = COALESCE(EXCLUDED.image_key, emoji.image_key),\n            media_type = CASE\n                WHEN EXCLUDED.image_key IS NOT NULL THEN EXCLUDED.media_type\n                ELSE emoji.media_type\n            END,\n            last_failed_at = EXCLUDED.last_failed_at,\n            updated_at = now()\n        RETURNING\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at\n        ",
+  "query": "\n        SELECT\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at\n        FROM emoji WHERE shortcode = $1 AND host IS NULL\n        ",
   "describe": {
     "columns": [
       {
@@ -104,6 +104,28 @@
       },
       {
         "ordinal": 9,
+        "name": "license",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "emoji",
+            "name": "license"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "is_sensitive",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "emoji",
+            "name": "is_sensitive"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -114,7 +136,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -125,7 +147,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "last_failed_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -138,12 +160,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Timestamptz"
+        "Text"
       ]
     },
     "nullable": [
@@ -156,10 +173,12 @@
       false,
       true,
       false,
+      true,
+      false,
       false,
       false,
       true
     ]
   },
-  "hash": "4db2fb09f7e5ada68ccec5781fabd3156f63ff1dfbb96451668cb3a5db590a37"
+  "hash": "8482dfe52b0c6db8f605b7da9dc51d379978925aa79300557e15c4c1522d8567"
 }

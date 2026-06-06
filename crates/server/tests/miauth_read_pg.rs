@@ -625,6 +625,8 @@ async fn emojis_returns_local_emojis_in_misskey_shape(pool: PgPool) {
             aliases: vec!["cherryblossom".into()],
             image_key: "emoji/local/sakura.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await
@@ -637,6 +639,8 @@ async fn emojis_returns_local_emojis_in_misskey_shape(pool: PgPool) {
             aliases: vec![],
             image_key: "emoji/local/blob.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await
@@ -2011,6 +2015,8 @@ async fn notes_show_my_reaction_local_custom_emoji(pool: PgPool) {
             aliases: vec![],
             image_key: "emoji/local/foo.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await

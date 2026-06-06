@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at\n        FROM emoji WHERE ap_id = $1\n        ",
+  "query": "\n        SELECT\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at\n        FROM emoji WHERE ap_id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -104,6 +104,28 @@
       },
       {
         "ordinal": 9,
+        "name": "license",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "emoji",
+            "name": "license"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "is_sensitive",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "emoji",
+            "name": "is_sensitive"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -114,7 +136,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -125,7 +147,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "last_failed_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -151,10 +173,12 @@
       false,
       true,
       false,
+      true,
+      false,
       false,
       false,
       true
     ]
   },
-  "hash": "434d5075c8117a164b53c7334e2d5539e0b3ba579d2063aabb302f2cf5dcea67"
+  "hash": "0bf0c71d9e39e59ad3a0adfe2aa296e67851a7f7b4147d287024b3c3a0e3a93e"
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, created_at, updated_at, last_failed_at\n        FROM emoji\n        WHERE host IS NULL\n          AND (\n              shortcode ILIKE $1 ESCAPE '\\'\n              OR EXISTS (\n                  SELECT 1 FROM jsonb_array_elements_text(aliases) AS a\n                  WHERE a ILIKE $1 ESCAPE '\\'\n              )\n          )\n        ORDER BY shortcode ASC\n        LIMIT $2\n        ",
+  "query": "\n        SELECT\n            id, shortcode, host, category,\n            aliases as \"aliases: Json<Vec<String>>\",\n            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at\n        FROM emoji WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -104,6 +104,28 @@
       },
       {
         "ordinal": 9,
+        "name": "license",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "emoji",
+            "name": "license"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "is_sensitive",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "emoji",
+            "name": "is_sensitive"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -114,7 +136,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -125,7 +147,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "last_failed_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -138,7 +160,6 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
         "Int8"
       ]
     },
@@ -152,10 +173,12 @@
       false,
       true,
       false,
+      true,
+      false,
       false,
       false,
       true
     ]
   },
-  "hash": "eea2e3d5080c79165715d0af61592c03b8efb627cbb161c989d758148d2c50b5"
+  "hash": "aaa98bc539f54bae0bd1b8b4d4d848783078d4b51fe7bc2e10ef1dacd05c36de"
 }

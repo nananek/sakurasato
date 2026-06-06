@@ -80,6 +80,8 @@ async fn insert_local_emoji(pool: &PgPool, shortcode: &str, aliases: Vec<String>
             aliases,
             image_key: format!("emoji/local/{shortcode}.webp"),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await

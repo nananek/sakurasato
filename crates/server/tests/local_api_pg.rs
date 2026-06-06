@@ -370,6 +370,8 @@ async fn timeline_home_includes_reaction_counts(pool: PgPool) {
             aliases: vec![],
             image_key: "emoji/local/blob.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await

@@ -538,6 +538,8 @@ async fn emoji_upsert_rejects_invalid_shortcode(pool: PgPool) -> sqlx::Result<()
                 aliases: vec![],
                 image_key: "x".into(),
                 media_type: "image/png".into(),
+                license: None,
+                is_sensitive: false,
             },
         )
         .await
@@ -567,6 +569,8 @@ async fn emoji_upsert_accepts_shortcode_up_to_128_chars(pool: PgPool) -> sqlx::R
                 aliases: vec![],
                 image_key: format!("emoji/local/{shortcode}.webp"),
                 media_type: "image/webp".into(),
+                license: None,
+                is_sensitive: false,
             },
         )
         .await
@@ -586,6 +590,8 @@ async fn emoji_upsert_overwrites_by_shortcode(pool: PgPool) -> sqlx::Result<()> 
             aliases: vec!["party".into()],
             image_key: "emoji/local/blob_party.png".into(),
             media_type: "image/png".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await?;
@@ -600,6 +606,8 @@ async fn emoji_upsert_overwrites_by_shortcode(pool: PgPool) -> sqlx::Result<()> 
             aliases: vec!["party".into(), "tada".into()],
             image_key: "emoji/local/blob_party.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await?;
@@ -607,6 +615,53 @@ async fn emoji_upsert_overwrites_by_shortcode(pool: PgPool) -> sqlx::Result<()> 
     assert_eq!(second.category.as_deref(), Some("celebration"));
     assert_eq!(second.aliases.0, vec!["party", "tada"]);
     assert_eq!(second.media_type, "image/webp");
+    Ok(())
+}
+
+/// Issue: emoji metadata round-trip。`license` / `is_sensitive` を `upsert_local` で
+/// 保存し読み戻せること、再 upsert で上書きされること (migration 0024)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn emoji_upsert_roundtrips_license_and_sensitive(pool: PgPool) -> sqlx::Result<()> {
+    let row = repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "licensed".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/licensed.webp".into(),
+            media_type: "image/webp".into(),
+            license: Some("CC-BY-4.0".into()),
+            is_sensitive: true,
+        },
+    )
+    .await?;
+    assert_eq!(row.license.as_deref(), Some("CC-BY-4.0"));
+    assert!(row.is_sensitive);
+
+    // get 経路でも読み戻せる。
+    let fetched = repo::emoji::get_local_by_shortcode(&pool, "licensed")
+        .await?
+        .expect("emoji present");
+    assert_eq!(fetched.license.as_deref(), Some("CC-BY-4.0"));
+    assert!(fetched.is_sensitive);
+
+    // 再 upsert (= 同名上書き) で None / false に戻せる。
+    let overwritten = repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "licensed".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/licensed.webp".into(),
+            media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
+        },
+    )
+    .await?;
+    assert_eq!(overwritten.id, row.id, "same row");
+    assert!(overwritten.license.is_none());
+    assert!(!overwritten.is_sensitive);
     Ok(())
 }
 
@@ -794,6 +849,8 @@ async fn reaction_content_consolidation_collapses_host_suffix_dups(
             aliases: vec![],
             image_key: "emoji/local/foo.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await?;
@@ -945,6 +1002,8 @@ async fn migration_0023_restores_host_for_remote_reaction_content(
             aliases: vec![],
             image_key: "emoji/local/foo.webp".into(),
             media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
         },
     )
     .await?;

@@ -110,6 +110,13 @@ struct MisskeyEmojiBody {
     category: Option<String>,
     #[serde(default)]
     aliases: Vec<String>,
+    /// Misskey export の license (= 利用条件 free text)。古い / 他実装の zip では
+    /// 欠落しうるので `default`。
+    #[serde(default)]
+    license: Option<String>,
+    /// Misskey `isSensitive`。欠落時は `false`。
+    #[serde(default, rename = "isSensitive")]
+    is_sensitive: bool,
 }
 
 /// 1 zip 全体の処理結果サマリ。CLI 出力 / テスト assertion 用。
@@ -276,6 +283,8 @@ async fn import_archive<R: Read + Seek>(
             aliases: entry.emoji.aliases.clone(),
             image_key: storage_key.clone(),
             media_type: media_type.clone(),
+            license: entry.emoji.license.clone(),
+            is_sensitive: entry.emoji.is_sensitive,
         };
         if let Err(err) = repo::emoji::upsert_local(state.pool(), new).await {
             warn!(
@@ -374,6 +383,27 @@ mod tests {
         assert!(meta.emojis[0].downloaded);
         assert_eq!(meta.emojis[0].emoji.name, "blob_party");
         assert!(!meta.emojis[1].downloaded);
+    }
+
+    /// `license` / `isSensitive` を meta.json から取り込む (round-trip export 用)。
+    /// 欠落時は `None` / `false` に倒れる (古い / 他実装の zip 寛容性)。
+    #[test]
+    fn meta_captures_license_and_sensitive() {
+        let raw = r#"{
+            "metaVersion": 2,
+            "emojis": [
+                {"downloaded": true, "fileName": "a.png",
+                 "emoji": {"name": "licensed", "license": "CC-BY-4.0", "isSensitive": true}},
+                {"downloaded": true, "fileName": "b.png",
+                 "emoji": {"name": "plain"}}
+            ]
+        }"#;
+        let meta: MisskeyMeta = serde_json::from_str(raw).unwrap();
+        assert_eq!(meta.emojis[0].emoji.license.as_deref(), Some("CC-BY-4.0"));
+        assert!(meta.emojis[0].emoji.is_sensitive);
+        // 欠落は default。
+        assert!(meta.emojis[1].emoji.license.is_none());
+        assert!(!meta.emojis[1].emoji.is_sensitive);
     }
 
     /// 古い metaVersion=1 (= host / exportedAt が無いケース) も受ける。

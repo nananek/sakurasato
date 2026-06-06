@@ -91,6 +91,8 @@ mod tests {
             media_type: "image/webp".into(),
             ap_id: None,
             is_local: true,
+            license: None,
+            is_sensitive: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_failed_at: None,

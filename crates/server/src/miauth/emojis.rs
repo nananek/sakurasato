@@ -39,11 +39,9 @@ use crate::miauth::conv::MissEmoji;
 use crate::miauth::error::internal_error;
 use crate::state::AppState;
 
-/// `MiAuth` listener が `/api/emojis` で返す件数上限 (= local 絵文字一覧 + 既存
-/// `/api/v1/emojis` の `MAX_LIMIT`)。お一人様 server で local emoji は
-/// せいぜい数千件 (= Misskey-zip インポートで上書きされる単一テナント) なので、
-/// 一度に全部返して問題ない値域。
-const EMOJIS_FETCH_LIMIT: i64 = 10_000;
+/// `MiAuth` listener が `/api/emojis` で返す件数上限。公開 discovery endpoint
+/// ([`crate::routes::emojis`]) と共有するため core の値を参照する。
+const EMOJIS_FETCH_LIMIT: i64 = sakurasato_core::repo::emoji::LIST_FETCH_LIMIT;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct EmojisBody {

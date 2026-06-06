@@ -191,6 +191,11 @@ pub struct EmojiRow {
     pub media_type: String,
     pub ap_id: Option<String>,
     pub is_local: bool,
+    /// AP `_misskey_license.freeText` 相当 (migration 0024)。Misskey zip import で
+    /// 取り込む。`None` = 明示ライセンス無し。
+    pub license: Option<String>,
+    /// Misskey `isSensitive` (migration 0024)。NOT NULL DEFAULT FALSE。
+    pub is_sensitive: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_failed_at: Option<DateTime<Utc>>,
