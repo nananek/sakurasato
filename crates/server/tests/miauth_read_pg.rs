@@ -1244,6 +1244,84 @@ async fn notifications_list_returns_misskey_shape(pool: PgPool) {
     );
 }
 
+/// Issue #244: remote custom emoji の reaction 通知で、埋め込み note が
+/// `reactionEmojis` に自鯖キャッシュ URL を載せること。Aria の通知一覧は
+/// `notification.note.reactionEmojis[reaction の `@host` 付きキー]` から
+/// reaction icon を解決するので、これが無いとローカル非保有の remote 絵文字が
+/// 通知でも描画できない。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notifications_reaction_embeds_remote_emoji_url(pool: PgPool) {
+    use sakurasato_core::repo::notification::{self, NewNotification};
+
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    let note_id = seed_note(&pool, alice, "sakurasato.test", "hi", Visibility::Public).await;
+
+    // remote 絵文字 `:foo@remote.test:` を学習済み (= #243 後の wire 形)。
+    let emoji = repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "foo".into(),
+            ap_id: "https://remote.test/emojis/foo".into(),
+            host: "remote.test".into(),
+            image_key: Some("emoji/remote/remote.test/foo.webp".into()),
+            media_type: "image/webp".into(),
+            last_failed_at: None,
+        },
+    )
+    .await
+    .expect("seed remote emoji");
+    // note への実 reaction 行 (= 集計対象)。content は #243 の `:foo@host:` 形。
+    repo::reaction::insert(
+        &pool,
+        "https://remote.test/users/bob/r/foo",
+        note_id,
+        bob,
+        ":foo@remote.test:",
+        Some(emoji.id),
+    )
+    .await
+    .expect("seed reaction");
+    // 通知行。reaction 文字列も `:foo@remote.test:`。
+    notification::insert(
+        &pool,
+        NewNotification {
+            recipient_actor_id: alice,
+            event_type: "reaction".into(),
+            notifier_actor_id: Some(bob),
+            note_id: Some(note_id),
+            reaction: Some(":foo@remote.test:".into()),
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(
+        app,
+        "/api/i/notifications",
+        json!({"i": token, "limit": 10}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    let first = &v.as_array().expect("array")[0];
+
+    assert_eq!(first["type"], "reaction");
+    assert_eq!(first["reaction"], ":foo@remote.test:");
+    // 埋め込み note の reactionEmojis に `@host` 付きキー → 自鯖キャッシュ URL。
+    let url = &first["note"]["reactionEmojis"]["foo@remote.test"];
+    assert_eq!(
+        url, "https://sakurasato.test/media/emoji/remote/remote.test/foo.webp",
+        "通知の埋め込み note が remote 絵文字 URL を載せること; got note={:?}",
+        first["note"]
+    );
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn notifications_mark_all_as_read_clears_unread(pool: PgPool) {
     use sakurasato_core::repo::notification::{self, NewNotification};
