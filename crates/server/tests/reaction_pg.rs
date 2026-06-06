@@ -312,12 +312,14 @@ async fn inbound_emoji_react_learns_remote_emoji(pool: PgPool) {
     assert_eq!(emoji.host.as_deref(), Some("remote.test"));
     assert!(!emoji.is_local);
 
-    // reaction 行が学習した emoji_id を参照している。
+    // reaction 行が学習した emoji_id を参照している。Issue #242: remote 絵文字を
+    // 学習できたので content は host を保った `:blob_party@remote.test:` 形になる
+    // (host 無し `:blob_party:` を渡すと Aria が自鯖ローカル絵文字と誤認するため)。
     let row = repo::reaction::get_by_ap_id(&pool, &activity_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.content, ":blob_party:");
+    assert_eq!(row.content, ":blob_party@remote.test:");
     assert_eq!(row.emoji_id, Some(emoji.id));
 }
 
@@ -383,12 +385,14 @@ async fn inbound_emoji_react_learns_emoji_with_separate_drive_host(pool: PgPool)
     assert!(emoji.image_key.is_none());
     assert!(emoji.last_failed_at.is_some());
 
-    // reaction 行が学習した emoji_id を参照している。
+    // reaction 行が学習した emoji_id を参照している。Issue #242: 画像 fetch が
+    // 失敗 (dead socket) しても emoji は学習済みなので、content は host を保った
+    // `:blobcat@remote.test:` 形になる (host は signer 由来)。
     let row = repo::reaction::get_by_ap_id(&pool, &activity_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.content, ":blobcat:");
+    assert_eq!(row.content, ":blobcat@remote.test:");
     assert_eq!(row.emoji_id, Some(emoji.id));
 }
 

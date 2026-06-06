@@ -197,7 +197,12 @@ async fn process_inbound_reaction(
     // `raw_content` のどちらを渡しても shortcode 比較は同じ結果になるが、
     // normalize 後の content を渡しておく方が「DB に書く値で学習する」一貫性
     // が取れる。
-    let emoji_id = learn_emoji_tag(state, signer, activity, &content).await;
+    let learned = learn_emoji_tag(state, signer, activity, &content).await;
+    let emoji_id = learned.as_ref().map(|l| l.id);
+
+    // Issue #242: リモート custom emoji は wire/DB content を `:shortcode@host:` 形で
+    // 保つ。詳細は [`reaction_content_for_storage`] の doc を参照。
+    let content = reaction_content_for_storage(content, learned.as_ref());
 
     let inserted = repo::reaction::insert_or_get(
         state.pool(),
@@ -230,7 +235,8 @@ async fn process_inbound_reaction(
     Ok(())
 }
 
-/// Issue #186: inbound reaction の content を `:shortcode:` 形に正規化する。
+/// Issue #186: inbound reaction の content を host を剥がした `:shortcode:` 形に
+/// **一旦** 正規化する。
 ///
 /// PR #183 の OUTBOUND 側 [`parse_local_emoji_shortcode`](crate::local_api::reactions)
 /// と対称形。**`@host` の host が何であろうと無条件で剥がす** ── 我々の
@@ -247,6 +253,15 @@ async fn process_inbound_reaction(
 /// 本関数で content から host を剥がしても [`learn_emoji_tag`] の shortcode 比較
 /// は変わらず動く ── どちらも `extract_shortcode` 経由で shortcode 部だけ比較
 /// しているため。
+///
+/// **Issue #242**: ただしこの host 剥がしは「素の正規化」で終わりではない。
+/// [`process_inbound_reaction`] は本関数の出力で `learn_emoji_tag` を回し、それが
+/// remote 絵文字 ([`LearnedEmoji`]) を返した場合は **`:shortcode@host:` に host を
+/// 付け直して** DB / wire に書く。host 無しの `:foo:` を Misskey/Aria に渡すと
+/// 「自鯖ローカル絵文字」と誤認され reactionEmojis を見ずに自鯖 store を引いてしまう
+/// ため、真リモート絵文字は host を保つ必要がある。本関数が一律 strip するのは、
+/// 「ローカル絵文字の往復 (#182)」と「真リモート」を文字列だけでは判別できないから
+/// で、判別は emoji 学習結果 (= `is_local`) に委ねる設計。
 fn normalize_inbound_reaction_content(content: &str) -> String {
     let Some(shortcode) = extract_shortcode(content) else {
         // Unicode (= `:` 囲みでない) や empty / malformed は素通し。
@@ -255,6 +270,30 @@ fn normalize_inbound_reaction_content(content: &str) -> String {
         return content.to_string();
     };
     format!(":{shortcode}:")
+}
+
+/// Issue #242: DB / wire に書く最終的な reaction content を決める。
+///
+/// `normalized` は [`normalize_inbound_reaction_content`] が host を剥がした
+/// `:shortcode:` (または Unicode) 形。`learned` は [`learn_emoji_tag`] の結果:
+///
+/// - `Some(remote 絵文字)` → `:shortcode@host:` に host を **付け直す**。host 無しの
+///   `:foo:` を渡すと Misskey/Aria が「自鯖ローカル絵文字」と誤認して reactionEmojis
+///   を見ず自鯖 emoji store を引き、ローカルに同名 shortcode が無い絵文字を描画
+///   できなくなる (= versitygw にキャッシュ画像はあるのに見えない)。`learn_emoji_tag`
+///   は `Emoji.id` host == signer host を強制するので、学習できた絵文字は必ず
+///   signer 鯖の remote 絵文字 (`is_local=false`)。
+/// - `None` (Unicode / ローカル絵文字往復 #182 / 学習不能) → `normalized` のまま。
+///   ローカル絵文字は host 無し `:foo:` を Aria が自鯖 store で解決するのが正しい。
+fn reaction_content_for_storage(normalized: String, learned: Option<&LearnedEmoji>) -> String {
+    let Some(LearnedEmoji { host, .. }) = learned else {
+        return normalized;
+    };
+    match extract_shortcode(&normalized) {
+        Some(shortcode) => format!(":{shortcode}@{host}:"),
+        // learned が Some なら normalized は必ず `:foo:` 形だが、防御的に素通し。
+        None => normalized,
+    }
 }
 
 /// `content` を Activity から取り出す。
@@ -281,12 +320,23 @@ fn extract_content(activity: &JsonValue, kind: ReactionKind) -> Result<String, D
     Ok(c)
 }
 
+/// [`learn_emoji_tag`] が学習に成功したリモート custom emoji の識別情報。
+struct LearnedEmoji {
+    /// `emoji` テーブルの id (= `reaction.emoji_id` に入れる)。
+    id: i64,
+    /// 学習した絵文字の host (= 検証済み signer host、lowercase)。reaction content の
+    /// `@host` suffix に使い、Misskey/Aria が `reactionEmojis` 経由で解決できるように
+    /// する (Issue #242)。`learn_emoji_tag` は signer の自前 emoji しか学習しない
+    /// (`Emoji.id` host == signer host を強制) ので、必ず remote host になる。
+    host: String,
+}
+
 /// Activity の `tag: [Emoji]` から remote 絵文字を学習する。
 ///
-/// `content` に該当する `Emoji.name` が見つかればその id を返す。複数 tag が
-/// あっても content と name (`:foo:`) が一致するものだけ採用する。`Emoji.id` の
-/// host が signer host と異なる場合は無視する (spoofing 防止)。`Emoji.icon.url`
-/// の host は signer と異なってよい (Issue #239、別ドメイン drive 対応)。
+/// `content` に該当する `Emoji.name` が見つかればその id と host を [`LearnedEmoji`]
+/// で返す。複数 tag があっても content と name (`:foo:`) が一致するものだけ採用する。
+/// `Emoji.id` の host が signer host と異なる場合は無視する (spoofing 防止)。
+/// `Emoji.icon.url` の host は signer と異なってよい (Issue #239、別ドメイン drive 対応)。
 ///
 /// 学習自体は best-effort。失敗しても reaction の記録は続行する。
 #[allow(
@@ -298,7 +348,7 @@ async fn learn_emoji_tag(
     signer: &ActorRow,
     activity: &JsonValue,
     content: &str,
-) -> Option<i64> {
+) -> Option<LearnedEmoji> {
     let tags = activity.get("tag")?.as_array()?;
     let signer_host = Url::parse(&signer.ap_id).ok()?.host_str()?.to_lowercase();
 
@@ -425,7 +475,10 @@ async fn learn_emoji_tag(
                 reason,
                 "remote emoji fetch skipped (cache hit / recent failure backoff)",
             );
-            return Some(row.id);
+            return Some(LearnedEmoji {
+                id: row.id,
+                host: signer_host.clone(),
+            });
         }
 
         // fetch を試みる。失敗時は `image_key = None` を SQL 側 COALESCE で温存
@@ -462,7 +515,10 @@ async fn learn_emoji_tag(
                     last_failed_at = ?row.last_failed_at,
                     "remote emoji learned",
                 );
-                return Some(row.id);
+                return Some(LearnedEmoji {
+                    id: row.id,
+                    host: signer_host.clone(),
+                });
             }
             Err(err) => {
                 warn!(
@@ -669,6 +725,59 @@ mod tests {
     fn normalize_inbound_does_not_touch_malformed_empty_shortcode() {
         assert_eq!(normalize_inbound_reaction_content(":@host:"), ":@host:");
         assert_eq!(normalize_inbound_reaction_content("::"), "::");
+    }
+
+    /// Issue #242 のメイン: remote 絵文字を学習できた reaction は、host を剥がした
+    /// `:foo:` ではなく `:foo@host:` を DB / wire に書く。Misskey/Aria が
+    /// reactionEmojis 経由で解決できるようにするため。
+    #[test]
+    fn reaction_content_reattaches_host_for_learned_remote_emoji() {
+        let learned = LearnedEmoji {
+            id: 42,
+            host: "misskey.io".into(),
+        };
+        assert_eq!(
+            reaction_content_for_storage(":blob:".into(), Some(&learned)),
+            ":blob@misskey.io:"
+        );
+        // normalize 前に host が付いていても、normalize 済 `:foo:` を渡す前提なので
+        // learn 側の host が勝つ (= signer host で一貫させる)。
+        let learned2 = LearnedEmoji {
+            id: 7,
+            host: "example.test".into(),
+        };
+        assert_eq!(
+            reaction_content_for_storage(":blob_party:".into(), Some(&learned2)),
+            ":blob_party@example.test:"
+        );
+    }
+
+    /// Issue #242: 学習できなかった (= `None`) reaction は normalize 済 content を
+    /// そのまま使う。Unicode / ローカル絵文字往復 (#182) / 学習不能はここに合流し、
+    /// host 無し `:foo:` のまま (= Aria が自鯖 store で解決するのが正しい)。
+    #[test]
+    fn reaction_content_passthrough_when_not_learned() {
+        assert_eq!(
+            reaction_content_for_storage(":blob:".into(), None),
+            ":blob:"
+        );
+        assert_eq!(reaction_content_for_storage("👍".into(), None), "👍");
+        assert_eq!(reaction_content_for_storage(String::new(), None), "");
+    }
+
+    /// Issue #242: Unicode を learned 扱いで渡す経路は実際には起きない
+    /// (`learn_emoji_tag` は `:foo:` 形でしか shortcode 一致しない) が、防御的に
+    /// `extract_shortcode` が `None` を返す content は素通しすることを固定する。
+    #[test]
+    fn reaction_content_defensive_passthrough_for_non_shortcode() {
+        let learned = LearnedEmoji {
+            id: 1,
+            host: "misskey.io".into(),
+        };
+        assert_eq!(
+            reaction_content_for_storage("👍".into(), Some(&learned)),
+            "👍"
+        );
     }
 
     // ── Issue #192: should_skip_fetch のテスト ────────────────────────────
