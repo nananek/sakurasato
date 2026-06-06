@@ -77,7 +77,7 @@ jobs:
             org.opencontainers.image.description=Sakurasato ${{ matrix.name }} (M10 hardened, distroless + rootless)
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
