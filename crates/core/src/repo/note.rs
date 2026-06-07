@@ -582,3 +582,114 @@ pub async fn list_by_author(
     .fetch_all(pool)
     .await
 }
+
+/// **M14 #150 (`MiAuth` `users/notes`)** ── `list_by_author` の Misskey
+/// `users/notes` 互換版。著者本人の Note を `viewer` 視点の可視性で絞った上で、
+/// `notes/timeline` と同じ **時刻ウィンドウ** (`published_at` 排他境界) +
+/// `withReplies` / `withFiles` フィルタを掛けて引く。
+///
+/// ## `list_by_author` との差分
+///
+/// - カーソルが `before_id` (= note id 1 本) ではなく `since_date` / `until_date`
+///   (= `published_at` の **排他** 境界 `>` / `<`)。これは `users/notes` が
+///   renote (= 別連番の `announce`) と時刻順マージされるため、id ではなく
+///   時刻でページングする必要があるから (`list_home_timeline_window` と対称)。
+/// - `with_replies = false` のとき返信を除外する。ただし **自己スレッド**
+///   (= 自分の note への返信) は Misskey 仕様どおり残す ── 親 note が自分の
+///   ものか `in_reply_to_note_id` で判定する。親 note を我々が把握していない
+///   remote 返信 (`in_reply_to_note_id IS NULL` だが `in_reply_to_ap_id` あり)
+///   は「他者宛返信」とみなして除外する。
+/// - `with_files = true` のとき添付のある note だけに絞る (= Misskey の
+///   「メディア」タブ)。`attachments` は JSONB 配列なので `jsonb_array_length`。
+///
+/// 並びは `published_at DESC`、同時刻は `id DESC` で決定的に。可視性述語は
+/// [`list_by_author`] と完全に同一 (= 自分は全部、他者は public/unlisted は常時・
+/// followers は accepted follow 時・direct は audience 一致時)。
+///
+/// ## カーソルの既知の制約 (= `notes/timeline` と共有)
+///
+/// 境界は **`published_at` 一本** (排他)。これは note (= `note.id`) と renote
+/// (= 別連番の `announce.id`) を時刻順マージするために id ではなく時刻で
+/// ページングする必要があるため ([`crate::miauth`] の `users/notes` /
+/// `notes/timeline` ハンドラ参照)。`ORDER BY` は `id DESC` を tiebreak に持つので
+/// **同一ページ内** の順序は決定的だが、**ページ境界に秒以下まで同一の
+/// `published_at` が複数並ぶ** と排他境界が取りこぼし得る (= 2 つの id 空間を
+/// またぐ複合カーソルが組めないため)。ローカル note は µs 精度の `now()` で
+/// 衝突しにくく、実害は remote の秒精度 timestamp が同秒に密集した稀ケースに
+/// 限られる。`list_home_timeline_window` 経由の home timeline と同じ既知の
+/// トレードオフで、本関数で新たに悪化させてはいない。
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
+pub async fn list_by_author_window(
+    pool: &PgPool,
+    author_actor_id: i64,
+    viewer_actor_id: i64,
+    viewer_ap_id: &str,
+    with_replies: bool,
+    with_files: bool,
+    since_date: Option<DateTime<Utc>>,
+    until_date: Option<DateTime<Utc>>,
+    limit: i64,
+) -> sqlx::Result<Vec<TimelineEntry>> {
+    let viewer_inbox_array =
+        serde_json::to_value([viewer_ap_id]).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query_as!(
+        TimelineEntry,
+        r#"
+        SELECT
+            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,
+            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,
+            n.to_recipients as "to_recipients: Json<Vec<String>>",
+            n.cc_recipients as "cc_recipients: Json<Vec<String>>",
+            n.attachments as "attachments: Json<JsonValue>",
+            n.tags as "tags: Json<JsonValue>",
+            n.is_local, n.url, n.published_at, n.edited_at, n.created_at, n.updated_at,
+            a.ap_id AS actor_ap_id,
+            a.preferred_username AS actor_preferred_username,
+            a.display_name AS actor_display_name,
+            a.icon_url AS actor_icon_url
+        FROM note n
+        JOIN actor a ON a.id = n.actor_id
+        WHERE n.actor_id = $1
+          AND (
+            $1 = $2
+            OR n.visibility IN ('public', 'unlisted')
+            OR (
+              n.visibility = 'followers'
+              AND EXISTS (
+                SELECT 1 FROM follow
+                WHERE follower_actor_id = $2
+                  AND followed_actor_id = $1
+                  AND state = 'accepted'
+              )
+            )
+            OR (
+              n.visibility = 'direct'
+              AND (n.to_recipients @> $3::jsonb OR n.cc_recipients @> $3::jsonb)
+            )
+          )
+          AND (
+            $4
+            OR n.in_reply_to_ap_id IS NULL
+            OR EXISTS (
+              SELECT 1 FROM note p
+              WHERE p.id = n.in_reply_to_note_id AND p.actor_id = n.actor_id
+            )
+          )
+          AND (NOT $5 OR jsonb_array_length(n.attachments) > 0)
+          AND ($6::TIMESTAMPTZ IS NULL OR n.published_at > $6)
+          AND ($7::TIMESTAMPTZ IS NULL OR n.published_at < $7)
+        ORDER BY n.published_at DESC, n.id DESC
+        LIMIT $8
+        "#,
+        author_actor_id,
+        viewer_actor_id,
+        viewer_inbox_array,
+        with_replies,
+        with_files,
+        since_date,
+        until_date,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}

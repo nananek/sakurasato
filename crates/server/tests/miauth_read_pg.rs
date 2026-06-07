@@ -2114,3 +2114,755 @@ async fn timeline_my_reaction_null_for_other_users_reaction_only(pool: PgPool) {
     );
     assert_eq!(n["reactions"]["👍"], 1);
 }
+
+// ─── #150 (Aria fix): users/notes ────────────────────────────────────────────
+
+/// `seed_note_with_audience` の汎用版 ── `published_at` / 返信親 / 添付を任意に
+/// 指定できる。`users/notes` の時刻カーソル / withReplies / withFiles テスト用。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "テスト用の自由度の高い seed helper"
+)]
+async fn seed_note_full(
+    pool: &PgPool,
+    actor_id: i64,
+    host: &str,
+    content: &str,
+    visibility: Visibility,
+    published_at: chrono::DateTime<chrono::Utc>,
+    in_reply_to: Option<(i64, String)>,
+    attachments: serde_json::Value,
+) -> i64 {
+    let ap_id = format!("https://{host}/notes/pending-{}", Uuid::new_v4());
+    let (irt_id, irt_ap) = match in_reply_to {
+        Some((id, ap)) => (Some(id), Some(ap)),
+        None => (None, None),
+    };
+    let to = if matches!(visibility, Visibility::Direct) {
+        Vec::new()
+    } else {
+        vec!["https://www.w3.org/ns/activitystreams#Public".into()]
+    };
+    let new = NewNote {
+        ap_id: ap_id.clone(),
+        actor_id,
+        content: content.into(),
+        language: Some("ja".into()),
+        in_reply_to_ap_id: irt_ap,
+        in_reply_to_note_id: irt_id,
+        summary: None,
+        visibility,
+        sensitive: false,
+        to_recipients: to,
+        cc_recipients: vec![],
+        attachments,
+        tags: json!([]),
+        is_local: true,
+        url: None,
+        published_at,
+    };
+    let row = repo::note::insert(pool, new).await.expect("seed note");
+    let canonical = format!("https://{host}/notes/{}", row.id);
+    repo::note::set_ap_id_and_url(pool, row.id, &canonical, &canonical)
+        .await
+        .expect("set canonical url");
+    row.id
+}
+
+/// local note の canonical `ap_id` (= `set_ap_id_and_url` が設定する値)。返信親の
+/// `in_reply_to_ap_id` を組み立てるのに使う。
+fn canonical_ap_id(host: &str, note_id: i64) -> String {
+    format!("https://{host}/notes/{note_id}")
+}
+
+async fn users_notes_request(
+    app: axum::Router,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    app.oneshot(
+        Request::post("/api/users/notes")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_by_user_id_returns_notes_in_id_desc(pool: PgPool) {
+    let host = "sakurasato.test";
+    let alice = seed_local_actor(&pool, host, "alice").await;
+    let t0 = chrono::Utc::now();
+    let _ = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "first",
+        Visibility::Public,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+    let _ = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "second",
+        Visibility::Public,
+        t0 + chrono::Duration::seconds(1),
+        None,
+        json!([]),
+    )
+    .await;
+    let last = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "third",
+        Visibility::Public,
+        t0 + chrono::Duration::seconds(2),
+        None,
+        json!([]),
+    )
+    .await;
+
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": alice.to_string(), "limit": 10}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().expect("users/notes returns bare array");
+    assert_eq!(notes.len(), 3);
+    // 時刻降順 ── 最後に投稿した "third" が先頭。
+    assert_eq!(notes[0]["id"], last.to_string());
+    assert_eq!(notes[0]["text"], "third");
+    assert_eq!(notes[0]["user"]["username"], "alice");
+    // local actor は host: null (= notes/timeline と同じ wire 仕様)。
+    assert!(notes[0]["user"]["host"].is_null());
+    assert_eq!(notes[0]["visibility"], "public");
+    // MissNote 必須キー (= misskey_dart Note.fromJson が要求する形)。
+    for key in ["mentions", "fileIds", "files"] {
+        assert!(
+            notes[0][key].is_array(),
+            "{key} must be array: {}",
+            notes[0]
+        );
+    }
+    for key in ["reactions", "reactionEmojis", "emojis"] {
+        assert!(
+            notes[0][key].is_object(),
+            "{key} must be object: {}",
+            notes[0]
+        );
+    }
+    assert!(notes[0]["userId"].is_string());
+    assert!(notes[0]["createdAt"].is_string());
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_until_id_is_exclusive(pool: PgPool) {
+    let host = "sakurasato.test";
+    let alice = seed_local_actor(&pool, host, "alice").await;
+    let t0 = chrono::Utc::now();
+    let n0 = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "a",
+        Visibility::Public,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+    let n1 = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "b",
+        Visibility::Public,
+        t0 + chrono::Duration::seconds(1),
+        None,
+        json!([]),
+    )
+    .await;
+    let n2 = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "c",
+        Visibility::Public,
+        t0 + chrono::Duration::seconds(2),
+        None,
+        json!([]),
+    )
+    .await;
+
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": alice.to_string(), "untilId": n2.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let ids: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect();
+    // untilId 排他 ── n2 は出ない、n1/n0 は出る。
+    assert!(
+        !ids.contains(&n2.to_string()),
+        "untilId must be exclusive: {ids:?}"
+    );
+    assert!(ids.contains(&n1.to_string()), "{ids:?}");
+    assert!(ids.contains(&n0.to_string()), "{ids:?}");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_since_id_is_exclusive(pool: PgPool) {
+    let host = "sakurasato.test";
+    let alice = seed_local_actor(&pool, host, "alice").await;
+    let t0 = chrono::Utc::now();
+    let n0 = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "a",
+        Visibility::Public,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+    let n1 = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "b",
+        Visibility::Public,
+        t0 + chrono::Duration::seconds(1),
+        None,
+        json!([]),
+    )
+    .await;
+    let n2 = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "c",
+        Visibility::Public,
+        t0 + chrono::Duration::seconds(2),
+        None,
+        json!([]),
+    )
+    .await;
+
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": alice.to_string(), "sinceId": n0.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let ids: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect();
+    // sinceId 排他 ── n0 は出ない、n1/n2 は出る。
+    assert!(
+        !ids.contains(&n0.to_string()),
+        "sinceId must be exclusive: {ids:?}"
+    );
+    assert!(ids.contains(&n1.to_string()), "{ids:?}");
+    assert!(ids.contains(&n2.to_string()), "{ids:?}");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_unknown_user_returns_404(pool: PgPool) {
+    let host = "sakurasato.test";
+    let _alice = seed_local_actor(&pool, host, "alice").await;
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let resp =
+        users_notes_request(router_for(&state), json!({"i": token, "userId": "999999"})).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_missing_user_id_returns_400(pool: PgPool) {
+    let host = "sakurasato.test";
+    let _alice = seed_local_actor(&pool, host, "alice").await;
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let resp = users_notes_request(router_for(&state), json!({"i": token})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_without_scope_returns_401(pool: PgPool) {
+    let host = "sakurasato.test";
+    let alice = seed_local_actor(&pool, host, "alice").await;
+    let state = make_state(pool.clone(), host, "alice");
+    // scope ゼロの token ── require_scope が弾く。
+    let token = issue_token_with_scopes(&pool, &[]).await;
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": alice.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `withReplies=false` は他者宛返信を除外するが、自己スレッド (= 自分の note への
+/// 返信) は残す。`withReplies` 既定 (true) では全部返る。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_with_replies_false_excludes_other_replies_keeps_self(pool: PgPool) {
+    let host = "sakurasato.test";
+    let alice = seed_local_actor(&pool, host, "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    let t0 = chrono::Utc::now();
+
+    // P = alice トップレベル、R = alice の P への自己返信。
+    let p = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "parent",
+        Visibility::Public,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+    let r = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "self-reply",
+        Visibility::Public,
+        t0 + chrono::Duration::seconds(1),
+        Some((p, canonical_ap_id(host, p))),
+        json!([]),
+    )
+    .await;
+    // B = bob のノート、Q = alice の B への返信 (= 他者宛返信)。
+    let b = seed_note_full(
+        &pool,
+        bob,
+        "remote.test",
+        "bob note",
+        Visibility::Public,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+    let q = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "reply to bob",
+        Visibility::Public,
+        t0 + chrono::Duration::seconds(2),
+        Some((b, canonical_ap_id("remote.test", b))),
+        json!([]),
+    )
+    .await;
+
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    // 既定 (withReplies 省略 = true) → P, R, Q の 3 件 (B は bob 著者なので対象外)。
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": alice.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let ids: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        ids.contains(&p.to_string()),
+        "default must include parent: {ids:?}"
+    );
+    assert!(
+        ids.contains(&r.to_string()),
+        "default must include self-reply: {ids:?}"
+    );
+    assert!(
+        ids.contains(&q.to_string()),
+        "default must include other-reply: {ids:?}"
+    );
+    assert_eq!(ids.len(), 3, "{ids:?}");
+
+    // withReplies=false → P, R は残り Q は消える。
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": alice.to_string(), "withReplies": false}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let ids: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        ids.contains(&p.to_string()),
+        "withReplies=false must keep parent: {ids:?}"
+    );
+    assert!(
+        ids.contains(&r.to_string()),
+        "withReplies=false must keep self-thread reply: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&q.to_string()),
+        "withReplies=false must drop other-user reply: {ids:?}"
+    );
+}
+
+/// 対象ユーザの renote (= `Announce`) が renote `MissNote` として混ざる。
+/// `withRenotes=false` で除外される。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_includes_authors_renote(pool: PgPool) {
+    let host = "sakurasato.test";
+    let alice = seed_local_actor(&pool, host, "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    let t0 = chrono::Utc::now();
+
+    // alice 自身のノート + alice が bob のノートを boost。
+    let own = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "alice own",
+        Visibility::Public,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+    let boosted = seed_note_full(
+        &pool,
+        bob,
+        "remote.test",
+        "bob original",
+        Visibility::Public,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+    let announce = repo::announce::insert_or_get(
+        &pool,
+        "https://sakurasato.test/users/alice/activities/announce-1",
+        boosted,
+        alice,
+        t0 + chrono::Duration::seconds(5),
+    )
+    .await
+    .unwrap();
+
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    // 既定 (withRenotes true) → renote が boost 時刻で先頭、own が後。
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": alice.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().unwrap();
+    assert_eq!(notes.len(), 2, "own note + renote: {arr}");
+    let rn = &notes[0];
+    assert_eq!(rn["id"], format!("rn:{}", announce.id));
+    assert!(rn["text"].is_null(), "renote text must be null: {rn}");
+    assert_eq!(rn["user"]["username"], "alice", "renoter is alice: {rn}");
+    assert_eq!(rn["renoteId"], boosted.to_string());
+    assert_eq!(rn["renote"]["id"], boosted.to_string());
+    assert_eq!(rn["renote"]["text"], "bob original");
+    assert_eq!(rn["renote"]["user"]["username"], "bob");
+    assert_eq!(notes[1]["id"], own.to_string());
+
+    // withRenotes=false → renote が消えて own だけ。
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": alice.to_string(), "withRenotes": false}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let ids: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![own.to_string()],
+        "withRenotes=false drops renote: {ids:?}"
+    );
+}
+
+/// `withFiles=true` は添付のある note だけに絞る。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_with_files_filters_to_attachments(pool: PgPool) {
+    let host = "sakurasato.test";
+    let alice = seed_local_actor(&pool, host, "alice").await;
+    let t0 = chrono::Utc::now();
+    let _no_file = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "text only",
+        Visibility::Public,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+    let with_file = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "has media",
+        Visibility::Public,
+        t0 + chrono::Duration::seconds(1),
+        None,
+        json!([{
+            "type": "Document",
+            "mediaType": "image/webp",
+            "url": "https://cdn.test/pic.webp",
+            "name": "alt text",
+        }]),
+    )
+    .await;
+
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": alice.to_string(), "withFiles": true}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().unwrap();
+    assert_eq!(
+        notes.len(),
+        1,
+        "withFiles=true keeps only media notes: {arr}"
+    );
+    assert_eq!(notes[0]["id"], with_file.to_string());
+    assert!(
+        !notes[0]["files"].as_array().unwrap().is_empty(),
+        "media note must carry files: {}",
+        notes[0]
+    );
+    assert!(!notes[0]["fileIds"].as_array().unwrap().is_empty());
+}
+
+/// remote 対象ユーザの followers 限定ノートは、viewer が follow していなければ
+/// 見えない (= `list_by_author` 可視性述語の再利用が効いている)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_hides_remote_followers_only_when_not_following(pool: PgPool) {
+    let host = "sakurasato.test";
+    let alice = seed_local_actor(&pool, host, "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    let t0 = chrono::Utc::now();
+    let followers_note = seed_note_full(
+        &pool,
+        bob,
+        "remote.test",
+        "followers only",
+        Visibility::Followers,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    // follow していない → 見えない (空配列)。
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    assert!(
+        arr.as_array().unwrap().is_empty(),
+        "followers-only note must be hidden from non-follower: {arr}"
+    );
+
+    // accepted follow 後 → 見える。
+    seed_accepted_follow(&pool, alice, bob).await;
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let ids: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        ids.contains(&followers_note.to_string()),
+        "follower must see followers-only note: {ids:?}"
+    );
+}
+
+/// **プライバシー回帰防止**: 対象ユーザが boost した followers 限定 note は、
+/// その note の author を follow していない viewer には (renote 経由でも) 見えない。
+/// review (security-visibility / correctness-edge 両 lens) で blocker 指摘された
+/// 経路 ── renote window は `visibility <> 'direct'` までしか絞らないので、handler
+/// 側の `viewer_can_view_entry` が最後の砦になる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_hides_renote_of_followers_only_from_non_follower(pool: PgPool) {
+    let host = "sakurasato.test";
+    let alice = seed_local_actor(&pool, host, "alice").await; // viewer (お一人様)
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await; // 対象 (renoter)
+    let carol = seed_remote_actor(&pool, "other.test", "carol").await; // 元 note author
+    let t0 = chrono::Utc::now();
+
+    // carol の followers 限定 note を bob が boost。
+    let secret = seed_note_full(
+        &pool,
+        carol,
+        "other.test",
+        "carol followers-only secret",
+        Visibility::Followers,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+    let announce = repo::announce::insert_or_get(
+        &pool,
+        "https://remote.test/users/bob/activities/announce-secret",
+        secret,
+        bob,
+        t0 + chrono::Duration::seconds(5),
+    )
+    .await
+    .unwrap();
+
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    // alice は carol を follow していない → boost 経由でも見えない (空配列)。
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    assert!(
+        arr.as_array().unwrap().is_empty(),
+        "renote of followers-only note must be hidden from non-follower: {arr}"
+    );
+
+    // alice が carol を follow したら、boost も見えるようになる。
+    seed_accepted_follow(&pool, alice, carol).await;
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().unwrap();
+    assert_eq!(notes.len(), 1, "follower sees the boost: {arr}");
+    assert_eq!(notes[0]["id"], format!("rn:{}", announce.id));
+    assert_eq!(notes[0]["renote"]["id"], secret.to_string());
+    assert_eq!(notes[0]["renote"]["user"]["username"], "carol");
+}
+
+/// `published_at` が秒以下まで同一でも、`id DESC` tiebreak で **同一ページ内** の
+/// 順序が決定的 (= review correctness-edge lens の指摘。ページ境界の取りこぼしは
+/// `notes/timeline` と共有の既知制約で、本テストはページ内決定性のみ担保する)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_notes_identical_published_at_orders_by_id_desc(pool: PgPool) {
+    let host = "sakurasato.test";
+    let alice = seed_local_actor(&pool, host, "alice").await;
+    // 完全に同一の published_at を 2 件に与える。
+    let t = chrono::Utc::now();
+    let n1 = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "same-ts a",
+        Visibility::Public,
+        t,
+        None,
+        json!([]),
+    )
+    .await;
+    let n2 = seed_note_full(
+        &pool,
+        alice,
+        host,
+        "same-ts b",
+        Visibility::Public,
+        t,
+        None,
+        json!([]),
+    )
+    .await;
+    // seed 順で n2.id > n1.id。
+    assert!(n2 > n1, "seed order should yield n2.id > n1.id");
+
+    let state = make_state(pool.clone(), host, "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let resp = users_notes_request(
+        router_for(&state),
+        json!({"i": token, "userId": alice.to_string(), "limit": 10}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let ids: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect();
+    // 同一 ts → id DESC で決定的 (n2 が先)。
+    assert_eq!(
+        ids,
+        vec![n2.to_string(), n1.to_string()],
+        "id DESC tiebreak: {ids:?}"
+    );
+}
