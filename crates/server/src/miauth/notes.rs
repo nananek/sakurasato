@@ -475,14 +475,23 @@ pub(crate) async fn viewer_can_view_entry(
     }
 }
 
-/// local actor の id を引く。お一人様サーバ前提で 1 件しかない。
-pub(crate) async fn resolve_self_actor_id(state: &AppState) -> Option<i64> {
+/// local actor の row を引く。お一人様サーバ前提で 1 件しかない。
+/// `users/notes` は visibility / direct 判定に `id` と `ap_id` の双方が要るので、
+/// 行ごと取って 1 query に収める。
+pub(crate) async fn resolve_self_actor(
+    state: &AppState,
+) -> Option<sakurasato_core::model::ActorRow> {
     let host = &state.config().server.host;
     let user = &state.config().server.user;
     match repo::actor::get_by_username_host(state.pool(), user, host).await {
-        Ok(Some(row)) if row.is_local => Some(row.id),
+        Ok(Some(row)) if row.is_local => Some(row),
         _ => None,
     }
+}
+
+/// local actor の id を引く。お一人様サーバ前提で 1 件しかない。
+pub(crate) async fn resolve_self_actor_id(state: &AppState) -> Option<i64> {
+    resolve_self_actor(state).await.map(|row| row.id)
 }
 
 /// local actor の `ap_id` を引く (= direct visibility 判定で audience に含まれる
@@ -501,6 +510,253 @@ async fn viewer_ap_id(state: &AppState) -> Option<String> {
 /// 範囲外 (= `i64::MAX` を超える / sec 換算で範囲外) は `None` に倒す。
 fn ms_epoch_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms).single()
+}
+
+// ─── #150 (Aria fix): users/notes (= ユーザのノート一覧 / プロフィール) ──────
+
+/// `with_replies` / `with_renotes` の serde 既定 `true` 用 (= Misskey 仕様)。
+fn default_true() -> bool {
+    true
+}
+
+/// Misskey `users/notes` body。
+///
+/// 対象ユーザは **`userId` のみ** で指定する ── Misskey 仕様で `users/notes` は
+/// `username` + `host` 経路を持たない (`users/show` とは非対称)。`withReplies` /
+/// `withRenotes` は既定 **true**、`withFiles` は既定 **false**
+/// ([[miauth-misskey-dart-required-fields]] とは無関係の wire 既定値)。
+#[derive(Debug, Deserialize)]
+pub struct UsersNotesBody {
+    #[serde(default)]
+    pub i: Option<String>,
+    /// 文字列化された Sakurasato 内部 `i64` actor id。
+    #[serde(rename = "userId", default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// **排他下限** (`published_at > sinceId 解決時刻`)。`"rn:N"` 形式の renote
+    /// カーソルも受ける ([`resolve_cursor_ts`] が解決)。
+    #[serde(rename = "sinceId", default)]
+    pub since_id: Option<String>,
+    /// **排他上限** (`published_at < untilId 解決時刻`)。
+    #[serde(rename = "untilId", default)]
+    pub until_id: Option<String>,
+    /// **排他下限 (時刻)** ── ms epoch。
+    #[serde(rename = "sinceDate", default)]
+    pub since_date: Option<i64>,
+    /// **排他上限 (時刻)** ── ms epoch。
+    #[serde(rename = "untilDate", default)]
+    pub until_date: Option<i64>,
+    /// Misskey 既定 `true` ── 返信も含む。`false` で他者宛返信を除外 (自己
+    /// スレッドは残す。詳細は [`repo::note::list_by_author_window`])。
+    #[serde(rename = "withReplies", default = "default_true")]
+    pub with_replies: bool,
+    /// Misskey 既定 `true` ── 対象ユーザの renote (boost) も時刻順マージする。
+    #[serde(rename = "withRenotes", default = "default_true")]
+    pub with_renotes: bool,
+    /// Misskey 既定 `false` ── `true` で添付のある note だけに絞る (= メディア
+    /// タブ)。メディア絞り込み時は renote (添付概念なし) を除外する。
+    #[serde(rename = "withFiles", default)]
+    pub with_files: bool,
+}
+
+/// `POST /api/users/notes` handler ── 指定ユーザのノート一覧 (= Aria の
+/// プロフィール / ユーザタイムライン)。
+///
+/// 構造は [`timeline`] (= home timeline) とほぼ同型で、違いは:
+/// (a) note window が「viewer の home」ではなく **対象ユーザ著者** スコープ
+///     ([`repo::note::list_by_author_window`]、viewer 可視性で絞る)、
+/// (b) renote window も対象ユーザ著者スコープ
+///     ([`repo::announce::list_author_renote_window`])、renoter は常に対象本人、
+/// (c) `withReplies` / `withFiles` フィルタ。
+///
+/// レスポンスは **`MissNote` の素の配列** (Misskey `users/notes` wire 仕様。
+/// envelope で包まない)。1 要素の shape は `notes/timeline` と完全に同一なので、
+/// Aria (`misskey_dart`) が `notes/timeline` を parse できている限り本経路も安全。
+#[allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    reason = "note/renote マージ + カーソル解決で 1 ハンドラに収める。renoter/renoted は AP 用語"
+)]
+pub async fn users_notes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<UsersNotesBody>>,
+) -> Response {
+    // body 無しは userId 不在と同義 (= Misskey クライアントは必ず body を送る)。
+    let Some(Json(body)) = body else {
+        return bad_request("userId is required");
+    };
+    let Some(_token) =
+        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
+    else {
+        return auth::unauthorized("invalid or revoked token");
+    };
+
+    // 対象ユーザ解決 (userId のみ ── username+host は users/notes では非対応)。
+    let Some(user_id_str) = body.user_id.as_deref() else {
+        return bad_request("userId is required");
+    };
+    let Ok(target_id) = user_id_str.parse::<i64>() else {
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_USER", "no such user");
+    };
+    let target = match repo::actor::get_by_id(state.pool(), target_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_USER", "no such user"),
+        Err(err) => {
+            tracing::error!(?err, target_id, "miauth users/notes: target lookup failed");
+            return error_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "user lookup failed",
+            );
+        }
+    };
+
+    // viewer = local self actor (お一人様)。可視性 + direct 判定に id / ap_id 双方。
+    let Some(viewer) = resolve_self_actor(&state).await else {
+        return error_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor initialization failed",
+        );
+    };
+
+    let limit = body
+        .limit
+        .unwrap_or(TIMELINE_LIMIT_DEFAULT)
+        .clamp(1, TIMELINE_LIMIT_MAX);
+
+    // カーソル: id ("rn:N" 可) を境界 **時刻** に解決し、date 境界 (ms epoch) と
+    // 統合する。note と renote を時刻順マージするため id ではなく published_at で
+    // window する (= notes/timeline と同じ流儀)。
+    let until_ts = match body.until_id.as_deref() {
+        Some(s) => resolve_cursor_ts(&state, s).await,
+        None => None,
+    }
+    .or_else(|| body.until_date.and_then(ms_epoch_to_datetime));
+    let since_ts = match body.since_id.as_deref() {
+        Some(s) => resolve_cursor_ts(&state, s).await,
+        None => None,
+    }
+    .or_else(|| body.since_date.and_then(ms_epoch_to_datetime));
+
+    // note window (著者本人 + viewer 可視性 + withReplies / withFiles)。
+    let note_entries = match repo::note::list_by_author_window(
+        state.pool(),
+        target.id,
+        viewer.id,
+        &viewer.ap_id,
+        body.with_replies,
+        body.with_files,
+        since_ts,
+        until_ts,
+        limit,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(?err, "miauth users/notes: note window failed");
+            return error_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "notes query failed",
+            );
+        }
+    };
+
+    // renote window (= 対象ユーザの Announce)。withRenotes=false ならスキップ。
+    // メディア絞り込み (withFiles=true) 時も renote は添付概念が無いので除外する。
+    let renote_rows = if body.with_renotes && !body.with_files {
+        repo::announce::list_author_renote_window(
+            state.pool(),
+            target.id,
+            since_ts,
+            until_ts,
+            limit,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(?err, "users/notes: renote window failed; dropping renotes");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
+    // renote の元 note を一括解決 (renoter は対象ユーザ本人なので actor map 不要)。
+    let renoted_ids: Vec<i64> = renote_rows.iter().map(|r| r.renoted_note_id).collect();
+    let renoted_entries = repo::note::list_timeline_entries_by_ids(state.pool(), &renoted_ids)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                ?err,
+                "users/notes: renoted entries lookup failed; dropping renotes"
+            );
+            Vec::new()
+        });
+    let entry_by_id: std::collections::HashMap<i64, &sakurasato_core::repo::note::TimelineEntry> =
+        renoted_entries.iter().map(|e| (e.id, e)).collect();
+
+    // summaries: note window + renote の元 note の全 id。
+    let mut all_note_ids: Vec<i64> = note_entries.iter().map(|e| e.id).collect();
+    all_note_ids.extend(renoted_ids.iter().copied());
+    let summaries = bulk_load_note_summaries(state.pool(), &all_note_ids, viewer.id).await;
+    let empty = NoteSummary {
+        reactions: Vec::new(),
+        announce: None,
+        my_reaction: None,
+    };
+
+    let host = &state.config().server.host;
+
+    // note と renote を (sort_ts, MissNote) で 1 本に統合する。
+    let mut items: Vec<(chrono::DateTime<chrono::Utc>, MissNote)> =
+        Vec::with_capacity(note_entries.len() + renote_rows.len());
+    for e in &note_entries {
+        let summary = summaries.get(&e.id).unwrap_or(&empty);
+        items.push((
+            e.published_at,
+            timeline_entry_to_miss_note(e, summary, host),
+        ));
+    }
+    for r in &renote_rows {
+        // 元 note が引けない renote は黙ってスキップ (FK 上は起きない)。
+        let Some(entry) = entry_by_id.get(&r.renoted_note_id) else {
+            continue;
+        };
+        // **プライバシー**: renote window は `visibility <> 'direct'` までしか
+        // 絞っていない。対象ユーザが boost した followers 限定 note を、その note の
+        // author を follow していない viewer に見せないよう、ここで描画前に viewer
+        // 可視性を再判定する (= notes/show / notes/reactions と同じ防御)。public /
+        // unlisted は常に true なので通常の boost は影響を受けない。
+        if !viewer_can_view_entry(&state, entry, viewer.id).await {
+            continue;
+        }
+        let summary = summaries.get(&entry.id).unwrap_or(&empty);
+        let renoted = timeline_entry_to_miss_note(entry, summary, host);
+        // renoter は常に対象ユーザ本人。
+        let renoter = from_actor_and_counts(&target, 0, 0, 0);
+        let created_at = r
+            .announce_published_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let renote = build_renote_miss_note(
+            r.announce_id,
+            &r.announce_ap_id,
+            &created_at,
+            renoter,
+            r.renoter_actor_id,
+            renoted,
+        );
+        items.push((r.announce_published_at, renote));
+    }
+
+    // 時刻降順。同時刻の決定的順序のため id (string) を tiebreak に。limit へ切る。
+    items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
+    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let notes: Vec<MissNote> = items.into_iter().map(|(_, n)| n).collect();
+    Json(notes).into_response()
 }
 
 // ─── #160: write endpoints (notes/create, notes/delete, notes/renote) ───────

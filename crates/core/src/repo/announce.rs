@@ -205,3 +205,48 @@ pub async fn list_home_renote_window(
     .fetch_all(pool)
     .await
 }
+
+/// **M14 #150 (`MiAuth` `users/notes`)** ── 特定 actor (= `users/notes` の対象
+/// ユーザ) が行った renote (`Announce`) を `published_at` 降順・時刻カーソル付き
+/// で引く。`list_home_renote_window` の **著者スコープ版**。
+///
+/// 対象: `ann.actor_id = $1` (= プロフィール所有者本人の boost のみ)。home
+/// timeline 版が「自分 or followee」を対象にするのに対し、こちらは単一著者に
+/// 限定する。元 note の `visibility = direct` を除外するのは home 版と対称
+/// (= boost 可能なのは公開系 note のみという前提)。`since_ts` / `until_ts` は
+/// **排他** (`>` / `<`) で、note 側ウィンドウ ([`crate::repo::note::list_by_author_window`])
+/// と同じ境界時刻を渡してマージする。
+pub async fn list_author_renote_window(
+    pool: &PgPool,
+    author_actor_id: i64,
+    since_ts: Option<DateTime<Utc>>,
+    until_ts: Option<DateTime<Utc>>,
+    limit: i64,
+) -> sqlx::Result<Vec<RenoteWindowRow>> {
+    sqlx::query_as!(
+        RenoteWindowRow,
+        r#"
+        SELECT
+            ann.id AS announce_id,
+            ann.ap_id AS announce_ap_id,
+            ann.published_at AS announce_published_at,
+            ann.actor_id AS renoter_actor_id,
+            ann.note_id AS renoted_note_id
+        FROM announce ann
+        JOIN note n ON n.id = ann.note_id
+        WHERE
+            n.visibility <> 'direct'
+            AND ann.actor_id = $1
+            AND ($2::TIMESTAMPTZ IS NULL OR ann.published_at > $2)
+            AND ($3::TIMESTAMPTZ IS NULL OR ann.published_at < $3)
+        ORDER BY ann.published_at DESC, ann.id DESC
+        LIMIT $4
+        "#,
+        author_actor_id,
+        since_ts,
+        until_ts,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
