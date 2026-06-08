@@ -80,6 +80,61 @@ pub async fn run(config: sakurasato_core::Config, args: DeliverArgs) -> anyhow::
     Ok(())
 }
 
+/// スタンドアロン CLI が enqueue した配送行を、その場 (= CLI 自プロセス) で
+/// 即 flush する。
+///
+/// 常駐 daemon の配送ワーカ ([`worker::run`]) は #211 以降、アイドル時に
+/// `delivery_queue` をポーリングせず、in-process の `AppState::wake_delivery`
+/// 通知でのみ起床する (Neon scale-to-zero 対応)。`follow` / `move-out` /
+/// `alias` / `follow-request` / `actor lock|unlock` などの CLI サブコマンドは
+/// daemon とは **別プロセス** で動くため、CLI 側の `wake_delivery` は daemon の
+/// ワーカに届かない。結果、CLI が積んだ Follow / Move / Accept / Update は
+/// daemon が `IDLE_FALLBACK` (最大 1h) で目を覚ますまで配送されず、federation
+/// test の Mastodon prefollow / 2-sks move-out がタイムアウトしていた。
+///
+/// そこで CLI は自プロセスで due 行を drain して即配送する ── #211 以前の
+/// 「空ポーリングが CLI enqueue をほどなく拾う」挙動を、ポーリング無しで
+/// 取り戻すもの。配送失敗行は [`try_deliver_one`] が `mark_failed` で backoff に
+/// 倒すので、以降の retry は従来どおり daemon ワーカ (または次回の CLI flush)
+/// に委ねる。enqueue 自体は成功済みなので、配送失敗で CLI を異常終了させない
+/// (best-effort: 失敗は warn ログのみ)。
+pub async fn flush_due_now(state: &AppState) {
+    // 1 回の CLI flush で drain する最大バッチ数の安全網。due 行が即再 due に
+    // なり続ける異常系で無限ループしないための上限。
+    const MAX_BATCHES: usize = 100;
+    // 1 バッチで拾う行数 (worker の `TICK_BATCH` と揃える)。
+    const DRAIN_BATCH: i64 = 50;
+
+    for _ in 0..MAX_BATCHES {
+        let rows = match repo::delivery_queue::pick_due(state.pool(), DRAIN_BATCH).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(error = %err, "cli flush: pick_due failed; leaving rows for the worker");
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+        for row in rows {
+            // `try_deliver_one` は成功/一時失敗/dead を必ず `mark_*` で倒す
+            // (= pick_due の対象から外れる) ので、次バッチで同じ行は再選択され
+            // ない。Err は best-effort 配送のログ用途に留める。
+            if let Err(err) = try_deliver_one(state, row.id).await {
+                warn!(
+                    queue_id = row.id,
+                    error = %err,
+                    "cli flush: delivery failed; leaving row for retry",
+                );
+            }
+        }
+    }
+    warn!(
+        max_batches = MAX_BATCHES,
+        "cli flush: hit batch cap; remaining rows left for the delivery worker",
+    );
+}
+
 /// 任意の Activity JSON を配送キューに追加する。
 ///
 /// 重複排除や宛先展開 (`shared_inbox` 集約等) は M3b-3 の責務。PR2 では

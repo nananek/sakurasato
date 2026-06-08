@@ -417,13 +417,14 @@ pub async fn run_with_state(state: &AppState, args: FollowArgs) -> anyhow::Resul
         return Ok(());
     }
     if outcome.already_pending {
-        // **Issue #113**: 既存 pending 行への再叩き ── enqueue 抑止。配送
-        // worker が retry を回す前提。明示 retry したいときは `deliver
-        // --queue-id N` で個別 flush できる。
+        // **Issue #113**: 既存 pending 行への再叩き ── 重複は enqueue しない。
+        // ただし CLI は daemon とは別プロセスで daemon ワーカを起床できないので、
+        // 据え置きの pending 行を自プロセスで即 flush する (#211 cross-process
+        // 回帰対応)。
+        delivery::flush_due_now(state).await;
         println!(
             "follow already pending for {target}: follow_id={id} state=pending \
-             (worker will retry; use `sakurasato-server deliver --queue-id N` \
-             to flush manually)",
+             (flushed inline; worker will retry if delivery failed)",
             target = outcome.target.ap_id,
             id = outcome.follow.id,
         );
@@ -433,6 +434,9 @@ pub async fn run_with_state(state: &AppState, args: FollowArgs) -> anyhow::Resul
         .queue_id
         .ok_or_else(|| anyhow::anyhow!("internal: pending Follow returned without queue_id"))?;
     let inbox = outcome.inbox_url.unwrap_or_default();
+    // CLI は別プロセスなので daemon ワーカは `wake_delivery` で起床しない。
+    // 積んだ Follow を自プロセスで即配送する (#211 cross-process 回帰対応)。
+    delivery::flush_due_now(state).await;
     println!(
         "queued Follow to {target}: follow_id={follow_id} delivery_queue_id={queue_id} inbox={inbox}",
         target = outcome.target.ap_id,

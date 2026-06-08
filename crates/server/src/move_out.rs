@@ -256,10 +256,14 @@ async fn enqueue_to_followers(
     match delivery::enqueue_activities(state.pool(), local_actor.id, &inboxes, activity).await {
         Ok(n) => {
             let queued = usize::try_from(n).unwrap_or(usize::MAX);
-            // CLI (move-out) 経路ではワーカ未稼働なので permit が貯まるだけ
-            // (= 次回 serve 起動時の pick_due が拾う)。serve 経路なら即配送。
+            // move-out / alias はどちらも CLI (= daemon とは別プロセス) からのみ
+            // 呼ばれる。CLI の `wake_delivery` は daemon ワーカに届かないので、
+            // 積んだ Move / Update を自プロセスで即 flush して送る
+            // (#211 cross-process 回帰対応)。`wake_delivery` は将来 in-process で
+            // 呼ばれた場合に備えた no-op 防御として残す。
             if queued > 0 {
                 state.wake_delivery();
+                delivery::flush_due_now(state).await;
             }
             queued
         }
