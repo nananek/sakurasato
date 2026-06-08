@@ -169,6 +169,10 @@ async fn mutate_print(
     let (row, follower, queued_id, inbox_url) = mutate(state, follow_id, response_type)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
+    // `mutate` 内の `wake_delivery` は daemon の local API 経路用。CLI は別
+    // プロセスで daemon ワーカを起床できないので、積んだ Accept/Reject を
+    // 自プロセスで即 flush して送る (#211 cross-process 回帰対応)。
+    delivery::flush_due_now(state).await;
     println!(
         "follow-request {verb}: follow_id={id} queue_id={qid} follower={follower} inbox={inbox}",
         verb = response_type.verb(),

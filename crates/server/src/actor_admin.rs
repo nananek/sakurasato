@@ -151,7 +151,11 @@ async fn enqueue_to_followers(
         }
     }
     if queued > 0 {
+        // `actor lock/unlock` は CLI (= daemon とは別プロセス) からのみ呼ばれる。
+        // CLI の `wake_delivery` は daemon ワーカに届かないので、積んだ Update を
+        // 自プロセスで即 flush して送る (#211 cross-process 回帰対応)。
         state.wake_delivery();
+        delivery::flush_due_now(state).await;
     }
     info!(
         actor = %local_actor.ap_id,
