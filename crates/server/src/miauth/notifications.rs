@@ -9,6 +9,10 @@
 //! - <https://api-doc.misskey.io/api/endpoints/i/notifications>
 //! - <https://api-doc.misskey.io/api/endpoints/notifications/mark-all-as-read>
 //!
+//! `i/notifications` の `markAsRead` は **default `true`** で、Misskey では「一覧
+//! 取得そのものが既読化操作」になる (Aria はこれでベルをクリアする)。`list`
+//! はこれを honor し、`markAsRead: false` を明示したときだけ既読化を抑止する。
+//!
 //! Notification object (本実装が返すサブセット):
 //!
 //! ```json
@@ -61,6 +65,11 @@ pub struct NotificationsBody {
     pub since_id: Option<String>,
     #[serde(rename = "untilId", default)]
     pub until_id: Option<String>,
+    /// Misskey 互換: `markAsRead` (**default `true`**)。取得そのものを既読化操作と
+    /// する仕様で、Aria はこれを叩いてベルの未読をクリアする。`None` (未指定) は
+    /// `true` 扱い。`Some(false)` を明示したときだけ既読化を抑止する。
+    #[serde(rename = "markAsRead", default)]
+    pub mark_as_read: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -117,6 +126,20 @@ pub async fn list(
     for row in &rows {
         out.push(build_notification(&state, row, &host, &summaries, &mut actor_cache).await);
     }
+
+    // Misskey 互換: `i/notifications` は `markAsRead` (default true) で「取得 =
+    // 既読化」する。これを実装しないと `count_unread` が減らず `/api/i` の
+    // `hasUnreadNotification` が永遠に true のまま残り、Aria の通知ベルに新着
+    // マークが空振りで付き続ける (報告バグ)。`markAsRead: false` を明示した
+    // ときだけ抑止する。`out` 構築後に既読化するので返却ペイロードの `isRead` は
+    // 取得時点の値 (= 通常 false) を保つ ── Misskey も「今回の新着」を見せてから
+    // 既読化する。best-effort (失敗は warn のみで一覧は返す)。
+    if body.mark_as_read != Some(false)
+        && let Err(err) = repo::notification::mark_all_read(state.pool(), recipient).await
+    {
+        tracing::warn!(?err, "miauth i/notifications: markAsRead mark_all_read failed");
+    }
+
     Json(out).into_response()
 }
 
