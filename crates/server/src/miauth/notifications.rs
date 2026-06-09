@@ -137,7 +137,10 @@ pub async fn list(
     if body.mark_as_read != Some(false)
         && let Err(err) = repo::notification::mark_all_read(state.pool(), recipient).await
     {
-        tracing::warn!(?err, "miauth i/notifications: markAsRead mark_all_read failed");
+        tracing::warn!(
+            ?err,
+            "miauth i/notifications: markAsRead mark_all_read failed"
+        );
     }
 
     Json(out).into_response()
