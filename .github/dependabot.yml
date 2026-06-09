@@ -8,6 +8,20 @@ updates:
     open-pull-requests-limit: 10
     commit-message:
       prefix: "deps"
+    ignore:
+      # ratatui は ratatui-image とバージョン結合がある。#255/#256 で踏んだとおり、
+      # ratatui 0.30.1 を旧 ratatui-image 11.0.3 と組ませると Kitty 画像の重ね順が
+      # 壊れる (= buffer diff の CellDiffOption 化に image 側が 11.0.4 で追従)。
+      # ratatui の実バージョンは ratatui-image の要求 (^0.30.1) が駆動するので、
+      # Dependabot で ratatui を単独 bump させず、ratatui-image の更新にペアで追従
+      # させる (ratatui を上げたいときは ratatui-image を上げる)。
+      - dependency-name: "ratatui"
+      # crossterm は ratatui 内部 (0.29) と一致必須 (Cargo.toml 参照)。単独 minor/major
+      # bump は版ズレを生むので止める。security patch (= patch bump) は許可。
+      - dependency-name: "crossterm"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
 
   # GitHub Actions
   - package-ecosystem: github-actions
