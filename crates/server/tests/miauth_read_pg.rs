@@ -1366,6 +1366,79 @@ async fn notifications_mark_all_as_read_clears_unread(pool: PgPool) {
     assert_eq!(notification::count_unread(&pool, alice).await.unwrap(), 0);
 }
 
+/// Misskey 互換: `i/notifications` は `markAsRead` (default true) で取得 = 既読化。
+/// 未指定で list を叩くと未読が 0 になる (= Aria のベルがクリアされる経路)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notifications_list_marks_read_by_default(pool: PgPool) {
+    use sakurasato_core::repo::notification::{self, NewNotification};
+
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    notification::insert(
+        &pool,
+        NewNotification {
+            recipient_actor_id: alice,
+            event_type: "follow".into(),
+            notifier_actor_id: Some(bob),
+            note_id: None,
+            reaction: None,
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(notification::count_unread(&pool, alice).await.unwrap(), 1);
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    // markAsRead 未指定 = default true。取得しただけで既読化される。
+    let resp = post(app, "/api/i/notifications", json!({"i": token})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // 返却ペイロード自体は取得時点の isRead (= false) を保つ。
+    let v = read_json(resp).await;
+    assert_eq!(v.as_array().unwrap()[0]["isRead"], false);
+    // が、副作用で未読カウントは 0 になっている。
+    assert_eq!(notification::count_unread(&pool, alice).await.unwrap(), 0);
+}
+
+/// `markAsRead: false` を明示したときは既読化しない (= 一覧だけ覗く用途)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notifications_list_mark_as_read_false_keeps_unread(pool: PgPool) {
+    use sakurasato_core::repo::notification::{self, NewNotification};
+
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    notification::insert(
+        &pool,
+        NewNotification {
+            recipient_actor_id: alice,
+            event_type: "follow".into(),
+            notifier_actor_id: Some(bob),
+            note_id: None,
+            reaction: None,
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post(
+        app,
+        "/api/i/notifications",
+        json!({"i": token, "markAsRead": false}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // 既読化しないので未読は据え置き。
+    assert_eq!(notification::count_unread(&pool, alice).await.unwrap(), 1);
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn notifications_without_token_is_401(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
