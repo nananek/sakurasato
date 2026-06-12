@@ -71,8 +71,14 @@ async fn media_rejects_dotdot_traversal(pool: PgPool) {
         .unwrap();
     // is_safe_key が S3 呼び出しの前に弾くので 400。S3 まで届いていれば
     // 接続失敗で 500 になるはずなので、400 が返ることで「key 検証が手前で
-    // 動いている」ことが確認できる。
+    // 動いている」ことが確認できる。400 にも no-store が付く (#261)。
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+    );
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
@@ -114,17 +120,23 @@ async fn media_rejects_double_slash(pool: PgPool) {
 //
 // 通過 (S3 fetch まで進む) ケース:
 //   - `kind = avatar` (= 常に public)
-//   - `kind = attachment` + `note_id IS NOT NULL` (visibility 不問)
+//   - `kind = attachment` (note 紐付け状態 / visibility 不問)
 //   - `emoji/local/...` prefix
 // 拒否 (= 404) ケース:
 //   - 未知 key (= media table に row 無し)
-//   - `kind = attachment` + `note_id IS NULL` (孤児 / 未投稿 draft)
 //
 // `attachment` の visibility ガード (`followers` / `direct` → 404) は
 // PR #108 で導入したが、Fediverse 標準は media URL を *URL obscurity* で
 // 防衛する慣行 (= Mastodon / Misskey も非認証で配信) で、private 投稿の
-// 画像がリモートで壊れて見える致命的副作用があったため撤回した。詳細は
+// 画像がリモートで壊れて見える致命的副作用があったため撤回した。
+// `note_id IS NULL` (= 未添付) の孤児ガードも #261 で撤去 ── Misskey drive
+// モデルではアップロード直後から閲覧可能で、404 が CDN に負キャッシュされ
+// 「投稿後も画像が 404」になっていた。詳細は
 // `crates/server/src/routes/media.rs::authorized_for_public` の doc を見る。
+//
+// 負レスポンス (400 / 404 / 500) には `Cache-Control: no-store` が付くこと
+// (#261) も本テスト群で固定する (400 = traversal、404 = 未知 key、500 =
+// reaches_s3 の S3 接続失敗ブランチ)。
 
 fn seed_local_actor(username: &str, host: &str) -> NewActor {
     let ap_id = format!("https://{host}/users/{username}");
@@ -192,8 +204,11 @@ fn new_note(actor_id: i64, ap_suffix: &str, visibility: Visibility) -> NewNote {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn media_unknown_key_returns_404(pool: PgPool) {
+async fn media_unknown_key_returns_404_no_store(pool: PgPool) {
     // media table に行が無い key は authorization で拒否 → 404。
+    // 404 には `Cache-Control: no-store` が付く (#261) ── `.webp` は CDN の
+    // デフォルトキャッシュ対象拡張子で、負キャッシュが残ると後から正常化
+    // しても 404 に見え続けるため。
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::routes::router(state);
 
@@ -206,11 +221,21 @@ async fn media_unknown_key_returns_404(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+    );
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn media_orphan_attachment_returns_404(pool: PgPool) {
-    // kind=attachment + note_id NULL は孤児 → 404。
+async fn media_orphan_attachment_reaches_s3(pool: PgPool) {
+    // kind=attachment + note_id NULL (= drive アップロード直後、note 未紐付)
+    // も配信する (#261)。Misskey drive モデルではアップロード直後から
+    // `DriveFile.url` が閲覧可能で、ここで 404 を返すと CDN の負キャッシュが
+    // 「投稿後も画像が 404」を固定化していた。authorization 通過 → S3 不在
+    // 環境では 500 に倒れる (= 本 suite の reaches_s3 規約)。
     let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
         .await
         .unwrap();
@@ -228,7 +253,15 @@ async fn media_orphan_attachment_returns_404(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // 5xx も no-store (#261) ── S3 障害中の一時的な 500 が CDN に焼き付いて
+    // 復旧後も「壊れた画像」に見え続けないように。
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+    );
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
@@ -351,9 +384,10 @@ async fn media_public_redirect_302_for_authorized_key(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn media_public_redirect_still_404_for_orphan(pool: PgPool) {
-    // `public_base_url` 設定でも認可ゲートは維持: orphan attachment (note 未紐付)
-    // はリダイレクトせず 404。連合に出ていない key を公開 URL へ誘導しない。
+async fn media_public_redirect_302_for_orphan(pool: PgPool) {
+    // `public_base_url` 設定時も、orphan attachment (note 未紐付) は #261 で
+    // 配信対象 → 302 リダイレクト。drive アップロード直後のプレビュー GET が
+    // このパスに乗る (R2 には upload 時点で PUT 済みなので 302 先は実在する)。
     let actor = repo::actor::insert(&pool, seed_local_actor("alice", "example.test"))
         .await
         .unwrap();
@@ -373,7 +407,13 @@ async fn media_public_redirect_still_404_for_orphan(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("https://media.example.test/orphan.webp"),
+    );
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

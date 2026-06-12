@@ -800,9 +800,15 @@ class TestAttachmentFederation:
         )
         assert media["kind"] == "attachment"
 
-        # 注: orphan media (= note 未紐付け、`note_id IS NULL`) は PR #143 後も
-        # 404 のまま (= 連合に出ていない bytes を露出させない、意図的)。
-        # `create_note` で note に紐付けてから fetch する。
+        # #261: orphan media (= note 未紐付け、`note_id IS NULL`) も配信される
+        # (Misskey drive モデル ── アップロード直後から閲覧可能)。実 versitygw
+        # に対して「note 紐付け前の非認証 GET が 200」をここで固定する。
+        orphan_resp = sakurasato.fetch_media(media["url"])
+        assert orphan_resp.status_code == 200, (
+            f"drive-uploaded media must be reachable before note attach "
+            f"(#261); got {orphan_resp.status_code}"
+        )
+
         marker = f"attach-public-{int(time.time() * 1000)}"
         sakurasato.create_note(
             f"with public image: {marker}",
@@ -855,9 +861,9 @@ class TestAttachmentFederation:
             alt="followers-only test image",
         )
 
-        # orphan は 404 のままなので、必ず note に紐付けてから fetch する
-        # (= 連合に出る前の bytes は依然 404、PR #143 で公開したのはあくまで
-        # 「note 紐付き + followers/direct」だけ)。
+        # #261 以降 orphan も配信されるが、本テストの主眼は「followers-only
+        # note 紐付き attachment が非認証で 200」(PR #143 回帰) なので、
+        # 従来どおり note に紐付けてから fetch する。
         marker = f"attach-followers-{int(time.time() * 1000)}"
         sakurasato.create_note(
             f"with followers-only image: {marker}",
