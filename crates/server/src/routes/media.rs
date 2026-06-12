@@ -23,6 +23,10 @@
 //!
 //! - `NoSuchKey` (オブジェクト不在) → 404。
 //! - その他の S3 エラー → 500 (詳細はログ出力のみ、本文に出さない)。
+//! - 負レスポンス (4xx/5xx) には一律 `Cache-Control: no-store` を付ける
+//!   (#261)。`.webp` は CDN (Cloudflare 等) のデフォルトキャッシュ対象
+//!   拡張子で、アップロード直後の attachment への GET が返した 404 が
+//!   エッジに数分残り、「投稿後も画像が 404」に見える事故を防ぐ。
 //!
 //! ## パスサニタイズ (PR #31 round-1 🔴 対応)
 //!
@@ -70,7 +74,7 @@ const REMOTE_EMOJI_KEY_PREFIX: &str = "emoji/remote/";
 pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     if !is_safe_key(&key) {
         tracing::warn!(key = %key, "media GET: rejected unsafe key");
-        return StatusCode::BAD_REQUEST.into_response();
+        return no_store(StatusCode::BAD_REQUEST);
     }
     // **設計判断**: 紐付き Note の visibility を見て followers/direct を 404 に
     // 落とす過去版 (PR #108 "IDOR fix") を撤回する。AP の `attachment.url` は
@@ -82,22 +86,27 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
     // direct 投稿の画像が「壊れた添付」として表示される (= 本ハンドラ修正の
     // 直接動機)。
     //
+    // さらに #261 で「未添付 (= `note_id IS NULL`) の attachment は 404」の
+    // 孤児ガードも撤去した。Misskey drive モデルではアップロード直後から
+    // `DriveFile.url` が閲覧可能で、クライアント (Aria 等) はプレビューの
+    // ため即 GET してくる。ここで返した 404 が CDN にキャッシュされ
+    // 「投稿後も画像が 404」になっていた。防衛線は紐付け状態によらず
+    // URL obscurity で一本化する。
+    //
     // 引き続き残すガード:
-    //   * `kind = attachment` で `note_id IS NULL` (= 未投稿 draft / 孤児) は
-    //     連合に出ていないので 404
     //   * `media` table に無い key は 404
     //   * 不明 kind は 404 (フェイルセーフ)
     if !authorized_for_public(&state, &key).await {
         tracing::debug!(key = %key, "media GET: refusing non-public key");
-        return StatusCode::NOT_FOUND.into_response();
+        return no_store(StatusCode::NOT_FOUND);
     }
 
     // 公開リダイレクトモード (`storage.public_base_url` 設定時):
     // バケットを公開 (R2 public access / CDN) にしている構成では、バイト列を
     // server で proxy (S3 GET + 全体バッファ) せず公開 base URL へ 302 で逃がす。
-    // 上の認可ゲートを通った key だけをリダイレクトするので、orphan / 未知 key は
-    // 従来どおり 404 (ただし R2 を public にした以上、key を知る者は R2 直叩きで
-    // ゲートを迂回できる ── key は SHA-256 で未公開なので URL obscurity で防衛)。
+    // 上の認可ゲートを通った key だけをリダイレクトするので、未知 key は
+    // 従来どおり 404 (key は SHA-256 で未公開なので URL obscurity で防衛 ──
+    // R2 を public にした以上 R2 直叩きも同じ防衛線に乗る)。
     // canonical URL は `<host>/media/<key>` のまま (build_media_url) なので、
     // 本モードを切っても / R2 ドメインを変えても連合 URL は壊れない。
     // 注: proxy 経路で付けていた CSP/nosniff は R2 直配信では付かない
@@ -122,7 +131,7 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
                 .into_response(),
             Err(err) => {
                 tracing::error!(?err, %location, "media GET: invalid redirect Location");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                no_store(StatusCode::INTERNAL_SERVER_ERROR)
             }
         };
     }
@@ -138,11 +147,11 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
     {
         Ok(resp) => resp,
         Err(SdkError::ServiceError(svc)) if matches!(svc.err(), GetObjectError::NoSuchKey(_)) => {
-            return StatusCode::NOT_FOUND.into_response();
+            return no_store(StatusCode::NOT_FOUND);
         }
         Err(err) => {
             tracing::error!(?err, key = %key, "media GET failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
@@ -157,7 +166,7 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
         Ok(agg) => agg.into_bytes(),
         Err(err) => {
             tracing::error!(?err, key = %key, "media GET: collect body failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
@@ -185,23 +194,39 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
     response
 }
 
+/// 負レスポンス (4xx/5xx) 共通の `Cache-Control: no-store` 付きレスポンス
+/// (#261)。
+///
+/// `/media/<sha256>.webp` は Cloudflare のデフォルトキャッシュ対象拡張子で、
+/// 404 はエッジに数分キャッシュされる。アップロード直後の attachment への
+/// GET (Aria 等クライアントの即時プレビュー) や、書き込み直前の remote
+/// emoji キャッシュへの GET が負キャッシュを植え付けると、server 側が
+/// 正常化した後も「404 のまま」に見える。400/5xx は Cloudflare デフォルト
+/// ではキャッシュされないが、他 CDN / proxy も含め負キャッシュ全般を
+/// 一律で禁止しておく。
+fn no_store(status: StatusCode) -> Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+    )
+        .into_response()
+}
+
 /// この key を public に配信してよいか判定する。
 ///
 /// 分類:
 /// - `emoji/local/...` prefix → カスタム絵文字。AS2 `Emoji.icon.url` として
 ///   連合相手が public fetch する慣習なので常に許可。
-/// - `media` table に対応 row あり:
-///   - `kind = avatar | header` → actor の icon/image として連合配信される
-///     ので public 許可。
-///   - `kind = attachment` + `note_id IS NOT NULL` → visibility に関係なく
-///     公開許可。Note 自体が followers / direct でも、AP 配送で audience に
-///     URL が渡っており、Mastodon の media proxy は post-delivery で URL を
-///     非認証 GET する。ここで visibility ガードすると「リモートで画像が
-///     壊れて見える」(PR #108 の過剰補正、本コミットで撤回)。Fediverse の
-///     慣行は *URL obscurity* (= SHA-256 hex の推測困難性) で防衛する。
-///   - `kind = attachment` + `note_id IS NULL` (孤児 = 未投稿 draft の残骸 /
-///     アップロード後に投稿に紐付かなかった) → 拒否。連合に出ていないので
-///     公開する筋がない。
+/// - `media` table に対応 row あり → kind が既知 (`avatar` / `header` /
+///   `attachment`) なら許可。
+///   - `avatar` / `header` は actor の icon/image として連合配信される。
+///   - `attachment` は **note 紐付け状態 / visibility を問わず** 公開する。
+///     visibility ガード (PR #108) は「リモートで画像が壊れて見える」過剰
+///     補正として #143 で撤回済み。`note_id IS NULL` の孤児ガードも #261 で
+///     撤去した ── Misskey drive モデルではアップロード直後 (= 投稿前) から
+///     `DriveFile.url` が閲覧可能で、ここで 404 を返すと CDN の負キャッシュ
+///     が「投稿後も 404」を固定化する。Fediverse の慣行どおり、防衛は
+///     *URL obscurity* (= SHA-256 hex の推測困難性) で一本化する。
 /// - `media` table に row 無し → 不明な key、拒否。
 ///
 /// **失敗時の方針**: DB エラー / lookup 失敗は安全側 = 拒否。許可漏れは
@@ -225,12 +250,8 @@ async fn authorized_for_public(state: &AppState, key: &str) -> bool {
         }
     };
     match media.kind.as_str() {
-        "avatar" | "header" => true,
-        "attachment" => {
-            // 紐付き note があれば visibility 問わず公開 (= URL obscurity)。
-            // 孤児だけ 404 で漏らさない。
-            media.note_id.is_some()
-        }
+        // attachment も紐付け状態を問わず公開 (#261、doc コメント参照)。
+        "avatar" | "header" | "attachment" => true,
         other => {
             // schema CHECK で 3 種に絞っているが、将来種別が増えたとき
             // 「明示的に許可していない種別は配信しない」フェイルセーフ。

@@ -143,7 +143,9 @@ services:
 - 設定すると、認可ゲート (公開可能な key か) を通った後に `302 → <public_base_url>/<key>` を返し、バイト列は Cloudflare edge / R2 から直接配信される (server の帯域とメモリを使わない)。
 - 連合に焼き込む URL は従来どおり `https://<host>/media/<key>` のままなので、**本設定を後で切っても / R2 ドメインを変えても連合 URL は壊れない**。
 - 未設定 (既定) なら server が S3/R2 から取得して proxy 配信する (バケット非公開のままで動く)。
-- 注意: (1) R2 を public にした以上、key (SHA-256) を知る者は R2 を直叩きでき、server の認可ゲートを迂回できる (連合に出ていない下書き添付等は *URL obscurity* のみで防衛)。(2) proxy 経路で付けていた `Content-Security-Policy` / `nosniff` は R2 直配信では付かない (media-proxy の再エンコードサニタイズが担保。必要なら Cloudflare 側 Transform Rules で付与)。
+- 注意: (1) R2 を public にした以上、key (SHA-256) を知る者は R2 を直叩きできる。media は #261 以降 server 経路でも紐付け状態によらず *URL obscurity* (= key の推測困難性) で防衛しており、R2 直叩きも同じ防衛線に乗る。(2) proxy 経路で付けていた `Content-Security-Policy` / `nosniff` は R2 直配信では付かない (media-proxy の再エンコードサニタイズが担保。必要なら Cloudflare 側 Transform Rules で付与)。
+- `GET /media/<key>` の負レスポンス (400/404/5xx) には `Cache-Control: no-store` が付く (#261)。`.webp` は Cloudflare のデフォルトキャッシュ対象拡張子で、アップロード直後の GET が返す一時的な 404 がエッジにキャッシュされると「投稿後も画像が 404」に見えるため。Cache Rules でこれを上書きしないこと。
+- #261 以降、note 削除 (MiAuth `notes/delete`) は添付画像を未公開化**しない** ── media 行は孤児化 (`note_id = NULL`) するだけで、`/media/<key>` は引き続き URL obscurity の下で配信される (`public_base_url` モードなら R2 直叩きも同様)。これは Misskey の drive モデル (note を消しても drive file は残る) に揃えた挙動。画像を本当に消すには note 削除後に `drive/files/delete` を呼ぶ (= DB 行と S3 オブジェクトの両方を削除する)。
 
 別案として、host 側 TOML を bind mount + `--config` で渡す方法もある:
 
