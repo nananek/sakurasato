@@ -45,8 +45,10 @@ use url::Url;
 use crate::net_guard;
 use crate::state::AppState;
 
-/// actor JSON のレスポンス上限 (256 KiB)。通常 actor は数 KB。
-const MAX_ACTOR_BYTES: usize = 256 * 1024;
+/// AP object JSON (actor / Note 等) のレスポンス上限 (256 KiB)。通常 actor /
+/// Note は数 KB なので、これを超えるものは攻撃か誤設定。`fetch_object_json`
+/// が actor / Note 両方の fetch でこの上限を共有する。
+const MAX_AP_OBJECT_BYTES: usize = 256 * 1024;
 
 /// 1 リクエストの全体 deadline (10 秒)。`reqwest` の `.timeout()` は接続→
 /// レスポンス読了までの全体に効くが、念のため `tokio::time::timeout` でも
@@ -76,7 +78,7 @@ pub enum FetchError {
     #[error("actor JSON is malformed: {0}")]
     Malformed(String),
 
-    #[error("response too large (>{MAX_ACTOR_BYTES} bytes)")]
+    #[error("response too large (>{MAX_AP_OBJECT_BYTES} bytes)")]
     TooLarge,
 
     #[error("database error: {0}")]
@@ -130,7 +132,7 @@ pub(crate) async fn fetch_object_json(
     enforce_url_policy(&url, &state.config().server.host)?;
 
     // 信頼境界外 URL なので Accept ヘッダで JSON-LD を明示要求。レスポンス
-    // ボディは MAX_ACTOR_BYTES で頭打ちする。reqwest は body streaming で
+    // ボディは MAX_AP_OBJECT_BYTES で頭打ちする。reqwest は body streaming で
     // 来るので、`bytes_stream()` を使い手で size を数えながら積む。
     let req = state
         .http_client()
@@ -176,7 +178,7 @@ pub(crate) async fn fetch_object_json(
         Ok(r) => r?,
         Err(_) => return Err(FetchError::Timeout),
     };
-    if bytes.len() > MAX_ACTOR_BYTES {
+    if bytes.len() > MAX_AP_OBJECT_BYTES {
         return Err(FetchError::TooLarge);
     }
 
