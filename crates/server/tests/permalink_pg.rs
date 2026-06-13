@@ -297,10 +297,12 @@ async fn permalink_renders_local_note_with_escaped_content(pool: PgPool) {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let html = std::str::from_utf8(&body).unwrap();
 
-    // content は HTML escape されている (M4 PR1 はサニタイザ未実装)。
+    // content は html_to_plain_text で strip されてから escape される ──
+    // `<script>` タグは中身だけ残り (= `alert('x')`)、その `'` は実体参照化
+    // されてページに入る。
     assert!(
-        html.contains("&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;"),
-        "escaped content not found: {html}"
+        html.contains("alert(&#x27;x&#x27;)"),
+        "stripped+escaped content not found: {html}"
     );
     // 生 `<script>` が出ていないこと (XSS regression テスト)。
     assert!(

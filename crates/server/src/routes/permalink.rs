@@ -7,11 +7,14 @@
 //!
 //! ## セキュリティ
 //!
-//! M4 PR1 時点で **inbound Note の content sanitization は未実装** のため、
-//! 安全側に倒して content / summary / display name 全てを HTML escape する。
-//! 結果として `<p>hello</p>` 形式の本文が `&lt;p&gt;hello&lt;/p&gt;` と
-//! 見える ── 仕様未満だが、XSS よりはマシ。サニタイザを入れた段階で
-//! content だけは raw 出力に戻す予定 (将来 milestone)。
+//! content sanitizer をまだ持たないため、`note.content` (= local / remote
+//! とも AP HTML) は [`crate::miauth::text::html_to_plain_text`] で一旦 plain
+//! text に倒し、改めて HTML escape し直してから `<div class="content">` に
+//! 入れる ([`render_content_block`])。`<script>` 等の危険タグは中身だけ残り、
+//! `<` / `&` は実体参照化されるので XSS は起きない。段落改行は `<br>` で
+//! 復元するので、本文が `&lt;p&gt;...&lt;/p&gt;` と生エスケープで見える従来
+//! の問題 (= 仕様未満) も解消する。summary / display name は短いプレーン
+//! テキスト想定なので従来どおり [`escape_text`] で直接 escape する。
 //!
 //! ## Content negotiation
 //!
@@ -239,7 +242,7 @@ fn render_html(note: &NoteRow, username: &str, display_name: Option<&str>) -> Bo
     let _ = writeln!(
         buf,
         r#"<div class="content">{}</div>"#,
-        escape_text(&note.content),
+        render_content_block(&note.content),
     );
     if note.summary.as_deref().is_some_and(|s| !s.is_empty()) {
         let _ = writeln!(buf, "</details>");
@@ -247,6 +250,28 @@ fn render_html(note: &NoteRow, username: &str, display_name: Option<&str>) -> Bo
     let _ = writeln!(buf, "</article>");
     let _ = writeln!(buf, "</body></html>");
     Body::from(buf)
+}
+
+/// `note.content` (= AP HTML) を permalink の `<div class="content">` 内に
+/// 安全かつ人間可読な形で入れる文字列へ変換する。
+///
+/// content sanitizer が無いので、まず [`crate::miauth::text::html_to_plain_text`]
+/// で HTML を plain text に倒し (タグは中身だけ残り entity は decode される)、
+/// 改めて [`escape_text`] で escape し直す ── strip の後で escape するため、
+/// 生の `<` / `&` がページに漏れることはなく XSS は起きない。段落 / 改行
+/// (`\n`) は `<br>` で復元して読みやすくする。
+fn render_content_block(content: &str) -> String {
+    let plain = crate::miauth::text::html_to_plain_text(content);
+    let mut out = String::with_capacity(plain.len() + 16);
+    let mut first = true;
+    for line in plain.split('\n') {
+        if !first {
+            out.push_str("<br>");
+        }
+        out.push_str(&escape_text(line));
+        first = false;
+    }
+    out
 }
 
 /// テキストノードに入れるための最小 HTML escape。`&`/`<`/`>`/`"`/`'` を

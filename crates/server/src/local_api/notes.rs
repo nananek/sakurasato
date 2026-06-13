@@ -200,6 +200,15 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         &state,
     );
 
+    // ローカル投稿は plain text なので、AP `Note.content` (= HTML 仕様) に
+    // 載せる前に HTML へ変換する。これをしないと `<` が連合先 / MiAuth
+    // クライアントで未閉じタグとして解釈され本文が壊れる。mention / emoji の
+    // 抽出は上で plain な `req.content` から済ませてあるので、ここで HTML 化
+    // しても tag 配列とは整合する。以降は DB / 配送 / SSE / レスポンスすべて
+    // この HTML 形を canonical な `content` として扱う (= remote note と同じ
+    // 不変条件)。
+    let content_html = crate::text::plain_text_to_html(&req.content);
+
     // direct で `to` が空 (= 自己 mention のみで剥がれて何も残らない等) なら拒否。
     if matches!(visibility, Visibility::Direct) && prepared.to.is_empty() {
         return bad_request("direct visibility has no recipients after resolution");
@@ -209,6 +218,7 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         &state,
         &local_actor,
         &req,
+        &content_html,
         &prepared,
         visibility,
         published_at,
@@ -229,7 +239,7 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
     let activity = build_create_activity(
         &local_actor,
         &canonical_url,
-        &req.content,
+        &content_html,
         prepared.summary.as_deref(),
         prepared.sensitive,
         req.language.as_deref(),
@@ -276,7 +286,10 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         actor_preferred_username: local_actor.preferred_username.clone(),
         actor_display_name: local_actor.display_name.clone(),
         actor_icon_url: local_actor.icon_url.clone(),
-        content: req.content.clone(),
+        // SSE / タイムライン / レスポンスも canonical な HTML 形を流す。TUI 側
+        // `content::to_plain_text` が remote note と同じ経路で plain text に
+        // 戻すので表示は変わらない (= local / remote を区別せず描画できる)。
+        content: content_html.clone(),
         summary: prepared.summary.clone(),
         visibility: visibility.as_str().to_string(),
         sensitive: prepared.sensitive,
@@ -289,7 +302,7 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         id: inserted,
         ap_id: canonical_url.clone(),
         url: canonical_url,
-        content: req.content,
+        content: content_html,
         summary: prepared.summary,
         visibility: visibility.as_str().to_string(),
         sensitive: prepared.sensitive,
@@ -916,6 +929,7 @@ async fn persist_note(
     state: &AppState,
     local_actor: &ActorRow,
     req: &CreateNoteRequest,
+    content_html: &str,
     prepared: &PreparedNote,
     visibility: Visibility,
     published_at: chrono::DateTime<chrono::Utc>,
@@ -953,7 +967,10 @@ async fn persist_note(
     let new_note = repo::note::NewNote {
         ap_id: placeholder_ap_id,
         actor_id: local_actor.id,
-        content: req.content.clone(),
+        // HTML 化済み content を保存する。`req.content` (plain) ではなく
+        // `content_html` を使うことで、DB の `note.content` は remote note と
+        // 同じく常に HTML となる (crate::text::plain_text_to_html)。
+        content: content_html.to_owned(),
         language: req.language.clone(),
         in_reply_to_ap_id: req.in_reply_to_ap_id.clone(),
         in_reply_to_note_id,
