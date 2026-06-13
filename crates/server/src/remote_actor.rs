@@ -109,9 +109,24 @@ pub async fn fetch_and_upsert(state: &AppState, ap_id: &str) -> Result<ActorRow,
     upsert(state, parsed).await
 }
 
-/// 純粋関数: HTTP GET だけ。テスト用に DB 非依存。
+/// actor JSON 取得。HTTP GET だけ。DB 非依存。
 async fn fetch_actor_json(state: &AppState, ap_id: &str) -> Result<JsonValue, FetchError> {
-    let url = Url::parse(ap_id)?;
+    fetch_object_json(state, ap_id).await
+}
+
+/// 任意の AP object (`Note` / `Actor` 等) を `uri` から `GET` する汎用 fetcher。
+///
+/// SSRF ガード ([`enforce_url_policy`]) / redirect 拒否 / サイズ上限 / `id`
+/// 一致検査を actor fetch と **完全共有** する ── 別経路で防御を書くと片方で
+/// 抜ける事故になる (本モジュール冒頭の方針)。`Announce` 受信時の未知 Note
+/// fetch ([`crate::dispatch::note::fetch_and_store_remote_note`]) もこの関数を
+/// 通すことで、画像取得を伴わない JSON GET (= remote actor fetch と同種、
+/// CLAUDE.md §3 の server 直 fetch 例外) に収める。
+pub(crate) async fn fetch_object_json(
+    state: &AppState,
+    uri: &str,
+) -> Result<JsonValue, FetchError> {
+    let url = Url::parse(uri)?;
     enforce_url_policy(&url, &state.config().server.host)?;
 
     // 信頼境界外 URL なので Accept ヘッダで JSON-LD を明示要求。レスポンス
@@ -142,10 +157,10 @@ async fn fetch_actor_json(state: &AppState, ap_id: &str) -> Result<JsonValue, Fe
             .unwrap_or("")
             .to_string();
         warn!(
-            ap_id,
+            uri,
             status = resp.status().as_u16(),
             location,
-            "actor fetch returned redirect; refusing to follow",
+            "AP object fetch returned redirect; refusing to follow",
         );
         return Err(FetchError::RedirectRefused(location));
     }
@@ -168,22 +183,22 @@ async fn fetch_actor_json(state: &AppState, ap_id: &str) -> Result<JsonValue, Fe
     let json: JsonValue = serde_json::from_slice(&bytes)
         .map_err(|e| FetchError::Malformed(format!("not JSON: {e}")))?;
 
-    // 受領 actor JSON の `id` が要求した ap_id と一致することを確認。
-    // 不一致は (a) 攻撃者が別 ap_id を仕込んだ偽装 actor を返した、
-    // (b) Mastodon の `Account#redirect` で別の actor を返している、の
-    // どちらか ── どちらも危険なので拒否する。
+    // 受領 JSON の `id` が要求した URI と一致することを確認。不一致は
+    // (a) 攻撃者が別 id を仕込んだ偽装 object を返した、(b) Mastodon の
+    // `Account#redirect` 等で別 object を返している、のどちらか ── どちらも
+    // 危険なので拒否する (actor / note 共通)。
     let id = json
         .get("id")
         .and_then(JsonValue::as_str)
-        .ok_or_else(|| FetchError::Malformed("actor JSON has no string `id`".into()))?;
-    if id != ap_id {
+        .ok_or_else(|| FetchError::Malformed("AP object JSON has no string `id`".into()))?;
+    if id != uri {
         warn!(
-            requested = ap_id,
+            requested = uri,
             returned = id,
-            "actor JSON id mismatch; refusing to upsert",
+            "AP object id mismatch; refusing to use",
         );
         return Err(FetchError::Malformed(format!(
-            "id mismatch: requested {ap_id}, got {id}"
+            "id mismatch: requested {uri}, got {id}"
         )));
     }
 

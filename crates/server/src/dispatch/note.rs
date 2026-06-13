@@ -151,6 +151,107 @@ pub(crate) async fn handle_create(
     Ok(())
 }
 
+/// followee の `Announce` が参照する **未知 Note** を origin から fetch して
+/// 取り込む (Issue #266)。取り込んだ [`NoteRow`] を返す。
+///
+/// M11 (#55) では「Announce 受信時の未知 Note 自動 fetch」を意図的にスコープ外
+/// にしていた (他人の boost で見知らぬ note を引き込まないため) が、結果として
+/// **フォローしていないアカウントの投稿への被リノートが表示されない** という
+/// 報告につながった。`@nekono` 等フォロー済み著者の投稿だけ既知 = 表示される、
+/// という散発挙動の正体。Mastodon / Misskey と同様に followee の Announce に
+/// 限って fetch を許可してこれを解消する。呼び出し元
+/// ([`super::announce::handle_announce`]) が signer = followee を保証する。
+///
+/// ## 防御
+///
+/// - fetch は [`crate::remote_actor::fetch_object_json`] 経由で SSRF / redirect
+///   拒否 / サイズ上限 / `id` 一致を **actor fetch と共有**。画像デコードを伴わ
+///   ない JSON GET なので CLAUDE.md §3 の server 直 fetch 例外に収まる。
+/// - `attributedTo` のホストが Note の `id` ホストと一致することを検証
+///   ([`same_host`]) ── 別ドメイン著者を騙る note の取り込み (なりすまし) を防ぐ。
+/// - 著者 actor は DB → 無ければ [`crate::remote_actor::fetch_and_upsert`] で
+///   解決 (鍵 / inbox / `id` 一致検査つき)。
+/// - **public / unlisted のみ**取り込む。boost は公開コンテンツ前提であり、
+///   万一 followers / direct な note を fetch できても第三者の非公開投稿を
+///   表示しないようにする (privacy)。
+pub(crate) async fn fetch_and_store_remote_note(
+    state: &AppState,
+    note_ap_id: &str,
+) -> Result<NoteRow, DispatchError> {
+    let json = crate::remote_actor::fetch_object_json(state, note_ap_id)
+        .await
+        .map_err(|e| DispatchError::Malformed(format!("fetch announced note: {e}")))?;
+    let JsonValue::Object(obj) = json else {
+        return Err(DispatchError::Malformed(
+            "fetched announced object is not a JSON object".into(),
+        ));
+    };
+
+    let object_type = obj
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if !object_type.eq_ignore_ascii_case("Note") {
+        return Err(DispatchError::Malformed(format!(
+            "announced object is not a Note (type={object_type:?})"
+        )));
+    }
+
+    // `id == note_ap_id` は fetch_object_json が保証済み。著者を解決する。
+    let author_uri = extract_attributed_to(&obj)
+        .ok_or_else(|| DispatchError::Malformed("announced note has no attributedTo".into()))?;
+    // 別ドメイン著者を騙る note を弾く (= note の id ホスト == 著者ホスト)。
+    same_host(note_ap_id, author_uri, "announced Note attributedTo")
+        .map_err(|e| DispatchError::Malformed(format!("{e:#}")))?;
+
+    let author = match repo::actor::get_by_ap_id(state.pool(), author_uri)
+        .await
+        .with_context(|| format!("lookup announced note author {author_uri}"))
+        .map_err(DispatchError::Internal)?
+    {
+        Some(a) => a,
+        None => crate::remote_actor::fetch_and_upsert(state, author_uri)
+            .await
+            .map_err(|e| DispatchError::Malformed(format!("fetch announced note author: {e}")))?,
+    };
+
+    let recipients = collect_recipients(&obj, &JsonValue::Null);
+    let new = build_remote_note(state, &author, note_ap_id, &obj, &recipients).await?;
+    if !matches!(new.visibility, Visibility::Public | Visibility::Unlisted) {
+        return Err(DispatchError::Malformed(format!(
+            "announced note is not public/unlisted (visibility={:?}); refusing to fetch-store",
+            new.visibility,
+        )));
+    }
+    let inserted = repo::note::insert(state.pool(), new)
+        .await
+        .with_context(|| format!("insert announced note {note_ap_id}"))
+        .map_err(DispatchError::Internal)?;
+    info!(
+        note_id = inserted.id,
+        note_ap_id,
+        author = %author.ap_id,
+        "announced note fetched and stored",
+    );
+    Ok(inserted)
+}
+
+/// `attributedTo` を string / `{id}` / 配列の先頭から URI として取り出す。
+/// Mastodon は string、Misskey 等は object や配列で出すことがある。
+fn extract_attributed_to(obj: &serde_json::Map<String, JsonValue>) -> Option<&str> {
+    fn one(v: &JsonValue) -> Option<&str> {
+        match v {
+            JsonValue::String(s) => Some(s.as_str()),
+            JsonValue::Object(map) => map.get("id").and_then(JsonValue::as_str),
+            _ => None,
+        }
+    }
+    match obj.get("attributedTo")? {
+        JsonValue::Array(arr) => arr.iter().find_map(one),
+        other => one(other),
+    }
+}
+
 /// 引用先 note を解決し、それが我々 local actor の local note を指しているか
 /// (= `is_local_quote`) を判定して返す。DB エラーは debug ログだけ残して
 /// `None` 扱いで進む ── quote 通知は本筋の Create 受領を巻き込まない。
@@ -520,5 +621,51 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn extract_attributed_to_handles_string_object_array() {
+        // string 形式 (Mastodon)
+        let o = json!({"attributedTo": "https://x.test/users/a"});
+        let JsonValue::Object(map) = o else {
+            unreachable!()
+        };
+        assert_eq!(extract_attributed_to(&map), Some("https://x.test/users/a"));
+
+        // object 形式 (`{id}`)
+        let o = json!({"attributedTo": {"id": "https://x.test/users/b", "type": "Person"}});
+        let JsonValue::Object(map) = o else {
+            unreachable!()
+        };
+        assert_eq!(extract_attributed_to(&map), Some("https://x.test/users/b"));
+
+        // 配列形式 → 最初に取れた URI
+        let o = json!({"attributedTo": [{"type": "Mention"}, "https://x.test/users/c"]});
+        let JsonValue::Object(map) = o else {
+            unreachable!()
+        };
+        assert_eq!(extract_attributed_to(&map), Some("https://x.test/users/c"));
+    }
+
+    #[test]
+    fn extract_attributed_to_missing_or_invalid_is_none() {
+        let o = json!({"type": "Note"});
+        let JsonValue::Object(map) = o else {
+            unreachable!()
+        };
+        assert_eq!(extract_attributed_to(&map), None);
+
+        // 数値 / null / id 無し object は無効
+        let o = json!({"attributedTo": 42});
+        let JsonValue::Object(map) = o else {
+            unreachable!()
+        };
+        assert_eq!(extract_attributed_to(&map), None);
+
+        let o = json!({"attributedTo": {"type": "Person"}});
+        let JsonValue::Object(map) = o else {
+            unreachable!()
+        };
+        assert_eq!(extract_attributed_to(&map), None);
     }
 }

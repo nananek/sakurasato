@@ -2,21 +2,25 @@
 //!
 //! ## スコープ
 //!
-//! - 対象: 既知 (= こちらの DB にある) ローカル / リモート Note の boost のみ。
 //! - 受け入れ条件: signer が我々の **followee** である (= local actor が
 //!   signer を `accepted` で follow している)。followee 以外の boost は
 //!   debug ログのみで no-op ── 他人の boost で見知らぬ note を引き込まない。
-//! - 既知 Note への boost は `announce` テーブルに idempotent insert。
-//!   `Undo Announce` は対称的に `delete_by_ap_id` で消す (本ファイル内で
-//!   `handle_undo_announce` を提供し、`super::dispatch_undo` から呼ばれる)。
+//! - 対象 Note が既知 (= こちらの DB にある) ならそのまま、未知なら
+//!   **origin から fetch して取り込む** (Issue #266、下記)。
+//! - boost は `announce` テーブルに idempotent insert。`Undo Announce` は
+//!   対称的に `delete_by_ap_id` で消す (本ファイル内で `handle_undo_announce`
+//!   を提供し、`super::dispatch_undo` から呼ばれる)。
 //!
-//! ## 未対応 (将来作業)
+//! ## 未知 Note の fetch (Issue #266)
 //!
-//! - **未知 Note の自動 fetch**: nekonoverse / Mastodon は Announce 受信時に
-//!   `object` URI を `GET` して取り込むのが慣習だが、対応すると外向き fetch
-//!   経路を増やすことになる (今は CLAUDE.md §3 で remote actor fetch 経路
-//!   だけが server 直接 GET を持つ)。本 M11 ではスコープ外とし、未知 Note
-//!   の Announce は debug ログのみで捨てる。
+//! M11 (#55) では「Announce 受信時の未知 Note 自動 fetch」をスコープ外にして
+//! いたが、フォローしていない著者の投稿への被リノートが「DB 未取得 = 未知」で
+//! 表示されない問題につながった。Mastodon / Misskey と同様、**followee の
+//! Announce に限って** `object` URI を `GET` して取り込む
+//! ([`super::note::fetch_and_store_remote_note`])。fetch は actor fetch と同じ
+//! SSRF / redirect / サイズガードを共有し、画像デコードを伴わない JSON GET な
+//! ので CLAUDE.md §3 の server 直 fetch 例外に収まる。fetch 失敗は boost を
+//! 黙って捨てる (従来の no-op と同じ着地)。
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -53,17 +57,32 @@ pub(crate) async fn handle_announce(
         return Ok(());
     }
 
-    let Some(note) = repo::note::get_by_ap_id(state.pool(), &target_uri)
+    let note = match repo::note::get_by_ap_id(state.pool(), &target_uri)
         .await
         .with_context(|| format!("lookup note {target_uri}"))
         .map_err(DispatchError::Internal)?
-    else {
-        debug!(
-            target = %target_uri,
-            signer = %signer.ap_id,
-            "Announce: target note unknown; no fetch (M11 scope)",
-        );
-        return Ok(());
+    {
+        Some(note) => note,
+        None => {
+            // **Issue #266**: M11 ではスコープ外にしていた「未知 Note の fetch」
+            // を followee の Announce に限り許可する ── これをしないと、
+            // フォローしていないアカウントの投稿への被リノートが
+            // 「DB 未取得 = 未知」で表示されない (報告バグ)。fetch 失敗
+            // (SSRF ガード / 404 / cross-origin / 非公開 / malformed) は従来
+            // どおり boost を黙って捨てて 202 を返す。
+            match super::note::fetch_and_store_remote_note(state, &target_uri).await {
+                Ok(note) => note,
+                Err(err) => {
+                    debug!(
+                        target = %target_uri,
+                        signer = %signer.ap_id,
+                        ?err,
+                        "Announce: target note unknown and fetch failed; dropping boost",
+                    );
+                    return Ok(());
+                }
+            }
+        }
     };
 
     let published_at = activity

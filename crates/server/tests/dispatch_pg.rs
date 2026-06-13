@@ -1862,9 +1862,11 @@ async fn announce_of_own_note_creates_notification(pool: PgPool) {
     );
 }
 
-/// 未知 Note への Announce は no-op (= 行を作らない / fetch しない)。
+/// 未知 Note への Announce は fetch を試みるが (Issue #266)、fetch 不能なら
+/// boost を捨てる (= 行を作らない)。ここでは `object` を loopback URL にして
+/// SSRF ガードで **即時** fetch 失敗させる (ネットワーク I/O 無しで決定的)。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn announce_of_unknown_note_is_noop(pool: PgPool) {
+async fn announce_of_unfetchable_unknown_note_drops_boost(pool: PgPool) {
     let (_lp, local_pub) = fresh_rsa();
     let (remote_priv, remote_pub) = fresh_rsa();
 
@@ -1898,7 +1900,8 @@ async fn announce_of_unknown_note_is_noop(pool: PgPool) {
         "id": announce_ap,
         "type": "Announce",
         "actor": remote.ap_id,
-        "object": "https://other.test/notes/never-seen",
+        // loopback → net_guard が即 Blocked で弾く (= 外向き接続を試さない)。
+        "object": "http://127.0.0.1/notes/never-seen",
         "published": "2026-05-31T13:00:00Z",
     })
     .to_string();
@@ -1911,7 +1914,10 @@ async fn announce_of_unknown_note_is_noop(pool: PgPool) {
     let row = sakurasato_core::repo::announce::get_by_ap_id(&pool, announce_ap)
         .await
         .unwrap();
-    assert!(row.is_none(), "unknown Note の boost は記録しない");
+    assert!(
+        row.is_none(),
+        "fetch 不能な unknown Note の boost は記録しない",
+    );
 }
 
 /// Undo Announce で `announce` 行が消える。
