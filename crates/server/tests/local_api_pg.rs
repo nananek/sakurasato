@@ -540,7 +540,9 @@ async fn create_note_persists_and_enqueues(pool: PgPool) {
     let loc = resp.headers().get(header::LOCATION).unwrap();
     assert!(loc.to_str().unwrap().starts_with("/notes/"));
     let json = read_json(resp).await;
-    assert_eq!(json["content"], "hello world");
+    // ローカル投稿の plain text は AP `Note.content` (= HTML) に変換されて
+    // 保存・配送・返却される (= `<` が連合先で未閉じタグ扱いされる問題の解消)。
+    assert_eq!(json["content"], "<p>hello world</p>");
     assert_eq!(json["visibility"], "public");
     assert_eq!(json["queued_deliveries"], 1);
     let id = json["id"].as_i64().unwrap();

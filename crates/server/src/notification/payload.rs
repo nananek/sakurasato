@@ -194,17 +194,17 @@ fn note_url(note: Option<&NoteRow>) -> Option<String> {
 /// embed の description / plain の `content` 本文を組み立てる。
 fn describe_event(event: NotificationEvent, ctx: &NotificationContext<'_>) -> Option<String> {
     match event {
-        NotificationEvent::Mention | NotificationEvent::Direct => {
-            ctx.note.map(|n| truncate(&n.content, TEXT_PREVIEW_CHARS))
-        }
+        NotificationEvent::Mention | NotificationEvent::Direct => ctx
+            .note
+            .map(|n| note_preview(&n.content, TEXT_PREVIEW_CHARS)),
         NotificationEvent::Quote => {
             // 「引用された自分の note の本文」を先に出し、引用者本文を続ける。
             let theirs = ctx
                 .note
-                .map(|n| truncate(&n.content, TEXT_PREVIEW_CHARS / 2));
+                .map(|n| note_preview(&n.content, TEXT_PREVIEW_CHARS / 2));
             let ours = ctx
                 .quote_target
-                .map(|n| truncate(&n.content, TEXT_PREVIEW_CHARS / 2));
+                .map(|n| note_preview(&n.content, TEXT_PREVIEW_CHARS / 2));
             match (theirs, ours) {
                 (Some(t), Some(o)) => Some(format!("引用元: {o}\n\n{t}")),
                 (Some(t), None) => Some(t),
@@ -216,15 +216,26 @@ fn describe_event(event: NotificationEvent, ctx: &NotificationContext<'_>) -> Op
             let emoji = ctx.reaction_content.unwrap_or("?");
             let target = ctx
                 .note
-                .map(|n| truncate(&n.content, TEXT_PREVIEW_CHARS / 2));
+                .map(|n| note_preview(&n.content, TEXT_PREVIEW_CHARS / 2));
             target.map_or_else(
                 || Some(emoji.to_string()),
                 |t| Some(format!("{emoji} → {t}")),
             )
         }
-        NotificationEvent::Renote => ctx.note.map(|n| truncate(&n.content, TEXT_PREVIEW_CHARS)),
+        NotificationEvent::Renote => ctx
+            .note
+            .map(|n| note_preview(&n.content, TEXT_PREVIEW_CHARS)),
         NotificationEvent::Follow | NotificationEvent::FollowRequest => None,
     }
+}
+
+/// note 本文 (= AP HTML) を webhook プレビュー用の plain text に倒してから
+/// 切り詰める。`note.content` は local / remote とも HTML なので、Discord /
+/// Slack 等にそのまま流すと `<p>` / `&lt;` が生で見えてしまう。
+/// [`crate::miauth::text::html_to_plain_text`] は副作用の無い純関数なので、
+/// 本モジュールの「純粋関数のみ」方針を崩さない。
+fn note_preview(content: &str, max: usize) -> String {
+    truncate(&crate::miauth::text::html_to_plain_text(content), max)
 }
 
 /// `s` を文字 (= Unicode scalar) 単位で `max` 文字に切り詰め、超過時は `…` を

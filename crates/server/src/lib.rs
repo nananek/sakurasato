@@ -36,6 +36,7 @@ pub mod routes;
 pub mod serve;
 pub(crate) mod sign;
 pub mod state;
+pub(crate) mod text;
 pub mod token;
 pub mod webfinger_guard;
 
