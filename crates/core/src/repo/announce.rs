@@ -164,6 +164,14 @@ pub struct RenoteWindowRow {
 /// actor。元 note の `visibility = direct` は除外 (note timeline と対称)。
 /// `since_ts` / `until_ts` は **排他** (`>` / `<`) で、混合タイムラインの時刻
 /// カーソルに使う (呼び出し側が `note` 側と同じ境界時刻を渡す)。
+///
+/// **viewer 可視性は SQL 側で担保** (Issue #253) ── 元 note (= boost 対象) の
+/// `followers` 限定可視性を、その author を viewer が follow していなければ
+/// 除外する。これにより followee が第三者の followers 限定 note を boost しても
+/// viewer に漏れない。`public` / `unlisted` は常に可視、viewer 自身の note も
+/// 可視。`direct` は上の `<> 'direct'` で先に除外済み。述語は
+/// [`crate::repo::note::list_by_author_window`] と同型で、per-item の follow
+/// 引き (旧 `viewer_can_view_entry` ループ) を不要にする。
 pub async fn list_home_renote_window(
     pool: &PgPool,
     viewer_actor_id: i64,
@@ -184,6 +192,19 @@ pub async fn list_home_renote_window(
         JOIN note n ON n.id = ann.note_id
         WHERE
             n.visibility <> 'direct'
+            AND (
+                n.visibility IN ('public', 'unlisted')
+                OR n.actor_id = $1
+                OR (
+                    n.visibility = 'followers'
+                    AND EXISTS (
+                        SELECT 1 FROM follow
+                        WHERE follower_actor_id = $1
+                          AND followed_actor_id = n.actor_id
+                          AND state = 'accepted'
+                    )
+                )
+            )
             AND (
                 ann.actor_id = $1
                 OR ann.actor_id IN (
@@ -216,9 +237,17 @@ pub async fn list_home_renote_window(
 /// (= boost 可能なのは公開系 note のみという前提)。`since_ts` / `until_ts` は
 /// **排他** (`>` / `<`) で、note 側ウィンドウ ([`crate::repo::note::list_by_author_window`])
 /// と同じ境界時刻を渡してマージする。
+///
+/// **viewer 可視性は SQL 側で担保** (Issue #253) ── `viewer_actor_id` を取り、
+/// boost 対象 note の `followers` 限定可視性を viewer が author を follow して
+/// いなければ除外する。これにより呼び出し側の per-item `viewer_can_view_entry`
+/// ループ (renote 件数ぶんの follow 引き = N+1) が不要になる。述語は
+/// [`list_home_renote_window`] / [`crate::repo::note::list_by_author_window`]
+/// と同型。
 pub async fn list_author_renote_window(
     pool: &PgPool,
     author_actor_id: i64,
+    viewer_actor_id: i64,
     since_ts: Option<DateTime<Utc>>,
     until_ts: Option<DateTime<Utc>>,
     limit: i64,
@@ -237,12 +266,26 @@ pub async fn list_author_renote_window(
         WHERE
             n.visibility <> 'direct'
             AND ann.actor_id = $1
-            AND ($2::TIMESTAMPTZ IS NULL OR ann.published_at > $2)
-            AND ($3::TIMESTAMPTZ IS NULL OR ann.published_at < $3)
+            AND (
+                n.visibility IN ('public', 'unlisted')
+                OR n.actor_id = $2
+                OR (
+                    n.visibility = 'followers'
+                    AND EXISTS (
+                        SELECT 1 FROM follow
+                        WHERE follower_actor_id = $2
+                          AND followed_actor_id = n.actor_id
+                          AND state = 'accepted'
+                    )
+                )
+            )
+            AND ($3::TIMESTAMPTZ IS NULL OR ann.published_at > $3)
+            AND ($4::TIMESTAMPTZ IS NULL OR ann.published_at < $4)
         ORDER BY ann.published_at DESC, ann.id DESC
-        LIMIT $4
+        LIMIT $5
         "#,
         author_actor_id,
+        viewer_actor_id,
         since_ts,
         until_ts,
         limit,
