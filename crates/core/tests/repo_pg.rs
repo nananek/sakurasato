@@ -199,7 +199,9 @@ async fn note_insert_is_idempotent_on_ap_id(pool: PgPool) -> sqlx::Result<()> {
     );
 
     // DB 上も 1 行のまま。
-    let stored = repo::note::get_by_ap_id(&pool, &first.ap_id).await?.unwrap();
+    let stored = repo::note::get_by_ap_id(&pool, &first.ap_id)
+        .await?
+        .unwrap();
     assert_eq!(stored.content, "<p>original</p>");
     Ok(())
 }
