@@ -11,6 +11,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::{Notify, broadcast};
 
+use crate::fetch_rate_limit::DomainRateLimiter;
 use crate::http_client;
 use crate::local_api::stream::{TIMELINE_CHANNEL_CAPACITY, TimelineEvent};
 use crate::media_proxy_client::MediaProxyClient;
@@ -75,6 +76,12 @@ struct Inner {
     /// autosuspend で接続を切ると LISTEN 中の通知を取りこぼすため (= アプリ
     /// メモリ上の `Notify` なら suspend をまたいでも消えない)。
     delivery_notify: Arc<Notify>,
+    /// 外向き AP object fetch の per-domain レート制限 (Issue #269)。
+    ///
+    /// [`crate::remote_actor::fetch_object_json`] (actor / Note fetch の唯一の
+    /// chokepoint) が宛先 host ごとにトークンを引く。悪意ある followee の
+    /// `Announce` flood 等で外部ドメインへの増幅 fetch を抑える。
+    fetch_rate_limiter: DomainRateLimiter,
 }
 
 impl AppState {
@@ -114,6 +121,7 @@ impl AppState {
             enable_remote_fetch: true,
             media_proxy,
             delivery_notify: Arc::new(Notify::new()),
+            fetch_rate_limiter: DomainRateLimiter::new(),
         })))
     }
 
@@ -140,6 +148,7 @@ impl AppState {
             enable_remote_fetch: false,
             media_proxy,
             delivery_notify: Arc::new(Notify::new()),
+            fetch_rate_limiter: DomainRateLimiter::new(),
         }))
     }
 
@@ -183,6 +192,13 @@ impl AppState {
     /// は `true`、テスト (`from_pool`) は `false`。
     pub(crate) fn enable_remote_fetch(&self) -> bool {
         self.0.enable_remote_fetch
+    }
+
+    /// `host` 宛の外向き AP fetch を 1 件分試みる (Issue #269)。bucket に空きが
+    /// あれば `true` (= fetch 続行)、枯渇していれば `false` (= 呼び出し側が
+    /// drop)。[`crate::remote_actor::fetch_object_json`] から呼ぶ。
+    pub(crate) fn try_acquire_fetch(&self, host: &str) -> bool {
+        self.0.fetch_rate_limiter.try_acquire(host)
     }
 
     /// Compute the canonical AP actor `id` URI for `username` against the
