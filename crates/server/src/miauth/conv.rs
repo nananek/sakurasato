@@ -1493,9 +1493,8 @@ mod tests {
         // remote actor の `summary` は HTML。`description` は plain 化されて
         // 生タグが消える (= #271、Note 本文の #170 と同型)。
         let mut actor = fake_actor(false, "remote.test", false);
-        actor.summary = Some(
-            r#"<p>hello <a href="https://remote.test/@me">@me</a></p><p>line2</p>"#.into(),
-        );
+        actor.summary =
+            Some(r#"<p>hello <a href="https://remote.test/@me">@me</a></p><p>line2</p>"#.into());
         let v = from_actor_detailed(&actor, 0, 0, 0);
         assert_eq!(v["description"], "hello @me\n\nline2");
     }
