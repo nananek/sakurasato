@@ -913,13 +913,24 @@ pub fn from_actor_detailed(
                     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             ),
         );
-        map.insert(
-            "description".to_string(),
-            actor
-                .summary
-                .clone()
-                .map_or(JsonValue::Null, JsonValue::String),
-        );
+        // `description` (= bio) は Misskey クライアントが **MFM (plain text)**
+        // として render する。AP actor の `summary` は **remote のとき HTML**
+        // (Mastodon / Misskey が `<p>` / `<a>` 等で配送) なので、無変換で載せると
+        // Aria 等で生タグが見える (= #271、Note 本文に対する #170 と同型)。
+        // [`crate::miauth::text::html_to_plain_text`] で plain 化する。
+        //
+        // 一方 **local** actor の `summary` は TUI 入力をそのまま保存し AP actor
+        // JSON にも raw emit する plain text なので、変換すると `price < 100` の
+        // ような `<` が tag として strip され壊れる。`actor.is_local` で分岐し、
+        // remote のときだけ変換する。
+        let description = match actor.summary.as_deref() {
+            Some(s) if !actor.is_local => {
+                JsonValue::String(crate::miauth::text::html_to_plain_text(s))
+            }
+            Some(s) => JsonValue::String(s.to_string()),
+            None => JsonValue::Null,
+        };
+        map.insert("description".to_string(), description);
         map.insert(
             "bannerUrl".to_string(),
             actor
@@ -1475,6 +1486,27 @@ mod tests {
         assert_eq!(v["isSilenced"], false);
         assert_eq!(v["isSuspended"], false);
         assert_eq!(v["publicReactions"], true);
+    }
+
+    #[test]
+    fn from_actor_detailed_strips_html_from_remote_description() {
+        // remote actor の `summary` は HTML。`description` は plain 化されて
+        // 生タグが消える (= #271、Note 本文の #170 と同型)。
+        let mut actor = fake_actor(false, "remote.test", false);
+        actor.summary =
+            Some(r#"<p>hello <a href="https://remote.test/@me">@me</a></p><p>line2</p>"#.into());
+        let v = from_actor_detailed(&actor, 0, 0, 0);
+        assert_eq!(v["description"], "hello @me\n\nline2");
+    }
+
+    #[test]
+    fn from_actor_detailed_keeps_local_plain_description_verbatim() {
+        // local actor の `summary` は plain text。`<` を含んでも strip されず
+        // そのまま (html_to_plain_text を通さない)。
+        let mut actor = fake_actor(true, "sakurasato.test", false);
+        actor.summary = Some("price < 100 & rising".into());
+        let v = from_actor_detailed(&actor, 0, 0, 0);
+        assert_eq!(v["description"], "price < 100 & rising");
     }
 
     /// misskey-dart `_$UserDetailedNotMeFromJson` で **非 null / default 無し**
