@@ -390,6 +390,77 @@ async fn timeline_includes_followee_renote_as_renote(pool: PgPool) {
     assert_eq!(notes[1]["text"], "original post");
 }
 
+/// home timeline (`notes/timeline`) で、followee が **第三者の followers 限定
+/// note** を boost しても、その author を follow していない viewer には漏れない
+/// (Issue #253 で `list_home_renote_window` の SQL に viewer 可視性述語を追加して
+/// 閉じた leak の回帰テスト)。follow したら見えるようになることも確認する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_hides_followee_renote_of_followers_only_from_non_follower(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await; // viewer
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await; // followee / renoter
+    let carol = seed_remote_actor(&pool, "other.test", "carol").await; // 元 note author
+    seed_accepted_follow(&pool, alice, bob).await;
+    let t0 = chrono::Utc::now();
+
+    // carol の followers 限定 note を bob が boost。
+    let secret = seed_note_full(
+        &pool,
+        carol,
+        "other.test",
+        "carol followers-only secret",
+        Visibility::Followers,
+        t0,
+        None,
+        json!([]),
+    )
+    .await;
+    let announce = repo::announce::insert_or_get(
+        &pool,
+        "https://remote.test/users/bob/activities/announce-tl-secret",
+        secret,
+        bob,
+        t0 + chrono::Duration::seconds(10),
+    )
+    .await
+    .unwrap();
+    let _ = announce;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+    let request = || {
+        router_for(&state).oneshot(
+            Request::post("/api/notes/timeline")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"i": token, "limit": 10})).unwrap(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    // alice は carol を follow していない → boost 経由でも見えない (空配列)。
+    let resp = request().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    assert!(
+        arr.as_array().unwrap().is_empty(),
+        "followee の followers 限定 boost は非フォロワーに漏れてはいけない: {arr}"
+    );
+
+    // alice が carol を follow したら boost が見える。
+    seed_accepted_follow(&pool, alice, carol).await;
+    let resp = request().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["renote"]["text"] == "carol followers-only secret"),
+        "carol を follow 後は boost が見えるべき: {arr}"
+    );
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn timeline_since_id_filters_strictly_greater(pool: PgPool) {
     let actor_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;

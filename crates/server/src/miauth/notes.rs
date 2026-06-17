@@ -672,6 +672,7 @@ pub async fn users_notes(
         repo::announce::list_author_renote_window(
             state.pool(),
             target.id,
+            viewer.id,
             since_ts,
             until_ts,
             limit,
@@ -726,14 +727,11 @@ pub async fn users_notes(
         let Some(entry) = entry_by_id.get(&r.renoted_note_id) else {
             continue;
         };
-        // **プライバシー**: renote window は `visibility <> 'direct'` までしか
-        // 絞っていない。対象ユーザが boost した followers 限定 note を、その note の
-        // author を follow していない viewer に見せないよう、ここで描画前に viewer
-        // 可視性を再判定する (= notes/show / notes/reactions と同じ防御)。public /
-        // unlisted は常に true なので通常の boost は影響を受けない。
-        if !viewer_can_view_entry(&state, entry, viewer.id).await {
-            continue;
-        }
+        // **プライバシー**は `list_author_renote_window` の SQL 側で担保済み
+        // (Issue #253) ── followers 限定 note を author を follow していない
+        // viewer に見せない述語が WHERE に入っているので、ここで per-item の
+        // `viewer_can_view_entry` を呼ぶ必要は無い (= renote 件数ぶんの follow
+        // 引き N+1 を解消)。
         let summary = summaries.get(&entry.id).unwrap_or(&empty);
         let renoted = timeline_entry_to_miss_note(entry, summary, host);
         // renoter は常に対象ユーザ本人。

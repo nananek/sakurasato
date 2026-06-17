@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            ann.id AS announce_id,\n            ann.ap_id AS announce_ap_id,\n            ann.published_at AS announce_published_at,\n            ann.actor_id AS renoter_actor_id,\n            ann.note_id AS renoted_note_id\n        FROM announce ann\n        JOIN note n ON n.id = ann.note_id\n        WHERE\n            n.visibility <> 'direct'\n            AND ann.actor_id = $1\n            AND ($2::TIMESTAMPTZ IS NULL OR ann.published_at > $2)\n            AND ($3::TIMESTAMPTZ IS NULL OR ann.published_at < $3)\n        ORDER BY ann.published_at DESC, ann.id DESC\n        LIMIT $4\n        ",
+  "query": "\n        SELECT\n            ann.id AS announce_id,\n            ann.ap_id AS announce_ap_id,\n            ann.published_at AS announce_published_at,\n            ann.actor_id AS renoter_actor_id,\n            ann.note_id AS renoted_note_id\n        FROM announce ann\n        JOIN note n ON n.id = ann.note_id\n        WHERE\n            n.visibility <> 'direct'\n            AND (\n                n.visibility IN ('public', 'unlisted')\n                OR n.actor_id = $1\n                OR (\n                    n.visibility = 'followers'\n                    AND EXISTS (\n                        SELECT 1 FROM follow\n                        WHERE follower_actor_id = $1\n                          AND followed_actor_id = n.actor_id\n                          AND state = 'accepted'\n                    )\n                )\n            )\n            AND (\n                ann.actor_id = $1\n                OR ann.actor_id IN (\n                    SELECT followed_actor_id\n                    FROM follow\n                    WHERE follower_actor_id = $1 AND state = 'accepted'\n                )\n            )\n            AND ($2::TIMESTAMPTZ IS NULL OR ann.published_at > $2)\n            AND ($3::TIMESTAMPTZ IS NULL OR ann.published_at < $3)\n        ORDER BY ann.published_at DESC\n        LIMIT $4\n        ",
   "describe": {
     "columns": [
       {
@@ -75,5 +75,5 @@
       false
     ]
   },
-  "hash": "d20497c7485e3eda26c0a7c8611e3f345052dc7d86b2f9ebc5f223fa0eba0958"
+  "hash": "21111f7ff5bec6206552ac2fd1c5e07ef088f8025efe38f3e6a5d91d11c2db67"
 }
