@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO note (\n            ap_id, actor_id, content, language, in_reply_to_ap_id,\n            in_reply_to_note_id, summary, visibility, sensitive,\n            to_recipients, cc_recipients, attachments, tags, is_local,\n            url, published_at\n        )\n        VALUES (\n            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,\n            $11, $12, $13, $14, $15, $16\n        )\n        RETURNING\n            id, ap_id, actor_id, content, language, in_reply_to_ap_id,\n            in_reply_to_note_id, summary, visibility, sensitive,\n            to_recipients as \"to_recipients: Json<Vec<String>>\",\n            cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            attachments as \"attachments: Json<JsonValue>\",\n            tags as \"tags: Json<JsonValue>\",\n            is_local, url, published_at, edited_at, created_at, updated_at\n        ",
+  "query": "\n        INSERT INTO note (\n            ap_id, actor_id, content, language, in_reply_to_ap_id,\n            in_reply_to_note_id, summary, visibility, sensitive,\n            to_recipients, cc_recipients, attachments, tags, is_local,\n            url, published_at\n        )\n        VALUES (\n            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,\n            $11, $12, $13, $14, $15, $16\n        )\n        ON CONFLICT (ap_id) DO UPDATE SET ap_id = EXCLUDED.ap_id\n        RETURNING\n            id, ap_id, actor_id, content, language, in_reply_to_ap_id,\n            in_reply_to_note_id, summary, visibility, sensitive,\n            to_recipients as \"to_recipients: Json<Vec<String>>\",\n            cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            attachments as \"attachments: Json<JsonValue>\",\n            tags as \"tags: Json<JsonValue>\",\n            is_local, url, published_at, edited_at, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -267,5 +267,5 @@
       false
     ]
   },
-  "hash": "f3d133eaec1eb892a8a76b5f5b5f2c43f8c67f079b636a7280dd6d51ddaa6cb0"
+  "hash": "0d07a3f6e7fb277bcec46eb92c7aa17720d7083f00d50ed7541855b20dab239a"
 }

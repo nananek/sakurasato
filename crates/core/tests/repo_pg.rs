@@ -161,6 +161,51 @@ async fn note_round_trip(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// `repo::note::insert` は `ap_id` 冪等 (Issue #270)。同じ `ap_id` で二度 insert
+/// しても UNIQUE 違反で `Err` にならず、**既存行をそのまま返す** ── 並行
+/// `Announce` / `Create` / fetch がエラー経路に落ちないことを担保する。二度目の
+/// insert で `content` 等を別値にしても、返るのは**既存行の値**で上書きされない。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn note_insert_is_idempotent_on_ap_id(pool: PgPool) -> sqlx::Result<()> {
+    let author = repo::actor::insert(&pool, sample_local_actor("idem")).await?;
+    let now = chrono::Utc::now();
+    let mk = |content: &str| repo::note::NewNote {
+        ap_id: "https://remote.test/notes/dup".into(),
+        actor_id: author.id,
+        content: content.into(),
+        language: None,
+        in_reply_to_ap_id: None,
+        in_reply_to_note_id: None,
+        summary: None,
+        visibility: Visibility::Public,
+        sensitive: false,
+        to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+        cc_recipients: vec![],
+        attachments: serde_json::json!([]),
+        tags: serde_json::json!([]),
+        is_local: false,
+        url: None,
+        published_at: now,
+    };
+
+    let first = repo::note::insert(&pool, mk("<p>original</p>")).await?;
+    // 二度目: 同じ ap_id だが content を変えても Err にならず既存行を返す。
+    let second = repo::note::insert(&pool, mk("<p>concurrent racer</p>")).await?;
+
+    assert_eq!(second.id, first.id, "same ap_id must map to the same row");
+    assert_eq!(
+        second.content, "<p>original</p>",
+        "existing content must NOT be overwritten by the racing insert",
+    );
+
+    // DB 上も 1 行のまま。
+    let stored = repo::note::get_by_ap_id(&pool, &first.ap_id)
+        .await?
+        .unwrap();
+    assert_eq!(stored.content, "<p>original</p>");
+    Ok(())
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn follow_state_transitions(pool: PgPool) -> sqlx::Result<()> {
     let me = repo::actor::insert(&pool, sample_local_actor("a")).await?;

@@ -28,6 +28,22 @@ pub struct NewNote {
     pub published_at: DateTime<Utc>,
 }
 
+/// Insert a note, returning the stored row.
+///
+/// **Idempotent on `ap_id`** ── 同じ `ap_id` の行が既に存在するとき、
+/// UNIQUE 違反で `Err` を返すのではなく **既存行をそのまま返す**
+/// (`ON CONFLICT (ap_id) DO UPDATE SET ap_id = EXCLUDED.ap_id`)。`DO UPDATE`
+/// (`DO NOTHING` ではない) を使うのは、並行 INSERT が走っているとき
+/// **相手 tx の commit を待ってから** 確定した既存行を `RETURNING` で返すため
+/// (`DO NOTHING` + 後追い `SELECT` は未 commit の競合行を取りこぼし得る)。
+/// `SET` するのは conflict key (`ap_id`) を自身の値に上書きする no-op だけなので、
+/// 既存行の `content` / `summary` 等は**書き換わらない** ── 編集は inbound
+/// `Update` (`update_content`) が担う責務で、ここで上書きしない。
+///
+/// この冪等化により、同一 Note を指す `Announce` / `Create` / fetch が並行
+/// して届いても (Issue #270)、一方が UNIQUE 違反 → `DispatchError::Internal`
+/// で捨てられる「エラー経路での競合処理」が消え、両方が既存行を得る。
+/// 新規 insert 時の `RETURNING` 挙動は従来どおり (挿入した行を返す)。
 pub async fn insert<'e, E>(executor: E, new: NewNote) -> sqlx::Result<NoteRow>
 where
     E: sqlx::PgExecutor<'e>,
@@ -49,6 +65,7 @@ where
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
             $11, $12, $13, $14, $15, $16
         )
+        ON CONFLICT (ap_id) DO UPDATE SET ap_id = EXCLUDED.ap_id
         RETURNING
             id, ap_id, actor_id, content, language, in_reply_to_ap_id,
             in_reply_to_note_id, summary, visibility, sensitive,
