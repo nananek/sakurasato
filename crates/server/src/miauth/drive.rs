@@ -109,17 +109,54 @@ pub async fn create(
         return bad_request("comment exceeds the 1500-character limit");
     }
 
-    // 既存パイプラインを共有 (kind = attachment)。エラー時の Response は
-    // local_api 形 (status は意味のあるもの) をそのまま返す ── 成功パスの
-    // DriveFile は完全に Misskey 形。
+    // 既存パイプラインを共有 (kind = attachment)。成功パスの DriveFile は
+    // 完全に Misskey 形。エラーは local_api 形 (`{"error": "<string>"}`) なので、
+    // Misskey クライアント (Aria 等) が期待する `{"error": {"code", "message"}}`
+    // に詰め替える (Issue #263) ── 詰め替えないと Aria 側で `error` を object と
+    // して読めず「不明なエラー」になり、なぜ失敗したか (例: HEIC 非対応) が
+    // ユーザに伝わらない。
     match local_api::media::upload_media_core(&state, "attachment", comment.as_deref(), bytes).await
     {
         Ok((row, _created)) => {
             let host = &state.config().server.host;
             Json(media_row_to_miss_file(&row, host)).into_response()
         }
-        Err(resp) => resp,
+        Err(resp) => upload_error_to_miss(&resp),
     }
+}
+
+/// `upload_media_core` の `local_api` 形エラー Response を **status code から**
+/// Misskey wire エラー (`{"error": {"code", "message"}}`) に詰め替える
+/// (Issue #263)。本体 body の詳細文言は内部実装寄りなので捨て、status に応じた
+/// クライアント向け文言を当てる (詳細は `upload_media_core` 側で `tracing` 済み)。
+///
+/// とりわけ **415 (`UNSUPPORTED_MEDIA_TYPE`)** は iOS カメラの HEIC で踏みやすい
+/// (media-proxy は PNG/JPEG/WebP/GIF のみ受理) ので、対応形式と回避策を message
+/// に明示して「サイレントに失敗」を避ける。
+fn upload_error_to_miss(resp: &Response) -> Response {
+    let status = resp.status();
+    let (code, message) = match status {
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => (
+            "UNSUPPORTED_MEDIA_TYPE",
+            "Unsupported image format (e.g. iOS HEIC). \
+             Convert to JPEG, PNG, WebP, or GIF before uploading. \
+             On iOS, set Camera → Formats → \"Most Compatible\" to shoot JPEG.",
+        ),
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            ("FILE_TOO_LARGE", "The file exceeds the upload size limit.")
+        }
+        StatusCode::BAD_REQUEST => ("INVALID_PARAM", "The upload was rejected as invalid."),
+        StatusCode::GATEWAY_TIMEOUT => (
+            "MEDIA_TIMEOUT",
+            "Image processing timed out. Please try again.",
+        ),
+        // BAD_GATEWAY / SERVICE_UNAVAILABLE / その他はサーバ側処理失敗。
+        _ => (
+            "MEDIA_PROCESSING_FAILED",
+            "Failed to process the uploaded image.",
+        ),
+    };
+    error_resp(status, code, message)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -456,5 +493,58 @@ async fn local_actor_id(state: &AppState) -> Option<i64> {
     match repo::actor::get_by_username_host(state.pool(), user, host).await {
         Ok(Some(a)) if a.is_local => Some(a.id),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    /// `local_api` 形のエラー Response を渡したとき、status を保ったまま Misskey
+    /// wire 形 (`error` が object で `code`/`message` を持つ) に詰め替わること。
+    async fn remap_status(status: StatusCode) -> serde_json::Value {
+        // upload_media_core が返すのと同じ local_api 形を模す。
+        let original = (status, Json(serde_json::json!({ "error": "raw reason" }))).into_response();
+        let mapped = upload_error_to_miss(&original);
+        assert_eq!(mapped.status(), status, "status must be preserved");
+        let bytes = mapped.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unsupported_media_type_maps_to_misskey_error_with_heic_hint() {
+        let body = remap_status(StatusCode::UNSUPPORTED_MEDIA_TYPE).await;
+        // Misskey クライアントは error を object として読む。
+        assert!(body["error"].is_object(), "error must be an object: {body}");
+        assert_eq!(body["error"]["code"], "UNSUPPORTED_MEDIA_TYPE");
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("HEIC"), "415 message must mention HEIC: {msg}");
+        assert!(
+            msg.contains("JPEG") && msg.contains("PNG"),
+            "415 message must list supported formats: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_statuses_map_to_misskey_object_errors() {
+        for (status, code) in [
+            (StatusCode::PAYLOAD_TOO_LARGE, "FILE_TOO_LARGE"),
+            (StatusCode::BAD_REQUEST, "INVALID_PARAM"),
+            (StatusCode::GATEWAY_TIMEOUT, "MEDIA_TIMEOUT"),
+            (StatusCode::BAD_GATEWAY, "MEDIA_PROCESSING_FAILED"),
+            (StatusCode::SERVICE_UNAVAILABLE, "MEDIA_PROCESSING_FAILED"),
+        ] {
+            let body = remap_status(status).await;
+            assert!(
+                body["error"].is_object(),
+                "error must be object for {status}"
+            );
+            assert_eq!(body["error"]["code"], code, "wrong code for {status}");
+            assert!(
+                body["error"]["message"].is_string(),
+                "message must be present for {status}"
+            );
+        }
     }
 }
