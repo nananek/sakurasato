@@ -638,6 +638,11 @@ Milktea iOS / MissRirica Android の「サーバを追加」画面に `https://<
 
 その後 `/miauth/{uuid}` を browser で開いた際の landing page が「CLI で approve せよ」というテキストを返すので、ホスト側で §6.4 を踏む。
 
+> **画像アップロードの形式について (iOS の HEIC)**
+> media-proxy が受理する画像形式は **PNG / JPEG / WebP / GIF** のみ (信頼できないバイト列のデコードを最小限の安全な format に絞る方針)。**iOS のカメラはデフォルトで HEIC** で保存するため、撮影した写真をそのまま添付すると `drive/files/create` が **415 Unsupported Media Type** で失敗する (スクリーンショット = PNG や、共有時に変換される JPEG は通る)。
+>
+> 回避策: iOS の **設定 → カメラ → フォーマット → 「互換性優先」** にすると JPEG で撮影される。失敗時はクライアントに Misskey 形式のエラー (`code: UNSUPPORTED_MEDIA_TYPE` + 対応形式を案内する message) が返るので、対応形式に変換して再アップロードする。HEIC のサーバ側デコード対応は [Issue #263](https://github.com/nananek/sakurasato/issues/263) で検討中 (ライセンス / 特許の整理待ち)。
+
 ### 6.4 CLI approve フロー
 
 クライアントが session UUID を生成して `/miauth/{uuid}` を開いた状態で、ホスト側から:
@@ -842,6 +847,10 @@ ls -ln /var/run/sakurasato-local/local.sock
 ```
 
 オプション A (bind mount) の手順をやり直す。
+
+### 9.5 mobile クライアントから画像添付が失敗する (iOS HEIC)
+
+→ media-proxy は **PNG / JPEG / WebP / GIF** のみ受理する。iOS のカメラ写真はデフォルト **HEIC** なので `drive/files/create` が **415 Unsupported Media Type** で弾かれる (`code: UNSUPPORTED_MEDIA_TYPE`)。iOS の **設定 → カメラ → フォーマット → 「互換性優先」** で JPEG 撮影に切り替えるか、対応形式に変換してから添付する。詳細は §6.3.3 の囲み / [Issue #263](https://github.com/nananek/sakurasato/issues/263)。media-proxy ログ (`§8.5`) に `unsupported_format` / `unknown_format` が出ていれば本件。
 
 ---
 

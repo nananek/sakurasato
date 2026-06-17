@@ -18,7 +18,7 @@ Mastodon / Misskey / Pleroma 等の Fediverse 実装と連合しつつ、**Web �
 | **TUI** | Kitty graphics protocol で画像表示・カスタム絵文字を表示。マウス（クリック / ホイール / ドラッグ）対応。カラースキーム切替可能 |
 | **視覚刺激の制御** | アバター / 添付 / カスタム絵文字 / プレビュー / アニメ をそれぞれ on/off できる「視覚刺激抑制モード」 |
 | **連合互換** | Mastodon 互換 + Misskey 絵文字リアクション (`EmojiReact`) + Misskey/Mastodon からの引っ越し (`Move` / `alsoKnownAs`) |
-| **画像安全化** | EXIF・位置情報を含むメタデータを除去、WebP 再エンコードでステガノグラフィ的ペイロードも破壊 |
+| **画像安全化** | EXIF・位置情報を含むメタデータを除去、WebP 再エンコードでステガノグラフィ的ペイロードも破壊。受理形式は **PNG / JPEG / WebP / GIF**（iOS の HEIC は非対応 → [DEPLOYMENT.md §6.3.3](DEPLOYMENT.md#633-mobile-クライアント側の設定) / [#263](https://github.com/nananek/sakurasato/issues/263)） |
 | **隔離** | 画像デコードと外部 HTTP GET（リモートメディア / OGP / WebFinger）は **専用 media-proxy コンテナ** に隔離。`mem_limit` で OOM kill を本体に波及させない |
 | **Docker** | `distroless` ベース + **rootless** + `read_only: true` + `cap_drop: [ALL]` + `no-new-privileges` |
 | **言語** | Rust（メモリ安全 + `#![forbid(unsafe_code)]`）|
