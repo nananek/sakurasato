@@ -72,6 +72,9 @@ pub enum FetchError {
     #[error("actor fetch redirected; redirects are not followed (target {0:?})")]
     RedirectRefused(String),
 
+    #[error("outbound fetch to {host:?} is rate-limited; dropping (Issue #269)")]
+    RateLimited { host: String },
+
     #[error("actor fetch timed out")]
     Timeout,
 
@@ -130,6 +133,21 @@ pub(crate) async fn fetch_object_json(
 ) -> Result<JsonValue, FetchError> {
     let url = Url::parse(uri)?;
     enforce_url_policy(&url, &state.config().server.host)?;
+
+    // per-domain レート制限 (Issue #269)。actor / Note fetch の唯一の chokepoint
+    // なので、ここで宛先 host のトークンを引く。flood (例: 悪意ある followee の
+    // Announce 大量送出) のとき外部ドメインへの増幅 fetch を drop する。SSRF
+    // 検査を通った後にチェックするので、host は検証済みの宛先。
+    let host = url.host_str().unwrap_or_default();
+    if !state.try_acquire_fetch(host) {
+        warn!(
+            uri,
+            host, "outbound AP fetch rate-limited for domain; dropping (Issue #269)",
+        );
+        return Err(FetchError::RateLimited {
+            host: host.to_string(),
+        });
+    }
 
     // 信頼境界外 URL なので Accept ヘッダで JSON-LD を明示要求。レスポンス
     // ボディは MAX_AP_OBJECT_BYTES で頭打ちする。reqwest は body streaming で

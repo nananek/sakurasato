@@ -15,6 +15,7 @@ pub mod delivery;
 pub(crate) mod dispatch;
 pub mod emoji_import;
 pub(crate) mod extract;
+pub(crate) mod fetch_rate_limit;
 pub mod follow;
 pub mod follow_request;
 pub(crate) mod http_client;
