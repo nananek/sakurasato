@@ -52,7 +52,7 @@ jobs:
           --health-retries 12
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Cargo workspace がまだ無い間 (M1 着手前) は Rust ステップをスキップして
       # required status check を緑に保つ。Cargo.toml が入った時点で本稼働する。
