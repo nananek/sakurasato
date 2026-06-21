@@ -58,7 +58,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "serde"
 # multipart/form-data を受けるため (`axum::extract::Multipart`)。
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 clap = { version = "4", features = ["derive", "env"] }
 rsa = "0.9"
 # Ed25519 鍵生成・PEM 入出力。HTTP 署名生成自体は M3b-2 で導入予定。
