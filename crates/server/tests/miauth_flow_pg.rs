@@ -1060,3 +1060,35 @@ async fn api_endpoints_returns_top_level_array_with_emojis(pool: PgPool) {
         );
     }
 }
+
+/// `/api/meta` の `uri` は request の Host header (= tailscale tailnet host 等)
+/// ではなく canonical な公開 AP host を返す (#247)。identity 文字列が transport
+/// host を漏らさないことを保証する ── tailnet host を `Host` / `X-Forwarded-Host`
+/// で詐称しても `uri` は `config.server.host` のまま。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn meta_uri_is_canonical_host_not_request_host(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
+    let app = miauth::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/meta")
+                .header(header::HOST, "foo.tailnet.ts.net:8443")
+                .header("x-forwarded-host", "foo.tailnet.ts.net:8443")
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let meta = read_json(resp).await;
+    assert_eq!(
+        meta["uri"], "https://sakurasato.test",
+        "meta.uri must be the canonical public host, not the request Host header"
+    );
+}
