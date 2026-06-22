@@ -50,7 +50,16 @@ jobs:
           # 投稿できるようにする。default では Bash tool が制限されてて、
           # action 内蔵の buffered inline comment 経路を Claude が選ばない
           # ため silent で終わる事案があった (iikanji-kakeibo 由来の知見)。
-          claude_args: '--allowed-tools Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh api:*)'
+          #
+          # 値全体を **二重引用符で囲む** こと。`claude_args` は shell 風に
+          # トークン化されるため、`Bash(gh pr comment:*)` の内部スペースを
+          # 引用符で守らないと `Bash(gh` / `pr` / `comment:*)` に単語分割され、
+          # 渡される allowed-tools が壊れて `gh pr comment` が拒否される
+          # (= review は走るが verdict を post できず silent 終了。
+          # PR #280 で `permission_denials_count: 9` として実害を確認)。
+          # 引用符で囲めば 1 トークンとして `--allowed-tools` に渡り、CLI 側で
+          # comma 分割されてスペース入りパターンが保たれる。
+          claude_args: '--allowed-tools "Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh api:*)"'
           prompt: |
             この repo (`sakurasato`) は **お一人様 TUI 専用 Fediverse (ActivityPub)
             サーバ**。Rust 製で、`crates/server` が AP 連合デーモン + ローカル API +
