@@ -50,6 +50,19 @@ pub struct DiscoveryLink {
 /// href は **request の Host header** から組み立てる。reverse proxy 配下は
 /// `X-Forwarded-Host` + `X-Forwarded-Proto` を優先 (= 一般的 de facto)。
 /// いずれも欠落していれば `config.server.host` + `https` にフォールバック。
+///
+/// ## なぜ identity 系 (`/api/meta.uri`) と host 由来が違うのか (#247)
+///
+/// discovery href は「nodeinfo 2.1 doc を **どこから取るか**」を指す fetch
+/// ポインタであり、インスタンスの identity 文字列ではない。これは `MiAuth`
+/// クライアント (= Milktea / `MissRirica` 等) の login probe で叩かれる経路なので、
+/// **client が到達済みの host (= request の Host)** に留めるほうが堅牢
+/// (account 追加前の最も不安定な段階で cross-host fetch を強いない)。一方
+/// `/api/meta.uri` は純粋な identity 表示文字列なので canonical な公開 host
+/// (`config.server.host`) に固定する ([`super::meta::handle`])。連合向けの
+/// AP 側 nodeinfo discovery ([`crate::routes::nodeinfo`]) は federation peer が
+/// 常に公開 host 経由で来るため canonical host を返す ── 文脈ごとに「到達
+/// 経路として正しい host」を選ぶ、という同じ原則の別側面。
 pub async fn well_known(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let base = build_base_url(&headers, &state.config().server.host);
     let body = Discovery {

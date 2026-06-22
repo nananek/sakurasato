@@ -32,12 +32,10 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::miauth::nodeinfo::build_base_url;
 use crate::state::AppState;
 
 /// `POST /api/meta` の body。Misskey 公式は `detail: bool` を受け取り、
@@ -51,18 +49,21 @@ pub struct MetaBody {
 }
 
 /// `POST /api/meta` handler。認証不要 (= login 前に叩かれる)。
-pub async fn handle(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    _body: Option<Json<MetaBody>>,
-) -> Response {
+pub async fn handle(State(state): State<AppState>, _body: Option<Json<MetaBody>>) -> Response {
     // `_body.detail` は currently unused (常に detail=true 相当を返す)。
     let cfg = state.config();
     let info = &cfg.server.info;
 
-    // URI は request の Host header から組み立てる (= nodeinfo discovery と
-    // 同じ理由。tailscale 越し client が tailnet host を見るため)。
-    let uri = build_base_url(&headers, &cfg.server.host);
+    // `uri` は **canonical な公開 AP host** (`config.server.host`) で固定する
+    // (#247)。request の Host header (= tailscale tailnet host 等) は transport の
+    // 詳細であってインスタンスの identity ではない。note の `uri`/`url`・avatar・
+    // media URL はすべて公開 host で組み立てられており、`uri` だけ tailnet を
+    // 指すと「instance = tailnet」「canonical = public」の二重性で client が
+    // 混乱する。公開 host は avatar/添付の配信で既に client から到達できている
+    // (= 画像が表示できている) ので、ここを公開 host に揃えても到達性の前提は
+    // 増えない。なお nodeinfo discovery の href は別判断で request-host のまま
+    // (= login probe を client が到達済みの経路に留める。[`super::nodeinfo`] 参照)。
+    let uri = format!("https://{}", cfg.server.host);
 
     // 表示名 (= name) は ServerInfo::name 優先、なければ host を使う。
     let name = info.name.clone().unwrap_or_else(|| cfg.server.host.clone());
