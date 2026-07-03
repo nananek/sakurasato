@@ -128,6 +128,7 @@ pub async fn run(options: TuiOptions) -> anyhow::Result<()> {
         images,
         previews,
         options.suppression,
+        options.default_visibility,
     );
 
     // 初回タイムライン取得。
@@ -2467,6 +2468,7 @@ mod tests {
             ImageCache::new(None, None),
             crate::preview::PreviewCache::new(None),
             ImageSuppression::default(),
+            crate::compose::Visibility::Public,
         )
     }
 

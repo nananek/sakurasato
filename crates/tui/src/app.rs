@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::client::{NoteCreatedPayload, TimelineNote, Whoami};
-use crate::compose::{Compose, LastComposeDefaults};
+use crate::compose::{Compose, LastComposeDefaults, Visibility};
 use crate::image_cache::ImageCache;
 use crate::suppression::ImageSuppression;
 use crate::theme::Theme;
@@ -240,6 +240,7 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments, reason = "App 初期化は依存が多い")]
     pub fn new(
         theme: Theme,
         whoami: Whoami,
@@ -247,7 +248,17 @@ impl App {
         images: ImageCache,
         previews: crate::preview::PreviewCache,
         suppression: ImageSuppression,
+        default_visibility: Visibility,
     ) -> Self {
+        // Issue #289: 起動時デフォルト公開範囲を初回 compose と
+        // `last_compose_defaults` の両方にシードする。以後は送信のたびに
+        // `snapshot_defaults` → `apply_last_defaults` で直前値を引き継ぐ。
+        let last_compose_defaults = LastComposeDefaults {
+            visibility: default_visibility,
+            ..LastComposeDefaults::default()
+        };
+        let mut compose = Compose::new();
+        compose.apply_last_defaults(last_compose_defaults);
         Self {
             theme,
             whoami,
@@ -257,7 +268,7 @@ impl App {
             next_before_ts_ms: None,
             timeline_exhausted: false,
             focus: Focus::Timeline,
-            compose: Compose::new(),
+            compose,
             status: None,
             should_quit: false,
             socket_label,
@@ -279,7 +290,7 @@ impl App {
             note_detail: None,
             help_state: HelpState::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
-            last_compose_defaults: LastComposeDefaults::default(),
+            last_compose_defaults,
         }
     }
 
@@ -462,6 +473,7 @@ mod tests {
             ImageCache::new(None, None),
             crate::preview::PreviewCache::new(None),
             ImageSuppression::default(),
+            Visibility::Public,
         )
     }
 
@@ -477,6 +489,23 @@ mod tests {
             inbox: "https://x.test/users/me/inbox".into(),
             outbox: None,
         }
+    }
+
+    #[test]
+    fn default_visibility_seeds_initial_compose() {
+        // Issue #289: App::new に渡した既定公開範囲が、送信前の 1 通目の
+        // compose と last_compose_defaults の両方に乗る。
+        let app = App::new(
+            Theme::default(),
+            whoami(),
+            "test".into(),
+            ImageCache::new(None, None),
+            crate::preview::PreviewCache::new(None),
+            ImageSuppression::default(),
+            Visibility::Followers,
+        );
+        assert_eq!(app.compose.visibility(), Visibility::Followers);
+        assert_eq!(app.last_compose_defaults.visibility, Visibility::Followers);
     }
 
     #[test]

@@ -83,4 +83,8 @@ pub struct TuiOptions {
     /// `any_enabled()` が `false` なら端末への画像プロトコル問い合わせ
     /// 自体をスキップしてテキスト専用 UI で起動する。
     pub suppression: suppression::ImageSuppression,
+    /// Issue #289: 投稿エディタの起動時デフォルト公開範囲。CLI `--visibility`
+    /// で指定する。送信のたびに直前値を引き継ぐ (Issue #93) が、起動直後の
+    /// 1 通目はこの値で始まる。未指定時は `public`。
+    pub default_visibility: compose::Visibility,
 }

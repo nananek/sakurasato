@@ -65,6 +65,12 @@ struct Cli {
     #[arg(long, default_value_t = 40)]
     page_size: i64,
 
+    /// 投稿エディタの起動時デフォルト公開範囲
+    /// (`public` / `unlisted` / `followers` / `direct`)。送信ごとに直前値を
+    /// 引き継ぐが、起動直後の 1 通目はこの値で始まる (Issue #289)。
+    #[arg(long, default_value = "public", env = "SAKURASATO_VISIBILITY")]
+    visibility: sakurasato_tui::compose::Visibility,
+
     /// 画像表示を全要素一括で無効化する (= 視覚刺激抑制の killswitch)。
     /// Kitty 等の対応端末でも強制的にテキスト UI に倒す。
     /// 要素別に細かく切りたい場合は `--no-avatars` 等の個別フラグを使う
@@ -155,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
         theme,
         page_size: cli.page_size.clamp(1, 80),
         suppression,
+        default_visibility: cli.visibility,
     };
 
     runtime::run(opts).await
@@ -264,6 +271,7 @@ mod tests {
             theme: "sakura".into(),
             theme_file: None,
             page_size: 40,
+            visibility: sakurasato_tui::compose::Visibility::Public,
             no_images: false,
             no_avatars: false,
             no_attachments: false,
