@@ -20,6 +20,7 @@
 //! - 巨大ディレクトリは `MAX_ENTRIES` で切る (= UI で破綻させない)。
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// 1 ディレクトリ走査で読み込む上限。これを超える分は静かに切り捨てる
 /// (status バーに警告を出す呼び出し側で対応する)。
@@ -63,6 +64,11 @@ pub struct Entry {
     /// 走らせると tokio メインスレッドをブロックするので、ここで事前に
     /// キャッシュしておく (PR #43 round-2 review Medium 対応)。
     pub size: Option<u64>,
+    /// 作成日時 (Issue #287)。`Metadata::created` を優先し、取れない環境
+    /// (= created が ENOTSUP の FS/カーネル) では `modified` (mtime) に
+    /// フォールバックする。stat 失敗時は `None`。同種エントリ内の並び順
+    /// (作成日降順) のソートキーに使う。`..` は常に `None` で先頭固定。
+    pub created: Option<SystemTime>,
 }
 
 impl Entry {
@@ -74,7 +80,23 @@ impl Entry {
                 .map_or_else(|| path.to_path_buf(), Path::to_path_buf),
             is_dir: true,
             size: None,
+            created: None,
         }
+    }
+}
+
+/// エントリの並び順比較 (Issue #287)。`..` を除いた範囲に適用する:
+/// 1. ディレクトリ → ファイルの優先度。
+/// 2. 同種内は **作成日降順** (新しいものが上)。created 不明 (`None`) は末尾へ。
+/// 3. 時刻が同値なら名前昇順 (ASCII 安定)。
+///
+/// `Option<SystemTime>` の `Ord` は `None < Some` なので、降順にするため
+/// `b` と `a` を入れ替えて比較する (= `Some` が先、`None` が後)。
+fn cmp_entries(a: &Entry, b: &Entry) -> std::cmp::Ordering {
+    match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => b.created.cmp(&a.created).then_with(|| a.name.cmp(&b.name)),
     }
 }
 
@@ -82,7 +104,8 @@ impl Entry {
 pub struct FilePicker {
     pub mode: PickerMode,
     pub cwd: PathBuf,
-    /// 並び順: 親 `..`、その後ディレクトリ (a-z)、最後にファイル (a-z)。
+    /// 並び順: 親 `..` を先頭に、その後ディレクトリ → ファイルの順。
+    /// 同種内は作成日降順 (新しいものが上、Issue #287)、時刻同値は名前昇順。
     pub entries: Vec<Entry>,
     pub selected: usize,
     pub show_hidden: bool,
@@ -173,30 +196,34 @@ impl FilePicker {
             }
             // file_type は symlink を fail-open に扱う (= 通常 file/dir として判定)。
             let is_dir = dent.file_type().is_ok_and(|t| t.is_dir());
-            // ファイルサイズは render 前に読んでキャッシュ。`DirEntry::metadata`
+            // metadata は render 前に一度読んでキャッシュ。`DirEntry::metadata`
             // は OS によっては readdir で得た値をそのまま使う最適化があるので、
-            // `fs::metadata` を別途呼ぶより安い。失敗時は None で渡し UI 側で
-            // "(unknown size)" を出す。ディレクトリは概念的に size 無し。
+            // `fs::metadata` を別途呼ぶより安い。render 時に同期 stat を走らせ
+            // ないためここで size / created を確定させる。
+            let meta = dent.metadata().ok();
+            // ファイルサイズ。失敗時は None で UI 側 "(unknown size)"。
+            // ディレクトリは概念的に size 無し。
             let size = if is_dir {
                 None
             } else {
-                dent.metadata().ok().map(|m| m.len())
+                meta.as_ref().map(std::fs::Metadata::len)
             };
+            // 作成日時 (Issue #287)。created 優先、無ければ mtime にフォールバック。
+            let created = meta
+                .as_ref()
+                .and_then(|m| m.created().or_else(|_| m.modified()).ok());
             entries.push(Entry {
                 name,
                 path: dent.path(),
                 is_dir,
                 size,
+                created,
             });
         }
         self.truncated = truncated;
         self.last_error = None;
-        // dir → file の優先度。文字列比較は ASCII 安定。
-        entries[1..].sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.cmp(&b.name),
-        });
+        // 先頭の `..` を固定したまま残りを並べ替える (Issue #287)。
+        entries[1..].sort_by(cmp_entries);
         Ok(entries)
     }
 
@@ -366,5 +393,67 @@ mod tests {
         let cats = picker.entries.iter().find(|e| e.name == "cats").unwrap();
         assert!(cats.is_dir);
         assert_eq!(cats.size, None);
+    }
+
+    /// テスト用 [`Entry`] を `name` / `is_dir` / `created` から手早く作る。
+    fn entry(name: &str, is_dir: bool, created: Option<SystemTime>) -> Entry {
+        Entry {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            is_dir,
+            size: None,
+            created,
+        }
+    }
+
+    #[test]
+    fn sort_dirs_before_files_then_created_desc() {
+        // Issue #287: ディレクトリ優先 → 同種内は作成日降順。時刻同値は名前昇順、
+        // created 不明 (None) は末尾。FS のタイムスタンプ解像度に依存しないよう
+        // 比較関数を直接叩く。
+        let base = SystemTime::UNIX_EPOCH;
+        let older = base + std::time::Duration::from_secs(100);
+        let newer = base + std::time::Duration::from_secs(200);
+        let mut items = [
+            entry("old_file.png", false, Some(older)),
+            entry("new_dir", true, Some(newer)),
+            entry("new_file.png", false, Some(newer)),
+            entry("undated_file.png", false, None),
+            entry("old_dir", true, Some(older)),
+        ];
+        items.sort_by(cmp_entries);
+        let names: Vec<&str> = items.iter().map(|e| e.name.as_str()).collect();
+        // dir が先 (new_dir → old_dir)、その後 file を作成日降順
+        // (new_file → old_file → 日時不明 undated_file)。
+        assert_eq!(
+            names,
+            vec![
+                "new_dir",
+                "old_dir",
+                "new_file.png",
+                "old_file.png",
+                "undated_file.png",
+            ]
+        );
+    }
+
+    #[test]
+    fn created_is_cached_in_entry() {
+        // Issue #287: read_dir 時点で created (or mtime fallback) を stat 済み。
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let picker = FilePicker::new(PickerMode::Attachment, tmp.path().join("photos"));
+        let dog = picker
+            .entries
+            .iter()
+            .find(|e| e.name == "dog.jpg")
+            .expect("dog.jpg should be listed");
+        assert!(
+            dog.created.is_some(),
+            "created (or mtime fallback) should be stat'd at read_dir time"
+        );
+        // `..` は常に None 固定。
+        assert_eq!(picker.entries[0].name, "..");
+        assert_eq!(picker.entries[0].created, None);
     }
 }
