@@ -235,21 +235,32 @@ chmod 644 secrets/postgres_password.txt secrets/s3_secret_key.txt
 
 ## 9. ビルド・実行コマンド（確立後に追記）
 
-```bash
-# 開発
-cargo build --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+> **ビルドは常に Docker 内で行う。** ホストに rust ツールチェーンは入れない
+> 方針 (このリポジトリの開発機は rust 未導入)。`cargo` を直接叩かず、
+> `docker/dev.Dockerfile` (= release と同じ `rust:1.96-alpine`) で cargo を
+> 走らせる薄いラッパ `scripts/dev/cargo.sh` / `make` 経由で行う。ラッパは
+> workspace を bind mount し、registry/target キャッシュをホスト XDG cache 配下
+> (起動ユーザ所有) に置くので、ホストに root 所有ファイルを作らず高速に再ビルド
+> できる。**Claude もビルド/テスト検証はこの経路で行うこと。**
 
-# DB マイグレーション
+```bash
+# 開発 (Docker 内 cargo。実体は scripts/dev/cargo.sh)
+make build          # = cargo build --workspace
+make clippy         # = cargo clippy --workspace --all-targets -- -D warnings
+make test           # = cargo test --workspace
+make check          # fmt --check + clippy + test (ci.yml と同じ 3 点セット)
+make cargo ARGS='tree -i crossterm'   # 任意 cargo
+./scripts/dev/cargo.sh build --workspace   # make を介さない直接呼びも可
+
+# DB マイグレーション (sqlx-cli も Docker 経由が望ましいが未ラップ)
 sqlx migrate run
 
 # 起動（開発, ローカル build）
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 # server 管理 CLI
-cargo run -p sakurasato-server -- init
-# TUI（ホスト端末）
-cargo run -p sakurasato-tui
+docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm server init
+# TUI（ホスト端末。Kitty graphics のため tui はコンテナ外実行が前提だが、
+#      ビルド成果物は docker/tui.Dockerfile で作る。ローカル cargo run は使わない）
 
 # 起動（本番風, ghcr 発行済みイメージを pull）
 # ─ §11 publish.yml で発行された ghcr.io/nananek/sakurasato-* を使う
