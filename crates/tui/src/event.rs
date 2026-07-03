@@ -16,6 +16,9 @@ use crate::picker::PickerMode;
 pub enum Action {
     Noop,
     Quit,
+    /// Issue #286: 全画面を再送する (`terminal.clear()` を挟んで redraw)。
+    /// `Ctrl-L` で手動起動。tmux 復帰やモーダル閉じで残った画像残像を消す。
+    ForceRedraw,
     SelectNext,
     SelectPrev,
     PageDown,
@@ -236,6 +239,11 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
     }
     if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
         return Action::Quit;
+    }
+    // Issue #286: Ctrl-L はどの focus でも全画面再描画 (端末が汚れたときの
+    // 手動回復)。printable でないので compose のテキスト入力とも衝突しない。
+    if k.code == KeyCode::Char('l') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        return Action::ForceRedraw;
     }
     match focus {
         Focus::Timeline => translate_timeline_key(k),
@@ -1060,6 +1068,21 @@ mod tests {
             assert!(matches!(
                 translate(Event::Key(key(code, KeyModifiers::NONE)), Focus::Help),
                 Action::ToggleHelp,
+            ));
+        }
+    }
+
+    #[test]
+    fn ctrl_l_forces_redraw_in_any_focus() {
+        // Issue #286: Ctrl-L はどの focus でも全画面再描画に倒す (端末が汚れた
+        // ときの手動回復)。compose 中でも printable でないのでテキストと衝突しない。
+        for focus in [Focus::Timeline, Focus::Compose, Focus::NoteDetail] {
+            assert!(matches!(
+                translate(
+                    Event::Key(key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+                    focus,
+                ),
+                Action::ForceRedraw,
             ));
         }
     }

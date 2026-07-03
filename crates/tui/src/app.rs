@@ -160,6 +160,13 @@ pub struct App {
     pub status: Option<StatusLine>,
     /// True なら次の draw loop で抜ける。
     pub should_quit: bool,
+    /// Issue #286: 次の描画で全画面を再送すべきか。`true` のとき runtime は
+    /// `terminal.clear()` (= back buffer reset) を挟んでから draw する。
+    /// ratatui-image の Kitty プロトコルは各行先頭セルにプレースホルダを置き
+    /// 差分が同一だと再送をスキップするため、tmux のウィンドウ切替復帰や
+    /// モーダル開閉で実端末側の画像が消えても ratatui は「描画済み」と誤認
+    /// する。焦点変化 / `Resize` / `FocusGained` / 手動 `Ctrl-L` で立てて回復する。
+    pub force_redraw: bool,
     /// 接続先 socket (status bar 表示用)。
     pub socket_label: String,
     /// 画像 (アバター) キャッシュ。`Picker` 取得失敗時は無効化された Cache が
@@ -271,6 +278,7 @@ impl App {
             compose,
             status: None,
             should_quit: false,
+            force_redraw: false,
             socket_label,
             images,
             picker: None,

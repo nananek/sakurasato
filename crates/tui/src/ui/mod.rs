@@ -2344,6 +2344,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         help_entry(palette, "i", "image suppression toggle"),
         help_entry(palette, "p", "open profile of author"),
         help_entry(palette, ":", "command prompt"),
+        help_entry(palette, "Ctrl-L", "force full redraw (fix image glitches)"),
         Line::from(""),
         Line::from(Span::styled("compose", help_section(palette))),
         help_entry(palette, "Enter", "insert newline"),

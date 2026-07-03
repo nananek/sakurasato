@@ -10,7 +10,10 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
+use crossterm::event::{
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    EventStream,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -258,7 +261,7 @@ async fn main_loop(
                 app.tick();
             }
         }
-        *last_rects = redraw(terminal, app)?;
+        *last_rects = redraw_maybe_clear(terminal, app)?;
     }
     Ok(())
 }
@@ -271,6 +274,18 @@ fn redraw(terminal: &mut TuiTerminal, app: &mut App) -> anyhow::Result<ui::Panel
     Ok(captured)
 }
 
+/// Issue #286: `app.force_redraw` が立っていれば `terminal.clear()` を挟んでから
+/// 通常描画する。`clear` は back buffer を reset するので次フレームで全セルを
+/// 再送し、ratatui-image の Kitty プレースホルダも再配置される (= tmux 復帰 /
+/// モーダル閉じで消えた画像が戻る)。clear は全画面再送でコストが高いので、
+/// フラグが立ったフレームだけに限定する。
+fn redraw_maybe_clear(terminal: &mut TuiTerminal, app: &mut App) -> anyhow::Result<ui::PanelRects> {
+    if std::mem::take(&mut app.force_redraw) {
+        terminal.clear().context("force full redraw")?;
+    }
+    redraw(terminal, app)
+}
+
 async fn handle_event(
     event: Event,
     app: &mut App,
@@ -279,8 +294,25 @@ async fn handle_event(
     rects: &ui::PanelRects,
     upload_tx: &mpsc::Sender<UploadOutcome>,
 ) {
+    // Issue #286: 端末外要因で画面が汚れうるイベントは全画面再描画を要求する。
+    // - Resize: レイアウトが変わり Kitty プレースホルダの位置がずれる。
+    // - FocusGained: tmux のウィンドウ/ペイン切替から戻ったとき (要 focus-events)。
+    //   実端末側の画像が消えていても ratatui の差分は再送しないため clear で回復。
+    // 画像が無効な端末 (--no-images / 非グラフィック) では Kitty シーケンス自体
+    // 出ず崩れないので、clear のチラつきを避けて自動トリガはスキップする
+    // (手動 Ctrl-L は Action::ForceRedraw 経由で常に効く)。
+    let images_active = app.images.enabled();
+    if images_active && matches!(event, Event::Resize(..) | Event::FocusGained) {
+        app.force_redraw = true;
+    }
+    // モーダル/オーバーレイの開閉は focus 変化で捉えられる (各 overlay は専用の
+    // Focus バリアントを持つ)。閉じたときに下の画像を再送させる。
+    let before_focus = app.focus;
     let action = translate(event, app.focus);
     apply_action(action, app, api, page_size, rects, upload_tx).await;
+    if images_active && app.focus != before_focus {
+        app.force_redraw = true;
+    }
 }
 
 #[allow(clippy::too_many_lines, reason = "single dispatcher for all actions")]
@@ -295,6 +327,9 @@ async fn apply_action(
     match action {
         Action::Noop => {}
         Action::Quit => app.should_quit = true,
+        // Issue #286: 手動 (Ctrl-L) の全画面再描画要求。次の redraw で
+        // terminal.clear() を挟む。
+        Action::ForceRedraw => app.force_redraw = true,
         Action::SelectNext => app.select_next(),
         Action::SelectPrev => app.select_prev(),
         Action::PageDown => {
@@ -2387,8 +2422,16 @@ fn next_theme(current: &Theme) -> &'static str {
 fn init_terminal() -> anyhow::Result<(TuiTerminal, bool)> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("enter alternate screen + mouse capture")?;
+    // EnableFocusChange: tmux (focus-events on) / 対応端末から FocusGained/Lost を
+    // 受け取り、ウィンドウ切替復帰時に全画面再描画するため (Issue #286)。未対応
+    // 端末は単に何も送ってこないだけで害はない。
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange
+    )
+    .context("enter alternate screen + mouse capture + focus change")?;
     let mut enhancement_active = false;
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         // 最小フラグ: DISAMBIGUATE_ESCAPE_CODES のみ。REPORT_EVENT_TYPES (=
@@ -2425,8 +2468,9 @@ fn restore_terminal(terminal: &mut TuiTerminal, enhancement_active: bool) -> any
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture,
+        DisableFocusChange,
     )
-    .context("leave alternate screen + mouse capture")?;
+    .context("leave alternate screen + mouse capture + focus change")?;
     terminal.show_cursor().context("show cursor")?;
     Ok(())
 }
