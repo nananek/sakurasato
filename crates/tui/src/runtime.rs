@@ -195,6 +195,9 @@ async fn main_loop(
 ) -> anyhow::Result<()> {
     // ratatui に描画。最初の 1 frame。
     *last_rects = redraw(terminal, app)?;
+    // Issue #286: 初回フレームの scroll 位置を基準として控える ── これが無いと
+    // 1 ループ目で「初期状態からの変化あり」と誤検知して無駄に clear する。
+    app.last_scroll_sig = app.scroll_signature();
 
     while !app.should_quit {
         // 投稿エディタが viewport から外れたら戻す前にスクロール調整しておく。
@@ -279,7 +282,19 @@ fn redraw(terminal: &mut TuiTerminal, app: &mut App) -> anyhow::Result<ui::Panel
 /// 再送し、ratatui-image の Kitty プレースホルダも再配置される (= tmux 復帰 /
 /// モーダル閉じで消えた画像が戻る)。clear は全画面再送でコストが高いので、
 /// フラグが立ったフレームだけに限定する。
+///
+/// Issue #286 追補: スクロール **だけ** でも Kitty 画像は残像になる。画像を
+/// 含むビューの縦スクロール位置 ([`App::scroll_signature`]) が前フレームから
+/// 変わっていれば、画像セルが別位置へ動いた = 残像が出るので同じく clear を
+/// 挟む。`selected` の移動が viewport 内に収まる (= top が動かない) フレームは
+/// signature が不変なので clear されず、無駄なちらつきを出さない。画像が無効な
+/// 端末では自動トリガを抑止する ([`App::images`] enabled 判定)。
 fn redraw_maybe_clear(terminal: &mut TuiTerminal, app: &mut App) -> anyhow::Result<ui::PanelRects> {
+    let sig = app.scroll_signature();
+    if app.images.enabled() && sig != app.last_scroll_sig {
+        app.force_redraw = true;
+    }
+    app.last_scroll_sig = sig;
     if std::mem::take(&mut app.force_redraw) {
         terminal.clear().context("force full redraw")?;
     }

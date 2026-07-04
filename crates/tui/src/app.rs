@@ -165,8 +165,14 @@ pub struct App {
     /// ratatui-image の Kitty プロトコルは各行先頭セルにプレースホルダを置き
     /// 差分が同一だと再送をスキップするため、tmux のウィンドウ切替復帰や
     /// モーダル開閉で実端末側の画像が消えても ratatui は「描画済み」と誤認
-    /// する。焦点変化 / `Resize` / `FocusGained` / 手動 `Ctrl-L` で立てて回復する。
+    /// する。焦点変化 / `Resize` / `FocusGained` / スクロール / 手動 `Ctrl-L` で
+    /// 立てて回復する。
     pub force_redraw: bool,
+    /// Issue #286: 直近フレームで描画したときの [`Self::scroll_signature`]。
+    /// 次フレームで値が変われば「画像を含むビューがスクロールして Kitty
+    /// 画像セルの位置がずれた」ことを意味し、runtime が全画面再描画で残像を
+    /// 消す。`redraw_maybe_clear` が毎フレーム書き戻す。
+    pub last_scroll_sig: u64,
     /// 接続先 socket (status bar 表示用)。
     pub socket_label: String,
     /// 画像 (アバター) キャッシュ。`Picker` 取得失敗時は無効化された Cache が
@@ -279,6 +285,7 @@ impl App {
             status: None,
             should_quit: false,
             force_redraw: false,
+            last_scroll_sig: 0,
             socket_label,
             images,
             picker: None,
@@ -319,6 +326,31 @@ impl App {
     #[must_use]
     pub fn current_profile(&self) -> Option<&crate::profile::ProfileScreen> {
         self.profile_stack.last()
+    }
+
+    /// Issue #286: 「画像を含むビューの縦スクロール位置」を 1 値に畳む。
+    ///
+    /// 値が変われば Kitty 画像セルの絶対位置がずれた = 端末に残像が残るので、
+    /// runtime ([`crate::runtime::redraw_maybe_clear`]) が次フレームで
+    /// `terminal.clear()` を挟んで回復する。`selected` だけの移動 (viewport
+    /// 内で画像が動かないフレーム) は含めない ── 動かないフレームで無駄な
+    /// clear/flicker を出さないため、各ビューの「先頭表示 index」だけを混ぜる。
+    ///
+    /// 上位バイトに focus 種別タグ、下位に当該ビューの top / scroll offset を
+    /// 詰める。focus 変化自体は [`crate::runtime::handle_event`] が別途
+    /// `force_redraw` を立てるが、タグを混ぜておくと取りこぼしを二重に防げる。
+    #[must_use]
+    pub fn scroll_signature(&self) -> u64 {
+        let (tag, offset): (u64, usize) = match self.focus {
+            Focus::Timeline => (1, self.top),
+            Focus::Profile => (2, self.current_profile().map_or(0, |p| p.note_top)),
+            Focus::FollowList => (3, self.follow_list.as_ref().map_or(0, |f| f.top)),
+            Focus::Notifications => (4, self.notifications.as_ref().map_or(0, |n| n.top)),
+            Focus::NoteDetail => (5, self.note_detail.as_ref().map_or(0, |d| d.scroll)),
+            // 画像を持たない / スクロールしない overlay は一定値。
+            _ => (0, 0),
+        };
+        (tag << 56) | (offset as u64 & 0x00ff_ffff_ffff_ffff)
     }
 
     /// 初回 / 手動更新で取ったタイムラインで上書きする。
@@ -576,6 +608,26 @@ mod tests {
         assert_eq!(app.selected, 1);
         app.select_next();
         assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn scroll_signature_changes_only_on_top_move() {
+        // Issue #286: 画像残像回復のトリガ。`top` が動いたフレームだけ
+        // signature が変わり、`selected` だけの移動 (viewport 内) では不変。
+        let mut app = new_app();
+        app.replace_timeline(
+            (0..50)
+                .map(|i| note(50 - i, "https://x.test/users/me"))
+                .collect(),
+            None,
+        );
+        let base = app.scroll_signature();
+        // selected を動かしても top を触らなければ signature 不変。
+        app.selected = 3;
+        assert_eq!(app.scroll_signature(), base, "selected 移動は clear を誘発しない");
+        // top が動けば signature が変わる (= スクロール → clear)。
+        app.top = 5;
+        assert_ne!(app.scroll_signature(), base, "top 移動は clear を誘発する");
     }
 
     #[test]
