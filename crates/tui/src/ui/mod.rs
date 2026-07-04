@@ -190,6 +190,25 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
     }
 }
 
+/// 中央ボックス型モーダル overlay の背後に敷く全画面バックドロップ。
+///
+/// これらの overlay は端末の一部だけを覆うため、塗らないとボックス外の余白から
+/// 背後の Timeline のテキストや Kitty アバターが透ける。ratatui-image 11 系の
+/// Kitty は unicode-placeholder 方式で、画像は「プレースホルダ文字が入ったセル」
+/// に表示されるため、テキストだけでなくそのセルを上書きしないと端末側の画像も
+/// 残る。画面全体を `Clear` + `palette.background` で塗り潰すことで下層を隠し、
+/// placeholder セルも上書きして次フレーム差分で端末側の残像画像を消す。背景色は
+/// 前フレームと同一なので差分で再送されず、ちらつかない (焦点変化時の #286 全画面
+/// 再描画とも整合)。status バーに出す小さな prompt (command / alt) は 1 行を完全に
+/// 覆うので対象外。
+fn fill_modal_backdrop(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.background)),
+        area,
+    );
+}
+
 /// Issue #118: 絵文字検索モーダル。
 ///
 /// レイアウト (上から):
@@ -213,6 +232,7 @@ fn render_emoji_suggest(
     const PREVIEW_ROWS: u16 = 6;
 
     let palette = &app.theme.palette;
+    fill_modal_backdrop(frame, area, palette);
     let visible_max = crate::emoji_suggest::VISIBLE_MAX;
     let visible = state.filtered.len().min(visible_max).max(1);
     let show_preview = app.suppression.is_on(crate::suppression::Element::Emoji);
@@ -1765,6 +1785,7 @@ fn render_note_detail(
     state: &crate::note_detail::NoteDetailScreen,
 ) {
     let palette = &app.theme.palette;
+    fill_modal_backdrop(frame, area, palette);
     let note = &state.note;
 
     // 全画面の 80% を modal 領域に使う。
@@ -2319,6 +2340,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 #[allow(clippy::too_many_lines, reason = "help は宣言的でひと固まり")]
 fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
     let palette = &app.theme.palette;
+    fill_modal_backdrop(frame, area, palette);
     // 中央に max(60, area.width * 0.6) x min(20, area.height - 4) を浮かべる。
     let w = area.width.clamp(40, 60);
     let h = area.height.saturating_sub(6).clamp(10, 18);
@@ -2519,6 +2541,7 @@ fn help_entry(palette: &Palette, key: &str, desc: &str) -> Line<'static> {
 fn render_suppression_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use crate::suppression::Element;
     let palette = &app.theme.palette;
+    fill_modal_backdrop(frame, area, palette);
     let w = area.width.clamp(36, 48);
     let h = 12.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -2594,18 +2617,8 @@ fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) -> Rect {
     };
     let palette = &app.theme.palette;
 
-    // 背景の Timeline (テキスト + Kitty アバター) がボックス外の余白から透けない
-    // よう、まず画面全体を palette.background で塗り潰す。`Clear` で全セルを既定に
-    // 戻し、その上に背景色 Block を敷く ── これで下層の unicode-placeholder
-    // (= ratatui-image 11 系 Kitty 画像) が居たセルも上書きされ、次フレーム差分で
-    // 端末側の画像が消える。ボックスだけ Clear しても余白の Timeline は残るため
-    // 全画面塗りが必要。背景色は前フレームと同一なので差分で再送されず、ちらつか
-    // ない (焦点変化時の #286 全画面再描画とも整合)。
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(palette.background)),
-        area,
-    );
+    // 背後の Timeline がボックス外の余白から透けないよう全画面を塗る。
+    fill_modal_backdrop(frame, area, palette);
 
     // ボックス本体 (= 端末の 8 割) を中央に置く。
     let w = area.width.saturating_sub(4).max(40);
