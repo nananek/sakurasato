@@ -624,7 +624,11 @@ mod tests {
         let base = app.scroll_signature();
         // selected を動かしても top を触らなければ signature 不変。
         app.selected = 3;
-        assert_eq!(app.scroll_signature(), base, "selected 移動は clear を誘発しない");
+        assert_eq!(
+            app.scroll_signature(),
+            base,
+            "selected 移動は clear を誘発しない"
+        );
         // top が動けば signature が変わる (= スクロール → clear)。
         app.top = 5;
         assert_ne!(app.scroll_signature(), base, "top 移動は clear を誘発する");
