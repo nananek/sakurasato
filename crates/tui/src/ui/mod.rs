@@ -2594,7 +2594,20 @@ fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) -> Rect {
     };
     let palette = &app.theme.palette;
 
-    // 全画面 overlay (= 端末の 8 割) を使う。
+    // 背景の Timeline (テキスト + Kitty アバター) がボックス外の余白から透けない
+    // よう、まず画面全体を palette.background で塗り潰す。`Clear` で全セルを既定に
+    // 戻し、その上に背景色 Block を敷く ── これで下層の unicode-placeholder
+    // (= ratatui-image 11 系 Kitty 画像) が居たセルも上書きされ、次フレーム差分で
+    // 端末側の画像が消える。ボックスだけ Clear しても余白の Timeline は残るため
+    // 全画面塗りが必要。背景色は前フレームと同一なので差分で再送されず、ちらつか
+    // ない (焦点変化時の #286 全画面再描画とも整合)。
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.background)),
+        area,
+    );
+
+    // ボックス本体 (= 端末の 8 割) を中央に置く。
     let w = area.width.saturating_sub(4).max(40);
     let h = area.height.saturating_sub(4).max(15);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
