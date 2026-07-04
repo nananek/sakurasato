@@ -142,6 +142,12 @@ pub enum Focus {
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "App は TUI 全体の状態集約 struct。独立した UI フラグ (should_quit / \
+              force_redraw / scroll_dirty / timeline_exhausted) を state machine 化\
+              する意味はない"
+)]
 pub struct App {
     pub theme: Theme,
     pub whoami: Whoami,
@@ -165,14 +171,21 @@ pub struct App {
     /// ratatui-image の Kitty プロトコルは各行先頭セルにプレースホルダを置き
     /// 差分が同一だと再送をスキップするため、tmux のウィンドウ切替復帰や
     /// モーダル開閉で実端末側の画像が消えても ratatui は「描画済み」と誤認
-    /// する。焦点変化 / `Resize` / `FocusGained` / スクロール / 手動 `Ctrl-L` で
-    /// 立てて回復する。
+    /// する。焦点変化 / `Resize` / `FocusGained` / 手動 `Ctrl-L`、および
+    /// スクロール settle 後 (= [`Self::scroll_dirty`] のデバウンス) で立てて
+    /// 回復する。
     pub force_redraw: bool,
     /// Issue #286: 直近フレームで描画したときの [`Self::scroll_signature`]。
     /// 次フレームで値が変われば「画像を含むビューがスクロールして Kitty
-    /// 画像セルの位置がずれた」ことを意味し、runtime が全画面再描画で残像を
-    /// 消す。`redraw_maybe_clear` が毎フレーム書き戻す。
+    /// 画像セルの位置がずれた」ことを意味する。`redraw_maybe_clear` が毎
+    /// フレーム書き戻す。
     pub last_scroll_sig: u64,
+    /// Issue #286: スクロールで画像セルが動き、Kitty 残像が出ている可能性が
+    /// ある状態。毎フレーム `terminal.clear()` すると激しくちらつくため即時
+    /// clear せず、スクロールが idle tick で settle したフレームで 1 回だけ
+    /// 全画面再描画して回復する (= デバウンス)。回復した (= 何らかの clear を
+    /// 挟んだ) 時点で false に戻す。
+    pub scroll_dirty: bool,
     /// 接続先 socket (status bar 表示用)。
     pub socket_label: String,
     /// 画像 (アバター) キャッシュ。`Picker` 取得失敗時は無効化された Cache が
@@ -286,6 +299,7 @@ impl App {
             should_quit: false,
             force_redraw: false,
             last_scroll_sig: 0,
+            scroll_dirty: false,
             socket_label,
             images,
             picker: None,

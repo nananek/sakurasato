@@ -262,6 +262,13 @@ async fn main_loop(
             }
             () = tokio::time::sleep(TICK_INTERVAL) => {
                 app.tick();
+                // Issue #286: idle tick = スクロールが settle した合図。保留中の
+                // 残像があればこのフレームで 1 回だけ全画面再描画して回復する
+                // (デバウンス)。スクロール中は input イベントが連続して tick が
+                // 発火しないため clear されず、指を離すと消える。
+                if app.images.enabled() && std::mem::take(&mut app.scroll_dirty) {
+                    app.force_redraw = true;
+                }
             }
         }
         *last_rects = redraw_maybe_clear(terminal, app)?;
@@ -285,17 +292,25 @@ fn redraw(terminal: &mut TuiTerminal, app: &mut App) -> anyhow::Result<ui::Panel
 ///
 /// Issue #286 追補: スクロール **だけ** でも Kitty 画像は残像になる。画像を
 /// 含むビューの縦スクロール位置 ([`App::scroll_signature`]) が前フレームから
-/// 変わっていれば、画像セルが別位置へ動いた = 残像が出るので同じく clear を
-/// 挟む。`selected` の移動が viewport 内に収まる (= top が動かない) フレームは
-/// signature が不変なので clear されず、無駄なちらつきを出さない。画像が無効な
-/// 端末では自動トリガを抑止する ([`App::images`] enabled 判定)。
+/// 変わっていれば、画像セルが別位置へ動いた = 残像が出る。ただしここで即座に
+/// clear すると、スクロールし続けるあいだ毎フレーム全画面再送になって激しく
+/// ちらつく。そこで [`App::scroll_dirty`] だけ立てておき、実際の clear は
+/// スクロールが止まった (= idle tick が発火した) フレームまで遅延させる
+/// (デバウンス、`main_loop` の `tick` 分岐参照)。`selected` の移動が viewport
+/// 内に収まる (= top が動かない) フレームは signature が不変なので dirty に
+/// ならない。画像が無効な端末では自動トリガを抑止する ([`App::images`]
+/// enabled 判定)。
 fn redraw_maybe_clear(terminal: &mut TuiTerminal, app: &mut App) -> anyhow::Result<ui::PanelRects> {
     let sig = app.scroll_signature();
     if app.images.enabled() && sig != app.last_scroll_sig {
-        app.force_redraw = true;
+        // スクロールで画像セルが動いた。即 clear せず「回復待ち」だけ記録する。
+        app.scroll_dirty = true;
     }
     app.last_scroll_sig = sig;
     if std::mem::take(&mut app.force_redraw) {
+        // 何らかの全画面 clear を挟むなら、保留中のスクロール残像もここで一掃
+        // されるので dirty を落とす (idle tick での二度手間 clear を防ぐ)。
+        app.scroll_dirty = false;
         terminal.clear().context("force full redraw")?;
     }
     redraw(terminal, app)
