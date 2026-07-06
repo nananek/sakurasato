@@ -138,7 +138,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
     // しなくてもいいが、両方同時に出ると操作が混乱するので Picker focus 時
     // は Help は描かない設計 (= 上で focus == Help のときだけ render_help)。
     let picker_list = if app.focus == Focus::Picker {
-        render_picker(frame, area, app)
+        // ピッカ overlay は最下段の status バーを覆わない。status には
+        // `render_status` が「file picker: <mode> (Enter=select, Esc=cancel)」の
+        // キーヒントを出しており、ピッカを開いている間こそ見せたい (ボックス内に
+        // 同じヒントは無い)。全画面塗り (fill_modal_backdrop) が status 行まで
+        // 潰すと、このヒントが実ユーザーからも federation TUI テストからも消える。
+        let overlay_area = Rect {
+            height: area.height.saturating_sub(status_area.height),
+            ..area
+        };
+        render_picker(frame, overlay_area, app)
     } else {
         Rect::default()
     };
