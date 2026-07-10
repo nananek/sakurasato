@@ -2,7 +2,7 @@
 # Sakurasato server: distroless + rootless, musl 静的バイナリ。
 
 # ---- builder ----
-FROM rust:1.96-alpine AS builder
+FROM rust:1.97-alpine AS builder
 
 RUN apk add --no-cache musl-dev pkgconfig
 
