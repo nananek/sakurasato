@@ -64,7 +64,7 @@ rsa = "0.9"
 # Ed25519 鍵生成・PEM 入出力。HTTP 署名生成自体は M3b-2 で導入予定。
 # pkcs8 / pem 機能で SigningKey / VerifyingKey の PKCS#8 PEM 入出力を有効化、
 # rand_core 機能で SigningKey::generate(&mut OsRng) を生やす。
-ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
+ed25519-dalek = { version = "3", features = ["pkcs8", "pem", "rand_core"] }
 # Multikey (FEP-521a) のための multibase encode。
 multibase = "0.9"
 http = "1"
