@@ -113,7 +113,14 @@ pub async fn handle(
 /// 上書きする。`policies` は `/api/meta` と完全に同じ object を渡す ──
 /// `media_proxy.max_bytes` を MiB に丸めて [`build_policies`] に渡せば
 /// `maxFileSizeMb` 等が一致する。
-async fn build_self_me_detailed(state: &AppState) -> Result<JsonValue, Response> {
+///
+/// `POST /api/miauth/{uuid}/check` ([`crate::miauth::check`]) の `user` フィールド
+/// も **同じ self `MeDetailed`** を返す ── Aria (`misskey_dart`) は check レスポンス
+/// の `user` を login 直後の self user として `MeDetailed` で parse し、`isBot` /
+/// `isCat` 等の **required bool** を cast する。最小 `MissUser` (= `UserLite`) を
+/// 返すと欠落フィールドが `null as bool` になり `type 'Null' is not a subtype of
+/// type 'bool'` で crash するため、`/api/i` と `check` で同じ builder を共有する。
+pub(crate) async fn build_self_me_detailed(state: &AppState) -> Result<JsonValue, Response> {
     let host = &state.config().server.host;
     let user = &state.config().server.user;
     let actor = match repo::actor::get_by_username_host(state.pool(), user, host).await {

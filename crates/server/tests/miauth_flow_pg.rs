@@ -262,7 +262,8 @@ async fn check_pending_returns_polling_response(pool: PgPool) {
     assert!(body["user"].is_null());
 }
 
-/// CLI approve 後の check は token + `MissUser` を返し、session が consumed に倒れる。
+/// CLI approve 後の check は token + self `MeDetailed` (= `/api/i` と同形) を返し、
+/// session が consumed に倒れる。#150 (Aria fix) で最小 `MissUser` から昇格。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn check_after_approve_returns_token_and_user(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
@@ -292,7 +293,7 @@ async fn check_after_approve_returns_token_and_user(pool: PgPool) {
         .unwrap();
     assert_eq!(rows, 1);
 
-    // approved 状態への check ── token 発行 + consumed への CAS + `MissUser` を返す。
+    // approved 状態への check ── token 発行 + consumed への CAS + self `MeDetailed` を返す。
     let path = format!("/api/miauth/{uuid}/check");
     let resp = app
         .clone()
@@ -313,6 +314,37 @@ async fn check_after_approve_returns_token_and_user(pool: PgPool) {
     assert_eq!(body["user"]["followersCount"], 0);
     assert_eq!(body["user"]["followingCount"], 0);
     assert_eq!(body["user"]["notesCount"], 0);
+    // #150 (Aria fix): check の `user` は `/api/i` と同じ full `MeDetailed`。
+    // Aria (misskey_dart) は check レスポンスの `user` を self `MeDetailed` として
+    // parse し、以下の required bool を cast する ── 欠落すると `null as bool` で
+    // `type 'Null' is not a subtype of type 'bool'` crash する。最小 `MissUser`
+    // (= UserLite) への回帰を防ぐため、UserDetailed / MeDetailed 双方の必須 bool
+    // が存在し bool 型であることを固定する。
+    for key in [
+        "isBot",
+        "isCat",
+        "isSilenced",
+        "isSuspended",
+        "publicReactions",
+        "isAdmin",
+        "isModerator",
+        "hasUnreadNotification",
+    ] {
+        assert!(
+            body["user"][key].is_boolean(),
+            "check user must carry MeDetailed required bool {key:?} (Aria crash otherwise); got {:?}",
+            body["user"][key]
+        );
+    }
+    // `MeDetailed` 固有の object / array も存在する (= `/api/i` と同形)。
+    assert!(
+        body["user"]["policies"].is_object(),
+        "check user must carry MeDetailed policies object"
+    );
+    assert!(
+        body["user"]["roles"].is_array(),
+        "check user must carry MeDetailed roles array"
+    );
 
     // session が consumed に倒れていて、token 行が作られている。
     let row = repo::miauth::get_session(&pool, uuid)
