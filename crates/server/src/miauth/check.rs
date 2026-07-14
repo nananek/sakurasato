@@ -39,20 +39,26 @@ use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::miauth::conv::{MissUser, from_actor_and_counts};
 use crate::miauth::error::internal_error;
 use crate::state::AppState;
 
 /// `POST /api/miauth/{uuid}/check` のレスポンス body。
 ///
-/// Misskey wire shape は `{ok: bool, token: string|null, user: MissUser|null}` 形式。
+/// Misskey wire shape は `{ok: bool, token: string|null, user: MeDetailed|null}` 形式。
 /// `ok = false` のときは `token` / `user` 両方 null (= pending)。
-/// `ok = true` のときは `token` 文字列 + `user` `MissUser`。
+/// `ok = true` のときは `token` 文字列 + `user` `MeDetailed` (= `/api/i` と同形)。
+///
+/// `user` を最小 `MissUser` (= `UserLite`) ではなく `MeDetailed` の JSON で返す
+/// のは、Aria (`misskey_dart`) が check レスポンスの `user` を **self `MeDetailed`**
+/// として parse し `isBot` / `isCat` 等の required bool を cast するため ──
+/// 欠落フィールドが `null as bool` で crash する (`type 'Null' is not a subtype
+/// of type 'bool'`)。builder は [`crate::miauth::i::build_self_me_detailed`] を
+/// `/api/i` と共有する。
 #[derive(Debug, Serialize)]
 struct CheckResponse {
     ok: bool,
     token: Option<String>,
-    user: Option<MissUser>,
+    user: Option<serde_json::Value>,
 }
 
 /// `POST /api/miauth/{uuid}/check` handler。
@@ -149,7 +155,7 @@ async fn handle_approved(state: &AppState, session: &MiAuthSessionRow) -> Respon
         };
     }
 
-    let user = match build_miss_user(state).await {
+    let user = match crate::miauth::i::build_self_me_detailed(state).await {
         Ok(u) => u,
         Err(resp) => return resp,
     };
@@ -166,7 +172,7 @@ async fn handle_approved(state: &AppState, session: &MiAuthSessionRow) -> Respon
 /// NULL に倒れているケースでは `token: null` を返す ── client は手元の token
 /// を保持して使い続ける責務がある。
 async fn handle_consumed(state: &AppState, session: &MiAuthSessionRow) -> Response {
-    let user = match build_miss_user(state).await {
+    let user = match crate::miauth::i::build_self_me_detailed(state).await {
         Ok(u) => u,
         Err(resp) => return resp,
     };
@@ -193,35 +199,4 @@ fn not_found(reason: &str) -> Response {
         })),
     )
         .into_response()
-}
-
-/// local actor + 集計 count → `MissUser`。失敗 (= local actor 不在 / DB エラー)
-/// は 500 を返す。
-async fn build_miss_user(state: &AppState) -> Result<MissUser, Response> {
-    let host = &state.config().server.host;
-    let user = &state.config().server.user;
-    let actor =
-        match sakurasato_core::repo::actor::get_by_username_host(state.pool(), user, host).await {
-            Ok(Some(row)) if row.is_local => row,
-            Ok(_) => {
-                tracing::error!(host, user, "local actor not found for /api/miauth/check");
-                return Err(internal_error(
-                    "local actor not initialized; run `sakurasato init`",
-                ));
-            }
-            Err(err) => {
-                tracing::error!(?err, "local actor lookup failed for /api/miauth/check");
-                return Err(internal_error("failed to look up local actor"));
-            }
-        };
-    let followers = sakurasato_core::repo::follow::count_followers(state.pool(), actor.id)
-        .await
-        .unwrap_or(0);
-    let following = sakurasato_core::repo::follow::count_following(state.pool(), actor.id)
-        .await
-        .unwrap_or(0);
-    let notes = sakurasato_core::repo::note::count_local(state.pool())
-        .await
-        .unwrap_or(0);
-    Ok(from_actor_and_counts(&actor, followers, following, notes))
 }
