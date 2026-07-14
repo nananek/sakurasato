@@ -59,7 +59,15 @@ jobs:
           # PR #280 で `permission_denials_count: 9` として実害を確認)。
           # 引用符で囲めば 1 トークンとして `--allowed-tools` に渡り、CLI 側で
           # comma 分割されてスペース入りパターンが保たれる。
-          claude_args: '--allowed-tools "Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh api:*)"'
+          #
+          # `gh pr diff` / `gh pr view` も allow する ── review には差分の読み出し
+          # が要る。従来は読み取りに `gh api` しか許可しておらず、かつ prompt が
+          # PR 番号を `gh pr list --head <branch>` で取れと指示していたが `gh pr
+          # list` は allowlist 外で拒否される。番号を得られないまま verdict を
+          # post せず silent 終了する事案があった (#295, `permission_denials_count:
+          # 5`, 投稿 0 件)。対策として PR 番号は prompt に `${{ }}` で直接注入し
+          # (下記 Output 節)、`gh pr list` 依存を消した。
+          claude_args: '--allowed-tools "Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*)"'
           prompt: |
             この repo (`sakurasato`) は **お一人様 TUI 専用 Fediverse (ActivityPub)
             サーバ**。Rust 製で、`crates/server` が AP 連合デーモン + ローカル API +
@@ -123,18 +131,22 @@ jobs:
             - 既存パターン (設定読み出し、エラー型、命名) に整合しているか
 
             **Output (必須)**:
-            review summary を **必ず top-level PR comment として post** すること。
-            silent で終わらない。手順:
+            **対象 PR は #${{ github.event.pull_request.number || github.event.issue.number }}**。
+            この番号を以下すべての `gh` コマンドで使う ── **`gh pr list` で探さない**
+            (allowlist 外で拒否され、番号を得られず silent 終了する)。
 
-            1. Review 内容を markdown でまとめる (= verdict 行 + 観点別の OK/NG 表
+            手順 (**silent で終わらないこと**):
+
+            1. 差分を取得:
+               `gh pr diff ${{ github.event.pull_request.number || github.event.issue.number }}`
+            2. review を markdown でまとめる (= verdict 行 + 観点別の OK/NG 表
                + 補足説明)
-            2. 投稿:
-               `gh pr comment <PR_NUMBER> --body "<review markdown>"`
-               (PR_NUMBER は `gh pr list --head <branch> --json number` で取得)
-            3. 1 行目に **verdict: approve / request-changes / block** の
+            3. **top-level comment として post**:
+               `gh pr comment ${{ github.event.pull_request.number || github.event.issue.number }} --body "<review markdown>"`
+            4. 1 行目に **verdict: approve / request-changes / block** の
                いずれかを必ず入れる
-            4. 行依存の finding があれば追加で
-               `gh pr review <N> --comment --body "..."` で個別 line comment
-               (= 任意、無くてもよい)
+            5. 行依存の finding があれば追加で
+               `gh pr review ${{ github.event.pull_request.number || github.event.issue.number }} --comment --body "..."`
+               で個別 line comment (= 任意、無くてもよい)
 
             日本語で書くこと。
