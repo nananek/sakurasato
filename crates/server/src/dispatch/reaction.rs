@@ -14,8 +14,13 @@
 //!
 //! - F3 (body actor == signer) と nested actor 検査は [`super::dispatch`] が
 //!   通過済み。ここでは signer を「`object` の author 本人」とみなしてよい。
-//! - `object` (= 対象 Note URI) はこちらの local note を指していなければ
-//!   silently skip (= 連合相手の retry ループに乗らないよう 202)。
+//! - `object` (= 対象 Note URI) は **既に DB にある note** を指していなければ
+//!   silently skip (= 連合相手の retry ループに乗らないよう 202)。local / remote
+//!   は問わない ── フォロイー投稿やフォロイーの boost 経由で取り込んだ remote
+//!   note (= タイムラインに並ぶ投稿) への第三者リアクションもカウント反映する
+//!   (Misskey 準拠)。未知 note は fetch せず skip する (reaction 受信を契機に
+//!   外部 fetch を走らせない)。in-app / webhook 通知は our own (local) note への
+//!   reaction のみ発火し、remote note への reaction はカウントのみ反映する。
 //! - `Emoji.id` の host は signer host と一致することを要求する ── 他インスタンス
 //!   の絵文字 ID を spoofing 学習させない (identity 境界)。
 //! - `Emoji.icon.url` の host は signer と異なってよい (Issue #239: Misskey は
@@ -166,9 +171,11 @@ async fn process_inbound_reaction(
     // 表示で「同じ shortcode が 2 行に分かれて出る」現象を抑える。
     let content = normalize_inbound_reaction_content(&raw_content);
 
-    // 対象 Note は **local** でなければ受けない (= remote 同士の reaction が
-    // 我々の inbox に流れてくる経路は想定しないし、流れてきても DB に Note
-    // が無いので reaction を作れない)。
+    // 対象 Note は **既に DB にある** ものだけ受ける (local / remote 問わず)。
+    // フォロイー投稿・フォロイーの boost 経由で取り込んだ remote note (= タイム
+    // ラインに並ぶ投稿) への第三者リアクションもカウント反映する (Misskey 準拠)。
+    // DB に無い note は fetch せず skip する ── reaction 受信を契機に無制限な
+    // 外部 fetch を走らせないため (= 「タイムラインにある投稿だけ」に閉じる)。
     let Some(note) = repo::note::get_by_ap_id(state.pool(), &object_uri)
         .await
         .with_context(|| format!("lookup note {object_uri}"))
@@ -178,19 +185,10 @@ async fn process_inbound_reaction(
             kind = kind.as_str(),
             object = %object_uri,
             signer = %signer.ap_id,
-            "reaction target note not found locally; ignoring (silent 202)"
+            "reaction target note not stored; ignoring (silent 202, no fetch)"
         );
         return Ok(());
     };
-    if !note.is_local {
-        info!(
-            kind = kind.as_str(),
-            object = %object_uri,
-            signer = %signer.ap_id,
-            "reaction target is a remote note; ignoring"
-        );
-        return Ok(());
-    }
 
     // `tag: [Emoji]` を学習し、対応する emoji_id があれば reaction に紐付ける。
     // [`learn_emoji_tag`] は内部で `extract_shortcode` を呼ぶので `content` /
@@ -227,10 +225,15 @@ async fn process_inbound_reaction(
         "reaction recorded",
     );
 
-    // 通知発火 (fire-and-forget)。reaction target は local note のみここに来る
-    // (上で `is_local` チェック済み)。通知本文も正規化済 content (= UI 表示
-    // と一致する文字列) を使う。
-    notification::dispatch::notify_reaction(state, signer, &note, &content).await;
+    // 通知発火 (fire-and-forget)。通知は **our own (local) note** への reaction
+    // のみ ── remote note (= followee 等のタイムライン投稿) への第三者リアク
+    // ションはカウント反映だけ行い、in-app / webhook 通知は出さない (Misskey も
+    // 自分以外の note の reaction では通知しない。見知らぬ第三者のリアクション
+    // で通知が洪水になるのを防ぐ)。通知本文は正規化済 content (= UI 表示と一致
+    // する文字列) を使う。
+    if note.is_local {
+        notification::dispatch::notify_reaction(state, signer, &note, &content).await;
+    }
 
     Ok(())
 }
