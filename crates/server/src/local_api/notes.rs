@@ -298,6 +298,12 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
     }));
     let _ = state.timeline_sender().send(event);
 
+    // Misskey 互換 `/streaming` (Aria 等) の homeTimeline へも push。TUI 用 SSE
+    // とは別 broadcast (`crate::event_bus`)。購読者ゼロは正常なので結果は無視。
+    let _ = state
+        .stream_sender()
+        .send(crate::event_bus::StreamEvent::Note { note_id: inserted });
+
     let body = CreateNoteResponse {
         id: inserted,
         ap_id: canonical_url.clone(),

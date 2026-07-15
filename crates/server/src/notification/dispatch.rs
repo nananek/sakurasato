@@ -97,12 +97,20 @@ async fn record_in_app(
         reaction: ctx.reaction_content.map(str::to_string),
         created_at: ctx.occurred_at,
     };
-    if let Err(err) = repo::notification::insert(state.pool(), new).await {
-        warn!(
+    match repo::notification::insert(state.pool(), new).await {
+        Ok(row) => {
+            // Misskey 互換 `/streaming` の main channel へ push (fire-and-forget)。
+            // insert 直後の行をそのまま載せる ── subscriber 側で再 fetch しない。
+            // 挿入失敗時は送らない (= 実在しない通知を stream に流さない)。
+            let _ = state
+                .stream_sender()
+                .send(crate::event_bus::StreamEvent::Notification(Box::new(row)));
+        }
+        Err(err) => warn!(
             ?err,
             event = event.as_str(),
             "notification: in-app insert failed"
-        );
+        ),
     }
 }
 
