@@ -14,6 +14,7 @@ pub mod cli;
 pub mod delivery;
 pub(crate) mod dispatch;
 pub mod emoji_import;
+pub mod event_bus;
 pub(crate) mod extract;
 pub(crate) mod fetch_rate_limit;
 pub mod follow;

@@ -11,6 +11,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::{Notify, broadcast};
 
+use crate::event_bus::{STREAM_CHANNEL_CAPACITY, StreamEvent};
 use crate::fetch_rate_limit::DomainRateLimiter;
 use crate::http_client;
 use crate::local_api::stream::{TIMELINE_CHANNEL_CAPACITY, TimelineEvent};
@@ -32,6 +33,12 @@ struct Inner {
     /// される ── SSE 接続が一時的に詰まっても publisher (POST notes 等) は
     /// ブロックしない設計。capacity は [`TIMELINE_CHANNEL_CAPACITY`] を参照。
     timeline_tx: broadcast::Sender<TimelineEvent>,
+    /// Misskey 互換 `/streaming` (Aria 等) を購読しているクライアントに、新規
+    /// note / boost / 通知 / リアクション増減を配る broadcast channel。TUI 用
+    /// [`Inner::timeline_tx`] とは **別立て** で、TUI 側の wire を壊さずに
+    /// streaming 専用イベント ([`StreamEvent`]) を増やせる (`crate::event_bus`
+    /// の module doc 参照)。capacity は [`STREAM_CHANNEL_CAPACITY`]。
+    stream_tx: broadcast::Sender<StreamEvent>,
     /// versitygw (S3 互換) 向けクライアント。`from_config` は config から
     /// `access_key` / `secret_access_key` / endpoint / region を読んで構築し、
     /// `from_pool` (テスト) はダミー endpoint で構築する ── 本物の S3 に
@@ -111,12 +118,14 @@ impl AppState {
         let s3 = build_s3_client(&config)?;
         let media_proxy = MediaProxyClient::new(config.media_proxy.socket.clone());
         let (timeline_tx, _) = broadcast::channel(TIMELINE_CHANNEL_CAPACITY);
+        let (stream_tx, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
         Ok(Self(Arc::new(Inner {
             config,
             pool,
             http,
             s3,
             timeline_tx,
+            stream_tx,
             allow_internal_inbox: false,
             enable_remote_fetch: true,
             media_proxy,
@@ -138,12 +147,14 @@ impl AppState {
             build_s3_client(&config).expect("aws-sdk-s3 builder is infallible from static creds");
         let media_proxy = MediaProxyClient::new(config.media_proxy.socket.clone());
         let (timeline_tx, _) = broadcast::channel(TIMELINE_CHANNEL_CAPACITY);
+        let (stream_tx, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
         Self(Arc::new(Inner {
             config,
             pool,
             http,
             s3,
             timeline_tx,
+            stream_tx,
             allow_internal_inbox: true,
             enable_remote_fetch: false,
             media_proxy,
@@ -227,6 +238,17 @@ impl AppState {
     /// publisher 側は気にせず無視する設計 (SSE を誰も購読していないのは正常)。
     pub fn timeline_sender(&self) -> &broadcast::Sender<TimelineEvent> {
         &self.0.timeline_tx
+    }
+
+    /// Misskey 互換 `/streaming` 配信用 broadcast sender。dispatch / local API
+    /// 経路が DB commit 後に `send(event)` を呼び、`GET /streaming` の WebSocket
+    /// handler が [`broadcast::Sender::subscribe`] で消費する。
+    ///
+    /// [`timeline_sender`](Self::timeline_sender) と同じく、購読者ゼロで `send`
+    /// が `Err` を返すのは正常 (streaming 接続が無いだけ) なので publisher は
+    /// 結果を無視する。
+    pub fn stream_sender(&self) -> &broadcast::Sender<StreamEvent> {
+        &self.0.stream_tx
     }
 }
 

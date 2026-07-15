@@ -135,6 +135,19 @@ pub(crate) async fn handle_undo(
         deleted,
         "reaction undone",
     );
+
+    // Misskey 互換 `/streaming` の noteUpdated (unreacted) へ push。削除した行の
+    // note_id / content を使う (= `row` は削除前に引いてある)。
+    if deleted > 0 {
+        let _ = state
+            .stream_sender()
+            .send(crate::event_bus::StreamEvent::ReactionUpdated {
+                note_id: row.note_id,
+                reaction: row.content.clone(),
+                kind: crate::event_bus::ReactionKind::Unreacted,
+            });
+    }
+
     Ok(())
 }
 
@@ -234,6 +247,18 @@ async fn process_inbound_reaction(
     if note.is_local {
         notification::dispatch::notify_reaction(state, signer, &note, &content).await;
     }
+
+    // Misskey 互換 `/streaming` の noteUpdated へ push (fire-and-forget)。通知と
+    // 違い local / remote を問わず、タイムラインに並ぶ note の reaction 増減を
+    // 購読中クライアントに反映する。冪等再受信 (= 既存 reaction の再 insert) でも
+    // 送るが、Aria 側は reaction map の再描画で吸収するので害は無い。
+    let _ = state
+        .stream_sender()
+        .send(crate::event_bus::StreamEvent::ReactionUpdated {
+            note_id: note.id,
+            reaction: content.clone(),
+            kind: crate::event_bus::ReactionKind::Reacted,
+        });
 
     Ok(())
 }

@@ -177,7 +177,11 @@ pub async fn mark_all_read(
 }
 
 /// `NotificationRow` 1 行を Misskey Notification object に組み立てる。
-async fn build_notification(
+///
+/// `/api/i/notifications` (本 module) と `/streaming` の main channel
+/// ([`crate::miauth::streaming`]) が共有する。`summaries` は対象 note の
+/// reaction/announce 集計 (無ければ空 map を渡してよい ── 内部で空 fallback)。
+pub(crate) async fn build_notification(
     state: &AppState,
     row: &NotificationRow,
     host: &str,

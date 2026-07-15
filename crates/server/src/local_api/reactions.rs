@@ -148,6 +148,16 @@ pub(crate) async fn create_reaction_core(
     };
 
     let queued = if inserted.ap_id == ap_id {
+        // 新規 reaction のとき (= 冪等再叩きでない) だけ Misskey 互換 `/streaming`
+        // の noteUpdated (reacted) へ push。自分のリアクションも購読中クライアント
+        // (Aria 等) に反映する。
+        let _ = state
+            .stream_sender()
+            .send(crate::event_bus::StreamEvent::ReactionUpdated {
+                note_id: note.id,
+                reaction: content.to_string(),
+                kind: crate::event_bus::ReactionKind::Reacted,
+            });
         let activity = build_reaction_activity(
             state,
             &local_actor,
@@ -489,8 +499,18 @@ async fn build_and_dispatch_delete_core(
         });
         enqueue_reaction_delivery(state, local_actor, local_actor.id, &activity).await
     };
-    if let Err(err) = repo::reaction::delete_by_ap_id(state.pool(), &row.ap_id).await {
-        warn!(?err, reaction_id = row.id, "DELETE core: row delete failed");
+    match repo::reaction::delete_by_ap_id(state.pool(), &row.ap_id).await {
+        Ok(_) => {
+            // Misskey 互換 `/streaming` の noteUpdated (unreacted) へ push。
+            let _ = state
+                .stream_sender()
+                .send(crate::event_bus::StreamEvent::ReactionUpdated {
+                    note_id: row.note_id,
+                    reaction: row.content.clone(),
+                    kind: crate::event_bus::ReactionKind::Unreacted,
+                });
+        }
+        Err(err) => warn!(?err, reaction_id = row.id, "DELETE core: row delete failed"),
     }
     queued
 }

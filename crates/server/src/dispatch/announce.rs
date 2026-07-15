@@ -104,6 +104,16 @@ pub(crate) async fn handle_announce(
         "boost recorded",
     );
 
+    // Misskey 互換 `/streaming` の homeTimeline へ renote frame として push
+    // (fire-and-forget)。通知 (下の notify_renote) は自分の note の boost のみ
+    // だが、home timeline には followee の boost を is_local を問わず並べる
+    // (= REST の list_home_renote_window と対称)。
+    let _ = state
+        .stream_sender()
+        .send(crate::event_bus::StreamEvent::Renote {
+            announce_id: row.id,
+        });
+
     // 通知は **自分の note が boost された時だけ** 発火する (Misskey / Mastodon
     // と同じ作法)。followee が第三者の note を boost したのは home timeline の
     // 内容であって「自分への通知」ではない ── これを通知に流すと Aria の通知

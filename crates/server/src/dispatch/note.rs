@@ -148,6 +148,18 @@ pub(crate) async fn handle_create(
     )
     .await;
 
+    // Misskey 互換 `/streaming` の homeTimeline へ push (fire-and-forget)。
+    // followee 投稿 (= followed) のみタイムラインに並ぶ。我々宛 mention/reply
+    // だけの note (addresses_us かつ非 followee) は home に載せない ── REST の
+    // `notes/timeline` (list_home_timeline_window) と対称にする。
+    if followed {
+        let _ = state
+            .stream_sender()
+            .send(crate::event_bus::StreamEvent::Note {
+                note_id: inserted.id,
+            });
+    }
+
     Ok(())
 }
 
