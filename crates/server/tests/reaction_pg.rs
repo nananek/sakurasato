@@ -209,6 +209,42 @@ async fn seed_local_note(pool: &PgPool, local_actor_id: i64) -> (i64, String) {
     (inserted.id, ap_id)
 }
 
+/// `seed_local_note` の remote 版。`author_actor_id` の remote actor が書いた
+/// `is_local: false` の note を 1 件保持する ── 実運用では followee 投稿 /
+/// フォロイーの boost 経由で取り込まれ「タイムラインに並ぶ」note を模す。
+async fn seed_remote_note(
+    pool: &PgPool,
+    author_actor_id: i64,
+    host: &str,
+    n: u32,
+) -> (i64, String) {
+    let ap_id = format!("https://{host}/notes/{n}");
+    let inserted = repo::note::insert(
+        pool,
+        repo::note::NewNote {
+            ap_id: ap_id.clone(),
+            actor_id: author_actor_id,
+            content: "remote timeline post".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: false,
+            url: Some(ap_id.clone()),
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    (inserted.id, ap_id)
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn inbound_like_records_reaction(pool: PgPool) {
     let (_, local_pub) = fresh_rsa();
@@ -610,4 +646,63 @@ async fn inbound_like_to_unknown_note_is_silently_accepted(pool: PgPool) {
         .await
         .unwrap();
     assert!(gone.is_none(), "no reaction row should be created");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn inbound_reaction_on_remote_note_is_recorded(pool: PgPool) {
+    // フォロイー (carol@remote.test) の投稿 = タイムラインに並ぶ remote note に、
+    // **別の** remote user (bob@other.test) がリアクション → カウント反映する
+    // (Misskey 準拠)。ただし our own note ではないので in-app 通知は出さない。
+    // dispatch は「note が DB にあること」だけを見る (local/remote 問わず)。
+    let (_, local_pub) = fresh_rsa();
+    let (_, carol_pub) = fresh_rsa();
+    let (bob_priv, bob_pub) = fresh_rsa();
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let carol = repo::actor::insert(&pool, remote_actor("remote.test", "carol", &carol_pub))
+        .await
+        .unwrap();
+    let bob = repo::actor::insert(&pool, remote_actor("other.test", "bob", &bob_pub))
+        .await
+        .unwrap();
+    let (note_id, note_ap_id) = seed_remote_note(&pool, carol.id, "remote.test", 42).await;
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let activity_id = "https://other.test/users/bob/activities/like-remote".to_string();
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": activity_id,
+        "type": "Like",
+        "actor": bob.ap_id,
+        "object": note_ap_id,
+        "content": "👍",
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", bob.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &bob_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // reaction が remote note に記録される (= 従来は is_local ガードで捨てていた)。
+    let row = repo::reaction::get_by_ap_id(&pool, &activity_id)
+        .await
+        .unwrap()
+        .expect("reaction on a stored remote note should be recorded");
+    assert_eq!(row.note_id, note_id);
+    assert_eq!(row.actor_id, bob.id);
+    assert_eq!(row.content, "👍");
+
+    // our own note ではないので in-app 通知は立たない (カウントのみ反映)。
+    let notifs = repo::notification::list(&pool, local.id, 10, None, None)
+        .await
+        .unwrap();
+    assert!(
+        notifs.is_empty(),
+        "remote note への第三者 reaction では通知を出さない (got {} notifs)",
+        notifs.len(),
+    );
 }
