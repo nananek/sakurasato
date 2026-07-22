@@ -118,6 +118,9 @@ pub fn router(state: AppState) -> Router {
             "/api/users/search-by-username-and-host",
             post(users::search_by_username_and_host),
         )
+        // 一般ユーザー検索画面。未実装だと Aria の MisskeyUsers.search
+        // (SearchUsersNotifier) が 404 → ApiService.post で crash。
+        .route("/api/users/search", post(users::search))
         // M14 #160 ── write endpoints
         .route("/api/notes/create", post(notes::create))
         .route("/api/notes/delete", post(notes::delete))

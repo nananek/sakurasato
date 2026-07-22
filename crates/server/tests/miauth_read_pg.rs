@@ -3183,6 +3183,109 @@ async fn users_search_by_username_and_host_matches_prefix(pool: PgPool) {
     assert_eq!(usernames, vec!["bobcat".to_string()]);
 }
 
+/// 自分自身 (local actor) も他の actor と同様に検索結果に出る ── 除外ロジック
+/// を持たせていないことの回帰防止 (リストへ自分を追加する UI 導線でまず
+/// 自分自身を検索できる必要がある)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_search_by_username_and_host_includes_self(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let _bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/users/search-by-username-and-host")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"i": token, "username": "alice"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let usernames: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["username"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        usernames,
+        vec!["alice".to_string()],
+        "self must appear in search-by-username-and-host results: {usernames:?}"
+    );
+    assert!(arr[0]["host"].is_null(), "self is local: host must be null");
+}
+
+/// `users/search` (部分一致・display name も見る一般検索) でも自分自身が
+/// 除外されないこと。`origin` を明示していない (combined) 場合と
+/// `origin: "local"` の両方で確認する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_search_includes_self(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let _bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    for origin in [None, Some("local")] {
+        let mut body = json!({"i": token, "query": "alice"});
+        if let Some(o) = origin {
+            body["origin"] = json!(o);
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/users/search")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let arr = read_json(resp).await;
+        let usernames: Vec<String> = arr
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["username"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            usernames,
+            vec!["alice".to_string()],
+            "self must appear in users/search results (origin={origin:?}): {usernames:?}"
+        );
+    }
+
+    // display name ("Alice") での部分一致でも自分自身が見つかる。
+    let resp = app
+        .oneshot(
+            Request::post("/api/users/search")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"i": token, "query": "lic"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let arr = read_json(resp).await;
+    assert!(
+        arr.as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["username"] == "alice"),
+        "self must be findable via display_name substring match: {arr:?}"
+    );
+}
+
 /// 検索語に `%`/`_` が含まれていてもワイルドカードとして展開されず、
 /// リテラル一致として扱われる (= 意図しない大量マッチを起こさない)。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
