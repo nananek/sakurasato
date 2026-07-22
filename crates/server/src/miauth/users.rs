@@ -38,8 +38,10 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use sakurasato_core::model::ActorRow;
 use sakurasato_core::repo;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 
 use crate::miauth::auth;
 use crate::miauth::conv::from_actor_detailed;
@@ -60,9 +62,19 @@ pub struct UsersShowBody {
     pub username: Option<String>,
     #[serde(default)]
     pub host: Option<String>,
+    /// 経路 3: `userIds` 一括指定 (= `MisskeyUsers.showByIds`、Aria の
+    /// リストメンバー表示画面 `ListUsersNotifier` が使う)。指定時は他の
+    /// フィールドより優先し、レスポンスは単一 object ではなく **配列** になる
+    /// (Misskey 仕様、`userId`/`username` 経路と排他)。
+    #[serde(rename = "userIds", default)]
+    pub user_ids: Option<Vec<String>>,
 }
 
 /// `POST /api/users/show` handler。
+///
+/// `userIds` (配列) が指定された場合は一括取得経路 ── 見つからない id は
+/// 404 にせず黙ってスキップする (Misskey 仕様。1 件消えているだけで
+/// リスト全体の表示が壊れるのを避ける)。
 pub async fn handle(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -74,6 +86,23 @@ pub async fn handle(
     else {
         return auth::unauthorized("invalid or revoked token");
     };
+
+    // 0. userIds 一括指定経路 (= 他経路より優先、レスポンス shape が異なる)。
+    if let Some(ids) = body.user_ids.as_ref() {
+        let ids: Vec<i64> = ids.iter().filter_map(|s| s.parse::<i64>().ok()).collect();
+        let actors = match repo::actor::list_by_ids(state.pool(), &ids).await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(?err, "miauth users/show (batch): list_by_ids failed");
+                return internal_error("failed to look up users");
+            }
+        };
+        let mut out = Vec::with_capacity(actors.len());
+        for actor in &actors {
+            out.push(build_detailed_json(&state, actor).await);
+        }
+        return Json(out).into_response();
+    }
 
     // 1. userId 直接指定経路。
     let actor = if let Some(uid) = body.user_id.as_deref() {
@@ -111,9 +140,22 @@ pub async fn handle(
             }
         }
     } else {
-        return bad_request("either userId or username is required");
+        return bad_request("either userId, username, or userIds is required");
     };
 
+    let detailed = build_detailed_json(&state, &actor).await;
+    Json(detailed).into_response()
+}
+
+/// `ActorRow` → `UserDetailed` 相当の JSON。followers/following/notes count を
+/// 都度引く (`users/show` の単発呼び出しでは無視できるコスト、`userIds` 一括
+/// 経路でも Aria のリスト表示は数十件規模までなので N+1 の実害は薄い)。
+///
+/// `from_actor_detailed` 内の `from_actor_and_counts` が `actor.is_local` に
+/// 応じて host を `None` (local) / `Some(actor.host)` (remote) に倒すため、
+/// 本関数は `ActorRow` をそのまま渡せば正しい host が得られる
+/// (= `conv::timeline_entry_to_miss_note` のような上書きは不要)。
+async fn build_detailed_json(state: &AppState, actor: &ActorRow) -> JsonValue {
     let followers = repo::follow::count_followers(state.pool(), actor.id)
         .await
         .unwrap_or(0);
@@ -132,13 +174,7 @@ pub async fn handle(
         // wire shape に number が必要なので 0 を返して埋める。
         0
     };
-
-    // `from_actor_detailed` 内の `from_actor_and_counts` が `actor.is_local` に
-    // 応じて host を `None` (local) / `Some(actor.host)` (remote) に倒すため、
-    // 本 handler は `ActorRow` をそのまま渡せば正しい host が得られる
-    // (= `conv::timeline_entry_to_miss_note` のような上書きは不要)。
-    let detailed = from_actor_detailed(&actor, followers, following, notes);
-    Json(detailed).into_response()
+    from_actor_detailed(actor, followers, following, notes)
 }
 
 /// `limit` の既定値・上限。Misskey 公式仕様 (default 10, max 100) に揃える。
