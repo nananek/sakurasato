@@ -3228,6 +3228,51 @@ async fn users_search_endpoints_include_url_key_for_client_dispatch(pool: PgPool
     }
 }
 
+/// `users/show` の `userIds` (配列) 一括経路 ── Aria の `ListUsersNotifier`
+/// (= リストメンバー表示画面) が `MisskeyUsers.showByIds` 経由で叩く。
+/// 単一 `userId`/`username` 経路と異なりレスポンスは配列になる。存在しない
+/// id は 404 にせず黙ってスキップする (Misskey 仕様、1 件消えているだけで
+/// リスト全体の表示が壊れるのを避ける)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_show_batch_by_ids_returns_array_and_skips_unknown(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/users/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "i": token,
+                        "userIds": [alice.to_string(), bob.to_string(), "999999"],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let items = arr.as_array().expect("userIds response must be an array");
+    let ids: Vec<String> = items
+        .iter()
+        .map(|u| u["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        2,
+        "unknown id must be skipped, not error out the whole batch: {ids:?}"
+    );
+    assert!(ids.contains(&alice.to_string()));
+    assert!(ids.contains(&bob.to_string()));
+}
+
 /// 自分自身 (local actor) も他の actor と同様に検索結果に出る ── 除外ロジック
 /// を持たせていないことの回帰防止 (リストへ自分を追加する UI 導線でまず
 /// 自分自身を検索できる必要がある)。
