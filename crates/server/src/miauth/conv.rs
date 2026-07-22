@@ -956,6 +956,20 @@ pub fn from_actor_detailed(
         map.insert("isSilenced".to_string(), JsonValue::Bool(false));
         map.insert("isSuspended".to_string(), JsonValue::Bool(false));
         map.insert("publicReactions".to_string(), JsonValue::Bool(true));
+
+        // **必須ではなく key の存在自体が意味を持つフィールド**: misskey_dart の
+        // `User.fromJson` (= `MisskeyUsers.search` / `searchByUsernameAndHost` が
+        // 使う polymorphic factory) は `json.containsKey("url")` の有無だけで
+        // `UserLite.fromJson` (無し) / `UserDetailed.fromJson` (有り) を出し分ける。
+        // 本関数はこれまで `url` キー自体を emit していなかったため、値の
+        // 妥当性とは無関係に **常に `UserLite` として parse され**、Aria の
+        // `SearchUsersNotifier._fetchUsers` が `response.whereType<UserDetailed>()`
+        // で全件除外 → 200 + 非空 JSON なのに検索結果が常に空、という症状に
+        // なっていた (2026-07-22 調査)。Sakurasato は AP actor の `url` (=
+        // ActivityPub `id` とは別の「人間可読ページ」property) を保存して
+        // いないため値は常に `null` にする ── **null でも key が存在すれば
+        // `containsKey` は true** なので、これだけで UserDetailed 経路に乗る。
+        map.insert("url".to_string(), JsonValue::Null);
     }
     v
 }
@@ -1575,6 +1589,25 @@ mod tests {
                 "required bool `{key}` must be present and boolean"
             );
         }
+    }
+
+    /// 2026-07-22 調査: `misskey_dart` の `User.fromJson` (=
+    /// `MisskeyUsers.search` / `searchByUsernameAndHost` が使う) は
+    /// `json.containsKey("url")` の有無だけで `UserLite` / `UserDetailed` を
+    /// 出し分ける。`url` キー自体が無いと常に `UserLite` 扱いになり、Aria の
+    /// `SearchUsersNotifier` が `whereType<UserDetailed>()` で全件除外 →
+    /// 200 + 非空 JSON なのに検索結果が常に空、という回帰が起きる。値は
+    /// `null` でよいが **キーは必ず存在すること**。
+    #[test]
+    fn from_actor_detailed_includes_url_key_for_userdetailed_dispatch() {
+        let actor = fake_actor(false, "remote.test", false);
+        let v = from_actor_detailed(&actor, 0, 0, 0);
+        let map = v.as_object().expect("from_actor_detailed must be object");
+        assert!(
+            map.contains_key("url"),
+            "response must contain a `url` key (even if null) so misskey_dart's \
+             User.fromJson dispatches to UserDetailed instead of UserLite: {v}"
+        );
     }
 
     // ── #165 round-2 fix: MissNote.user.host が local actor で null になる ──
