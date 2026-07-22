@@ -3183,6 +3183,51 @@ async fn users_search_by_username_and_host_matches_prefix(pool: PgPool) {
     assert_eq!(usernames, vec!["bobcat".to_string()]);
 }
 
+/// 2026-07-22 調査 (shinVPS 実機): `misskey_dart` の `User.fromJson` は
+/// `containsKey("url")` の有無だけで `UserLite`/`UserDetailed` を出し分ける。
+/// `url` キーが無いと常に `UserLite` 扱いになり、Aria の `SearchUsersNotifier`
+/// が `whereType<UserDetailed>()` で全件除外 → 200 + 非空 JSON なのに検索
+/// 結果が常に空、という症状になっていた。両エンドポイントの各要素に
+/// `url` キーが (値は null でよいので) 必ず存在することを固定する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_search_endpoints_include_url_key_for_client_dispatch(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let _bob = seed_remote_actor(&pool, "remote.test", "bobcat").await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    for (path, body) in [
+        ("/api/users/search", json!({"i": token, "query": "bob"})),
+        (
+            "/api/users/search-by-username-and-host",
+            json!({"i": token, "username": "bob"}),
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let arr = read_json(resp).await;
+        let items = arr.as_array().unwrap();
+        assert!(!items.is_empty(), "{path}: expected at least one result");
+        for item in items {
+            assert!(
+                item.as_object().unwrap().contains_key("url"),
+                "{path}: each result must contain a `url` key (may be null): {item}"
+            );
+        }
+    }
+}
+
 /// 自分自身 (local actor) も他の actor と同様に検索結果に出る ── 除外ロジック
 /// を持たせていないことの回帰防止 (リストへ自分を追加する UI 導線でまず
 /// 自分自身を検索できる必要がある)。
