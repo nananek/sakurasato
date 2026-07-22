@@ -316,6 +316,51 @@ pub async fn search_by_username_host(
     .await
 }
 
+/// `users/search` (`MiAuth`, Aria の一般ユーザー検索画面) 用。
+/// [`search_by_username_host`] が `preferred_username` の前方一致のみを
+/// 見るのに対し、こちらは `preferred_username` **または** `display_name` の
+/// 部分一致 (ILIKE) で検索する ── 検索ボックスに愛称や display name を
+/// 打っても引っかかるようにする Misskey の `users/search` 挙動に合わせる。
+///
+/// `query_pattern` は呼び出し側が ILIKE 特殊文字をエスケープ済みの完全
+/// パターン文字列 (= 前後 `%` 込みの部分一致パターン) を渡すこと。
+/// `origin_is_local`: `Some(true)` = local のみ、`Some(false)` = remote のみ、
+/// `None` = 両方 (Misskey `origin: combined` 相当)。
+pub async fn search(
+    pool: &PgPool,
+    query_pattern: &str,
+    origin_is_local: Option<bool>,
+    limit: i64,
+    offset: i64,
+) -> sqlx::Result<Vec<ActorRow>> {
+    sqlx::query_as!(
+        ActorRow,
+        r#"
+        SELECT
+            id, ap_id, preferred_username, host, display_name, summary,
+            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
+            followers_url, following_url, public_key_id, public_key_pem,
+            private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
+            also_known_as as "also_known_as: Json<Vec<String>>",
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
+        FROM actor
+        WHERE
+            (preferred_username ILIKE $1 OR display_name ILIKE $1)
+            AND ($2::BOOLEAN IS NULL OR is_local = $2)
+        ORDER BY is_local DESC, preferred_username ASC
+        LIMIT $3 OFFSET $4
+        "#,
+        query_pattern,
+        origin_is_local,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Touch the `updated_at` column and refresh `fetched_at` for a remote actor.
 /// Used when re-fetching actor metadata from a remote server.
 pub async fn mark_fetched(pool: &PgPool, id: i64) -> sqlx::Result<()> {

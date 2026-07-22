@@ -1,5 +1,5 @@
-//! `POST /api/users/show` + `POST /api/users/search-by-username-and-host`
-//! (= M14 #159, 親 issue #150)。
+//! `POST /api/users/show` + `POST /api/users/search-by-username-and-host` +
+//! `POST /api/users/search` (= M14 #159, 親 issue #150)。
 //!
 //! Misskey 互換クライアント (Milktea / `MissRirica` / Aria 等) が「ユーザを
 //! 開く」「ユーザを検索する」経路。`show` は `userId` 直接指定と
@@ -9,6 +9,7 @@
 //!
 //! - <https://api-doc.misskey.io/api/endpoints/users/show>
 //! - <https://api-doc.misskey.io/api/endpoints/users/search-by-username-and-host>
+//! - <https://api-doc.misskey.io/api/endpoints/users/search>
 //!
 //! observed wire shape (= `misskey-py` `users_show()` で本物 Misskey の admin を
 //! 引いたときに返るキー):
@@ -19,16 +20,19 @@
 //! createdAt, description, bannerUrl, isBot, isCat
 //! ```
 //!
-//! `search-by-username-and-host` はこのキー集合を持つオブジェクトの配列を
-//! 返す。Aria の「リストにメンバーを追加」UI がユーザー検索に使う経路
-//! (`misskey_dart` `MisskeyUsers.searchByUsernameAndHost`) ── 未実装のまま
-//! だと Aria 側で API 呼び出しが失敗し例外を投げるため、リスト機能とセットで
+//! `search-by-username-and-host` / `search` はこのキー集合を持つオブジェクト
+//! の配列を返す。前者はリスト機能の「メンバー追加」UI が `username` 前方
+//! 一致で使う経路 (`misskey_dart` `MisskeyUsers.searchByUsernameAndHost`)、
+//! 後者は一般ユーザー検索画面が `query` 部分一致 (username or display name)
+//! で使う経路 (`misskey_dart` `MisskeyUsers.search`) ── どちらも未実装だと
+//! Aria 側で API 呼び出しが失敗し例外を投げるため、リスト機能とセットで
 //! 実装する。
 //!
 //! ## scope
 //!
-//! Misskey 仕様で `users/show` / `users/search-by-username-and-host` は
-//! ともに **`read:account`** scope を要求する (= `/api/i` と同じ最小権限)。
+//! Misskey 仕様で `users/show` / `users/search-by-username-and-host` /
+//! `users/search` はいずれも **`read:account`** scope を要求する
+//! (= `/api/i` と同じ最小権限)。
 
 use axum::Json;
 use axum::extract::State;
@@ -235,4 +239,90 @@ fn escape_ilike_pattern(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+const SEARCH_QUERY_LIMIT_DEFAULT: i64 = 10;
+const SEARCH_QUERY_LIMIT_MAX: i64 = 100;
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SearchBody {
+    #[serde(default)]
+    pub i: Option<String>,
+    /// 検索語。`preferred_username` / `display_name` の部分一致に使う。
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// `"local"` / `"remote"` / `"combined"` (省略時 = combined)。
+    #[serde(default)]
+    pub origin: Option<String>,
+}
+
+/// `POST /api/users/search` handler。
+///
+/// Aria の一般ユーザー検索画面が使う経路 (`misskey_dart` `MisskeyUsers.search`)。
+/// [`search_by_username_and_host`] と異なり、検索語は `preferred_username`
+/// **または** `display_name` の部分一致で見る (= 検索ボックスへの自然な入力に
+/// 合わせる)。`query` が空/欠落のときは 400 ではなく空配列を返す ── 検索
+/// ボックスが空の瞬間にクライアントが呼んでも例外を投げさせないための
+/// 安全側の挙動。
+pub async fn search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<SearchBody>>,
+) -> Response {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    let Some(_token_row) =
+        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
+    else {
+        return auth::unauthorized("invalid or revoked token");
+    };
+
+    let Some(query) = body
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Json(Vec::<serde_json::Value>::new()).into_response();
+    };
+    let pattern = format!("%{}%", escape_ilike_pattern(query));
+    let origin_is_local = match body.origin.as_deref() {
+        Some("local") => Some(true),
+        Some("remote") => Some(false),
+        _ => None,
+    };
+    let limit = body
+        .limit
+        .unwrap_or(SEARCH_QUERY_LIMIT_DEFAULT)
+        .clamp(1, SEARCH_QUERY_LIMIT_MAX);
+    let offset = body.offset.unwrap_or(0).max(0);
+
+    let actors =
+        match repo::actor::search(state.pool(), &pattern, origin_is_local, limit, offset).await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(?err, "miauth users/search: query failed");
+                return internal_error("user search failed");
+            }
+        };
+
+    let mut out = Vec::with_capacity(actors.len());
+    for actor in actors {
+        let followers = repo::follow::count_followers(state.pool(), actor.id)
+            .await
+            .unwrap_or(0);
+        let following = repo::follow::count_following(state.pool(), actor.id)
+            .await
+            .unwrap_or(0);
+        let notes = if actor.is_local {
+            repo::note::count_local(state.pool()).await.unwrap_or(0)
+        } else {
+            0
+        };
+        out.push(from_actor_detailed(&actor, followers, following, notes));
+    }
+    Json(out).into_response()
 }
