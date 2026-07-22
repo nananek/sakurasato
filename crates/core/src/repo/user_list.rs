@@ -83,13 +83,19 @@ pub enum AddMemberError {
     /// 対象リストが存在しない。
     ListNotFound,
     /// `member_actor_id` を `state = 'accepted'` で follow していない。
-    /// Mastodon/Misskey と同様、フォロー済みの相手のみリストに追加できる。
+    /// Mastodon/Misskey と同様、フォロー済みの相手のみリストに追加できる
+    /// (ただし自分自身は例外、[`add_member`] 参照)。
     NotFollowing,
 }
 
 /// `member_actor_id` をリストに追加する。`follower_actor_id` は local actor
 /// の id (= 呼び出し側が resolve 済みの値を渡す)。`follow.state = 'accepted'`
 /// でなければ [`AddMemberError::NotFollowing`] を返し、DB に触らない。
+///
+/// **例外: 自分自身 (`member_actor_id == follower_actor_id`) は無条件で
+/// 追加できる。** 自分自身を follow する概念は存在しない (`follow` テーブル
+/// に自己 loop 行を作らない設計) ため、通常の accepted-follow チェックの
+/// 対象外にする ── 「自分の投稿も含めたリスト」を作りたいユーザ要望に対応。
 ///
 /// 既にメンバーなら `ON CONFLICT DO NOTHING` で冪等 (エラーにしない)。
 pub async fn add_member(
@@ -101,11 +107,14 @@ pub async fn add_member(
     if get_by_id(pool, list_id).await?.is_none() {
         return Ok(Err(AddMemberError::ListNotFound));
     }
-    let accepted = crate::repo::follow::get_by_pair(pool, follower_actor_id, member_actor_id)
-        .await?
-        .is_some_and(|f| f.state == "accepted");
-    if !accepted {
-        return Ok(Err(AddMemberError::NotFollowing));
+    let is_self = member_actor_id == follower_actor_id;
+    if !is_self {
+        let accepted = crate::repo::follow::get_by_pair(pool, follower_actor_id, member_actor_id)
+            .await?
+            .is_some_and(|f| f.state == "accepted");
+        if !accepted {
+            return Ok(Err(AddMemberError::NotFollowing));
+        }
     }
     sqlx::query!(
         r#"
@@ -160,8 +169,9 @@ pub async fn count_members(pool: &PgPool, list_id: i64) -> sqlx::Result<i64> {
 
 /// リストタイムライン (= リストメンバーの投稿) を `published_at`/`id` カーソル
 /// でページングして取る。`repo::note::list_home_timeline_window` と同じ列を
-/// 返すが、自分自身の投稿は含めない (Mastodon/Misskey 準拠。リストは
-/// 「他者をグルーピングして見る」機能であり home timeline の代替ではない)。
+/// 返すが、`user_list_member` に入っている actor のみが対象 ── 自分自身は
+/// 自動では含まれない (home timeline の代替ではないため) が、[`add_member`]
+/// の自己追加例外で明示的にメンバーへ加えれば、その投稿もここに乗る。
 #[allow(clippy::too_many_arguments)]
 pub async fn list_list_timeline_window(
     pool: &PgPool,

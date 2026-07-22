@@ -82,7 +82,7 @@ pub enum Command {
     /// フォロー中ユーザーをグルーピングした専用タイムライン。MiAuth 経路
     /// (`users/lists/*` + `notes/user-list-timeline`, Aria 等の Misskey
     /// クライアント向け) / TUI ローカル API と同じ DB を操作する CLI 管理系。
-    /// メンバー追加は `follow.state = 'accepted'` の相手のみ可能。
+    /// メンバー追加は `follow.state = 'accepted'` の相手 (+ 自分自身) のみ可能。
     List(ListArgs),
     /// Manage Discord 互換 webhook 通知チャンネル。
     ///
@@ -353,8 +353,8 @@ pub enum ListCommand {
     Delete(ListIdArgs),
     /// `--id <N>` のリストにメンバーを追加する。`--actor` は
     /// `acct` (`user@host`) または `actor.id` (数値) のいずれかを受け付ける。
-    /// 対象は `follow.state = 'accepted'` の相手のみ (Sakurasato 固有の制約、
-    /// `crate::miauth::lists` module doc 参照)。
+    /// 対象は `follow.state = 'accepted'` の相手、または自分自身 (Sakurasato
+    /// 固有の制約、`crate::miauth::lists` module doc 参照)。
     AddMember(ListMemberArgs),
     /// `--id <N>` のリストからメンバーを削除する。
     RemoveMember(ListMemberArgs),

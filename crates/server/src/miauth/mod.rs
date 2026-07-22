@@ -112,6 +112,12 @@ pub fn router(state: AppState) -> Router {
         // #150 (Aria fix) ── ユーザのノート一覧 (= プロフィール / ユーザ TL)。
         // 未実装だと Aria の TimelineNotesNotifier が 404 → ApiService.post で crash。
         .route("/api/users/notes", post(notes::users_notes))
+        // リスト機能 (メンバー追加 UI) 用のユーザー検索。未実装だと Aria の
+        // MisskeyUsers.searchByUsernameAndHost が 404 → ApiService.post で crash。
+        .route(
+            "/api/users/search-by-username-and-host",
+            post(users::search_by_username_and_host),
+        )
         // M14 #160 ── write endpoints
         .route("/api/notes/create", post(notes::create))
         .route("/api/notes/delete", post(notes::delete))

@@ -2649,6 +2649,63 @@ async fn notifications_list_and_mark_all_read(pool: PgPool) {
 
 // ─── リスト機能 (Mastodon/Misskey 互換) ─────────────────────────────────
 
+/// 自分自身は follow していなくても無条件でリストに追加できる
+/// (`repo::user_list::add_member` の self 例外)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn list_add_self_as_member_without_follow(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/lists")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": "with me" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_id = read_json(resp).await["id"].as_i64().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/lists/{list_id}/members"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "actor_id": me.id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/lists/{list_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let detail = read_json(resp).await;
+    let members = detail["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0]["id"], me.id);
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn list_create_and_list_roundtrip(pool: PgPool) {
     let raw = issue_token(&pool, "tui").await;

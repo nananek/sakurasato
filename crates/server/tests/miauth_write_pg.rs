@@ -922,6 +922,46 @@ async fn users_lists_create_returns_miss_user_list(pool: PgPool) {
     assert!(v["createdAt"].is_string());
 }
 
+/// 自分自身は follow していなくても `users/lists/push` で無条件に追加できる
+/// (`repo::user_list::add_member` の self 例外)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_lists_push_allows_self_without_follow(pool: PgPool) {
+    let me = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account", "read:account"]).await;
+
+    let created = read_json(
+        post_json(
+            app.clone(),
+            "/api/users/lists/create",
+            json!({"i": token, "name": "with me"}),
+        )
+        .await,
+    )
+    .await;
+    let list_id = created["id"].as_str().unwrap().to_string();
+
+    let resp = post_json(
+        app.clone(),
+        "/api/users/lists/push",
+        json!({"i": token, "listId": list_id, "userId": me.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let show = read_json(
+        post_json(
+            app,
+            "/api/users/lists/show",
+            json!({"i": token, "listId": list_id}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(show["userIds"], json!([me.to_string()]));
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn users_lists_push_requires_accepted_follow_then_succeeds(pool: PgPool) {
     let me = seed_local_actor(&pool, "sakurasato.test", "alice").await;

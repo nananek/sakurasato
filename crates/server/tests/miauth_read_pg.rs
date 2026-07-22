@@ -3148,3 +3148,75 @@ async fn notes_user_list_timeline_only_includes_members_notes(pool: PgPool) {
     );
     assert!(!ids.contains(&carols_note.to_string()));
 }
+
+// ─── users/search-by-username-and-host (リスト機能のメンバー検索, Aria 対応) ──
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_search_by_username_and_host_matches_prefix(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let _bob = seed_remote_actor(&pool, "remote.test", "bobcat").await;
+    let _carol = seed_remote_actor(&pool, "remote.test", "carol").await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/users/search-by-username-and-host")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"i": token, "username": "bob"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let usernames: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["username"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(usernames, vec!["bobcat".to_string()]);
+}
+
+/// 検索語に `%`/`_` が含まれていてもワイルドカードとして展開されず、
+/// リテラル一致として扱われる (= 意図しない大量マッチを起こさない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_search_by_username_and_host_escapes_wildcards(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let _weird = seed_remote_actor(&pool, "remote.test", "a_b").await;
+    let _other = seed_remote_actor(&pool, "remote.test", "axb").await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/users/search-by-username-and-host")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"i": token, "username": "a_b"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let usernames: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["username"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        usernames,
+        vec!["a_b".to_string()],
+        "`_` in the query must not act as a single-char wildcard: {usernames:?}"
+    );
+}

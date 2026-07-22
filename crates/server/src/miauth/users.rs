@@ -1,11 +1,14 @@
-//! `POST /api/users/show` (= M14 #159, 親 issue #150)。
+//! `POST /api/users/show` + `POST /api/users/search-by-username-and-host`
+//! (= M14 #159, 親 issue #150)。
 //!
-//! Misskey 互換クライアント (Milktea / `MissRirica` 等) が「ユーザを開く」
-//! 経路。`userId` 直接指定と `username` + `host` 指定の 2 経路をサポートする。
+//! Misskey 互換クライアント (Milktea / `MissRirica` / Aria 等) が「ユーザを
+//! 開く」「ユーザを検索する」経路。`show` は `userId` 直接指定と
+//! `username` + `host` 指定の 2 経路をサポートする。
 //!
 //! ## clean-room
 //!
 //! - <https://api-doc.misskey.io/api/endpoints/users/show>
+//! - <https://api-doc.misskey.io/api/endpoints/users/search-by-username-and-host>
 //!
 //! observed wire shape (= `misskey-py` `users_show()` で本物 Misskey の admin を
 //! 引いたときに返るキー):
@@ -16,10 +19,16 @@
 //! createdAt, description, bannerUrl, isBot, isCat
 //! ```
 //!
+//! `search-by-username-and-host` はこのキー集合を持つオブジェクトの配列を
+//! 返す。Aria の「リストにメンバーを追加」UI がユーザー検索に使う経路
+//! (`misskey_dart` `MisskeyUsers.searchByUsernameAndHost`) ── 未実装のまま
+//! だと Aria 側で API 呼び出しが失敗し例外を投げるため、リスト機能とセットで
+//! 実装する。
+//!
 //! ## scope
 //!
-//! Misskey 仕様で `users/show` は **`read:account`** scope を要求する
-//! (= `/api/i` と同じ最小権限)。
+//! Misskey 仕様で `users/show` / `users/search-by-username-and-host` は
+//! ともに **`read:account`** scope を要求する (= `/api/i` と同じ最小権限)。
 
 use axum::Json;
 use axum::extract::State;
@@ -126,4 +135,104 @@ pub async fn handle(
     // (= `conv::timeline_entry_to_miss_note` のような上書きは不要)。
     let detailed = from_actor_detailed(&actor, followers, following, notes);
     Json(detailed).into_response()
+}
+
+/// `limit` の既定値・上限。Misskey 公式仕様 (default 10, max 100) に揃える。
+const SEARCH_LIMIT_DEFAULT: i64 = 10;
+const SEARCH_LIMIT_MAX: i64 = 100;
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SearchByUsernameAndHostBody {
+    #[serde(default)]
+    pub i: Option<String>,
+    /// 前方一致検索するローカル部分 (= `@` より前)。省略時は host のみで
+    /// 絞る (= 空なら全 actor が対象)。
+    #[serde(default)]
+    pub username: Option<String>,
+    /// 完全一致する host。省略時は local/remote 問わず全体から検索する。
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `POST /api/users/search-by-username-and-host` handler。
+///
+/// リスト機能の「メンバー追加」で Aria 等が使うユーザー検索経路。
+/// `username` の前方一致 (大小文字無視) + 任意 `host` 完全一致で
+/// ローカル DB に存在する actor (= 過去に連合でやり取りした相手 + 自分自身)
+/// を検索する。WebFinger 等の新規解決は行わない (= 既知 actor のみが対象)。
+pub async fn search_by_username_and_host(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<SearchByUsernameAndHostBody>>,
+) -> Response {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    let Some(_token_row) =
+        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
+    else {
+        return auth::unauthorized("invalid or revoked token");
+    };
+
+    let username_pattern = body
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("{}%", escape_ilike_pattern(s)));
+    let host = body
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase);
+    let limit = body
+        .limit
+        .unwrap_or(SEARCH_LIMIT_DEFAULT)
+        .clamp(1, SEARCH_LIMIT_MAX);
+
+    let actors = match repo::actor::search_by_username_host(
+        state.pool(),
+        username_pattern.as_deref(),
+        host.as_deref(),
+        limit,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                "miauth users/search-by-username-and-host: query failed"
+            );
+            return internal_error("user search failed");
+        }
+    };
+
+    let mut out = Vec::with_capacity(actors.len());
+    for actor in actors {
+        let followers = repo::follow::count_followers(state.pool(), actor.id)
+            .await
+            .unwrap_or(0);
+        let following = repo::follow::count_following(state.pool(), actor.id)
+            .await
+            .unwrap_or(0);
+        let notes = if actor.is_local {
+            repo::note::count_local(state.pool()).await.unwrap_or(0)
+        } else {
+            0
+        };
+        out.push(from_actor_detailed(&actor, followers, following, notes));
+    }
+    Json(out).into_response()
+}
+
+/// ILIKE パターンとして解釈される特殊文字 (`%` `_` `\`) をエスケープする。
+/// 検索語に偶然これらの文字が含まれていても、意図せぬワイルドカード展開を
+/// 起こさずリテラル一致として扱う (`PostgreSQL` の LIKE/ILIKE 既定エスケープ
+/// 文字は `\`)。
+fn escape_ilike_pattern(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }

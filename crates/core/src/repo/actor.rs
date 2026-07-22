@@ -273,6 +273,49 @@ pub async fn get_by_username_host(
     .await
 }
 
+/// `users/search-by-username-and-host` (`MiAuth`, リスト機能のユーザー検索/
+/// Aria クライアントのメンバー選択 UI) 用。`preferred_username` の前方一致
+/// (ILIKE) + 任意 `host` 完全一致で actor を検索する。
+///
+/// `username_pattern` は呼び出し側が ILIKE 特殊文字 (`%`/`_`/`\`) を
+/// エスケープ済みの完全パターン文字列 (= 末尾 `%` 込み) を渡すこと
+/// ([`crate::repo::actor`] 呼び出し側の `escape_ilike_pattern` 参照)。
+/// 検索結果は少数 (お一人様サーバが知る actor の総数はせいぜい数百) なので
+/// per-row の followers/following count は呼び出し側が別途引く前提
+/// (N+1 だが実害が無い規模)。
+pub async fn search_by_username_host(
+    pool: &PgPool,
+    username_pattern: Option<&str>,
+    host: Option<&str>,
+    limit: i64,
+) -> sqlx::Result<Vec<ActorRow>> {
+    sqlx::query_as!(
+        ActorRow,
+        r#"
+        SELECT
+            id, ap_id, preferred_username, host, display_name, summary,
+            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,
+            followers_url, following_url, public_key_id, public_key_pem,
+            private_key_pem,
+            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
+            also_known_as as "also_known_as: Json<Vec<String>>",
+            moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            fetched_at, created_at, updated_at
+        FROM actor
+        WHERE
+            ($1::TEXT IS NULL OR preferred_username ILIKE $1)
+            AND ($2::TEXT IS NULL OR host = $2)
+        ORDER BY is_local DESC, preferred_username ASC
+        LIMIT $3
+        "#,
+        username_pattern,
+        host,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Touch the `updated_at` column and refresh `fetched_at` for a remote actor.
 /// Used when re-fetching actor metadata from a remote server.
 pub async fn mark_fetched(pool: &PgPool, id: i64) -> sqlx::Result<()> {

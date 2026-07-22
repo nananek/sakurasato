@@ -23,12 +23,15 @@
 //! ## Sakurasato 固有の制約 (Misskey 本家との差異)
 //!
 //! Misskey 本家はフォロー関係の無い相手でもリストに追加できるが、Sakurasato
-//! では **`follow.state = 'accepted'` の相手のみ** 追加を許可する
-//! (`sakurasato_core::repo::user_list::add_member` 参照)。お一人様サーバで
+//! では **`follow.state = 'accepted'` の相手 (+ 自分自身) のみ** 追加を許可
+//! する (`sakurasato_core::repo::user_list::add_member` 参照)。お一人様サーバで
 //! 「フォローすらしていない相手をリスト管理する」実用上の需要が薄い一方、
 //! 既知の accepted actor に限定することで actor 解決 (`WebFinger` 等) を経ずに
-//! 常にローカル DB の行だけで完結させられる。違反時は `NOT_FOLLOWING` エラー
-//! (= [`crate::miauth::following`] の同名コードと同じ意味) を返す。
+//! 常にローカル DB の行だけで完結させられる。**自分自身は例外的に無条件で
+//! 追加できる** (= 「自分の投稿も混ぜたリスト」を作れるようにするため。
+//! 自分自身を follow する概念が無いので accepted-follow チェックの対象外)。
+//! 違反時は `NOT_FOLLOWING` エラー (= [`crate::miauth::following`] の同名
+//! コードと同じ意味) を返す。
 
 use axum::Json;
 use axum::extract::State;
