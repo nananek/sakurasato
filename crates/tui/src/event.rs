@@ -216,6 +216,40 @@ pub enum Action {
     NoteDetailPrevAttachment,
     /// Issue #133 (4): モーダル内で現在の添付の sensitive blur を toggle (s)。
     NoteDetailToggleReveal,
+    /// リスト機能: `:lists` ── 一覧画面を push。
+    OpenLists,
+    /// リスト機能: `:home` ── 表示中タイムラインを home に戻す。
+    HomeTimeline,
+    /// リスト機能: 一覧 / メンバー一覧でカーソル下移動 (`j`/`Down`)。
+    ListsSelectNext,
+    /// リスト機能: 一覧 / メンバー一覧でカーソル上移動 (`k`/`Up`)。
+    ListsSelectPrev,
+    /// リスト機能: 一覧で `Enter` ── 選択中リストのタイムラインに切替。
+    ListsEnter,
+    /// リスト機能: 一覧で `m` ── 選択中リストのメンバー一覧を開く。
+    ListsOpenMembers,
+    /// リスト機能: 一覧で `n` ── 新規リスト作成 (タイトル入力 overlay)。
+    ListsNew,
+    /// リスト機能: 一覧で `R` ── 選択中リストをリネーム (タイトル入力 overlay)。
+    ListsRename,
+    /// リスト機能: 一覧で `d` ── 選択中リストを削除。
+    ListsDelete,
+    /// リスト機能: メンバー一覧で `a` ── acct 入力 overlay を開く。
+    ListsMemberAdd,
+    /// リスト機能: メンバー一覧で `x` ── 選択中メンバーを削除。
+    ListsMemberRemove,
+    /// リスト機能: `r` ── 再取得 (一覧 / メンバー一覧どちらでも)。
+    ListsRefresh,
+    /// リスト機能: `Esc`/`q` ── メンバー一覧なら一覧へ戻る、一覧なら画面を閉じる。
+    ListsClose,
+    /// リスト機能: タイトル/acct 入力 overlay 中の文字入力。
+    ListsInputChar(char),
+    /// リスト機能: 入力 overlay 中の Backspace。
+    ListsInputBackspace,
+    /// リスト機能: 入力 overlay の確定 (`Enter`)。
+    ListsInputSubmit,
+    /// リスト機能: 入力 overlay のキャンセル (`Esc`)。
+    ListsInputCancel,
 }
 
 /// crossterm イベント → Action。
@@ -224,8 +258,21 @@ pub enum Action {
     reason = "値で渡す `Event` を tests でも自然に書きたい"
 )]
 pub fn translate(event: Event, focus: Focus) -> Action {
+    translate_with_context(event, focus, false)
+}
+
+/// [`translate`] の拡張版。`lists_input_active` は `Focus::Lists` 中に
+/// [`crate::lists::ListsScreen::input`] が `Some` かどうか (= タイトル/acct
+/// 入力 overlay 中は文字キーを全部テキスト入力として扱う必要があり、
+/// `translate_lists_key` だけ呼び出し側の app 状態を要求するため)。
+/// それ以外の focus では無視される。
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "値で渡す `Event` を tests でも自然に書きたい"
+)]
+pub fn translate_with_context(event: Event, focus: Focus, lists_input_active: bool) -> Action {
     match event {
-        Event::Key(k) => translate_key(k, focus),
+        Event::Key(k) => translate_key(k, focus, lists_input_active),
         Event::Mouse(m) => translate_mouse(m),
         Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
             Action::Noop
@@ -233,7 +280,7 @@ pub fn translate(event: Event, focus: Focus) -> Action {
     }
 }
 
-fn translate_key(k: KeyEvent, focus: Focus) -> Action {
+fn translate_key(k: KeyEvent, focus: Focus, lists_input_active: bool) -> Action {
     if k.kind == KeyEventKind::Release {
         return Action::Noop;
     }
@@ -259,6 +306,7 @@ fn translate_key(k: KeyEvent, focus: Focus) -> Action {
         Focus::Notifications => translate_notifications_key(k),
         Focus::EmojiSearch => translate_emoji_search_key(k),
         Focus::NoteDetail => translate_note_detail_key(k),
+        Focus::Lists => translate_lists_key(k, lists_input_active),
     }
 }
 
@@ -308,6 +356,37 @@ fn translate_requests_key(k: KeyEvent) -> Action {
         (KeyCode::Char('a'), m) if m.is_empty() => Action::RequestsApproveSelected,
         (KeyCode::Char('x'), m) if m.is_empty() => Action::RequestsRejectSelected,
         (KeyCode::Char('r'), m) if m.is_empty() => Action::RequestsRefresh,
+        _ => Action::Noop,
+    }
+}
+
+/// リスト機能のキー操作。`input_active` (= [`crate::lists::ListsScreen::input`]
+/// が `Some`) のときはタイトル/acct 入力 overlay 中なので、`q`/`n`/`d` などの
+/// 文字も全部テキスト入力として扱う (= コマンドキーとして横取りしない)。
+fn translate_lists_key(k: KeyEvent, input_active: bool) -> Action {
+    if input_active {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        return match k.code {
+            KeyCode::Esc => Action::ListsInputCancel,
+            KeyCode::Enter => Action::ListsInputSubmit,
+            KeyCode::Backspace => Action::ListsInputBackspace,
+            KeyCode::Char(c) if !ctrl => Action::ListsInputChar(c),
+            _ => Action::Noop,
+        };
+    }
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => Action::ListsClose,
+        (KeyCode::Char('q'), m) if m.is_empty() => Action::ListsClose,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::ListsSelectNext,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::ListsSelectPrev,
+        (KeyCode::Enter, _) => Action::ListsEnter,
+        (KeyCode::Char('m'), m) if m.is_empty() => Action::ListsOpenMembers,
+        (KeyCode::Char('n'), m) if m.is_empty() => Action::ListsNew,
+        (KeyCode::Char('R'), _) => Action::ListsRename,
+        (KeyCode::Char('d'), m) if m.is_empty() => Action::ListsDelete,
+        (KeyCode::Char('a'), m) if m.is_empty() => Action::ListsMemberAdd,
+        (KeyCode::Char('x'), m) if m.is_empty() => Action::ListsMemberRemove,
+        (KeyCode::Char('r'), m) if m.is_empty() => Action::ListsRefresh,
         _ => Action::Noop,
     }
 }

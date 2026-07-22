@@ -139,6 +139,26 @@ pub enum Focus {
     /// Issue #133 (3): Note 詳細モーダル。Timeline `Enter` で開く。
     /// `App::note_detail` が `Some` のときのみ取りうる。Esc / q で閉じる。
     NoteDetail,
+    /// リスト機能 (Mastodon/Misskey 互換)。`:lists` で開く。
+    /// `App::lists` が `Some` のときのみ取りうる。画面内でリスト一覧 /
+    /// メンバー一覧 / タイトル入力の 3 段が [`crate::lists::ListsScreen`]
+    /// 内部の state (`members` / `input`) で切り替わる (= 追加の `Focus`
+    /// variant は増やさない)。
+    Lists,
+}
+
+/// 現在 `App::notes` / `next_before_ts_ms` / `timeline_exhausted` が表示して
+/// いるタイムラインの種類。`Home` (フォロー中) と `List` (リストメンバーの
+/// 投稿) は同じ 3 フィールドを使い回す (= 切替時に fetch し直して差し替える)
+/// ── 別々にバッファを持つと SSE 反映やページングロジックが二重化するため。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TimelineSource {
+    #[default]
+    Home,
+    List {
+        id: i64,
+        title: String,
+    },
 }
 
 #[derive(Debug)]
@@ -155,6 +175,9 @@ pub struct App {
     pub next_before_ts_ms: Option<i64>,
     /// 追加読み込みが終わったかどうか (= サーバから空配列が返ったら true)。
     pub timeline_exhausted: bool,
+    /// 現在 `notes` が表示しているタイムラインの種類。`:lists` 画面で
+    /// `List { .. }` に切り替わり、`:home` またはリストの再選択で戻せる。
+    pub current_timeline: TimelineSource,
     pub focus: Focus,
     pub compose: Compose,
     pub status: Option<StatusLine>,
@@ -228,6 +251,9 @@ pub struct App {
     /// 押した瞬間の Note snapshot を保持する。`Focus::NoteDetail` の
     /// あいだだけ `Some`。`Esc` / `q` で `None` に戻す。
     pub note_detail: Option<crate::note_detail::NoteDetailScreen>,
+    /// リスト機能の画面 state。`:lists` で開く。`Focus::Lists` のあいだ
+    /// だけ `Some`。
+    pub lists: Option<crate::lists::ListsScreen>,
     /// Help overlay の scroll 状態。`Focus::Help` の入り口で `scroll = 0` に
     /// リセットされる ── 毎回先頭から読めるようにする。
     pub help_state: HelpState,
@@ -274,6 +300,7 @@ impl App {
             top: 0,
             next_before_ts_ms: None,
             timeline_exhausted: false,
+            current_timeline: TimelineSource::Home,
             focus: Focus::Timeline,
             compose,
             status: None,
@@ -296,6 +323,7 @@ impl App {
             notifications: None,
             emoji_suggest: None,
             note_detail: None,
+            lists: None,
             help_state: HelpState::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             last_compose_defaults,
@@ -343,6 +371,14 @@ impl App {
     /// SSE からの `note.created` を反映する。重複 (= 自分の POST が SSE で返って
     /// くる場合 / 連投の race) は `id` で dedupe する。
     pub fn ingest_note_created(&mut self, payload: NoteCreatedPayload) {
+        // リストタイムライン表示中は SSE の新着 (= フォロー中全体のイベント) を
+        // 混ぜない。リストメンバーの新着かどうかを TUI 側で判定する手段が無い
+        // ため (`current_timeline` はタイトルしか持たない)、素直に「表示中の
+        // ソースが Home のときだけ即時反映」に倒す。リスト表示中の新着は次回
+        // 手動更新 / 再入場で拾える。
+        if self.current_timeline != TimelineSource::Home {
+            return;
+        }
         let mut note = payload.into_timeline_note();
         // SSE 越しでは `is_local` が分からないので whoami と突き合わせて補正。
         if note.actor_ap_id == self.whoami.ap_id {

@@ -50,6 +50,7 @@ pub mod follow_list;
 pub mod follow_requests;
 pub mod image_cache;
 pub mod in_flight;
+pub mod lists;
 pub mod note_detail;
 pub mod notifications;
 pub mod picker;

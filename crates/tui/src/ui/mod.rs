@@ -68,6 +68,9 @@ pub struct PanelRects {
     /// Issue #115: `FollowList` 画面の一覧領域 (= `ensure_visible` / `PageDown` 用)。
     /// 非表示時は zero rect。
     pub follow_list: Rect,
+    /// リスト機能の一覧 / メンバー一覧領域 (= `ensure_visible` 用)。
+    /// 非表示時は zero rect。
+    pub lists: Rect,
 }
 
 /// タイムラインのスクロール可能領域内に並んだ note の行位置をビット圧縮せず
@@ -102,6 +105,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
     let mut follow_requests_rect = Rect::default();
     let mut notifications_rect = Rect::default();
     let mut follow_list_rect = Rect::default();
+    let mut lists_rect = Rect::default();
     let rows = if matches!(app.focus, Focus::Profile)
         && let Some(profile) = app.current_profile()
     {
@@ -121,6 +125,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
         && let Some(n) = app.notifications.as_ref()
     {
         notifications_rect = render_notifications_screen(frame, timeline_area, app, n);
+        ScrollHits::default()
+    } else if matches!(app.focus, Focus::Lists)
+        && let Some(ls) = app.lists.as_ref()
+    {
+        lists_rect = render_lists_screen(frame, timeline_area, app, ls);
         ScrollHits::default()
     } else {
         render_timeline(frame, timeline_area, app)
@@ -196,6 +205,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
         follow_requests: follow_requests_rect,
         notifications: notifications_rect,
         follow_list: follow_list_rect,
+        lists: lists_rect,
     }
 }
 
@@ -1305,6 +1315,173 @@ fn render_follow_requests_screen(
     list_rect
 }
 
+/// リスト機能 (Mastodon/Misskey 互換) の画面。[`crate::lists::ListsScreen`]
+/// の内部 state (`members` / `input`) に応じて 3 段を描き分ける ──
+/// [`render_follow_requests_screen`] と同じ組み立て。
+#[allow(
+    clippy::too_many_lines,
+    reason = "一覧 / メンバー一覧 / 入力 overlay の 3 段を 1 関数に集約"
+)]
+fn render_lists_screen(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    ls: &crate::lists::ListsScreen,
+) -> Rect {
+    let palette = &app.theme.palette;
+    let title = if let Some(members) = ls.members.as_ref() {
+        format!(
+            "  list members — {} ({})  ",
+            members.title,
+            members.items.len()
+        )
+    } else {
+        format!("  lists ({})  ", ls.items.len())
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style(palette, app.focus == Focus::Lists))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let header_rect = Rect::new(inner.x, inner.y, inner.width, 1.min(inner.height));
+    if let Some(input) = ls.input.as_ref() {
+        let label = match input.kind {
+            crate::lists::ListsInputKind::Create => "new list title",
+            crate::lists::ListsInputKind::Rename(_) => "rename to",
+            crate::lists::ListsInputKind::AddMember(_) => "add member (acct)",
+        };
+        let line = Line::from(vec![
+            Span::styled(format!("  {label}: "), Style::default().fg(palette.muted)),
+            Span::styled(
+                input.buffer.clone(),
+                Style::default().fg(palette.foreground),
+            ),
+            Span::styled("_", Style::default().fg(palette.accent)),
+        ]);
+        frame.render_widget(Paragraph::new(line), header_rect);
+    } else {
+        let hint = if ls.members.is_some() {
+            "  [j/k=move  a=add  x=remove  r=refresh  Esc=back]"
+        } else {
+            "  [j/k=move  Enter=switch  m=members  n=new  R=rename  d=delete  r=refresh  Esc=close]"
+        };
+        let header = Line::from(vec![Span::styled(hint, Style::default().fg(palette.muted))]);
+        frame.render_widget(Paragraph::new(header), header_rect);
+    }
+
+    let list_top = inner.y + header_rect.height;
+    let list_height = inner.height.saturating_sub(header_rect.height);
+    let list_rect = Rect::new(inner.x, list_top, inner.width, list_height);
+    if list_rect.height == 0 {
+        return list_rect;
+    }
+
+    if let Some(members) = ls.members.as_ref() {
+        if members.items.is_empty() {
+            let para = Paragraph::new(Line::from(Span::styled(
+                "  (no members — press a to add one)".to_string(),
+                Style::default().fg(palette.muted),
+            )));
+            frame.render_widget(para, list_rect);
+            return list_rect;
+        }
+        let visible = list_rect.height as usize;
+        let top = members.top.min(members.items.len().saturating_sub(1));
+        let lines: Vec<Line<'static>> = members
+            .items
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(visible)
+            .map(|(idx, actor)| {
+                let selected = idx == members.cursor;
+                let marker = if selected { "▶ " } else { "  " };
+                let marker_style = if selected {
+                    Style::default()
+                        .fg(palette.accent_strong)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.muted)
+                };
+                let acct = format!("{}@{}", actor.preferred_username, actor.host);
+                Line::from(vec![
+                    Span::styled(marker.to_string(), marker_style),
+                    Span::styled(acct, Style::default().fg(palette.foreground)),
+                    Span::raw("  "),
+                    Span::styled(
+                        actor.display_name.clone().unwrap_or_default(),
+                        Style::default().fg(palette.muted),
+                    ),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), list_rect);
+        return list_rect;
+    }
+
+    if ls.items.is_empty() {
+        let msg = if ls.fetching {
+            "  loading…"
+        } else {
+            "  (no lists — press n to create one)"
+        };
+        let para = Paragraph::new(Line::from(Span::styled(
+            msg.to_string(),
+            Style::default().fg(palette.muted),
+        )));
+        frame.render_widget(para, list_rect);
+        return list_rect;
+    }
+
+    let visible = list_rect.height as usize;
+    let top = ls.top.min(ls.items.len().saturating_sub(1));
+    let lines: Vec<Line<'static>> = ls
+        .items
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(visible)
+        .map(|(idx, item)| {
+            let selected = idx == ls.cursor;
+            let marker = if selected { "▶ " } else { "  " };
+            let marker_style = if selected {
+                Style::default()
+                    .fg(palette.accent_strong)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.muted)
+            };
+            Line::from(vec![
+                Span::styled(marker.to_string(), marker_style),
+                Span::styled(
+                    format!("[{}] ", item.id),
+                    Style::default().fg(palette.muted),
+                ),
+                Span::styled(item.title.clone(), Style::default().fg(palette.foreground)),
+                Span::raw("  "),
+                Span::styled(
+                    format!("({} members)", item.member_count),
+                    Style::default().fg(palette.muted),
+                ),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), list_rect);
+    list_rect
+}
+
 /// #206 PR3: 通知一覧画面。1 件 1 行 (= wrap しない、`ensure_visible` の viewport
 /// = 行数前提)。各行は「カーソル ▶ / 未読 ● / 種別 glyph / notifier / 動詞 /
 /// reaction / 本文プレビュー」。色は全て theme palette 経由。
@@ -2269,6 +2446,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::Notifications => "notif",
         Focus::EmojiSearch => "emoji",
         Focus::NoteDetail => "note",
+        Focus::Lists => "lists",
     };
     // Issue #131: in-flight な async 操作があれば左端 3 cells に spinner を
     // 出す。0 件のときも 3 cells 確保して後続 span の位置を揺らさない。
@@ -2305,6 +2483,17 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(palette.muted),
         ),
     ];
+    // リスト表示中はどのリストを見ているか一目でわかるようバッジを出す
+    // (= home のときは何も出さない、既定状態を煩雑にしない)。
+    if let crate::app::TimelineSource::List { title, .. } = &app.current_timeline {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("tl:{title}"),
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if app.pending_uploads > 0 {
         spans.push(Span::raw("  │  "));
         spans.push(Span::styled(
@@ -2446,6 +2635,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         help_entry(palette, ":lock", "key-only mode (鍵アカ) on"),
         help_entry(palette, ":unlock", "key-only mode off"),
         help_entry(palette, ":requests", "pending follow requests"),
+        help_entry(palette, ":lists", "open lists screen"),
+        help_entry(palette, ":home", "back to home timeline"),
         help_entry(palette, ":q / :quit", "exit TUI"),
         help_entry(palette, "Tab", "complete command head"),
         Line::from(""),
@@ -2455,6 +2646,18 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         help_entry(palette, "x", "reject selected"),
         help_entry(palette, "r", "refresh list"),
         help_entry(palette, "Esc / q", "back to timeline"),
+        Line::from(""),
+        Line::from(Span::styled("lists", help_section(palette))),
+        help_entry(palette, "j / k", "next / prev list or member"),
+        help_entry(palette, "Enter", "switch timeline to selected list"),
+        help_entry(palette, "m", "open member list"),
+        help_entry(palette, "n", "new list"),
+        help_entry(palette, "R", "rename selected list"),
+        help_entry(palette, "d", "delete selected list"),
+        help_entry(palette, "a", "add member (in member list)"),
+        help_entry(palette, "x", "remove member (in member list)"),
+        help_entry(palette, "r", "refresh"),
+        help_entry(palette, "Esc / q", "back (member list -> list, or close)"),
         Line::from(""),
         Line::from(Span::styled("compose alt submit", help_section(palette))),
         help_entry(palette, "F2", "send (always works)"),

@@ -30,7 +30,7 @@ use crate::client::{
     ApiError, CreateNoteRequest, FollowTarget, LocalApi, MediaResponse, ProfileUpdate, StreamEvent,
 };
 use crate::compose::AttachmentRef;
-use crate::event::{Action, translate};
+use crate::event::Action;
 use crate::image_cache::ImageCache;
 use crate::in_flight::InFlightGuard;
 use crate::picker::{Activation, FilePicker, PickerMode};
@@ -215,6 +215,14 @@ async fn main_loop(
             let viewport = last_rects.notifications.height as usize;
             n.ensure_visible(viewport);
         }
+        // リスト機能画面のスクロール追従 (一覧 / メンバー一覧とも 1 件 1 行)。
+        if let Some(ls) = app.lists.as_mut() {
+            let viewport = last_rects.lists.height as usize;
+            match ls.members.as_mut() {
+                Some(m) => m.ensure_visible(viewport),
+                None => ls.ensure_visible(viewport),
+            }
+        }
         // Issue #115: FollowList 画面のスクロール追従。avatar 表示時は 1 件 2 行、
         // 抑制時は 1 件 1 行 (= render_follow_list_screen と同じ row_step 計算)。
         // `last_rects.follow_list` は直前フレームで確定した一覧領域の Rect。
@@ -308,10 +316,30 @@ async fn handle_event(
     // モーダル/オーバーレイの開閉は focus 変化で捉えられる (各 overlay は専用の
     // Focus バリアントを持つ)。閉じたときに下の画像を再送させる。
     let before_focus = app.focus;
-    let action = translate(event, app.focus);
+    let lists_input_active = app.lists.as_ref().is_some_and(|s| s.input.is_some());
+    let action = crate::event::translate_with_context(event, app.focus, lists_input_active);
     apply_action(action, app, api, page_size, rects, upload_tx).await;
     if images_active && app.focus != before_focus {
         app.force_redraw = true;
+    }
+}
+
+/// `app.current_timeline` に応じて home / list のどちらのタイムライン
+/// endpoint を叩くかを 1 箇所に集約する。`RefreshTimeline` / `LoadMore` /
+/// reaction・renote 成功後の再取得など、`api.timeline_home` を直接呼んでいた
+/// 全箇所がここを経由するよう置き換える (= リスト表示中に何か操作すると
+/// home に戻ってしまう回帰を防ぐ)。
+async fn fetch_timeline_page(
+    app: &App,
+    api: &LocalApi,
+    before_ts_ms: Option<i64>,
+    limit: i64,
+) -> Result<crate::client::TimelineResponse, ApiError> {
+    match &app.current_timeline {
+        crate::app::TimelineSource::Home => api.timeline_home(before_ts_ms, limit).await,
+        crate::app::TimelineSource::List { id, .. } => {
+            api.timeline_list(*id, before_ts_ms, limit).await
+        }
     }
 }
 
@@ -378,7 +406,7 @@ async fn apply_action(
         }
         Action::RefreshTimeline => {
             let _g = InFlightGuard::new(app.in_flight.clone());
-            match api.timeline_home(None, page_size).await {
+            match fetch_timeline_page(app, api, None, page_size).await {
                 Ok(resp) => {
                     let n = resp.notes.len();
                     app.replace_timeline(resp.notes, resp.next_before_ts_ms);
@@ -409,7 +437,7 @@ async fn apply_action(
             }
             let before = app.next_before_ts_ms;
             let _g = InFlightGuard::new(app.in_flight.clone());
-            match api.timeline_home(before, page_size).await {
+            match fetch_timeline_page(app, api, before, page_size).await {
                 Ok(resp) => {
                     let added = resp.notes.len();
                     app.append_older(resp.notes, resp.next_before_ts_ms);
@@ -483,9 +511,10 @@ async fn apply_action(
                 | Focus::AltPrompt
                 | Focus::Command
                 | Focus::Requests
-                | Focus::Notifications => {
+                | Focus::Notifications
+                | Focus::Lists => {
                     // overlay 中は背後 Timeline を動かさない。`Requests` /
-                    // `Notifications` (= 一覧画面) も同じく overlay 風。
+                    // `Notifications` / `Lists` (= 一覧画面) も同じく overlay 風。
                 }
                 _ => {
                     if delta > 0 {
@@ -728,6 +757,80 @@ async fn apply_action(
         Action::RequestsRejectSelected => requests_mutate_selected(app, api, false).await,
         Action::RequestsRefresh => requests_refresh(app, api).await,
         Action::RequestsClose => requests_close(app),
+        Action::OpenLists => command_open_lists(app, api).await,
+        Action::HomeTimeline => command_home_timeline(app, api, page_size).await,
+        Action::ListsSelectNext => {
+            if let Some(s) = app.lists.as_mut() {
+                match s.members.as_mut() {
+                    Some(m) => m.select_next(),
+                    None => s.select_next(),
+                }
+            }
+        }
+        Action::ListsSelectPrev => {
+            if let Some(s) = app.lists.as_mut() {
+                match s.members.as_mut() {
+                    Some(m) => m.select_prev(),
+                    None => s.select_prev(),
+                }
+            }
+        }
+        Action::ListsEnter => lists_switch_timeline_selected(app, api, page_size).await,
+        Action::ListsOpenMembers => lists_open_members_selected(app, api).await,
+        Action::ListsNew => {
+            if let Some(s) = app.lists.as_mut()
+                && s.members.is_none()
+            {
+                s.input = Some(crate::lists::ListsInput::new(
+                    crate::lists::ListsInputKind::Create,
+                ));
+            }
+        }
+        Action::ListsRename => {
+            if let Some(s) = app.lists.as_mut()
+                && s.members.is_none()
+                && let Some(current) = s.current()
+            {
+                let (id, title) = (current.id, current.title.clone());
+                s.input = Some(crate::lists::ListsInput::with_initial(
+                    crate::lists::ListsInputKind::Rename(id),
+                    &title,
+                ));
+            }
+        }
+        Action::ListsDelete => lists_delete_selected(app, api).await,
+        Action::ListsMemberAdd => {
+            if let Some(s) = app.lists.as_mut()
+                && let Some(m) = s.members.as_ref()
+            {
+                s.input = Some(crate::lists::ListsInput::new(
+                    crate::lists::ListsInputKind::AddMember(m.list_id),
+                ));
+            }
+        }
+        Action::ListsMemberRemove => lists_member_remove_selected(app, api).await,
+        Action::ListsRefresh => lists_refresh(app, api).await,
+        Action::ListsClose => lists_close(app),
+        Action::ListsInputChar(c) => {
+            if let Some(s) = app.lists.as_mut()
+                && let Some(input) = s.input.as_mut()
+            {
+                input.insert_char(c);
+            }
+        }
+        Action::ListsInputBackspace => {
+            if let Some(s) = app.lists.as_mut()
+                && let Some(input) = s.input.as_mut()
+            {
+                input.backspace();
+            }
+        }
+        Action::ListsInputSubmit => lists_input_submit(app, api).await,
+        Action::ListsInputCancel => {
+            if let Some(s) = app.lists.as_mut() {
+                s.input = None;
+            }
+        }
         Action::OpenNotifications => command_open_notifications(app, api).await,
         Action::NotificationsSelectNext => {
             if let Some(s) = app.notifications.as_mut() {
@@ -1119,7 +1222,7 @@ async fn undo_reaction(app: &mut App, api: &LocalApi, page_size: i64) {
                 StatusKind::Success,
                 Some(Duration::from_secs(3)),
             );
-            if let Ok(resp) = api.timeline_home(None, page_size).await {
+            if let Ok(resp) = fetch_timeline_page(app, api, None, page_size).await {
                 app.replace_timeline(resp.notes, resp.next_before_ts_ms);
             }
         }
@@ -1253,7 +1356,7 @@ async fn send_renote(app: &mut App, api: &LocalApi, page_size: i64) {
                 StatusKind::Success,
                 Some(Duration::from_secs(3)),
             );
-            if let Ok(resp) = api.timeline_home(None, page_size).await {
+            if let Ok(resp) = fetch_timeline_page(app, api, None, page_size).await {
                 app.replace_timeline(resp.notes, resp.next_before_ts_ms);
             }
         }
@@ -1290,7 +1393,7 @@ async fn undo_renote(app: &mut App, api: &LocalApi, page_size: i64) {
                 StatusKind::Success,
                 Some(Duration::from_secs(3)),
             );
-            if let Ok(resp) = api.timeline_home(None, page_size).await {
+            if let Ok(resp) = fetch_timeline_page(app, api, None, page_size).await {
                 app.replace_timeline(resp.notes, resp.next_before_ts_ms);
             }
         }
@@ -1323,7 +1426,7 @@ async fn send_reaction(app: &mut App, api: &LocalApi, note_id: i64, content: &st
                 Some(Duration::from_secs(3)),
             );
             // 成功 → タイムラインを取り直して reaction count を反映。
-            if let Ok(resp) = api.timeline_home(None, page_size).await {
+            if let Ok(resp) = fetch_timeline_page(app, api, None, page_size).await {
                 app.replace_timeline(resp.notes, resp.next_before_ts_ms);
             }
         }
@@ -1814,6 +1917,8 @@ async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
         Command::Unlock => command_actor_lock(app, api, false).await,
         Command::OpenRequests => command_open_requests(app, api).await,
         Command::OpenNotifications => command_open_notifications(app, api).await,
+        Command::OpenLists => command_open_lists(app, api).await,
+        Command::HomeTimeline => command_home_timeline(app, api, page_size).await,
         Command::Renote => send_renote(app, api, page_size).await,
         Command::Unrenote => undo_renote(app, api, page_size).await,
         Command::Invalid { reason } => {
@@ -2149,6 +2254,401 @@ async fn requests_refresh(app: &mut App, api: &LocalApi) {
 /// 込みで `:requests` を再実行する流れ)。
 fn requests_close(app: &mut App) {
     app.follow_requests = None;
+    app.focus = Focus::Timeline;
+}
+
+// ─── リスト機能 (Mastodon/Misskey 互換) ─────────────────────────────────
+
+/// `:lists` ── 一覧画面を開く + 初回 fetch。失敗しても画面は開く (= 空表示で
+/// ユーザに通知)。[`command_open_requests`] と同じ組み立て。
+async fn command_open_lists(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let mut screen = crate::lists::ListsScreen::new();
+    screen.fetching = true;
+    app.lists = Some(screen);
+    app.focus = Focus::Lists;
+    match api.list_lists().await {
+        Ok(resp) => {
+            if let Some(s) = app.lists.as_mut() {
+                s.replace(resp.items);
+            }
+        }
+        Err(err) => {
+            if let Some(s) = app.lists.as_mut() {
+                s.fetching = false;
+            }
+            app.set_status(
+                format!(":lists fetch failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `:home` ── 表示中タイムラインを home (フォロー中) に戻して再取得する。
+async fn command_home_timeline(app: &mut App, api: &LocalApi, page_size: i64) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    app.current_timeline = crate::app::TimelineSource::Home;
+    match api.timeline_home(None, page_size).await {
+        Ok(resp) => {
+            app.replace_timeline(resp.notes, resp.next_before_ts_ms);
+            app.set_status(
+                "switched to home timeline",
+                StatusKind::Success,
+                Some(Duration::from_secs(3)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("home timeline fetch failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `r` ── 一覧 / メンバー一覧のどちらでも、いま見ている段を再取得する。
+async fn lists_refresh(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(screen) = app.lists.as_ref() else {
+        return;
+    };
+    if let Some(members) = screen.members.as_ref() {
+        let list_id = members.list_id;
+        match api.show_list(list_id).await {
+            Ok(detail) => {
+                if let Some(s) = app.lists.as_mut()
+                    && let Some(m) = s.members.as_mut()
+                {
+                    m.items = detail.members;
+                    if m.cursor >= m.items.len() {
+                        m.cursor = m.items.len().saturating_sub(1);
+                    }
+                }
+            }
+            Err(err) => {
+                app.set_status(
+                    format!("refresh failed: {err}"),
+                    StatusKind::Error,
+                    Some(Duration::from_secs(6)),
+                );
+            }
+        }
+        return;
+    }
+    match api.list_lists().await {
+        Ok(resp) => {
+            if let Some(s) = app.lists.as_mut() {
+                s.replace(resp.items);
+            }
+        }
+        Err(err) => {
+            app.set_status(
+                format!("refresh failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `Enter` (一覧段のみ) ── 選択中リストのタイムラインに切替え、画面を閉じる。
+async fn lists_switch_timeline_selected(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(screen) = app.lists.as_ref() else {
+        return;
+    };
+    if screen.members.is_some() {
+        return;
+    }
+    let Some(target) = screen.current() else {
+        app.set_status(
+            "no list selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(3)),
+        );
+        return;
+    };
+    let (id, title) = (target.id, target.title.clone());
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    app.current_timeline = crate::app::TimelineSource::List {
+        id,
+        title: title.clone(),
+    };
+    match fetch_timeline_page(app, api, None, page_size).await {
+        Ok(resp) => {
+            app.replace_timeline(resp.notes, resp.next_before_ts_ms);
+            app.lists = None;
+            app.focus = Focus::Timeline;
+            app.set_status(
+                format!("switched to list \"{title}\""),
+                StatusKind::Success,
+                Some(Duration::from_secs(3)),
+            );
+        }
+        Err(err) => {
+            // 失敗時は home に戻す (= 中途半端な list 状態のまま画面だけ残さない)。
+            app.current_timeline = crate::app::TimelineSource::Home;
+            app.set_status(
+                format!("switch to list failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `m` (一覧段のみ) ── 選択中リストのメンバー一覧サブ画面を開く。
+async fn lists_open_members_selected(app: &mut App, api: &LocalApi) {
+    let Some(screen) = app.lists.as_ref() else {
+        return;
+    };
+    if screen.members.is_some() {
+        return;
+    }
+    let Some(target) = screen.current() else {
+        app.set_status(
+            "no list selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(3)),
+        );
+        return;
+    };
+    let (id, title) = (target.id, target.title.clone());
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    match api.show_list(id).await {
+        Ok(detail) => {
+            if let Some(s) = app.lists.as_mut() {
+                s.members = Some(crate::lists::MembersView::new(id, title, detail.members));
+            }
+        }
+        Err(err) => {
+            app.set_status(
+                format!("member list fetch failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `d` (一覧段のみ) ── 選択中リストを削除する。表示中タイムラインがその
+/// リストだった場合は home に戻す (再取得はしない、次の切替/更新で解決)。
+async fn lists_delete_selected(app: &mut App, api: &LocalApi) {
+    let Some(screen) = app.lists.as_ref() else {
+        return;
+    };
+    if screen.members.is_some() {
+        return;
+    }
+    let Some(target) = screen.current() else {
+        app.set_status(
+            "no list selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(3)),
+        );
+        return;
+    };
+    let (id, title) = (target.id, target.title.clone());
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    match api.delete_list(id).await {
+        Ok(()) => {
+            if let Some(s) = app.lists.as_mut() {
+                s.remove_id(id);
+            }
+            if matches!(&app.current_timeline, crate::app::TimelineSource::List { id: cur, .. } if *cur == id)
+            {
+                app.current_timeline = crate::app::TimelineSource::Home;
+            }
+            app.set_status(
+                format!("deleted list \"{title}\""),
+                StatusKind::Info,
+                Some(Duration::from_secs(4)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("delete failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `x` (メンバー一覧段のみ) ── 選択中メンバーをリストから削除する。
+async fn lists_member_remove_selected(app: &mut App, api: &LocalApi) {
+    let Some(screen) = app.lists.as_ref() else {
+        return;
+    };
+    let Some(members) = screen.members.as_ref() else {
+        return;
+    };
+    let Some(actor) = members.current() else {
+        app.set_status(
+            "no member selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(3)),
+        );
+        return;
+    };
+    let list_id = members.list_id;
+    let actor_id = actor.id;
+    let acct = format!("{}@{}", actor.preferred_username, actor.host);
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    match api.remove_list_member(list_id, actor_id).await {
+        Ok(()) => {
+            if let Some(s) = app.lists.as_mut() {
+                if let Some(m) = s.members.as_mut() {
+                    m.remove_actor(actor_id);
+                }
+                if let Some(entry) = s.items.iter_mut().find(|l| l.id == list_id) {
+                    entry.member_count = entry.member_count.saturating_sub(1);
+                }
+            }
+            app.set_status(
+                format!("removed {acct} from list"),
+                StatusKind::Info,
+                Some(Duration::from_secs(4)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("remove failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// 入力 overlay の `Enter` ── `kind` に応じて create / rename / add-member を
+/// 実行する。空入力は拒否 (= 誤って空タイトルを作らせない)。
+#[allow(clippy::too_many_lines, reason = "3 種類の入力を 1 関数に集約")]
+async fn lists_input_submit(app: &mut App, api: &LocalApi) {
+    let Some(screen) = app.lists.as_ref() else {
+        return;
+    };
+    let Some(input) = screen.input.as_ref() else {
+        return;
+    };
+    let kind = input.kind.clone();
+    let value = input.value().to_string();
+    if value.is_empty() {
+        app.set_status(
+            "input must not be empty",
+            StatusKind::Warning,
+            Some(Duration::from_secs(3)),
+        );
+        return;
+    }
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    match kind {
+        crate::lists::ListsInputKind::Create => match api.create_list(&value).await {
+            Ok(summary) => {
+                let title = summary.title.clone();
+                if let Some(s) = app.lists.as_mut() {
+                    s.upsert(summary);
+                    s.input = None;
+                }
+                app.set_status(
+                    format!("created list \"{title}\""),
+                    StatusKind::Success,
+                    Some(Duration::from_secs(4)),
+                );
+            }
+            Err(err) => {
+                app.set_status(
+                    format!("create failed: {err}"),
+                    StatusKind::Error,
+                    Some(Duration::from_secs(6)),
+                );
+            }
+        },
+        crate::lists::ListsInputKind::Rename(id) => match api.rename_list(id, &value).await {
+            Ok(summary) => {
+                let title = summary.title.clone();
+                if let Some(s) = app.lists.as_mut() {
+                    s.upsert(summary);
+                    s.input = None;
+                }
+                if let crate::app::TimelineSource::List {
+                    id: cur,
+                    title: cur_title,
+                } = &mut app.current_timeline
+                    && *cur == id
+                {
+                    cur_title.clone_from(&title);
+                }
+                app.set_status(
+                    format!("renamed to \"{title}\""),
+                    StatusKind::Success,
+                    Some(Duration::from_secs(4)),
+                );
+            }
+            Err(err) => {
+                app.set_status(
+                    format!("rename failed: {err}"),
+                    StatusKind::Error,
+                    Some(Duration::from_secs(6)),
+                );
+            }
+        },
+        crate::lists::ListsInputKind::AddMember(list_id) => {
+            match api.lookup_actor_by_acct(&value).await {
+                Ok(resolved) => {
+                    let actor_id = resolved.actor.id;
+                    match api.add_list_member(list_id, actor_id).await {
+                        Ok(()) => {
+                            if let Some(s) = app.lists.as_mut() {
+                                s.input = None;
+                                if let Some(entry) = s.items.iter_mut().find(|l| l.id == list_id) {
+                                    entry.member_count = entry.member_count.saturating_add(1);
+                                }
+                                if let Some(m) = s.members.as_mut() {
+                                    m.items.push(resolved.actor);
+                                }
+                            }
+                            app.set_status(
+                                format!("added {value} to list"),
+                                StatusKind::Success,
+                                Some(Duration::from_secs(4)),
+                            );
+                        }
+                        Err(err) => {
+                            app.set_status(
+                                format!("add member failed: {err}"),
+                                StatusKind::Error,
+                                Some(Duration::from_secs(6)),
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    app.set_status(
+                        format!("actor lookup failed: {err}"),
+                        StatusKind::Error,
+                        Some(Duration::from_secs(6)),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `Esc`/`q` (コマンドキーとしての Esc、入力 overlay 中は `ListsInputCancel`
+/// が別に処理する) ── メンバー一覧段ならその場だけ閉じて一覧段に戻り、
+/// 一覧段なら画面自体を閉じて Timeline に戻る。
+fn lists_close(app: &mut App) {
+    let Some(screen) = app.lists.as_mut() else {
+        return;
+    };
+    if screen.members.is_some() {
+        screen.members = None;
+        return;
+    }
+    app.lists = None;
     app.focus = Focus::Timeline;
 }
 

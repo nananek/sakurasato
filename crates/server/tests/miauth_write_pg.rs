@@ -898,3 +898,149 @@ async fn notes_create_reply_to_unknown_returns_error(pool: PgPool) {
     let v = read_json(resp).await;
     assert_eq!(v["error"]["code"], "NO_SUCH_REPLY_TARGET");
 }
+
+// ─── リスト機能 (Mastodon/Misskey 互換, `users/lists/*`) ────────────────────
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_lists_create_returns_miss_user_list(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/users/lists/create",
+        json!({"i": token, "name": "friends"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["name"], "friends");
+    assert_eq!(v["userIds"], json!([]));
+    assert!(v["id"].is_string());
+    assert!(v["createdAt"].is_string());
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_lists_push_requires_accepted_follow_then_succeeds(pool: PgPool) {
+    let me = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account", "read:account"]).await;
+
+    let created = read_json(
+        post_json(
+            app.clone(),
+            "/api/users/lists/create",
+            json!({"i": token, "name": "friends"}),
+        )
+        .await,
+    )
+    .await;
+    let list_id = created["id"].as_str().unwrap().to_string();
+
+    // bob をまだ follow していないので NOT_FOLLOWING。
+    let resp = post_json(
+        app.clone(),
+        "/api/users/lists/push",
+        json!({"i": token, "listId": list_id, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(read_json(resp).await["error"]["code"], "NOT_FOLLOWING");
+
+    accepted_follow(&pool, me, bob).await;
+
+    let resp = post_json(
+        app.clone(),
+        "/api/users/lists/push",
+        json!({"i": token, "listId": list_id, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let show = read_json(
+        post_json(
+            app.clone(),
+            "/api/users/lists/show",
+            json!({"i": token, "listId": list_id}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(show["userIds"], json!([bob.to_string()]));
+
+    // pull で削除できる。
+    let resp = post_json(
+        app.clone(),
+        "/api/users/lists/pull",
+        json!({"i": token, "listId": list_id, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let show = read_json(
+        post_json(
+            app,
+            "/api/users/lists/show",
+            json!({"i": token, "listId": list_id}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(show["userIds"], json!([]));
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_lists_delete_removes_list(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account", "read:account"]).await;
+
+    let created = read_json(
+        post_json(
+            app.clone(),
+            "/api/users/lists/create",
+            json!({"i": token, "name": "temp"}),
+        )
+        .await,
+    )
+    .await;
+    let list_id = created["id"].as_str().unwrap().to_string();
+
+    let resp = post_json(
+        app.clone(),
+        "/api/users/lists/delete",
+        json!({"i": token, "listId": list_id}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = post_json(
+        app,
+        "/api/users/lists/show",
+        json!({"i": token, "listId": list_id}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(read_json(resp).await["error"]["code"], "NO_SUCH_LIST");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_lists_create_without_scope_is_401(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    // read:account のみ (= write:account 不足)。
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/users/lists/create",
+        json!({"i": token, "name": "friends"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

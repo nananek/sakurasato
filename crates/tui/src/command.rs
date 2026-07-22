@@ -16,6 +16,8 @@
 //! - `:lock` ── 鍵アカ運用に切替 (M12 Issue #66)
 //! - `:unlock` ── 鍵アカ解除 (pending は auto-accept されない)
 //! - `:requests` ── 承認待ち follow 一覧画面 (`a` = approve / `x` = reject)
+//! - `:lists` ── リスト機能 (Mastodon/Misskey 互換) の一覧画面 ([`crate::lists`])
+//! - `:home` ── 表示中タイムラインを home (フォロー中) に戻す
 //! - `:q` / `:quit` ── 終了
 //! - `:help` / `:?` ── ヘルプ overlay を開く
 //!
@@ -51,6 +53,8 @@ pub const COMMAND_HEADS: &[&str] = &[
     "followers",
     "following",
     "help",
+    "home",
+    "lists",
     "lock",
     "lookup",
     "me",
@@ -187,6 +191,11 @@ pub enum Command {
     OpenRequests,
     /// #206 PR3: in-app 通知一覧画面を開く。`m` で全件既読 / `r` で再取得。
     OpenNotifications,
+    /// リスト機能 (Mastodon/Misskey 互換) の一覧画面を開く。
+    OpenLists,
+    /// 表示中タイムラインを home (フォロー中) に戻す。リスト表示中のみ意味を
+    /// 持つ (= 既に home ならタイムラインを再取得するだけ)。
+    HomeTimeline,
     /// #151: 選択中の Note を renote (boost) する。`b` キーと同じ動作。
     Renote,
     /// #151: 選択中の Note への自分の renote を取り消し。`B` キーと同じ動作。
@@ -227,6 +236,8 @@ pub fn parse(raw: &str) -> Command {
         "unlock" => no_arg(&rest, Command::Unlock, "unlock"),
         "requests" => no_arg(&rest, Command::OpenRequests, "requests"),
         "notifications" => no_arg(&rest, Command::OpenNotifications, "notifications"),
+        "lists" => no_arg(&rest, Command::OpenLists, "lists"),
+        "home" => no_arg(&rest, Command::HomeTimeline, "home"),
         "renote" => no_arg(&rest, Command::Renote, "renote"),
         "unrenote" => no_arg(&rest, Command::Unrenote, "unrenote"),
         "help" | "?" => Command::Help,
@@ -432,6 +443,13 @@ mod tests {
     #[test]
     fn parse_unknown_command() {
         assert!(matches!(parse("nuke"), Command::Unknown { .. }));
+    }
+
+    #[test]
+    fn parse_lists_and_home_no_args() {
+        assert_eq!(parse("lists"), Command::OpenLists);
+        assert_eq!(parse("home"), Command::HomeTimeline);
+        assert!(matches!(parse("lists x"), Command::Invalid { .. }));
     }
 
     #[test]

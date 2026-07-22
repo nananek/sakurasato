@@ -2,6 +2,7 @@
 /target
 **/target
 **/*.rs.bk
+/.dev-cache
 
 # Claude Code (local session state)
 .claude/

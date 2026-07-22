@@ -3010,3 +3010,141 @@ async fn users_notes_identical_published_at_orders_by_id_desc(pool: PgPool) {
         "id DESC tiebreak: {ids:?}"
     );
 }
+
+// ─── リスト機能 (Mastodon/Misskey 互換, `users/lists/list` + `notes/user-list-timeline`) ──
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_lists_list_returns_created_lists(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account", "write:account"]).await;
+
+    let created = read_json(
+        app.clone()
+            .oneshot(
+                Request::post("/api/users/lists/create")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"i": token, "name": "friends"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let list_id = created["id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/users/lists/list")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"i": token})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let items = arr.as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|l| l["id"].as_str() == Some(list_id.as_str())),
+        "created list must appear in users/lists/list: {items:?}"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_user_list_timeline_only_includes_members_notes(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "remote.test", "bob").await;
+    let carol = seed_remote_actor(&pool, "other.test", "carol").await;
+
+    for followed in [bob, carol] {
+        let ap_id = format!("https://sakurasato.test/follows/{alice}-{followed}");
+        let row = repo::follow::upsert_pending(&pool, &ap_id, alice, followed)
+            .await
+            .unwrap();
+        repo::follow::set_state(&pool, row.id, sakurasato_core::model::FollowState::Accepted)
+            .await
+            .unwrap();
+    }
+
+    let bobs_note = seed_note(&pool, bob, "remote.test", "bob says hi", Visibility::Public).await;
+    let carols_note = seed_note(
+        &pool,
+        carol,
+        "other.test",
+        "carol says hi",
+        Visibility::Public,
+    )
+    .await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account", "write:account"]).await;
+
+    let created = read_json(
+        app.clone()
+            .oneshot(
+                Request::post("/api/users/lists/create")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"i": token, "name": "just bob"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let list_id = created["id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/users/lists/push")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(
+                        &json!({"i": token, "listId": list_id, "userId": bob.to_string()}),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/user-list-timeline")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"i": token, "listId": list_id, "limit": 10}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let ids: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![bobs_note.to_string()],
+        "user-list-timeline must contain only bob's note: {ids:?}"
+    );
+    assert!(!ids.contains(&carols_note.to_string()));
+}

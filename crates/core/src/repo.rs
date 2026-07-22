@@ -20,3 +20,4 @@ pub mod note;
 pub mod notification;
 pub mod notification_channel;
 pub mod reaction;
+pub mod user_list;

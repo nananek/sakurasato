@@ -227,6 +227,63 @@ pub async fn list_home_renote_window(
     .await
 }
 
+/// リストタイムラインに混ぜる renote (= リストメンバーによる `Announce`) を、
+/// [`list_home_renote_window`] と同じ時刻カーソル方式で引く。`viewer_actor_id`
+/// は followers 限定 note の可視性判定 (= viewer が author を follow して
+/// いるか) にのみ使う ── boost の主体スコープは「viewer 自身 or フォロー中」
+/// ではなく「`list_id` のメンバー」に絞る。
+pub async fn list_list_renote_window(
+    pool: &PgPool,
+    list_id: i64,
+    viewer_actor_id: i64,
+    since_ts: Option<DateTime<Utc>>,
+    until_ts: Option<DateTime<Utc>>,
+    limit: i64,
+) -> sqlx::Result<Vec<RenoteWindowRow>> {
+    sqlx::query_as!(
+        RenoteWindowRow,
+        r#"
+        SELECT
+            ann.id AS announce_id,
+            ann.ap_id AS announce_ap_id,
+            ann.published_at AS announce_published_at,
+            ann.actor_id AS renoter_actor_id,
+            ann.note_id AS renoted_note_id
+        FROM announce ann
+        JOIN note n ON n.id = ann.note_id
+        WHERE
+            n.visibility <> 'direct'
+            AND (
+                n.visibility IN ('public', 'unlisted')
+                OR n.actor_id = $2
+                OR (
+                    n.visibility = 'followers'
+                    AND EXISTS (
+                        SELECT 1 FROM follow
+                        WHERE follower_actor_id = $2
+                          AND followed_actor_id = n.actor_id
+                          AND state = 'accepted'
+                    )
+                )
+            )
+            AND ann.actor_id IN (
+                SELECT member_actor_id FROM user_list_member WHERE list_id = $1
+            )
+            AND ($3::TIMESTAMPTZ IS NULL OR ann.published_at > $3)
+            AND ($4::TIMESTAMPTZ IS NULL OR ann.published_at < $4)
+        ORDER BY ann.published_at DESC
+        LIMIT $5
+        "#,
+        list_id,
+        viewer_actor_id,
+        since_ts,
+        until_ts,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// **M14 #150 (`MiAuth` `users/notes`)** ── 特定 actor (= `users/notes` の対象
 /// ユーザ) が行った renote (`Announce`) を `published_at` 降順・時刻カーソル付き
 /// で引く。`list_home_renote_window` の **著者スコープ版**。

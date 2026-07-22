@@ -152,6 +152,15 @@ pub struct FollowRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Row of the `user_list` table (Mastodon/Misskey 互換のユーザーリスト)。
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct UserListRow {
+    pub id: i64,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Row of the `delivery_queue` table.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct DeliveryQueueRow {

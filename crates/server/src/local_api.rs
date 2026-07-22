@@ -40,6 +40,11 @@
 //! - `GET /api/v1/followers` ── 自分を follow している accepted 一覧 (M13 PR3)
 //! - `GET /api/v1/actor/{id}/notes` ── 当該 actor の Note 一覧。viewer 視点の
 //!   visibility filter 経由 (M13 PR3)
+//! - `GET /api/v1/lists` / `POST /api/v1/lists` ── リスト一覧・作成
+//! - `GET|PATCH|DELETE /api/v1/lists/{id}` ── リスト詳細・リネーム・削除
+//! - `POST /api/v1/lists/{id}/members` / `DELETE /api/v1/lists/{id}/members/{actor_id}`
+//!   ── リストメンバー追加・削除
+//! - `GET /api/v1/timeline/list/{id}` ── リストタイムライン ([`user_list`])
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -70,6 +75,7 @@ pub mod reactions;
 pub mod renotes;
 pub mod stream;
 pub mod timeline;
+pub mod user_list;
 pub mod whoami;
 
 pub fn router(state: AppState) -> Router {
@@ -153,6 +159,24 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/notifications/mark-all-read",
             post(notifications::mark_all_read),
         )
+        // リスト機能 (Mastodon/Misskey 互換)。フォロー中ユーザーをグルーピング
+        // した専用タイムライン。`crate::local_api::user_list` 参照。
+        .route(
+            "/api/v1/lists",
+            get(user_list::list).post(user_list::create),
+        )
+        .route(
+            "/api/v1/lists/{id}",
+            get(user_list::show)
+                .patch(user_list::rename)
+                .delete(user_list::delete),
+        )
+        .route("/api/v1/lists/{id}/members", post(user_list::add_member))
+        .route(
+            "/api/v1/lists/{id}/members/{actor_id}",
+            axum::routing::delete(user_list::remove_member),
+        )
+        .route("/api/v1/timeline/list/{id}", get(user_list::timeline))
         // 全 `/api/v1/*` に Bearer 認証を要求する。`from_fn_with_state` で
         // middleware に `AppState` を渡し、`api_token` lookup に使う。
         .layer(axum::middleware::from_fn_with_state(

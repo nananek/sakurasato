@@ -77,6 +77,13 @@ pub enum Command {
     /// 積み、state を `accepted` に遷移。reject は Reject activity を積み、
     /// state を `rejected` に遷移。
     FollowRequest(FollowRequestArgs),
+    /// Manage user lists (Mastodon/Misskey 互換のリスト機能)。
+    ///
+    /// フォロー中ユーザーをグルーピングした専用タイムライン。MiAuth 経路
+    /// (`users/lists/*` + `notes/user-list-timeline`, Aria 等の Misskey
+    /// クライアント向け) / TUI ローカル API と同じ DB を操作する CLI 管理系。
+    /// メンバー追加は `follow.state = 'accepted'` の相手のみ可能。
+    List(ListArgs),
     /// Manage Discord 互換 webhook 通知チャンネル。
     ///
     /// 受信 (mention / DM / quote / reaction / renote / follow / follow-request)
@@ -324,6 +331,63 @@ pub struct FollowRequestMutateArgs {
     /// `follow.id` (= `follow-request list` で表示される number)。
     #[arg(long)]
     pub id: i64,
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    #[command(subcommand)]
+    pub command: ListCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ListCommand {
+    /// 新しいリストを作成する。
+    Create(ListCreateArgs),
+    /// 全リストを `member_count` 付きで列挙する。
+    List,
+    /// `--id <N>` のリストをメンバー込みで表示する。
+    Show(ListIdArgs),
+    /// `--id <N>` のリストをリネームする。
+    Rename(ListRenameArgs),
+    /// `--id <N>` のリストを削除する。
+    Delete(ListIdArgs),
+    /// `--id <N>` のリストにメンバーを追加する。`--actor` は
+    /// `acct` (`user@host`) または `actor.id` (数値) のいずれかを受け付ける。
+    /// 対象は `follow.state = 'accepted'` の相手のみ (Sakurasato 固有の制約、
+    /// `crate::miauth::lists` module doc 参照)。
+    AddMember(ListMemberArgs),
+    /// `--id <N>` のリストからメンバーを削除する。
+    RemoveMember(ListMemberArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ListCreateArgs {
+    #[arg(long)]
+    pub title: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ListIdArgs {
+    /// `user_list.id` (= `list list` で表示される number)。
+    #[arg(long)]
+    pub id: i64,
+}
+
+#[derive(Debug, Args)]
+pub struct ListRenameArgs {
+    #[arg(long)]
+    pub id: i64,
+    #[arg(long)]
+    pub title: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ListMemberArgs {
+    #[arg(long)]
+    pub id: i64,
+    /// `acct` (`user@host`, `@` prefix は任意) または `actor.id` (数値)。
+    #[arg(long)]
+    pub actor: String,
 }
 
 #[derive(Debug, Args)]

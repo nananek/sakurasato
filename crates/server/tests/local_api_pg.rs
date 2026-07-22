@@ -2647,6 +2647,291 @@ async fn notifications_list_and_mark_all_read(pool: PgPool) {
     assert_eq!(json["items"][0]["is_read"], true);
 }
 
+// ─── リスト機能 (Mastodon/Misskey 互換) ─────────────────────────────────
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn list_create_and_list_roundtrip(pool: PgPool) {
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/lists")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": "friends" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = read_json(resp).await;
+    assert_eq!(created["title"], "friends");
+    assert_eq!(created["member_count"], 0);
+    let id = created["id"].as_i64().unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/lists")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert!(
+        items.iter().any(|i| i["id"].as_i64() == Some(id)),
+        "created list must appear in GET /api/v1/lists: {items:?}"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn list_add_member_requires_accepted_follow(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/lists")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": "friends" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_id = read_json(resp).await["id"].as_i64().unwrap();
+
+    // bob をまだ follow していないので 400。
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/lists/{list_id}/members"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "actor_id": bob.id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // accepted follow にしてから再度追加すると 204、詳細にも反映される。
+    let follow_ap_id = format!("{}/follows/bob-by-alice", me.ap_id);
+    let row = repo::follow::upsert_pending(&pool, &follow_ap_id, me.id, bob.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/lists/{list_id}/members"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "actor_id": bob.id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/lists/{list_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let detail = read_json(resp).await;
+    let members = detail["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0]["id"], bob.id);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn list_rename_and_delete(pool: PgPool) {
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/lists")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": "old" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_id = read_json(resp).await["id"].as_i64().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/lists/{list_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": "new" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(read_json(resp).await["title"], "new");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/lists/{list_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/lists/{list_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn list_timeline_only_includes_members_notes(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+    let mut carol = common::sample_local_actor("carol", "other.test");
+    carol.is_local = false;
+    carol.private_key_pem = None;
+    carol.ed25519_private_key_pem = None;
+    let carol = repo::actor::insert(&pool, carol).await.unwrap();
+
+    for (follower, followed) in [(me.id, bob.id), (me.id, carol.id)] {
+        let ap_id = format!("https://example.test/follows/{follower}-{followed}");
+        let row = repo::follow::upsert_pending(&pool, &ap_id, follower, followed)
+            .await
+            .unwrap();
+        repo::follow::set_state(&pool, row.id, sakurasato_core::model::FollowState::Accepted)
+            .await
+            .unwrap();
+    }
+
+    let mine = insert_local_note(&pool, me.id, "example.test", "n1", "alice's own").await;
+    let bobs = insert_local_note(&pool, bob.id, "remote.test", "n2", "bob's note").await;
+    let carols = insert_local_note(&pool, carol.id, "other.test", "n3", "carol's note").await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/lists")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": "just bob" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_id = read_json(resp).await["id"].as_i64().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/lists/{list_id}/members"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "actor_id": bob.id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/timeline/list/{list_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    let notes = json["notes"].as_array().unwrap();
+    let ids: Vec<i64> = notes.iter().map(|n| n["id"].as_i64().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec![bobs],
+        "list timeline must contain only bob's note: {ids:?}"
+    );
+    assert!(!ids.contains(&mine), "list timeline must not include self");
+    assert!(
+        !ids.contains(&carols),
+        "list timeline must not include non-member followee"
+    );
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn notifications_requires_token(pool: PgPool) {
     let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));

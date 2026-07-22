@@ -41,6 +41,7 @@ pub mod endpoints;
 pub mod error;
 pub mod following;
 pub mod i;
+pub mod lists;
 pub mod meta;
 pub mod nodeinfo;
 pub mod notes;
@@ -122,6 +123,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/notes/reactions/delete", post(reactions::delete))
         .route("/api/following/create", post(following::create))
         .route("/api/following/delete", post(following::delete))
+        // リスト機能 (Mastodon/Misskey 互換)。`crate::miauth::lists` 参照。
+        .route("/api/users/lists/create", post(lists::create))
+        .route("/api/users/lists/list", post(lists::list))
+        .route("/api/users/lists/show", post(lists::show))
+        .route("/api/users/lists/update", post(lists::update))
+        .route("/api/users/lists/delete", post(lists::delete))
+        .route("/api/users/lists/push", post(lists::push))
+        .route("/api/users/lists/pull", post(lists::pull))
+        .route("/api/notes/user-list-timeline", post(lists::timeline))
         // drive (= Aria の添付アップロード / ドライブ閲覧)
         .route(
             "/api/drive/files/create",

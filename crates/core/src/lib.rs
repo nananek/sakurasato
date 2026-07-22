@@ -53,6 +53,7 @@ mod tests {
         //   のを is_local=FALSE 行に限り `:shortcode@host:` へ戻す)
         // 0024 emoji_license_sensitive (= 絵文字 metadata の round-trip export 用に
         //   emoji.license TEXT + emoji.is_sensitive BOOLEAN を追加)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 24);
+        // 0025 user_list (= リスト機能: user_list + user_list_member テーブルを追加)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 25);
     }
 }

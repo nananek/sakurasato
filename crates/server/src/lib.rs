@@ -21,6 +21,7 @@ pub mod follow;
 pub mod follow_request;
 pub(crate) mod http_client;
 pub mod init;
+pub mod list_cli;
 pub mod local_api;
 pub mod media_proxy_client;
 // M14 #157: MiAuth foundation (= 親 issue #150)。実 endpoint は #158-#160 で

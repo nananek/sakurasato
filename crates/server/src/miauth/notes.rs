@@ -418,7 +418,10 @@ pub async fn timeline(
 /// `"rn:<announce_id>"` なら announce、それ以外は note id として扱う。混合
 /// タイムラインを時刻でページングするための境界時刻 ── 解決できなければ
 /// `None` (= 境界無し扱いで先頭から)。
-async fn resolve_cursor_ts(state: &AppState, id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) async fn resolve_cursor_ts(
+    state: &AppState,
+    id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Some(rest) = id.strip_prefix("rn:") {
         let announce_id = rest.parse::<i64>().ok()?;
         repo::announce::get_by_id(state.pool(), announce_id)
@@ -508,7 +511,7 @@ async fn viewer_ap_id(state: &AppState) -> Option<String> {
 
 /// `sinceDate`/`untilDate` は **ms epoch** で渡される (Misskey 仕様)。
 /// 範囲外 (= `i64::MAX` を超える / sec 換算で範囲外) は `None` に倒す。
-fn ms_epoch_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
+pub(crate) fn ms_epoch_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms).single()
 }
 

@@ -418,6 +418,109 @@ impl LocalApi {
         decode_json(resp).await
     }
 
+    /// `GET /api/v1/lists` ── リスト一覧 (Mastodon/Misskey 互換のリスト機能)。
+    pub async fn list_lists(&self) -> Result<ListsResponse, ApiError> {
+        self.get_json("/api/v1/lists").await
+    }
+
+    /// `POST /api/v1/lists { title }` ── リスト作成。
+    pub async fn create_list(&self, title: &str) -> Result<ListSummary, ApiError> {
+        let body = serde_json::to_vec(&CreateListRequest { title })?;
+        let request = self
+            .request_builder(Method::POST, "/api/v1/lists")?
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// `GET /api/v1/lists/{id}` ── リスト詳細 (メンバー込み)。
+    pub async fn show_list(&self, id: i64) -> Result<ListDetail, ApiError> {
+        let path = format!("/api/v1/lists/{id}");
+        self.get_json(&path).await
+    }
+
+    /// `PATCH /api/v1/lists/{id} { title }` ── リストリネーム。
+    pub async fn rename_list(&self, id: i64, title: &str) -> Result<ListSummary, ApiError> {
+        let body = serde_json::to_vec(&RenameListRequest { title })?;
+        let path = format!("/api/v1/lists/{id}");
+        let request = self
+            .request_builder(Method::PATCH, &path)?
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// `DELETE /api/v1/lists/{id}` ── リスト削除。
+    pub async fn delete_list(&self, id: i64) -> Result<(), ApiError> {
+        let path = format!("/api/v1/lists/{id}");
+        let request = self
+            .request_builder(Method::DELETE, &path)?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body_string(resp.into_body()).await.unwrap_or_default();
+            return Err(ApiError::Status { status, body });
+        }
+        Ok(())
+    }
+
+    /// `POST /api/v1/lists/{id}/members { actor_id }` ── メンバー追加。
+    /// 追加できるのは `follow.state = 'accepted'` の相手のみ (server 側制約)。
+    pub async fn add_list_member(&self, id: i64, actor_id: i64) -> Result<(), ApiError> {
+        let body = serde_json::to_vec(&AddListMemberRequest { actor_id })?;
+        let path = format!("/api/v1/lists/{id}/members");
+        let request = self
+            .request_builder(Method::POST, &path)?
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body_string(resp.into_body()).await.unwrap_or_default();
+            return Err(ApiError::Status { status, body });
+        }
+        Ok(())
+    }
+
+    /// `DELETE /api/v1/lists/{id}/members/{actor_id}` ── メンバー削除。
+    pub async fn remove_list_member(&self, id: i64, actor_id: i64) -> Result<(), ApiError> {
+        let path = format!("/api/v1/lists/{id}/members/{actor_id}");
+        let request = self
+            .request_builder(Method::DELETE, &path)?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body_string(resp.into_body()).await.unwrap_or_default();
+            return Err(ApiError::Status { status, body });
+        }
+        Ok(())
+    }
+
+    /// `GET /api/v1/timeline/list/{id}` ── リストタイムライン。
+    /// `timeline_home` と同じ `before_ts_ms` カーソル方式。
+    pub async fn timeline_list(
+        &self,
+        list_id: i64,
+        before_ts_ms: Option<i64>,
+        limit: i64,
+    ) -> Result<TimelineResponse, ApiError> {
+        use std::fmt::Write as _;
+        let mut path = format!("/api/v1/timeline/list/{list_id}?limit={limit}");
+        if let Some(b) = before_ts_ms {
+            write!(&mut path, "&before_ts_ms={b}").expect("write to String");
+        }
+        self.get_json(&path).await
+    }
+
     /// `GET /api/v1/emojis?prefix=...&limit=...` ── ローカル絵文字候補
     /// (Issue #101)。reaction prompt の shortcode サジェスト popup で使う。
     ///
@@ -1207,6 +1310,49 @@ pub struct FollowListResponse {
     pub entries: Vec<FollowListEntry>,
     #[serde(default)]
     pub next_before_id: Option<i64>,
+}
+
+/// リスト機能 (Mastodon/Misskey 互換)。`server::local_api::user_list::UserListDto`
+/// と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListSummary {
+    pub id: i64,
+    pub title: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub member_count: i64,
+}
+
+/// `GET /api/v1/lists` のレスポンス body。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListsResponse {
+    pub items: Vec<ListSummary>,
+}
+
+/// `GET /api/v1/lists/{id}` のレスポンス body (= メンバー込み)。
+/// `server::local_api::user_list::UserListDetailDto` と対応。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListDetail {
+    pub id: i64,
+    pub title: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub members: Vec<ActorProfile>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateListRequest<'a> {
+    title: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct RenameListRequest<'a> {
+    title: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct AddListMemberRequest {
+    actor_id: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

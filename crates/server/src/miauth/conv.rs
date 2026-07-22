@@ -1099,6 +1099,37 @@ pub fn from_actor_me_detailed(
     v
 }
 
+/// `MissUserList` (Misskey 互換の `UserList`)。`users/lists/*` +
+/// `notes/user-list-timeline` (= リスト機能, `crate::miauth::lists`) で使う。
+///
+/// Misskey 本家の `id` は他の型と同じく string ── ここでも
+/// `user_list.id` (`i64`) を stringify する ([`MissUser::id`] と同じ流儀)。
+/// `user_ids` は Misskey `UserList.userIds` (= optional だが実クライアントは
+/// 参照するため常に emit する) に合わせて `Vec<String>` (stringified actor id)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissUserList {
+    pub id: String,
+    pub created_at: String,
+    pub name: String,
+    pub user_ids: Vec<String>,
+}
+
+/// [`sakurasato_core::model::UserListRow`] + メンバー actor id 一覧 → `MissUserList`。
+pub fn user_list_to_miss(
+    row: &sakurasato_core::model::UserListRow,
+    member_ids: &[i64],
+) -> MissUserList {
+    MissUserList {
+        id: row.id.to_string(),
+        created_at: row
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        name: row.title.clone(),
+        user_ids: member_ids.iter().map(i64::to_string).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

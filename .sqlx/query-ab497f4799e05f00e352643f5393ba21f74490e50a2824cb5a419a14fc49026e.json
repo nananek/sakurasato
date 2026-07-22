@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT member_actor_id AS \"member_actor_id!\"\n        FROM user_list_member\n        WHERE list_id = $1\n        ORDER BY member_actor_id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "member_actor_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "user_list_member",
+            "name": "member_actor_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ab497f4799e05f00e352643f5393ba21f74490e50a2824cb5a419a14fc49026e"
+}

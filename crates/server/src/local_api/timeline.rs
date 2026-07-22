@@ -422,9 +422,6 @@ pub struct TimelineResponse {
     pub next_before_ts_ms: Option<i64>,
 }
 
-// note window + renote window の取得・解決・merge を 1 関数で行うため 100 行を
-// 超える。`renoted_*` / `renoter_*` は AP 用語 (= renote された側 / renote した側)
-// で意図的に似せている。
 #[allow(
     clippy::too_many_lines,
     clippy::similar_names,
@@ -489,25 +486,57 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
         }
     };
 
+    merge_and_respond(
+        state.pool(),
+        host,
+        actor.id,
+        note_entries,
+        renote_rows,
+        limit,
+        "timeline/home",
+    )
+    .await
+}
+
+/// note window + renote window の解決・merge を 1 関数に集約したもの。
+/// `home` (フォロー中スコープ) と `crate::local_api::user_list::list_timeline`
+/// (リストメンバースコープ) は windows の取得元だけが異なり、以降の
+/// 集計・merge・応答組み立ては完全に共通なので、本関数として切り出して両者
+/// から呼ぶ。`log_prefix` はエラーログのタグ (呼び出し元を区別するため)。
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::similar_names,
+    reason = "timeline merge を 1 関数で組む / renoted・renoter は AP 用語"
+)]
+pub(crate) async fn merge_and_respond(
+    pool: &sqlx::PgPool,
+    host: &str,
+    viewer_actor_id: i64,
+    note_entries: Vec<TimelineEntry>,
+    renote_rows: Vec<sakurasato_core::repo::announce::RenoteWindowRow>,
+    limit: i64,
+    log_prefix: &str,
+) -> Response {
     // renote の元 note / renoter actor を一括解決。引けない場合は warn を残して
     // その renote を黙って落とす (= タイムライン本体は note で成立する)。
     let renoted_ids: Vec<i64> = renote_rows.iter().map(|r| r.renoted_note_id).collect();
     let renoter_ids: Vec<i64> = renote_rows.iter().map(|r| r.renoter_actor_id).collect();
-    let renoted_entries = repo::note::list_timeline_entries_by_ids(state.pool(), &renoted_ids)
+    let renoted_entries = repo::note::list_timeline_entries_by_ids(pool, &renoted_ids)
         .await
         .unwrap_or_else(|err| {
             warn!(
                 ?err,
-                "timeline/home: renoted entries lookup failed; dropping renotes"
+                log_prefix, "renoted entries lookup failed; dropping renotes"
             );
             Vec::new()
         });
-    let renoter_actors = repo::actor::list_by_ids(state.pool(), &renoter_ids)
+    let renoter_actors = repo::actor::list_by_ids(pool, &renoter_ids)
         .await
         .unwrap_or_else(|err| {
             warn!(
                 ?err,
-                "timeline/home: renoter actors lookup failed; dropping renotes"
+                log_prefix, "renoter actors lookup failed; dropping renotes"
             );
             Vec::new()
         });
@@ -526,7 +555,7 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
     all_note_ids.sort_unstable();
     all_note_ids.dedup();
     let mut by_note: HashMap<i64, Vec<ReactionSummaryDto>> = HashMap::new();
-    match repo::reaction::counts_for_notes(state.pool(), &all_note_ids).await {
+    match repo::reaction::counts_for_notes(pool, &all_note_ids).await {
         Ok(rows) => {
             for row in rows {
                 by_note
@@ -535,17 +564,17 @@ pub async fn home(State(state): State<AppState>, Query(q): Query<TimelineQuery>)
                     .push(row_to_dto(host, row));
             }
         }
-        Err(err) => warn!(?err, "timeline/home: reaction counts_for_notes failed"),
+        Err(err) => warn!(?err, log_prefix, "reaction counts_for_notes failed"),
     }
     let mut announce_by_note: HashMap<i64, sakurasato_core::repo::announce::AnnounceSummaryRow> =
         HashMap::new();
-    match repo::announce::counts_for_notes(state.pool(), &all_note_ids, actor.id).await {
+    match repo::announce::counts_for_notes(pool, &all_note_ids, viewer_actor_id).await {
         Ok(rows) => {
             for row in rows {
                 announce_by_note.insert(row.note_id, row);
             }
         }
-        Err(err) => warn!(?err, "timeline/home: announce counts_for_notes failed"),
+        Err(err) => warn!(?err, log_prefix, "announce counts_for_notes failed"),
     }
 
     // (sort_ts, TimelineNote) で merge。note は published_at、renote は renote 時刻。
