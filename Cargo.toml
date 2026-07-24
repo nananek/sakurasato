@@ -75,7 +75,7 @@ http = "1"
 #   署名 base に直結するため、順序保持マップが必要。
 # sha2: Digest / Content-Digest の SHA-256 計算 (rsa crate 経由ではなく明示)。
 # subtle: 署名値 / digest 比較を定数時間で行うため。
-base64 = "0.22"
+base64 = "0.23"
 httpdate = "1"
 indexmap = "2"
 # `oid` feature は rsa::pkcs1v15::SigningKey<Sha256> が `AssociatedOid` を要求するため必要。
