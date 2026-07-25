@@ -83,8 +83,13 @@ services:
     tmpfs:
       - /tmp
     # 危険な入力のデコードが暴走しても OOM kill で本体に波及させない。
-    mem_limit: 512m
-    memswap_limit: 512m
+    # 動画対応 (media_proxy.video.max_bytes 既定 200 MiB) により、入力バッファ
+    # + video_pipeline::process 内の to_vec() コピーだけで理論上 400 MiB 前後
+    # 必要になる。お一人様サーバで悪意ある入力は想定薄 (アップロードは常に
+    # 自分自身の動画) なので、厳密な最小値ではなく安全マージンを見て 1GiB に
+    # 引き上げる。
+    mem_limit: 1024m
+    memswap_limit: 1024m
     pids_limit: 256
     volumes:
       - media_sock:/run/sakurasato

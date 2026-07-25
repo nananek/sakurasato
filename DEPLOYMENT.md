@@ -34,7 +34,7 @@
 
 - **ホスト機**: 常時稼働する Linux 機（自宅サーバ / VPS / Raspberry Pi 等）
   - Docker 25+ または rootless Docker 推奨。`docker compose` v5+
-  - 最低 2 GB RAM（media-proxy `mem_limit: 512m` + postgres + server + versitygw）
+  - 最低 2.5〜3 GB RAM（media-proxy `mem_limit: 1024m`（動画対応のため引き上げ済み）+ postgres + server + versitygw）
   - 数 GB の空きディスク（postgres data + versitygw blob + media）
 - **公開ドメイン**: 自分の所有するドメインを Cloudflare DNS に乗せておく
   - 例: `sakurasato.example.com` を Sakurasato 用に割り当てる
