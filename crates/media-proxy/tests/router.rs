@@ -290,6 +290,34 @@ async fn webfinger_blocks_ssrf_hosts() {
     }
 }
 
+/// PR review 指摘の回帰テスト: `router()` が `/v1/video/sanitize` に
+/// `DefaultBodyLimit` の override をかけていないと、axum の既定 2 MiB で
+/// リクエストがハンドラに到達する前に 413 になり、`media_proxy.video.max_bytes`
+/// (`VideoConfig::default()` = 200 MiB) が実質意味を持たなくなる。
+/// 2 MiB を超えるボディでも 413 にならず (= ハンドラまで到達し) `415`
+/// (unsupported_media, フォーマット不明のダミーバイト列のため) になることを
+/// 確認する。
+#[tokio::test]
+async fn video_sanitize_accepts_body_larger_than_axum_default_2mib() {
+    let app = make_router();
+    let body = vec![0u8; 3 * 1024 * 1024]; // 3 MiB > axum 既定 2 MiB
+    let resp = app
+        .oneshot(
+            Request::post("/v1/video/sanitize")
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "DefaultBodyLimit override missing: 3 MiB body was rejected before reaching the handler"
+    );
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
 #[tokio::test]
 async fn sanitize_resizes_oversized_avatar() {
     let app = make_router();

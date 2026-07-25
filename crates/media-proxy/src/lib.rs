@@ -54,11 +54,24 @@ pub use state::ProxyState;
 /// `state` は出来上がった [`ProxyState`] を `Arc` で共有する。テストは
 /// 同関数を直接呼び、`tower::ServiceExt::oneshot` で叩く。
 pub fn router(state: Arc<ProxyState>) -> Router {
+    // axum の `DefaultBodyLimit` は明示上書きしない限り 2 MiB。`max_bytes` /
+    // `max_video_bytes` は config 由来でそれより大きいのが通常 (動画は
+    // 既定 200 MiB) なので、各サニタイズ route に個別で override をかける
+    // ── しないとハンドラ内の上限チェックに到達する前に axum 層で 413 になる。
+    let image_body_limit = state.max_bytes();
+    let video_body_limit = state.max_video_bytes();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/image/fetch", post(fetch::handle))
-        .route("/v1/image/sanitize", post(sanitize::handle))
-        .route("/v1/video/sanitize", post(video_sanitize::handle))
+        .route(
+            "/v1/image/sanitize",
+            post(sanitize::handle).layer(axum::extract::DefaultBodyLimit::max(image_body_limit)),
+        )
+        .route(
+            "/v1/video/sanitize",
+            post(video_sanitize::handle)
+                .layer(axum::extract::DefaultBodyLimit::max(video_body_limit)),
+        )
         .route("/v1/webfinger/resolve", post(webfinger::handle))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

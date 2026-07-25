@@ -747,10 +747,30 @@ mod webm {
         })
     }
 
+    /// `unknown size` (= 全 data bit が 1) 要素の扱い。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum UnknownSize {
+        /// `buf` の末尾までを payload とみなす。**top-level 走査 (`locate_segment`)
+        /// でのみ正しい** ── ストリーミング配信などで `Segment` 自身が
+        /// unknown size を持つのは仕様上正当で、`buf` (= 入力全体) の末尾が
+        /// 実際の終端と一致するため。
+        TreatAsRestOfBuf,
+        /// unknown size に遭遇したら fail-closed で reject する。
+        /// `Segment` 配下の子要素走査 (`find_child` 等) で使う ── `Cluster`
+        /// 等が unknown size を持つ場合、「`buf` の末尾まで」という解釈は
+        /// 誤りで (`buf` は `Segment` の payload 全体であり `Cluster` の
+        /// 終端ではない)、後続の兄弟要素 (`Tags`/`Attachments` 等) を
+        /// 走査から取りこぼし、無害化がバイパスされる。
+        Reject,
+    }
+
     /// element の合計バイト長 (`id_len` + `size_len` + `payload_len`) を計算する
-    /// 共通ロジック。`unknown size` (= `None`) は `buf` の末尾までを payload
-    /// とみなす (本実装では top-level Segment 相当のみ想定)。
-    fn element_total_len(buf: &[u8], offset: usize) -> Result<usize, ApiError> {
+    /// 共通ロジック。
+    fn element_total_len(
+        buf: &[u8],
+        offset: usize,
+        unknown_size: UnknownSize,
+    ) -> Result<usize, ApiError> {
         let (_, id_len) = read_element_id(&buf[offset..])?;
         let size_vint = read_size_vint(&buf[offset + id_len..])?;
         let header_len = id_len + size_vint.len;
@@ -758,7 +778,15 @@ mod webm {
             Some(v) => usize::try_from(v).map_err(|_| {
                 ApiError::unsupported_media("webm_size_overflow", "element size too large")
             })?,
-            None => buf.len() - offset - header_len,
+            None => match unknown_size {
+                UnknownSize::TreatAsRestOfBuf => buf.len() - offset - header_len,
+                UnknownSize::Reject => {
+                    return Err(ApiError::unsupported_media(
+                        "webm_unknown_size_unsupported",
+                        "unknown-size element is only supported at the top-level Segment",
+                    ));
+                }
+            },
         };
         let total_len = header_len + payload_len;
         if offset + total_len > buf.len() {
@@ -783,7 +811,9 @@ mod webm {
         while offset < input.len() {
             let (id, _) = read_element_id(&input[offset..])?;
             let header_len = element_header_len(input, offset)?;
-            let total_len = element_total_len(input, offset)?;
+            // top-level 走査: Segment 自身が unknown size を持つのは正当
+            // (ストリーミング等)。
+            let total_len = element_total_len(input, offset, UnknownSize::TreatAsRestOfBuf)?;
             if id == SEGMENT_ID {
                 return Ok((offset + header_len, offset + total_len));
             }
@@ -796,13 +826,15 @@ mod webm {
     }
 
     /// `buf` 内で `want` 型の最初の直接の子要素の payload 範囲を返す
-    /// (`buf` 内の相対 offset)。
+    /// (`buf` 内の相対 offset)。**常に `Segment` 配下 (またはその子孫) の
+    /// 走査にのみ使う** ── unknown size は fail-closed で reject する
+    /// ([`UnknownSize::Reject`])。
     fn find_child(buf: &[u8], want: [u8; 4]) -> Result<Option<(usize, usize)>, ApiError> {
         let mut offset = 0usize;
         while offset < buf.len() {
             let (id, _) = read_element_id(&buf[offset..])?;
             let header_len = element_header_len(buf, offset)?;
-            let total_len = element_total_len(buf, offset)?;
+            let total_len = element_total_len(buf, offset, UnknownSize::Reject)?;
             if id == want {
                 return Ok(Some((offset + header_len, offset + total_len)));
             }
@@ -817,7 +849,7 @@ mod webm {
         while offset < buf.len() {
             let (id, _) = read_element_id(&buf[offset..])?;
             let header_len = element_header_len(buf, offset)?;
-            let total_len = element_total_len(buf, offset)?;
+            let total_len = element_total_len(buf, offset, UnknownSize::Reject)?;
             if id == want {
                 out.push((offset + header_len, offset + total_len));
             }
@@ -827,12 +859,15 @@ mod webm {
     }
 
     /// `buf` の直接の子要素を走査し、`strip_ids` に一致する ID を `Void` に
-    /// インプレース書き換えする (1階層のみ、再帰しない)。
+    /// インプレース書き換えする (1階層のみ、再帰しない)。unknown size
+    /// (= `Cluster` 等) に遭遇したら fail-closed で reject する ──
+    /// 「`buf` 末尾まで」と解釈すると後続の兄弟要素 (`Tags`/`Attachments`
+    /// 等) を走査から取りこぼし、無害化がバイパスされてしまうため。
     fn strip_children_in_place(buf: &mut [u8], strip_ids: &[[u8; 4]]) -> Result<(), ApiError> {
         let mut offset = 0usize;
         while offset < buf.len() {
             let (id, _) = read_element_id(&buf[offset..])?;
-            let total_len = element_total_len(buf, offset)?;
+            let total_len = element_total_len(buf, offset, UnknownSize::Reject)?;
             if strip_ids.contains(&id) {
                 void_strip_element(&mut buf[offset..offset + total_len]);
             }
@@ -980,6 +1015,18 @@ mod webm {
             out
         }
 
+        /// `unknown size` (= 8バイト size VINT の全 data bit を 1) でエンコード
+        /// した要素を作る。`Cluster` 等がライブ配信で実際に使う形。
+        fn build_element_unknown_size(id: &[u8], payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(id);
+            let mut size_bytes = [0u8; 8];
+            write_size_vint(&mut size_bytes, (1u64 << 56) - 1, 8);
+            out.extend_from_slice(&size_bytes);
+            out.extend_from_slice(payload);
+            out
+        }
+
         const EBML_HEADER_ID: &[u8] = &[0x1A, 0x45, 0xDF, 0xA3];
         const SEGMENT_ID_BYTES: &[u8] = &[0x18, 0x53, 0x80, 0x67];
         const INFO_ID_BYTES: &[u8] = &[0x15, 0x49, 0xA9, 0x66];
@@ -1053,7 +1100,7 @@ mod webm {
             while offset < buf.len() {
                 let (id, id_len) = read_element_id(&buf[offset..]).ok()?;
                 let header_len = element_header_len(buf, offset).ok()?;
-                let total_len = element_total_len(buf, offset).ok()?;
+                let total_len = element_total_len(buf, offset, UnknownSize::Reject).ok()?;
                 let want_padded = {
                     let mut w = [0u8; 4];
                     w[4 - want.len()..].copy_from_slice(want);
@@ -1132,6 +1179,43 @@ mod webm {
 
             let err = process(&input, 60_000).unwrap_err();
             assert_eq!(err.reason, "webm_no_info");
+        }
+
+        /// PR review 指摘の回帰テスト: `Cluster` が unknown size (ライブ配信等
+        /// で実際に使われる形) を持つ場合、「`buf` 末尾まで」と誤って解釈すると
+        /// `Cluster` より後ろの `Tags` がサニタイズ走査から漏れて無害化され
+        /// ないまま出力に残ってしまう (= サニタイズのバイパス)。
+        /// fail-closed で reject されることを確認する。
+        #[test]
+        fn cluster_with_unknown_size_is_rejected_not_bypassed() {
+            let mut info_payload = Vec::new();
+            info_payload.extend_from_slice(&build_element(
+                TIMECODE_SCALE_ID_BYTES,
+                &1_000_000u64.to_be_bytes()[5..],
+            ));
+            info_payload
+                .extend_from_slice(&build_element(DURATION_ID_BYTES, &3_000.0f64.to_be_bytes()));
+            let info = build_element(INFO_ID_BYTES, &info_payload);
+
+            let tracks_payload = build_video_entry(1280, 720);
+            let tracks = build_element(TRACKS_ID_BYTES, &tracks_payload);
+
+            let cluster = build_element_unknown_size(CLUSTER_ID_BYTES, b"FAKE_CLUSTER_FRAME_DATA");
+            let tags = build_element(TAGS_ID_BYTES, b"FAKE_TAG_METADATA_MUST_NOT_LEAK");
+
+            let mut segment_payload = Vec::new();
+            segment_payload.extend_from_slice(&info);
+            segment_payload.extend_from_slice(&tracks);
+            segment_payload.extend_from_slice(&cluster);
+            segment_payload.extend_from_slice(&tags);
+            let segment = build_element(SEGMENT_ID_BYTES, &segment_payload);
+
+            let mut input = Vec::new();
+            input.extend_from_slice(&build_element(EBML_HEADER_ID, b"\x01"));
+            input.extend_from_slice(&segment);
+
+            let err = process(&input, 60_000).unwrap_err();
+            assert_eq!(err.reason, "webm_unknown_size_unsupported");
         }
 
         #[test]

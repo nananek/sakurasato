@@ -43,11 +43,6 @@ const VIDEO_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// 通常 256 KiB 以下、最大でも `max_pixels` から逆算して数 MiB に収まる。
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
-/// 動画サニタイズレスポンスの上限。動画は再エンコードしない (≒ 入力と
-/// 同サイズで返る) ため、画像用の `MAX_BODY_BYTES` とは別枠で大きく取る。
-/// `media_proxy.video.max_bytes` の既定 (200 MiB) に余裕を足した値。
-const MAX_VIDEO_BODY_BYTES: usize = 256 * 1024 * 1024;
-
 /// 認証境界外の表示用 authority。実 DNS 解決は行わない。
 const AUTHORITY: &str = "media-proxy.local";
 
@@ -213,7 +208,16 @@ impl MediaProxyClient {
 
     /// `POST /v1/video/sanitize` — 受け取った動画バイト列のコンテナ
     /// メタデータを無害化して返す (再エンコードはしない)。
-    pub async fn sanitize_video(&self, bytes: Bytes) -> Result<ProcessedVideo, MediaProxyError> {
+    ///
+    /// `max_response_bytes` は呼び出し側 (`media_proxy.video.max_bytes`) が
+    /// 決める。動画は再エンコードしないためレスポンスは概ね入力と同サイズで
+    /// 返る ── ここを固定値でハードコードすると config で上限を上げても
+    /// レスポンス読み取り側だけ頭打ちになる罠を作るため、呼び出し元と揃える。
+    pub async fn sanitize_video(
+        &self,
+        bytes: Bytes,
+        max_response_bytes: usize,
+    ) -> Result<ProcessedVideo, MediaProxyError> {
         let uri: http::Uri = UnixUri::new(&self.socket, "/v1/video/sanitize").into();
         let request = Request::builder()
             .method(Method::POST)
@@ -224,7 +228,7 @@ impl MediaProxyClient {
             .map_err(|e| MediaProxyError::Transport(e.to_string()))?;
 
         let resp = self.send(request, VIDEO_REQUEST_TIMEOUT).await?;
-        self.read_processed_video(resp).await
+        self.read_processed_video(resp, max_response_bytes).await
     }
 
     async fn send(
@@ -319,6 +323,7 @@ impl MediaProxyClient {
     async fn read_processed_video(
         &self,
         resp: hyper::Response<Incoming>,
+        max_response_bytes: usize,
     ) -> Result<ProcessedVideo, MediaProxyError> {
         let status = resp.status();
         let content_type = resp
@@ -329,7 +334,7 @@ impl MediaProxyClient {
         let width = header_u32(resp.headers(), "x-output-width");
         let height = header_u32(resp.headers(), "x-output-height");
         let duration_ms = header_u64(resp.headers(), "x-output-duration-ms");
-        let bytes = read_limited_body(resp.into_body(), MAX_VIDEO_BODY_BYTES).await?;
+        let bytes = read_limited_body(resp.into_body(), max_response_bytes).await?;
 
         if !status.is_success() {
             let parsed: serde_json::Value =

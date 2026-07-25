@@ -364,7 +364,7 @@ async fn upload_video_core(
     let local_actor = resolve_local_actor(state).await?;
 
     // 1. media-proxy でコンテナメタデータ無害化 (再エンコードはしない)
-    let processed = match state.media_proxy().sanitize_video(body).await {
+    let processed = match state.media_proxy().sanitize_video(body, max_bytes).await {
         Ok(p) => p,
         Err(err) => return Err(map_proxy_error(&err)),
     };
