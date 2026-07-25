@@ -295,8 +295,8 @@ async fn webfinger_blocks_ssrf_hosts() {
 /// リクエストがハンドラに到達する前に 413 になり、`media_proxy.video.max_bytes`
 /// (`VideoConfig::default()` = 200 MiB) が実質意味を持たなくなる。
 /// 2 MiB を超えるボディでも 413 にならず (= ハンドラまで到達し) `415`
-/// (unsupported_media, フォーマット不明のダミーバイト列のため) になることを
-/// 確認する。
+/// (`unsupported_media`, フォーマット不明のダミーバイト列のため) になる
+/// ことを確認する。
 #[tokio::test]
 async fn video_sanitize_accepts_body_larger_than_axum_default_2mib() {
     let app = make_router();
