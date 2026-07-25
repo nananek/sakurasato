@@ -51,6 +51,7 @@ fn make_config(host: &str) -> sakurasato_core::Config {
             socket: "/tmp/x".into(),
             max_bytes: 1024,
             max_pixels: 1024,
+            video: sakurasato_core::config::VideoConfig::default(),
         },
         miauth: None,
     }
@@ -179,6 +180,7 @@ fn new_media(storage_key: &str, kind: &str, owner_actor_id: i64) -> NewMedia {
         kind: kind.into(),
         alt_text: None,
         owner_actor_id,
+        duration_ms: None,
     }
 }
 

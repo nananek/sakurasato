@@ -11,6 +11,9 @@
 //! - `POST /v1/image/sanitize` — アップロード由来の生バイト列を受け取り、
 //!   再エンコードで埋め込みペイロードと EXIF を落として返す。M7 (TUI からの
 //!   アイコン/添付アップロード) で使う。
+//! - `POST /v1/video/sanitize` — アップロード由来の動画バイト列を受け取り、
+//!   コンテナメタデータ (udta/meta/uuid, Tags/Attachments/Chapters 等) を
+//!   インプレース無害化して返す (再エンコードはしない)。
 //! - `POST /v1/webfinger/resolve` — `acct:user@host` から `ActivityPub` actor
 //!   URI を解決する (M10)。WebFinger 取得自体は JSON 通信だが、外向き接続を
 //!   media-proxy に寄せて server コンテナの egress を絞る。
@@ -34,6 +37,8 @@ pub mod http_client;
 pub mod image_pipeline;
 pub mod sanitize;
 pub mod state;
+pub mod video_pipeline;
+pub mod video_sanitize;
 pub mod webfinger;
 
 use std::sync::Arc;
@@ -53,6 +58,7 @@ pub fn router(state: Arc<ProxyState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/image/fetch", post(fetch::handle))
         .route("/v1/image/sanitize", post(sanitize::handle))
+        .route("/v1/video/sanitize", post(video_sanitize::handle))
         .route("/v1/webfinger/resolve", post(webfinger::handle))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

@@ -102,6 +102,7 @@ fn make_config(host: &str) -> sakurasato_core::Config {
             socket: "/tmp/x".into(),
             max_bytes: 1024,
             max_pixels: 1024,
+            video: sakurasato_core::config::VideoConfig::default(),
         },
         miauth: None,
     }
@@ -346,6 +347,7 @@ async fn permalink_ap_json_includes_attachment(pool: PgPool) {
             kind: "attachment".into(),
             alt_text: Some("first".into()),
             owner_actor_id: actor.id,
+            duration_ms: None,
         },
     )
     .await
@@ -361,6 +363,7 @@ async fn permalink_ap_json_includes_attachment(pool: PgPool) {
             kind: "attachment".into(),
             alt_text: None,
             owner_actor_id: actor.id,
+            duration_ms: None,
         },
     )
     .await

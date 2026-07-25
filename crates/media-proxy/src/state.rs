@@ -42,4 +42,19 @@ impl ProxyState {
     pub fn max_pixels(&self) -> u64 {
         self.config.media_proxy.max_pixels
     }
+
+    /// 動画アップロードの最大バイト数。画像用 `max_bytes` とは別枠。
+    pub fn max_video_bytes(&self) -> usize {
+        usize::try_from(self.config.media_proxy.video.max_bytes).unwrap_or(usize::MAX)
+    }
+
+    /// 動画の最大再生時間 (ミリ秒)。コンテナヘッダの duration がこれを
+    /// 超えたら [`crate::video_pipeline`] が reject する。
+    pub fn max_video_duration_ms(&self) -> u64 {
+        self.config
+            .media_proxy
+            .video
+            .max_duration_secs
+            .saturating_mul(1000)
+    }
 }

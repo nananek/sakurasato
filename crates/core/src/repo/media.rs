@@ -15,6 +15,8 @@ pub struct NewMedia {
     pub kind: String,
     pub alt_text: Option<String>,
     pub owner_actor_id: i64,
+    /// 動画の再生時間 (ミリ秒)。画像は常に `None`。
+    pub duration_ms: Option<i64>,
 }
 
 /// 行を挿入して返す。`note_id` は常に NULL で入る (= 添付紐付けは別 API)。
@@ -27,12 +29,12 @@ where
         r#"
         INSERT INTO media (
             storage_key, media_type, width, height, byte_size,
-            kind, alt_text, owner_actor_id
+            kind, alt_text, owner_actor_id, duration_ms
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING
             id, storage_key, media_type, width, height, byte_size,
-            kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+            kind, alt_text, owner_actor_id, note_id, created_at, updated_at, duration_ms
         "#,
         new.storage_key,
         new.media_type,
@@ -42,6 +44,7 @@ where
         new.kind,
         new.alt_text,
         new.owner_actor_id,
+        new.duration_ms,
     )
     .fetch_one(executor)
     .await
@@ -57,7 +60,7 @@ pub async fn get_by_storage_key(
         MediaRow,
         r#"
         SELECT id, storage_key, media_type, width, height, byte_size,
-               kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+               kind, alt_text, owner_actor_id, note_id, created_at, updated_at, duration_ms
         FROM media WHERE storage_key = $1
         "#,
         storage_key,
@@ -75,7 +78,7 @@ where
         MediaRow,
         r#"
         SELECT id, storage_key, media_type, width, height, byte_size,
-               kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+               kind, alt_text, owner_actor_id, note_id, created_at, updated_at, duration_ms
         FROM media WHERE id = $1
         "#,
         id,
@@ -97,7 +100,7 @@ pub async fn list_by_ids(pool: &PgPool, ids: &[i64]) -> sqlx::Result<Vec<MediaRo
         MediaRow,
         r#"
         SELECT id, storage_key, media_type, width, height, byte_size,
-               kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+               kind, alt_text, owner_actor_id, note_id, created_at, updated_at, duration_ms
         FROM media WHERE id = ANY($1)
         ORDER BY id ASC
         "#,
@@ -119,7 +122,7 @@ pub async fn list_by_note(pool: &PgPool, note_id: i64) -> sqlx::Result<Vec<Media
         MediaRow,
         r#"
         SELECT id, storage_key, media_type, width, height, byte_size,
-               kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+               kind, alt_text, owner_actor_id, note_id, created_at, updated_at, duration_ms
         FROM media
         WHERE note_id = $1
         ORDER BY id ASC
@@ -144,7 +147,7 @@ pub async fn list_by_owner_window(
         MediaRow,
         r#"
         SELECT id, storage_key, media_type, width, height, byte_size,
-               kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+               kind, alt_text, owner_actor_id, note_id, created_at, updated_at, duration_ms
         FROM media
         WHERE owner_actor_id = $1
           AND ($2::BIGINT IS NULL OR id > $2)
@@ -172,7 +175,7 @@ pub async fn get_by_id_for_owner(
         MediaRow,
         r#"
         SELECT id, storage_key, media_type, width, height, byte_size,
-               kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+               kind, alt_text, owner_actor_id, note_id, created_at, updated_at, duration_ms
         FROM media
         WHERE id = $1 AND owner_actor_id = $2
         "#,
@@ -216,7 +219,7 @@ pub async fn set_alt_text_for_owner(
         SET alt_text = $3, updated_at = now()
         WHERE id = $1 AND owner_actor_id = $2
         RETURNING id, storage_key, media_type, width, height, byte_size,
-                  kind, alt_text, owner_actor_id, note_id, created_at, updated_at
+                  kind, alt_text, owner_actor_id, note_id, created_at, updated_at, duration_ms
         "#,
         id,
         owner_actor_id,

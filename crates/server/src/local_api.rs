@@ -83,7 +83,17 @@ pub fn router(state: AppState) -> Router {
     // 想定の大きいバイト列を受ける。axum の DefaultBodyLimit (= 2 MiB) を
     // 当該ルートだけ拡張する。`media.upload` ハンドラ自身も上限を再確認
     // するので、ここは max_bytes と同じ値に揃えればよい。
-    let upload_max = usize::try_from(state.config().media_proxy.max_bytes).unwrap_or(usize::MAX);
+    // 動画対応で `media_proxy.video.max_bytes` (既定200MiB > 画像の25MiB) が
+    // 加わったため、DefaultBodyLimit はこの層で弾かれないよう大きい方を採用する
+    // (= 実際の上限判定は `upload_image_core` / `upload_video_core` 側で行う)。
+    let upload_max = usize::try_from(
+        state
+            .config()
+            .media_proxy
+            .max_bytes
+            .max(state.config().media_proxy.video.max_bytes),
+    )
+    .unwrap_or(usize::MAX);
 
     Router::new()
         .route("/api/v1/whoami", get(whoami::handle))

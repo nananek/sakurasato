@@ -15,7 +15,7 @@ use http_body_util::BodyExt;
 use image::{ImageBuffer, ImageFormat, Rgba};
 use sakurasato_core::Config;
 use sakurasato_core::config::{
-    DatabaseConfig, MediaProxyConfig, ServerConfig, ServerInfo, StorageConfig,
+    DatabaseConfig, MediaProxyConfig, ServerConfig, ServerInfo, StorageConfig, VideoConfig,
 };
 use sakurasato_media_proxy::ProxyState;
 use serde_json::Value;
@@ -52,6 +52,7 @@ fn make_config() -> Config {
             // 4 MiB 上限。アバター用テスト PNG は 100x80 で十分小さい。
             max_bytes: 4 * 1024 * 1024,
             max_pixels: 16_000_000,
+            video: VideoConfig::default(),
         },
         miauth: None,
     }

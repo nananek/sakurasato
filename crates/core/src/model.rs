@@ -292,6 +292,8 @@ pub struct MediaRow {
     pub note_id: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// 動画の再生時間 (ミリ秒)。画像行では常に `None`。
+    pub duration_ms: Option<i64>,
 }
 
 /// Visibility enum (mirrors the `note.visibility` column).

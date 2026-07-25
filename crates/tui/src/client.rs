@@ -182,16 +182,19 @@ impl LocalApi {
 
     /// `POST /api/v1/media?kind=...[&alt=...]` ── M7 アップロード経路。
     ///
-    /// raw バイト列を `application/octet-stream` で送り、server 側で
-    /// media-proxy サニタイズ → versitygw 格納 → DB 登録までを行う。
-    /// 戻り値は `media.id` 等を含む JSON。
+    /// raw バイト列を送り、server 側で media-proxy サニタイズ → versitygw
+    /// 格納 → DB 登録までを行う。戻り値は `media.id` 等を含む JSON。
     ///
     /// **`kind`**: `"avatar"` / `"header"` / `"attachment"` のいずれか。
     /// **`alt`**: 添付時の代替テキスト (a11y)。`None` で省略可。
+    /// **`content_type`**: server 側の image/video 経路分岐に使うヒント
+    /// (server は権威判定せず、実際のフォーマット検証は media-proxy が行う)。
+    /// 画像は従来通り `application/octet-stream` を渡す。
     pub async fn upload_media(
         &self,
         kind: &str,
         alt: Option<&str>,
+        content_type: &str,
         body: Vec<u8>,
     ) -> Result<MediaResponse, ApiError> {
         // クエリ文字列は **必ず await 前に確定** させる ── `Serializer` は
@@ -209,7 +212,7 @@ impl LocalApi {
         };
         let request = self
             .request_builder(Method::POST, &path)?
-            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(CONTENT_TYPE, content_type)
             .body(Full::from(Bytes::from(body)))
             .map_err(|e| ApiError::Transport(e.to_string()))?;
         let resp = self.send(request).await?;

@@ -94,6 +94,7 @@ fn make_config(host: &str) -> sakurasato_core::Config {
             socket: "/tmp/dead-media-proxy.sock".into(),
             max_bytes: 4 * 1024 * 1024,
             max_pixels: 16_000_000,
+            video: sakurasato_core::config::VideoConfig::default(),
         },
         miauth: None,
     }
@@ -356,6 +357,7 @@ async fn profile_attaches_avatar_from_media_id(pool: PgPool) {
             kind: "avatar".into(),
             alt_text: None,
             owner_actor_id: actor.id,
+            duration_ms: None,
         },
     )
     .await
@@ -400,6 +402,7 @@ async fn profile_rejects_wrong_kind_for_icon(pool: PgPool) {
             kind: "attachment".into(),
             alt_text: None,
             owner_actor_id: actor.id,
+            duration_ms: None,
         },
     )
     .await
@@ -439,6 +442,7 @@ async fn notes_attach_owned_media(pool: PgPool) {
             kind: "attachment".into(),
             alt_text: Some("a cat".into()),
             owner_actor_id: actor.id,
+            duration_ms: None,
         },
     )
     .await
@@ -503,6 +507,7 @@ async fn notes_reject_double_attach(pool: PgPool) {
             kind: "attachment".into(),
             alt_text: None,
             owner_actor_id: actor.id,
+            duration_ms: None,
         },
     )
     .await
@@ -566,6 +571,7 @@ async fn notes_reject_too_many_attachments(pool: PgPool) {
                 kind: "attachment".into(),
                 alt_text: None,
                 owner_actor_id: actor.id,
+                duration_ms: None,
             },
         )
         .await
@@ -636,6 +642,7 @@ async fn notes_reject_foreign_media(pool: PgPool) {
             kind: "attachment".into(),
             alt_text: None,
             owner_actor_id: remote_row.id,
+            duration_ms: None,
         },
     )
     .await

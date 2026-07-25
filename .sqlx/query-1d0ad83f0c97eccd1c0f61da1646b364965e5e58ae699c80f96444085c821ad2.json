@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, storage_key, media_type, width, height, byte_size,\n               kind, alt_text, owner_actor_id, note_id, created_at, updated_at\n        FROM media\n        WHERE id = $1 AND owner_actor_id = $2\n        ",
+  "query": "\n        SELECT id, storage_key, media_type, width, height, byte_size,\n               kind, alt_text, owner_actor_id, note_id, created_at, updated_at, duration_ms\n        FROM media WHERE storage_key = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -134,12 +134,22 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 12,
+        "name": "duration_ms",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "media",
+            "name": "duration_ms"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
@@ -154,8 +164,9 @@
       false,
       true,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "990b4b79176d5e6178f41ff5dc9d4aca52b20e8f5cd7bed2c7ad8451ba1a6ec6"
+  "hash": "1d0ad83f0c97eccd1c0f61da1646b364965e5e58ae699c80f96444085c821ad2"
 }

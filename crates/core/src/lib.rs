@@ -54,6 +54,7 @@ mod tests {
         // 0024 emoji_license_sensitive (= 絵文字 metadata の round-trip export 用に
         //   emoji.license TEXT + emoji.is_sensitive BOOLEAN を追加)
         // 0025 user_list (= リスト機能: user_list + user_list_member テーブルを追加)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 25);
+        // 0026 video_media (= 動画添付対応: media.duration_ms / poster_storage_key を追加)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 26);
     }
 }

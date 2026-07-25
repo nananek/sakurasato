@@ -77,6 +77,7 @@ mod common {
                 socket: "/tmp/media.sock".into(),
                 max_bytes: 1024 * 1024,
                 max_pixels: 1_000_000,
+                video: sakurasato_core::config::VideoConfig::default(),
             },
             // `/miauth/{uuid}` handler が session ttl を参照するため `Some` で
             // 入れる ── 値はテスト内で寿命を切るかどうか分岐する。

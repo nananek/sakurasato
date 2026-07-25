@@ -69,6 +69,13 @@ socket = "/run/sakurasato/media.sock"
 max_bytes = 26214400      # 25 MiB
 max_pixels = 33554432     # 8192 * 4096 相当
 
+# 動画添付 (video/mp4, video/webm)。再エンコードしない (コンテナメタデータの
+# 無害化のみ) ため出力サイズ ≒ 入力サイズ。画像用 max_bytes とは別枠で
+# 一桁大きい値を許容する。
+[media_proxy.video]
+max_bytes = 209715200      # 200 MiB
+max_duration_secs = 300    # 5 分
+
 # ── #150 / M14 #157: MiAuth 互換 API endpoint (オプション) ───────────────
 #
 # Misskey クライアント (= Milktea / MissRirica など) からリアクション / 投稿

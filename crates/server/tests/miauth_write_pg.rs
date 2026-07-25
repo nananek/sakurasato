@@ -72,6 +72,7 @@ mod common {
                 socket: "/tmp/media.sock".into(),
                 max_bytes: 1024 * 1024,
                 max_pixels: 1_000_000,
+                video: sakurasato_core::config::VideoConfig::default(),
             },
             miauth: Some(MiAuthConfig {
                 listen: "unix:/tmp/miauth.sock".into(),
