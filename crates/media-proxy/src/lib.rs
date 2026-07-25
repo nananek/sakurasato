@@ -11,6 +11,9 @@
 //! - `POST /v1/image/sanitize` — アップロード由来の生バイト列を受け取り、
 //!   再エンコードで埋め込みペイロードと EXIF を落として返す。M7 (TUI からの
 //!   アイコン/添付アップロード) で使う。
+//! - `POST /v1/video/sanitize` — アップロード由来の動画バイト列を受け取り、
+//!   コンテナメタデータ (udta/meta/uuid, Tags/Attachments/Chapters 等) を
+//!   インプレース無害化して返す (再エンコードはしない)。
 //! - `POST /v1/webfinger/resolve` — `acct:user@host` から `ActivityPub` actor
 //!   URI を解決する (M10)。WebFinger 取得自体は JSON 通信だが、外向き接続を
 //!   media-proxy に寄せて server コンテナの egress を絞る。
@@ -34,6 +37,8 @@ pub mod http_client;
 pub mod image_pipeline;
 pub mod sanitize;
 pub mod state;
+pub mod video_pipeline;
+pub mod video_sanitize;
 pub mod webfinger;
 
 use std::sync::Arc;
@@ -49,10 +54,24 @@ pub use state::ProxyState;
 /// `state` は出来上がった [`ProxyState`] を `Arc` で共有する。テストは
 /// 同関数を直接呼び、`tower::ServiceExt::oneshot` で叩く。
 pub fn router(state: Arc<ProxyState>) -> Router {
+    // axum の `DefaultBodyLimit` は明示上書きしない限り 2 MiB。`max_bytes` /
+    // `max_video_bytes` は config 由来でそれより大きいのが通常 (動画は
+    // 既定 200 MiB) なので、各サニタイズ route に個別で override をかける
+    // ── しないとハンドラ内の上限チェックに到達する前に axum 層で 413 になる。
+    let image_body_limit = state.max_bytes();
+    let video_body_limit = state.max_video_bytes();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/image/fetch", post(fetch::handle))
-        .route("/v1/image/sanitize", post(sanitize::handle))
+        .route(
+            "/v1/image/sanitize",
+            post(sanitize::handle).layer(axum::extract::DefaultBodyLimit::max(image_body_limit)),
+        )
+        .route(
+            "/v1/video/sanitize",
+            post(video_sanitize::handle)
+                .layer(axum::extract::DefaultBodyLimit::max(video_body_limit)),
+        )
         .route("/v1/webfinger/resolve", post(webfinger::handle))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

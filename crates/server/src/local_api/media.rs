@@ -36,7 +36,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base16ct::lower as base16;
 use sakurasato_core::model::{ActorRow, MediaRow};
@@ -77,6 +77,8 @@ pub struct MediaResponse {
     pub byte_size: i64,
     pub kind: String,
     pub alt_text: Option<String>,
+    /// 動画の再生時間 (ミリ秒)。画像は常に `None`。
+    pub duration_ms: Option<i64>,
 }
 
 impl MediaResponse {
@@ -91,6 +93,7 @@ impl MediaResponse {
             byte_size: row.byte_size,
             kind: row.kind.clone(),
             alt_text: row.alt_text.clone(),
+            duration_ms: row.duration_ms,
         }
     }
 }
@@ -143,9 +146,13 @@ fn variant_for(kind: &str) -> Option<&'static str> {
 pub async fn upload(
     State(state): State<AppState>,
     Query(q): Query<UploadQuery>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match upload_media_core(&state, &q.kind, q.alt.as_deref(), body).await {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    match upload_media_core(&state, &q.kind, q.alt.as_deref(), content_type, body).await {
         Ok((row, created)) => {
             // dedupe ヒット (= 同一バイト列の既存行) は 200、新規 INSERT は 201。
             let status = if created {
@@ -159,6 +166,36 @@ pub async fn upload(
     }
 }
 
+/// アップロードの共通入り口。`Content-Type` ヒント (`video/*` かどうか) で
+/// 画像経路 ([`upload_image_core`]) / 動画経路 ([`upload_video_core`]) に
+/// 分岐する。**このヒントはクライアント申告に過ぎず権威ではない** ──
+/// 実際のフォーマット検証は media-proxy の box/element walker
+/// ([`sakurasato_media_proxy::video_pipeline`]) が構造的に行う (= 画像側の
+/// `variant` クエリと同じ考え方)。
+pub(crate) async fn upload_media_core(
+    state: &AppState,
+    kind: &str,
+    alt: Option<&str>,
+    content_type: Option<&str>,
+    body: Bytes,
+) -> Result<(MediaRow, bool), Response> {
+    if let Some(alt) = alt
+        && alt.chars().count() > ALT_MAX
+    {
+        return Err(bad_request("alt text exceeds the 1500-character limit"));
+    }
+    if body.is_empty() {
+        return Err(bad_request("request body is empty"));
+    }
+
+    let is_video_hint = content_type.is_some_and(|ct| ct.starts_with("video/"));
+    if is_video_hint {
+        upload_video_core(state, kind, alt, body).await
+    } else {
+        upload_image_core(state, kind, alt, body).await
+    }
+}
+
 /// 画像アップロードの共通コア。raw body (`local_api`) / multipart (`MiAuth` drive)
 /// のどちらの face からも呼べるよう、入力を **再エンコード前バイト列** +
 /// `kind` + `alt` に統一する。media-proxy サニタイズ → R2 PUT → `media` 行
@@ -168,7 +205,7 @@ pub async fn upload(
     clippy::too_many_lines,
     reason = "validate → media-proxy → dedupe → R2 PUT → INSERT を 1 本のパイプラインに収める"
 )]
-pub(crate) async fn upload_media_core(
+async fn upload_image_core(
     state: &AppState,
     kind: &str,
     alt: Option<&str>,
@@ -177,14 +214,6 @@ pub(crate) async fn upload_media_core(
     let Some(variant) = variant_for(kind) else {
         return Err(bad_request("kind must be one of avatar/header/attachment"));
     };
-    if let Some(alt) = alt
-        && alt.chars().count() > ALT_MAX
-    {
-        return Err(bad_request("alt text exceeds the 1500-character limit"));
-    }
-    if body.is_empty() {
-        return Err(bad_request("request body is empty"));
-    }
     let max_bytes = usize::try_from(state.config().media_proxy.max_bytes).unwrap_or(usize::MAX);
     if body.len() > max_bytes {
         return Err(error_with_body(
@@ -290,6 +319,7 @@ pub(crate) async fn upload_media_core(
         kind: kind.to_string(),
         alt_text: alt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         owner_actor_id: local_actor.id,
+        duration_ms: None,
     };
     let inserted = match repo::media::insert(state.pool(), new).await {
         Ok(row) => row,
@@ -300,6 +330,161 @@ pub(crate) async fn upload_media_core(
     };
 
     Ok((inserted, true))
+}
+
+/// 動画アップロードの共通コア。`kind=attachment` のみ許可 (avatar/header は
+/// 画像専用のまま)。media-proxy `/v1/video/sanitize` でコンテナメタデータを
+/// 無害化したバイト列を受け取り、R2 PUT → `media` 行 INSERT まで行う。
+/// 画像経路と異なり **再エンコードしない** ため、`storage_key` の拡張子は
+/// 入力コンテナに応じて `.mp4` / `.webm` を使う。
+#[allow(
+    clippy::too_many_lines,
+    reason = "validate → media-proxy → dedupe → R2 PUT → INSERT を 1 本のパイプラインに収める (upload_image_core と同じ理由)"
+)]
+async fn upload_video_core(
+    state: &AppState,
+    kind: &str,
+    alt: Option<&str>,
+    body: Bytes,
+) -> Result<(MediaRow, bool), Response> {
+    if kind != KIND_ATTACHMENT {
+        return Err(bad_request(
+            "video attachments are only allowed for kind=attachment",
+        ));
+    }
+    let max_bytes = state.config().media_proxy.video.max_bytes;
+    let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    if body.len() > max_bytes {
+        return Err(error_with_body(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "upload exceeds media_proxy.video.max_bytes",
+        ));
+    }
+
+    let local_actor = resolve_local_actor(state).await?;
+
+    // 1. media-proxy でコンテナメタデータ無害化 (再エンコードはしない)
+    let processed = match state.media_proxy().sanitize_video(body, max_bytes).await {
+        Ok(p) => p,
+        Err(err) => return Err(map_proxy_error(&err)),
+    };
+    let Some(width) = processed.width else {
+        error!("media-proxy did not return x-output-width header");
+        return Err(error_with_body(
+            StatusCode::BAD_GATEWAY,
+            "media-proxy missing width",
+        ));
+    };
+    let Some(height) = processed.height else {
+        error!("media-proxy did not return x-output-height header");
+        return Err(error_with_body(
+            StatusCode::BAD_GATEWAY,
+            "media-proxy missing height",
+        ));
+    };
+    let Some(duration_ms) = processed.duration_ms else {
+        error!("media-proxy did not return x-output-duration-ms header");
+        return Err(error_with_body(
+            StatusCode::BAD_GATEWAY,
+            "media-proxy missing duration",
+        ));
+    };
+    let Some(ext) = video_extension_for(&processed.content_type) else {
+        error!(
+            content_type = processed.content_type,
+            "media-proxy returned unexpected video content-type"
+        );
+        return Err(error_with_body(
+            StatusCode::BAD_GATEWAY,
+            "media-proxy returned unsupported video content-type",
+        ));
+    };
+
+    // 2. SHA-256 → storage_key
+    let hash = sha256(&processed.bytes);
+    let mut hex_buf = [0u8; 64];
+    let storage_key = format!(
+        "{hash}.{ext}",
+        hash = base16::encode_str(&hash, &mut hex_buf)
+            .expect("64-byte buf is enough for 32-byte hash"),
+    );
+
+    // 3. dedupe (画像経路と同じ方針)
+    match repo::media::get_by_storage_key(state.pool(), &storage_key).await {
+        Ok(Some(existing)) => {
+            if existing.owner_actor_id != local_actor.id {
+                warn!(
+                    storage_key,
+                    existing_owner = existing.owner_actor_id,
+                    requested_owner = local_actor.id,
+                    "media dedupe collision: existing row belongs to another actor"
+                );
+                return Err(error_with_body(
+                    StatusCode::CONFLICT,
+                    "media with the same content already exists for another actor",
+                ));
+            }
+            return Ok((existing, false));
+        }
+        Ok(None) => {}
+        Err(err) => {
+            error!(?err, "media dedupe lookup failed");
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+    }
+
+    // 4. versitygw に PUT
+    let bucket = state.config().storage.bucket.clone();
+    let put_bytes = processed.bytes.clone();
+    let byte_size = i64::try_from(put_bytes.len()).unwrap_or(i64::MAX);
+    let media_type = processed.content_type.clone();
+    let put_result = state
+        .s3_client()
+        .put_object()
+        .bucket(&bucket)
+        .key(&storage_key)
+        .body(ByteStream::from(put_bytes.to_vec()))
+        .content_type(&media_type)
+        .send()
+        .await;
+    if let Err(err) = put_result {
+        error!(?err, storage_key, "versitygw PUT failed");
+        return Err(error_with_body(
+            StatusCode::BAD_GATEWAY,
+            "object store write failed",
+        ));
+    }
+
+    // 5. media 行 insert
+    let new = repo::media::NewMedia {
+        storage_key: storage_key.clone(),
+        media_type,
+        width: i32::try_from(width).unwrap_or(i32::MAX),
+        height: i32::try_from(height).unwrap_or(i32::MAX),
+        byte_size,
+        kind: kind.to_string(),
+        alt_text: alt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        owner_actor_id: local_actor.id,
+        duration_ms: i64::try_from(duration_ms).ok(),
+    };
+    let inserted = match repo::media::insert(state.pool(), new).await {
+        Ok(row) => row,
+        Err(err) => {
+            error!(?err, "media insert failed");
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+    };
+
+    Ok((inserted, true))
+}
+
+/// media-proxy が返した `Content-Type` から storage key の拡張子を決める。
+fn video_extension_for(content_type: &str) -> Option<&'static str> {
+    match content_type {
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        _ => None,
+    }
 }
 
 fn host_of(state: &AppState) -> &str {

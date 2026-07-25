@@ -1569,6 +1569,40 @@ fn submit_alt_prompt(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<Upl
 /// を避けるため、ローカルで弾く方が UX 上望ましい (PR #43 review Medium)。
 const MAX_UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
 
+/// 動画添付の上限。`media_proxy.video.max_bytes` の既定 (200 MiB) に合わせる。
+/// TUI 起動時に config を持たないため画像用と同じく決め打ち。
+const MAX_VIDEO_UPLOAD_BYTES: u64 = 200 * 1024 * 1024;
+
+/// 拡張子が動画 (`.mp4` / `.webm`) かどうかを判定する。
+fn is_video_extension(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("mp4" | "webm")
+    )
+}
+
+/// 拡張子から動画添付かどうかを判定し、`Content-Type` を決める。
+/// `None` は画像経路 (従来通り `application/octet-stream`)。
+/// avatar/header は画像専用のため `mode` で先に弾く。
+fn video_content_type_for(path: &std::path::Path, mode: PickerMode) -> Option<&'static str> {
+    if mode != PickerMode::Attachment || !is_video_extension(path) {
+        return None;
+    }
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mp4") => Some("video/mp4"),
+        Some("webm") => Some("video/webm"),
+        _ => None,
+    }
+}
+
 /// バックグラウンドアップロードの本体。bytes を読み、`POST /api/v1/media`、
 /// 必要なら `PATCH /api/v1/actor/profile` まで叩いて結果を返す。
 async fn run_upload(
@@ -1578,18 +1612,29 @@ async fn run_upload(
     label: String,
     alt: Option<String>,
 ) -> UploadOutcome {
+    // Avatar/Header は画像専用。動画拡張子ならサーバの 400 に頼らず
+    // ここで早期に弾く (= server 側 `upload_video_core` の
+    // `kind != attachment` ガードと同じ判定を UX 側でも先取りする)。
+    if mode != PickerMode::Attachment && is_video_extension(&path) {
+        return UploadOutcome::Failed {
+            kind: mode,
+            message: "video files can only be uploaded as attachments".to_string(),
+        };
+    }
+    let video_content_type = video_content_type_for(&path, mode);
+    let max_bytes = if video_content_type.is_some() {
+        MAX_VIDEO_UPLOAD_BYTES
+    } else {
+        MAX_UPLOAD_BYTES
+    };
     // ファイルを読む **前** にメタデータで上限チェック。`tokio::fs::read`
     // はサイズ無制限に Vec に積むので、4 GiB 動画を選んでも握り込んで
-    // しまう。`MAX_UPLOAD_BYTES` で先に弾く (= server 側 `max_bytes` と
-    // 二重防御)。
+    // しまう。上限で先に弾く (= server 側 `max_bytes` と二重防御)。
     match tokio::fs::metadata(&path).await {
-        Ok(meta) if meta.len() > MAX_UPLOAD_BYTES => {
+        Ok(meta) if meta.len() > max_bytes => {
             return UploadOutcome::Failed {
                 kind: mode,
-                message: format!(
-                    "file too large: {} bytes (max {MAX_UPLOAD_BYTES})",
-                    meta.len()
-                ),
+                message: format!("file too large: {} bytes (max {max_bytes})", meta.len()),
             };
         }
         Ok(_) => {}
@@ -1609,8 +1654,9 @@ async fn run_upload(
             };
         }
     };
+    let content_type = video_content_type.unwrap_or("application/octet-stream");
     let media = match api
-        .upload_media(mode.as_kind(), alt.as_deref(), bytes)
+        .upload_media(mode.as_kind(), alt.as_deref(), content_type, bytes)
         .await
     {
         Ok(m) => m,

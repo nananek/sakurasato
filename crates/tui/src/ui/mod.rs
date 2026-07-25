@@ -3001,6 +3001,11 @@ fn render_picker_preview(
             Some(crate::preview::PreviewState::Failed { reason, .. }) => {
                 format!("  preview failed: {reason}")
             }
+            Some(crate::preview::PreviewState::Video { size }) => {
+                // Kitty graphics protocol は静止画向けのため実再生・
+                // サムネイル生成はしない (ポスターフレーム抽出は別issue)。
+                format!("  🎬 video attachment ({size} bytes) — no inline preview")
+            }
             _ => "  loading preview…".to_string(),
         };
         let placeholder = Paragraph::new(Line::from(Span::styled(

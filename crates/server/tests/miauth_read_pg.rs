@@ -73,6 +73,7 @@ mod common {
                 socket: "/tmp/media.sock".into(),
                 max_bytes: 1024 * 1024,
                 max_pixels: 1_000_000,
+                video: sakurasato_core::config::VideoConfig::default(),
             },
             miauth: Some(MiAuthConfig {
                 listen: "unix:/tmp/miauth.sock".into(),
@@ -1567,6 +1568,7 @@ async fn seed_media(pool: &PgPool, owner: i64, key: &str, alt: Option<&str>) -> 
             kind: "attachment".into(),
             alt_text: alt.map(str::to_string),
             owner_actor_id: owner,
+            duration_ms: None,
         },
     )
     .await

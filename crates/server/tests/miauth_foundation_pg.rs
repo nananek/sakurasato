@@ -68,6 +68,7 @@ mod common {
                 socket: "/tmp/media.sock".into(),
                 max_bytes: 1024 * 1024,
                 max_pixels: 1_000_000,
+                video: sakurasato_core::config::VideoConfig::default(),
             },
             // foundation #157 では Config に MiAuth を載せても serve 経路は
             // 走らない (= 統合テストは repo + ヘルパのみ叩く)。None で OK。

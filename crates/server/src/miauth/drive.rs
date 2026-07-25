@@ -115,7 +115,11 @@ pub async fn create(
     // に詰め替える (Issue #263) ── 詰め替えないと Aria 側で `error` を object と
     // して読めず「不明なエラー」になり、なぜ失敗したか (例: HEIC 非対応) が
     // ユーザに伝わらない。
-    match local_api::media::upload_media_core(&state, "attachment", comment.as_deref(), bytes).await
+    // 動画対応 (content-type ヒント分岐) は TUI local API 経路のみが対象。
+    // MiAuth drive 経由の動画アップロードは現状スコープ外 ── `None` を渡すと
+    // 常に画像経路 (`upload_image_core`) に入り、従来通り 415 で弾かれる。
+    match local_api::media::upload_media_core(&state, "attachment", comment.as_deref(), None, bytes)
+        .await
     {
         Ok((row, _created)) => {
             let host = &state.config().server.host;

@@ -35,6 +35,10 @@ use thiserror::Error;
 /// (= `media_proxy::http_client::REQUEST_TIMEOUT`)、ここはその上に裕度を足した値。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// 動画サニタイズ用の timeout。再エンコードしないとはいえ、200MB 級ペイロード
+/// の UDS 転送 + box walk には画像より裕度が要る。
+const VIDEO_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+
 /// レスポンス本文の上限 (= 4 MiB)。media-proxy 経由のアバター/プレビューは
 /// 通常 256 KiB 以下、最大でも `max_pixels` から逆算して数 MiB に収まる。
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -110,6 +114,18 @@ pub struct ProcessedImage {
     pub height: Option<u32>,
 }
 
+/// 動画 sanitize の正常レスポンス。画像と違い再エンコードしないため
+/// `content_type` は入力コンテナ (`video/mp4` | `video/webm`) をそのまま
+/// 反映する。`duration_ms` はコンテナヘッダから読んだ再生時間。
+#[derive(Debug)]
+pub struct ProcessedVideo {
+    pub bytes: Bytes,
+    pub content_type: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<u64>,
+}
+
 impl MediaProxyClient {
     /// 既存 socket パスでクライアントを構築する。
     /// socket が無くてもエラーにしない (= 起動時には media-proxy が未起動
@@ -143,7 +159,7 @@ impl MediaProxyClient {
             .body(Full::from(Bytes::from(body)))
             .map_err(|e| MediaProxyError::Transport(e.to_string()))?;
 
-        let resp = self.send(request).await?;
+        let resp = self.send(request, REQUEST_TIMEOUT).await?;
         self.read_processed(resp).await
     }
 
@@ -165,7 +181,7 @@ impl MediaProxyClient {
             .body(Full::from(Bytes::from(body)))
             .map_err(|e| MediaProxyError::Transport(e.to_string()))?;
 
-        let resp = self.send(request).await?;
+        let resp = self.send(request, REQUEST_TIMEOUT).await?;
         self.read_json::<ResolvedActor>(resp).await
     }
 
@@ -186,19 +202,45 @@ impl MediaProxyClient {
             .body(Full::from(bytes))
             .map_err(|e| MediaProxyError::Transport(e.to_string()))?;
 
-        let resp = self.send(request).await?;
+        let resp = self.send(request, REQUEST_TIMEOUT).await?;
         self.read_processed(resp).await
+    }
+
+    /// `POST /v1/video/sanitize` — 受け取った動画バイト列のコンテナ
+    /// メタデータを無害化して返す (再エンコードはしない)。
+    ///
+    /// `max_response_bytes` は呼び出し側 (`media_proxy.video.max_bytes`) が
+    /// 決める。動画は再エンコードしないためレスポンスは概ね入力と同サイズで
+    /// 返る ── ここを固定値でハードコードすると config で上限を上げても
+    /// レスポンス読み取り側だけ頭打ちになる罠を作るため、呼び出し元と揃える。
+    pub async fn sanitize_video(
+        &self,
+        bytes: Bytes,
+        max_response_bytes: usize,
+    ) -> Result<ProcessedVideo, MediaProxyError> {
+        let uri: http::Uri = UnixUri::new(&self.socket, "/v1/video/sanitize").into();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(http::header::HOST, AUTHORITY)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Full::from(bytes))
+            .map_err(|e| MediaProxyError::Transport(e.to_string()))?;
+
+        let resp = self.send(request, VIDEO_REQUEST_TIMEOUT).await?;
+        self.read_processed_video(resp, max_response_bytes).await
     }
 
     async fn send(
         &self,
         request: Request<Full<Bytes>>,
+        timeout: Duration,
     ) -> Result<hyper::Response<Incoming>, MediaProxyError> {
         let fut = self.inner.request(request);
-        match tokio::time::timeout(REQUEST_TIMEOUT, fut).await {
+        match tokio::time::timeout(timeout, fut).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => Err(MediaProxyError::Transport(e.to_string())),
-            Err(_) => Err(MediaProxyError::Timeout(REQUEST_TIMEOUT)),
+            Err(_) => Err(MediaProxyError::Timeout(timeout)),
         }
     }
 
@@ -212,7 +254,7 @@ impl MediaProxyClient {
         resp: hyper::Response<Incoming>,
     ) -> Result<T, MediaProxyError> {
         let status = resp.status();
-        let bytes = read_limited_body(resp.into_body()).await?;
+        let bytes = read_limited_body(resp.into_body(), MAX_BODY_BYTES).await?;
 
         if !status.is_success() {
             let parsed: serde_json::Value =
@@ -248,7 +290,7 @@ impl MediaProxyClient {
             .map(str::to_string);
         let width = header_u32(resp.headers(), "x-output-width");
         let height = header_u32(resp.headers(), "x-output-height");
-        let bytes = read_limited_body(resp.into_body()).await?;
+        let bytes = read_limited_body(resp.into_body(), MAX_BODY_BYTES).await?;
 
         if !status.is_success() {
             // media-proxy のエラーは JSON 構造化。`{error, reason}` を抜き出す。
@@ -277,6 +319,50 @@ impl MediaProxyClient {
             height,
         })
     }
+
+    async fn read_processed_video(
+        &self,
+        resp: hyper::Response<Incoming>,
+        max_response_bytes: usize,
+    ) -> Result<ProcessedVideo, MediaProxyError> {
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let width = header_u32(resp.headers(), "x-output-width");
+        let height = header_u32(resp.headers(), "x-output-height");
+        let duration_ms = header_u64(resp.headers(), "x-output-duration-ms");
+        let bytes = read_limited_body(resp.into_body(), max_response_bytes).await?;
+
+        if !status.is_success() {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+            return Err(MediaProxyError::Upstream {
+                status,
+                reason: parsed
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                message: parsed
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+
+        let content_type = content_type.ok_or(MediaProxyError::MissingContentType)?;
+        Ok(ProcessedVideo {
+            bytes,
+            content_type,
+            width,
+            height,
+            duration_ms,
+        })
+    }
 }
 
 /// HTTP ヘッダから `u32` を引き出す。欠如 / パース失敗時は `None`。
@@ -284,8 +370,13 @@ fn header_u32(headers: &http::HeaderMap, name: &str) -> Option<u32> {
     headers.get(name)?.to_str().ok()?.parse().ok()
 }
 
-async fn read_limited_body(body: Incoming) -> Result<Bytes, MediaProxyError> {
-    let limited = Limited::new(body, MAX_BODY_BYTES);
+/// HTTP ヘッダから `u64` を引き出す。欠如 / パース失敗時は `None`。
+fn header_u64(headers: &http::HeaderMap, name: &str) -> Option<u64> {
+    headers.get(name)?.to_str().ok()?.parse().ok()
+}
+
+async fn read_limited_body(body: Incoming, limit: usize) -> Result<Bytes, MediaProxyError> {
+    let limited = Limited::new(body, limit);
     match limited.collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
         Err(err) => {

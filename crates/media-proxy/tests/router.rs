@@ -15,7 +15,7 @@ use http_body_util::BodyExt;
 use image::{ImageBuffer, ImageFormat, Rgba};
 use sakurasato_core::Config;
 use sakurasato_core::config::{
-    DatabaseConfig, MediaProxyConfig, ServerConfig, ServerInfo, StorageConfig,
+    DatabaseConfig, MediaProxyConfig, ServerConfig, ServerInfo, StorageConfig, VideoConfig,
 };
 use sakurasato_media_proxy::ProxyState;
 use serde_json::Value;
@@ -52,6 +52,7 @@ fn make_config() -> Config {
             // 4 MiB 上限。アバター用テスト PNG は 100x80 で十分小さい。
             max_bytes: 4 * 1024 * 1024,
             max_pixels: 16_000_000,
+            video: VideoConfig::default(),
         },
         miauth: None,
     }
@@ -287,6 +288,34 @@ async fn webfinger_blocks_ssrf_hosts() {
             "{acct} → {json}"
         );
     }
+}
+
+/// PR review 指摘の回帰テスト: `router()` が `/v1/video/sanitize` に
+/// `DefaultBodyLimit` の override をかけていないと、axum の既定 2 MiB で
+/// リクエストがハンドラに到達する前に 413 になり、`media_proxy.video.max_bytes`
+/// (`VideoConfig::default()` = 200 MiB) が実質意味を持たなくなる。
+/// 2 MiB を超えるボディでも 413 にならず (= ハンドラまで到達し) `415`
+/// (`unsupported_media`, フォーマット不明のダミーバイト列のため) になる
+/// ことを確認する。
+#[tokio::test]
+async fn video_sanitize_accepts_body_larger_than_axum_default_2mib() {
+    let app = make_router();
+    let body = vec![0u8; 3 * 1024 * 1024]; // 3 MiB > axum 既定 2 MiB
+    let resp = app
+        .oneshot(
+            Request::post("/v1/video/sanitize")
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "DefaultBodyLimit override missing: 3 MiB body was rejected before reaching the handler"
+    );
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }
 
 #[tokio::test]

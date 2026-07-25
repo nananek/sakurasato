@@ -1,9 +1,9 @@
-//! M6 統合テスト: `GET /api/v1/media/proxy?url=&variant=`。
+//! 動画アップロード統合テスト: `POST /api/v1/media` の `video/*` 分岐経路。
 //!
-//! 認証 + 早期検証 (URL parse / SSRF / variant) の経路は本テストで覆う。
-//! 実 socket への接続失敗 (= media-proxy が起動していない) → 502 系も
-//! `from_pool` を使って実際に試す。実 media-proxy を立てる E2E は
-//! `crates/media-proxy/tests/` 側で別途確認する。
+//! 実 media-proxy には接続しない (= `media_upload_pg.rs` と同方針)。
+//! `Content-Type: video/*` ヒットによる分岐、`kind` ガード、
+//! `media_proxy.video.max_bytes` に基づく上限判定など、本体側のロジックを
+//! 覆う。実際の `media-proxy /v1/video/sanitize` 経路は手動 E2E で確認する。
 
 #![forbid(unsafe_code)]
 
@@ -63,7 +63,7 @@ mod common {
     }
 }
 
-fn make_config(host: &str, media_socket: &str) -> sakurasato_core::Config {
+fn make_config(host: &str) -> sakurasato_core::Config {
     sakurasato_core::Config {
         server: sakurasato_core::config::ServerConfig {
             host: host.into(),
@@ -90,10 +90,13 @@ fn make_config(host: &str, media_socket: &str) -> sakurasato_core::Config {
             public_base_url: None,
         },
         media_proxy: sakurasato_core::config::MediaProxyConfig {
-            socket: media_socket.into(),
+            socket: "/tmp/dead-media-proxy.sock".into(),
             max_bytes: 4 * 1024 * 1024,
             max_pixels: 16_000_000,
-            video: sakurasato_core::config::VideoConfig::default(),
+            video: sakurasato_core::config::VideoConfig {
+                max_bytes: 1_000,
+                max_duration_secs: 300,
+            },
         },
         miauth: None,
     }
@@ -119,86 +122,46 @@ async fn read_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
 }
 
-fn url_encode(s: &str) -> String {
-    // テスト用最小実装。`?` `&` `=` `:` `/` を encode する。
-    // 厳密には form_urlencoded だが、テスト URL は ASCII 限定なので簡易で十分。
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
-}
-
-/// テスト用に「絶対存在しない socket パス」を作る。tempfile を使うと
-/// `Drop` でファイルが消えるが、本テストでは「**接続が失敗する** こと」自体を
-/// 確かめたいので、消えても OK / 存在しなければなお OK。
-fn dead_socket_path() -> String {
-    format!(
-        "/tmp/sakurasato-media-proxy-test-{}.sock",
-        std::process::id()
-    )
-}
-
+/// `kind=avatar` + `Content-Type: video/mp4` は avatar/header が画像専用の
+/// ため 400 で弾かれる (`upload_video_core` の `kind != attachment` ガード)。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn proxy_requires_auth(pool: PgPool) {
-    let state = sakurasato_server::state::AppState::from_pool(
-        pool,
-        make_config("example.test", "/tmp/x.sock"),
-    );
-    let app = sakurasato_server::local_api::router(state);
-
-    let resp = app
-        .oneshot(
-            Request::get("/api/v1/media/proxy?url=https%3A%2F%2Fexample.com%2Fa.png")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn proxy_rejects_invalid_url_early(pool: PgPool) {
+async fn video_rejected_for_avatar_kind(pool: PgPool) {
     repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
         .await
         .unwrap();
     let raw = issue_token(&pool, "tui").await;
-    let state = sakurasato_server::state::AppState::from_pool(
-        pool,
-        make_config("example.test", "/tmp/x.sock"),
-    );
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
-
-    let path = format!("/api/v1/media/proxy?url={}", url_encode("not a url"));
     let resp = app
         .oneshot(
-            Request::get(&path)
+            Request::post("/api/v1/media?kind=avatar")
                 .header(header::AUTHORIZATION, format!("Bearer {raw}"))
-                .body(Body::empty())
+                .header(header::CONTENT_TYPE, "video/mp4")
+                .body(Body::from(vec![0u8; 16]))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let json = read_json(resp).await;
-    assert!(json["error"].as_str().unwrap().contains("invalid url"));
+    let body = read_json(resp).await;
+    assert!(body["error"].as_str().unwrap().contains("attachment"));
 }
 
+/// `kind=header` も同様に動画を拒否する。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn proxy_rejects_non_http_scheme(pool: PgPool) {
+async fn video_rejected_for_header_kind(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
     let raw = issue_token(&pool, "tui").await;
-    let state = sakurasato_server::state::AppState::from_pool(
-        pool,
-        make_config("example.test", "/tmp/x.sock"),
-    );
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
-
-    let path = format!(
-        "/api/v1/media/proxy?url={}",
-        url_encode("file:///etc/passwd")
-    );
     let resp = app
         .oneshot(
-            Request::get(&path)
+            Request::post("/api/v1/media?kind=header")
                 .header(header::AUTHORIZATION, format!("Bearer {raw}"))
-                .body(Body::empty())
+                .header(header::CONTENT_TYPE, "video/webm")
+                .body(Body::from(vec![0u8; 16]))
                 .unwrap(),
         )
         .await
@@ -206,87 +169,79 @@ async fn proxy_rejects_non_http_scheme(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// `media_proxy.video.max_bytes` (このテストでは 1000 バイト) 超過は
+/// `upload_video_core` 側の明示チェックで 413 になる。router 層の
+/// `DefaultBodyLimit` は画像/動画上限の大きい方に揃えてあるため、ここでは
+/// ハンドラ内バリデーションの経路を通す。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn proxy_blocks_ssrf_targets_server_side(pool: PgPool) {
+async fn video_payload_exceeds_video_max_bytes(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
     let raw = issue_token(&pool, "tui").await;
-    let state = sakurasato_server::state::AppState::from_pool(
-        pool,
-        make_config("example.test", "/tmp/x.sock"),
-    );
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
-
-    for url in [
-        "http://127.0.0.1/x",
-        "http://10.0.0.1/x",
-        "http://169.254.169.254/latest/meta-data/",
-        "http://localhost/x",
-        "http://postgres.local/x",
-    ] {
-        let path = format!("/api/v1/media/proxy?url={}", url_encode(url));
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::get(&path)
-                    .header(header::AUTHORIZATION, format!("Bearer {raw}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{url}");
-    }
-}
-
-#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn proxy_rejects_invalid_variant(pool: PgPool) {
-    let raw = issue_token(&pool, "tui").await;
-    let state = sakurasato_server::state::AppState::from_pool(
-        pool,
-        make_config("example.test", "/tmp/x.sock"),
-    );
-    let app = sakurasato_server::local_api::router(state);
-
-    let path = format!(
-        "/api/v1/media/proxy?url={}&variant=banner",
-        url_encode("https://example.com/a.png")
-    );
     let resp = app
         .oneshot(
-            Request::get(&path)
+            Request::post("/api/v1/media?kind=attachment")
                 .header(header::AUTHORIZATION, format!("Bearer {raw}"))
-                .body(Body::empty())
+                .header(header::CONTENT_TYPE, "video/mp4")
+                .body(Body::from(vec![0u8; 2000]))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let json = read_json(resp).await;
-    assert!(json["error"].as_str().unwrap().contains("variant"));
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// `kind=attachment` + 上限以内の動画は media-proxy に到達し、そこで
+/// socket 未接続のため 502 になる (= 早期 validation を通過後の経路)。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn proxy_returns_bad_gateway_when_socket_missing(pool: PgPool) {
-    // 実 media-proxy が居ない経路 (起動忘れ / clean restart 中) は 502 にする。
+async fn video_reaches_media_proxy_and_fails_with_bad_gateway(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
     let raw = issue_token(&pool, "tui").await;
-    let state = sakurasato_server::state::AppState::from_pool(
-        pool,
-        make_config("example.test", &dead_socket_path()),
-    );
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
     let app = sakurasato_server::local_api::router(state);
-
-    let path = format!(
-        "/api/v1/media/proxy?url={}",
-        url_encode("https://example.com/a.png")
-    );
     let resp = app
         .oneshot(
-            Request::get(&path)
+            Request::post("/api/v1/media?kind=attachment")
                 .header(header::AUTHORIZATION, format!("Bearer {raw}"))
-                .body(Body::empty())
+                .header(header::CONTENT_TYPE, "video/webm")
+                .body(Body::from(vec![0u8; 16]))
                 .unwrap(),
         )
         .await
         .unwrap();
-    // 接続エラーは Transport → BAD_GATEWAY にマップされる。
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+/// `Content-Type` が `video/*` で始まらなければ画像経路に入る。
+/// 動画バイト列を image variant として media-proxy に投げようとするが、
+/// 同じく socket 未接続で 502 になる (= 分岐そのものが正しく効いている
+/// ことの回帰テスト。もし分岐が壊れて `kind=attachment` の動画が誤って
+/// 画像経路に入っても、この経路とステータスコードだけでは区別できない
+/// ため、上の `video_reaches_media_proxy_and_fails_with_bad_gateway` と
+/// 対にして `kind=avatar` ガード [`video_rejected_for_avatar_kind`] で
+/// 分岐の実在を担保する)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn non_video_content_type_uses_image_path(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/media?kind=attachment")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(vec![0u8; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }

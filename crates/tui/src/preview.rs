@@ -44,7 +44,16 @@ const MAX_DIMENSION: u32 = 4096;
 pub enum PreviewState {
     Loading,
     Ready(Arc<Protocol>),
-    Failed { until: Instant, reason: String },
+    /// 動画ファイル (`.mp4` / `.webm`)。Kitty graphics protocol は静止画向け
+    /// のため実再生・サムネイル生成はせず、ファイルサイズのみ表示する
+    /// プレースホルダに倒す (ポスターフレーム抽出は別issue)。
+    Video {
+        size: u64,
+    },
+    Failed {
+        until: Instant,
+        reason: String,
+    },
 }
 
 impl std::fmt::Debug for PreviewState {
@@ -52,6 +61,7 @@ impl std::fmt::Debug for PreviewState {
         match self {
             Self::Loading => write!(f, "Loading"),
             Self::Ready(_) => write!(f, "Ready(<Protocol>)"),
+            Self::Video { size } => f.debug_struct("Video").field("size", size).finish(),
             Self::Failed { until, reason } => f
                 .debug_struct("Failed")
                 .field("until", until)
@@ -59,6 +69,17 @@ impl std::fmt::Debug for PreviewState {
                 .finish(),
         }
     }
+}
+
+/// 拡張子から動画ファイルかどうかを判定する。
+fn is_video_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("mp4" | "webm")
+    )
 }
 
 #[derive(Clone)]
@@ -112,7 +133,13 @@ impl PreviewCache {
     }
 
     /// `path` を解決し未取得 / 期限切れなら decode タスクを spawn する。
+    /// 動画ファイルは decode を試みず、ファイルサイズだけ stat して
+    /// [`PreviewState::Video`] に直行する (= 静止画デコードパスを通さない)。
     pub fn ensure(&self, path: &Path, size: Rect) {
+        if is_video_path(path) {
+            self.ensure_video(path);
+            return;
+        }
         let Some(picker) = self.picker.clone() else {
             return;
         };
@@ -148,6 +175,46 @@ impl PreviewCache {
                         PreviewState::Failed {
                             until: Instant::now() + RETRY_AFTER,
                             reason: err,
+                        },
+                    );
+                }
+            }
+        });
+    }
+
+    /// 動画ファイル用の軽量経路。decode はせず stat のみ行う。
+    fn ensure_video(&self, path: &Path) {
+        let needs_stat = {
+            let Ok(mut cache) = self.inner.lock() else {
+                return;
+            };
+            match cache.peek(path) {
+                Some(PreviewState::Video { .. } | PreviewState::Loading) => false,
+                Some(PreviewState::Failed { until, .. }) if Instant::now() < *until => false,
+                _ => {
+                    cache.put(path.to_path_buf(), PreviewState::Loading);
+                    true
+                }
+            }
+        };
+        if !needs_stat {
+            return;
+        }
+        let inner = self.inner.clone();
+        let path_owned = path.to_path_buf();
+        tokio::spawn(async move {
+            let outcome = tokio::fs::metadata(&path_owned).await;
+            let Ok(mut cache) = inner.lock() else { return };
+            match outcome {
+                Ok(meta) => {
+                    cache.put(path_owned, PreviewState::Video { size: meta.len() });
+                }
+                Err(err) => {
+                    cache.put(
+                        path_owned,
+                        PreviewState::Failed {
+                            until: Instant::now() + RETRY_AFTER,
+                            reason: format!("stat: {err}"),
                         },
                     );
                 }

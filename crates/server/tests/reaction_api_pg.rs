@@ -93,6 +93,7 @@ fn make_config(host: &str) -> sakurasato_core::Config {
             socket: "/tmp/x".into(),
             max_bytes: 1024,
             max_pixels: 1024,
+            video: sakurasato_core::config::VideoConfig::default(),
         },
         miauth: None,
     }

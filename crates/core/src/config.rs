@@ -468,6 +468,43 @@ pub struct MediaProxyConfig {
     pub max_bytes: u64,
     /// Maximum pixels (width * height) for decoded images.
     pub max_pixels: u64,
+    /// 動画添付の上限。`[media_proxy.video]` を config.toml に書かなければ
+    /// [`VideoConfig::default`] に倒れる (= 既存 deploy への影響ゼロ)。
+    #[serde(default)]
+    pub video: VideoConfig,
+}
+
+/// 動画添付 (`video/mp4` / `video/webm`) の上限設定。
+///
+/// 画像と違い再エンコードしない (コンテナメタデータの無害化のみ) ため、
+/// 出力サイズ ≒ 入力サイズになる。`max_bytes` は画像用の
+/// [`MediaProxyConfig::max_bytes`] とは別枠 (画像より一桁大きい値を想定)。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VideoConfig {
+    /// 動画アップロードの最大バイト数。既定 200 MiB。
+    #[serde(default = "default_video_max_bytes")]
+    pub max_bytes: u64,
+    /// 動画の最大再生時間 (秒)。コンテナヘッダから読み取った duration が
+    /// これを超えたら reject する。既定 300 秒 (5分)。
+    #[serde(default = "default_video_max_duration_secs")]
+    pub max_duration_secs: u64,
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_video_max_bytes(),
+            max_duration_secs: default_video_max_duration_secs(),
+        }
+    }
+}
+
+fn default_video_max_bytes() -> u64 {
+    209_715_200 // 200 MiB
+}
+
+fn default_video_max_duration_secs() -> u64 {
+    300 // 5 分
 }
 
 /// `MiAuth` 互換 API endpoint (= 親 issue #150 / M14 #157) の設定。
@@ -943,6 +980,19 @@ max_pixels = 33554432
                 err.contains("public_listen invalid"),
                 "expected wrapped error, got {err}",
             );
+            Ok(())
+        });
+    }
+
+    /// `[media_proxy.video]` を config.toml に書かなくても既定値に倒れる
+    /// (= 既存 deploy が動画対応追加で壊れないことを保証する)。
+    #[test]
+    fn media_proxy_video_defaults_when_section_absent() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            let cfg = Config::load(&path, None).unwrap();
+            assert_eq!(cfg.media_proxy.video.max_bytes, 209_715_200);
+            assert_eq!(cfg.media_proxy.video.max_duration_secs, 300);
             Ok(())
         });
     }
