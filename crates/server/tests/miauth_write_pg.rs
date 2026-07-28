@@ -195,6 +195,22 @@ async fn accepted_follow(pool: &PgPool, follower_id: i64, followed_id: i64) {
         .expect("accept follow");
 }
 
+/// `follower` から `followed` への Follow を `pending` のまま作る (= 鍵アカ
+/// 運用の承認待ち状態を再現する)。`accepted_follow` と対で
+/// `following/requests/*` テスト用。
+#[allow(clippy::similar_names)] // follower_id / followed_id は AP 用語
+async fn pending_follow(pool: &PgPool, follower_id: i64, followed_id: i64) -> i64 {
+    repo::follow::insert_pending(
+        pool,
+        &format!("https://example.test/follows/pending-{follower_id}-{followed_id}"),
+        follower_id,
+        followed_id,
+    )
+    .await
+    .expect("insert pending follow")
+    .id
+}
+
 async fn issue_token_with_scopes(pool: &PgPool, scopes: &[&str]) -> String {
     use sakurasato_server::token::{generate_raw, hash};
     let raw = generate_raw();
@@ -1084,4 +1100,143 @@ async fn users_lists_create_without_scope_is_401(pool: PgPool) {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─── following/requests/{list,accept,reject} (Aria FollowRequestsNotifier fix) ──
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requests_list_returns_pending(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    pending_follow(&pool, bob_id, alice_id).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post_json(app, "/api/following/requests/list", json!({"i": token})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    let items = v.as_array().expect("response must be a JSON array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["follower"]["username"], "bob");
+    assert_eq!(items[0]["follower"]["host"], "misskey.io");
+    assert_eq!(items[0]["followee"]["username"], "alice");
+    assert!(items[0]["id"].is_string());
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requests_list_without_scope_is_401(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    pending_follow(&pool, bob_id, alice_id).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    // write:following のみ (= read:account 不足)。
+    let token = issue_token_with_scopes(&pool, &["write:following"]).await;
+
+    let resp = post_json(app, "/api/following/requests/list", json!({"i": token})).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requests_accept_moves_state_and_enqueues_response(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let follow_id = pending_follow(&pool, bob_id, alice_id).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:following"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/following/requests/accept",
+        json!({"i": token, "userId": bob_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let row = repo::follow::get_by_id(&pool, follow_id)
+        .await
+        .unwrap()
+        .expect("follow row must still exist");
+    assert_eq!(row.state, "accepted");
+
+    let queued: i64 = sqlx::query_scalar!("SELECT count(*) FROM delivery_queue")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert!(
+        queued >= 1,
+        "delivery_queue should have the Accept activity"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requests_reject_sets_rejected(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let follow_id = pending_follow(&pool, bob_id, alice_id).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:following"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/following/requests/reject",
+        json!({"i": token, "userId": bob_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let row = repo::follow::get_by_id(&pool, follow_id)
+        .await
+        .unwrap()
+        .expect("follow row must still exist");
+    assert_eq!(row.state, "rejected");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requests_accept_unknown_user_returns_404(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // pending 行を作らない ── bob からの Follow は存在しない。
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:following"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/following/requests/accept",
+        json!({"i": token, "userId": bob_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        read_json(resp).await["error"]["code"],
+        "FOLLOW_REQUEST_NOT_FOUND"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requests_accept_already_accepted_returns_400(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // 既に accepted な行 (= 二重 accept のレース / リトライ)。
+    accepted_follow(&pool, bob_id, alice_id).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:following"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/following/requests/accept",
+        json!({"i": token, "userId": bob_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        read_json(resp).await["error"]["code"],
+        "FOLLOW_REQUEST_NOT_FOUND"
+    );
 }
