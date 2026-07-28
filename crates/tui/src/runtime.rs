@@ -491,6 +491,14 @@ async fn apply_action(
             // ホイールを `NoteDetailScrollDown/Up` に振り向ける ── UX 改善
             // も兼ねる。他 overlay (Suppression / Picker / EmojiSearch /
             // AltPrompt / Command) はホイール無視で十分。
+            //
+            // Profile / FollowList はこの match に無いまま `_` に落ちていた
+            // ため、これらの画面を見ている間にホイールを回すと画面には出て
+            // いない Timeline 側の `selected`/`top` が動いてしまうバグが
+            // あった (= マウスクリックの不具合と同じ「別画面が Timeline 領域
+            // を間借りしている」ことに起因する取りこぼし)。Requests /
+            // Notifications / Lists は「一覧画面」としてホイールでも一覧内を
+            // 移動できるようにする (クリック選択の追加と合わせて一貫させる)。
             match app.focus {
                 Focus::NoteDetail => {
                     if let Some(s) = app.note_detail.as_mut() {
@@ -505,16 +513,87 @@ async fn apply_action(
                         }
                     }
                 }
+                Focus::Profile => {
+                    if let Some(p) = app.current_profile_mut() {
+                        if delta > 0 {
+                            for _ in 0..delta {
+                                p.select_next_note();
+                            }
+                        } else {
+                            for _ in 0..(-delta) {
+                                p.select_prev_note();
+                            }
+                        }
+                    }
+                }
+                Focus::FollowList => {
+                    if let Some(fl) = app.follow_list.as_mut() {
+                        if delta > 0 {
+                            for _ in 0..delta {
+                                fl.select_next();
+                            }
+                        } else {
+                            for _ in 0..(-delta) {
+                                fl.select_prev();
+                            }
+                        }
+                    }
+                }
+                Focus::Requests => {
+                    if let Some(fr) = app.follow_requests.as_mut() {
+                        if delta > 0 {
+                            for _ in 0..delta {
+                                fr.select_next();
+                            }
+                        } else {
+                            for _ in 0..(-delta) {
+                                fr.select_prev();
+                            }
+                        }
+                    }
+                }
+                Focus::Notifications => {
+                    if let Some(n) = app.notifications.as_mut() {
+                        if delta > 0 {
+                            for _ in 0..delta {
+                                n.select_next();
+                            }
+                        } else {
+                            for _ in 0..(-delta) {
+                                n.select_prev();
+                            }
+                        }
+                    }
+                }
+                Focus::Lists => {
+                    if let Some(ls) = app.lists.as_mut() {
+                        if let Some(members) = ls.members.as_mut() {
+                            if delta > 0 {
+                                for _ in 0..delta {
+                                    members.select_next();
+                                }
+                            } else {
+                                for _ in 0..(-delta) {
+                                    members.select_prev();
+                                }
+                            }
+                        } else if delta > 0 {
+                            for _ in 0..delta {
+                                ls.select_next();
+                            }
+                        } else {
+                            for _ in 0..(-delta) {
+                                ls.select_prev();
+                            }
+                        }
+                    }
+                }
                 Focus::Suppression
                 | Focus::Picker
                 | Focus::EmojiSearch
                 | Focus::AltPrompt
-                | Focus::Command
-                | Focus::Requests
-                | Focus::Notifications
-                | Focus::Lists => {
-                    // overlay 中は背後 Timeline を動かさない。`Requests` /
-                    // `Notifications` / `Lists` (= 一覧画面) も同じく overlay 風。
+                | Focus::Command => {
+                    // overlay 中は背後 Timeline を動かさない。
                 }
                 _ => {
                     if delta > 0 {
@@ -1791,10 +1870,105 @@ fn handle_click(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
         app.focus = Focus::Compose;
         return;
     }
-    if rect_contains(rects.timeline, col, row) {
-        app.focus = Focus::Timeline;
-        if let Some(idx) = rects.timeline_rows.resolve(row) {
-            app.select_index(idx);
+    // Profile / FollowList / Requests / Notifications / Lists は Timeline と
+    // 同じ `rects.timeline` 領域に描かれる別画面 (`ui::draw` 参照)。以前は
+    // これらの focus 中でも無条件で `rect_contains(rects.timeline, ..)` に
+    // 落ちて `app.focus = Focus::Timeline` に書き換わってしまい、画面内を
+    // クリックしただけで意図せず閉じるバグがあった。focus ごとに専用のヘルパ
+    // (`click_*`) へ振り分け、対象画面の一覧項目をクリック選択できるようにする。
+    match app.focus {
+        Focus::Profile => click_profile(app, rects, col, row),
+        Focus::FollowList => click_follow_list(app, rects, col, row),
+        Focus::Requests => click_requests(app, rects, col, row),
+        Focus::Notifications => click_notifications(app, rects, col, row),
+        Focus::Lists => click_lists(app, rects, col, row),
+        _ => {
+            if rect_contains(rects.timeline, col, row) {
+                app.focus = Focus::Timeline;
+                if let Some(idx) = rects.timeline_rows.resolve(row) {
+                    app.select_index(idx);
+                }
+            }
+        }
+    }
+}
+
+fn click_profile(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
+    if rect_contains(rects.profile_notes, col, row)
+        && let Some(idx) = rects.profile_notes_rows.resolve(row)
+        && let Some(p) = app.current_profile_mut()
+    {
+        p.selected_note = idx;
+    }
+}
+
+fn click_follow_list(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
+    if !rect_contains(rects.follow_list, col, row) {
+        return;
+    }
+    let row_step = if app.images.enabled() && app.suppression.avatar {
+        2
+    } else {
+        1
+    };
+    if let Some(fl) = app.follow_list.as_mut() {
+        let len = fl.current().entries.len();
+        let top = fl.top;
+        if let Some(idx) = ui::hit::resolve_fixed_row(rects.follow_list, row, row_step, top, len) {
+            fl.selected = idx;
+        }
+    }
+}
+
+fn click_requests(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
+    if !rect_contains(rects.follow_requests, col, row) {
+        return;
+    }
+    if let Some(fr) = app.follow_requests.as_mut() {
+        let top = fr.top;
+        let len = fr.items.len();
+        if let Some(idx) = ui::hit::resolve_fixed_row(rects.follow_requests, row, 1, top, len) {
+            fr.cursor = idx;
+        }
+    }
+}
+
+fn click_notifications(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
+    if !rect_contains(rects.notifications, col, row) {
+        return;
+    }
+    if let Some(n) = app.notifications.as_mut() {
+        let top = n.top;
+        let len = n.items.len();
+        if let Some(idx) = ui::hit::resolve_fixed_row(rects.notifications, row, 1, top, len) {
+            n.cursor = idx;
+        }
+    }
+}
+
+fn click_lists(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
+    // 入力 overlay (タイトル / acct 入力) 中はクリックで一覧選択を動かさない
+    // ── テキスト入力に集中している最中の誤操作防止。
+    if !rect_contains(rects.lists, col, row) {
+        return;
+    }
+    let Some(ls) = app.lists.as_mut() else {
+        return;
+    };
+    if ls.input.is_some() {
+        return;
+    }
+    if let Some(members) = ls.members.as_mut() {
+        let top = members.top;
+        let len = members.items.len();
+        if let Some(idx) = ui::hit::resolve_fixed_row(rects.lists, row, 1, top, len) {
+            members.cursor = idx;
+        }
+    } else {
+        let top = ls.top;
+        let len = ls.items.len();
+        if let Some(idx) = ui::hit::resolve_fixed_row(rects.lists, row, 1, top, len) {
+            ls.cursor = idx;
         }
     }
 }
