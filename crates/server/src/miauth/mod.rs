@@ -40,6 +40,7 @@ pub mod emojis;
 pub mod endpoints;
 pub mod error;
 pub mod following;
+pub mod following_requests;
 pub mod i;
 pub mod lists;
 pub mod meta;
@@ -132,6 +133,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/notes/reactions/delete", post(reactions::delete))
         .route("/api/following/create", post(following::create))
         .route("/api/following/delete", post(following::delete))
+        // 鍵アカ運用 (#66) の pending Follow を Aria 等から確認・承認・拒否する。
+        // 未実装だと Aria の FollowRequestsNotifier が 404 → ApiService.post で
+        // crash する。
+        .route(
+            "/api/following/requests/list",
+            post(following_requests::list),
+        )
+        .route(
+            "/api/following/requests/accept",
+            post(following_requests::accept),
+        )
+        .route(
+            "/api/following/requests/reject",
+            post(following_requests::reject),
+        )
         // リスト機能 (Mastodon/Misskey 互換)。`crate::miauth::lists` 参照。
         .route("/api/users/lists/create", post(lists::create))
         .route("/api/users/lists/list", post(lists::list))
