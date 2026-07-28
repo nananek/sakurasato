@@ -317,7 +317,13 @@ async fn handle_event(
     // Focus バリアントを持つ)。閉じたときに下の画像を再送させる。
     let before_focus = app.focus;
     let lists_input_active = app.lists.as_ref().is_some_and(|s| s.input.is_some());
-    let action = crate::event::translate_with_context(event, app.focus, lists_input_active);
+    let picker_path_input_active = app.picker.as_ref().is_some_and(|p| p.path_input.is_some());
+    let action = crate::event::translate_with_context(
+        event,
+        app.focus,
+        lists_input_active,
+        picker_path_input_active,
+    );
     apply_action(action, app, api, page_size, rects, upload_tx).await;
     if images_active && app.focus != before_focus {
         app.force_redraw = true;
@@ -646,6 +652,36 @@ async fn apply_action(
             }
         }
         Action::PickerCancel => close_picker(app, false),
+        Action::PickerPathOpen => {
+            if let Some(p) = app.picker.as_mut() {
+                p.open_path_input();
+            }
+        }
+        Action::PickerPathChar(c) => {
+            if let Some(p) = app.picker.as_mut()
+                && let Some(input) = p.path_input.as_mut()
+            {
+                input.insert_char(c);
+            }
+        }
+        Action::PickerPathBackspace => {
+            if let Some(p) = app.picker.as_mut()
+                && let Some(input) = p.path_input.as_mut()
+            {
+                input.backspace();
+            }
+        }
+        Action::PickerPathComplete => {
+            if let Some(p) = app.picker.as_mut() {
+                p.complete_path_input();
+            }
+        }
+        Action::PickerPathCancel => {
+            if let Some(p) = app.picker.as_mut() {
+                p.cancel_path_input();
+            }
+        }
+        Action::PickerPathSubmit => picker_path_submit(app, api, upload_tx),
         Action::PopAttachment => {
             if let Some(att) = app.compose.pop_attachment() {
                 app.set_status(
@@ -1560,55 +1596,87 @@ fn picker_activate(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<Uploa
     let mode = picker.mode;
     match picker.activate() {
         Activation::Noop | Activation::Descended => {}
-        Activation::Selected(path) => {
-            // attachment はこのタイミングで上限再確認 (picker 開閉中に他経路で
-            // 添付が増えることは無いが、二重押下対策で念のため)。
-            if mode == PickerMode::Attachment && app.compose.attachments_full() {
-                app.set_status(
-                    "attachments full (max 4)",
-                    StatusKind::Warning,
-                    Some(Duration::from_secs(3)),
-                );
-                return;
-            }
-            let label = path
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or("(file)")
-                .to_string();
-            // M13 PR6: Attachment は alt text プロンプトを挟む。Avatar/Header
-            // は alt text 概念が無い (= AP `name` を載せる先が無い) ので
-            // 即時アップロード。
-            if mode == PickerMode::Attachment {
-                close_picker(app, true);
-                app.alt_prompt = Some(crate::alt_prompt::AltPrompt::new(mode, path, label));
-                app.focus = Focus::AltPrompt;
-                app.set_status(
-                    "alt text (Enter to submit / Esc to skip & cancel)",
-                    StatusKind::Info,
-                    None,
-                );
-                return;
-            }
-            app.pending_uploads = app.pending_uploads.saturating_add(1);
-            app.set_status(
-                format!("uploading {label} as {}...", mode.label()),
-                StatusKind::Info,
-                None,
-            );
-            close_picker(app, false);
-            let api = api.clone();
-            let tx = upload_tx.clone();
-            let guard = InFlightGuard::new(app.in_flight.clone());
-            tokio::spawn(async move {
-                // guard を move して保持 ── アップロード完了 (= tx.send 後)
-                // にこの closure を抜けて drop され、in_flight が dec される。
-                let _g = guard;
-                let outcome = run_upload(api, mode, path, label, None).await;
-                let _ = tx.send(outcome).await;
-            });
+        Activation::Selected(path) => picker_select_file(app, api, upload_tx, mode, path),
+    }
+}
+
+/// `/` パス直接入力 (Enter で確定) の結果を反映する。ディレクトリなら
+/// [`crate::picker::FilePicker::submit_path_input`] の中で既に descend
+/// 済みなので何もしない。ファイルを指していれば [`picker_select_file`] に
+/// 渡し、`j`/`k`/`Enter` で選んだときと全く同じアップロード/alt text
+/// フローに合流させる。無効なパスはエラーを status バーに出し、入力は
+/// (`submit_path_input` 側で) 維持されるので打ち直せる。
+fn picker_path_submit(app: &mut App, api: &LocalApi, upload_tx: &mpsc::Sender<UploadOutcome>) {
+    let Some(picker) = app.picker.as_mut() else {
+        return;
+    };
+    let mode = picker.mode;
+    match picker.submit_path_input() {
+        crate::picker::PathInputOutcome::Noop | crate::picker::PathInputOutcome::Descended => {}
+        crate::picker::PathInputOutcome::Invalid(msg) => {
+            app.set_status(msg, StatusKind::Error, Some(Duration::from_secs(4)));
+        }
+        crate::picker::PathInputOutcome::Selected(path) => {
+            picker_select_file(app, api, upload_tx, mode, path);
         }
     }
+}
+
+/// ピッカでファイルが確定した (= 一覧の `j`/`k`/`Enter` でも `/` パス入力の
+/// `Enter` でも共通) ときの後続処理。attachment は alt text プロンプトを
+/// 挟み、avatar/header は即時アップロードする。
+fn picker_select_file(
+    app: &mut App,
+    api: &LocalApi,
+    upload_tx: &mpsc::Sender<UploadOutcome>,
+    mode: PickerMode,
+    path: std::path::PathBuf,
+) {
+    // attachment はこのタイミングで上限再確認 (picker 開閉中に他経路で添付が
+    // 増えることは無いが、二重押下対策で念のため)。
+    if mode == PickerMode::Attachment && app.compose.attachments_full() {
+        app.set_status(
+            "attachments full (max 4)",
+            StatusKind::Warning,
+            Some(Duration::from_secs(3)),
+        );
+        return;
+    }
+    let label = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("(file)")
+        .to_string();
+    // M13 PR6: Attachment は alt text プロンプトを挟む。Avatar/Header は
+    // alt text 概念が無い (= AP `name` を載せる先が無い) ので即時アップロード。
+    if mode == PickerMode::Attachment {
+        close_picker(app, true);
+        app.alt_prompt = Some(crate::alt_prompt::AltPrompt::new(mode, path, label));
+        app.focus = Focus::AltPrompt;
+        app.set_status(
+            "alt text (Enter to submit / Esc to skip & cancel)",
+            StatusKind::Info,
+            None,
+        );
+        return;
+    }
+    app.pending_uploads = app.pending_uploads.saturating_add(1);
+    app.set_status(
+        format!("uploading {label} as {}...", mode.label()),
+        StatusKind::Info,
+        None,
+    );
+    close_picker(app, false);
+    let api = api.clone();
+    let tx = upload_tx.clone();
+    let guard = InFlightGuard::new(app.in_flight.clone());
+    tokio::spawn(async move {
+        // guard を move して保持 ── アップロード完了 (= tx.send 後) にこの
+        // closure を抜けて drop され、in_flight が dec される。
+        let _g = guard;
+        let outcome = run_upload(api, mode, path, label, None).await;
+        let _ = tx.send(outcome).await;
+    });
 }
 
 /// M13 PR6: alt text 入力確定 → upload kick。空入力 (Enter のみ) でも

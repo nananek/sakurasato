@@ -2596,6 +2596,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         help_entry(palette, "Enter", "descend / select file"),
         help_entry(palette, "Backspace", "go to parent"),
         help_entry(palette, ".", "toggle hidden files"),
+        help_entry(palette, "/", "type a path directly"),
+        help_entry(palette, "Tab (in path input)", "complete path"),
         help_entry(palette, "Esc / q", "cancel picker"),
         Line::from(""),
         Line::from(Span::styled("emoji search modal", help_section(palette))),
@@ -2885,10 +2887,49 @@ fn render_picker(frame: &mut Frame<'_>, area: Rect, app: &App) -> Rect {
     let list_area = cols[0];
     let preview_area = cols[1];
 
-    render_picker_list(frame, list_area, picker, palette);
+    // `/` で開いたパス直接入力は一覧の上に 1 行の入力欄として重ねる
+    // ([`crate::lists`] のタイトル/acct 入力と同じ組み立て)。
+    let entries_area = if let Some(input) = picker.path_input.as_ref() {
+        let input_rect = Rect::new(
+            list_area.x,
+            list_area.y,
+            list_area.width,
+            1.min(list_area.height),
+        );
+        render_picker_path_input(frame, input_rect, input, palette);
+        Rect::new(
+            list_area.x,
+            list_area.y + input_rect.height,
+            list_area.width,
+            list_area.height.saturating_sub(input_rect.height),
+        )
+    } else {
+        list_area
+    };
+
+    render_picker_list(frame, entries_area, picker, palette);
     render_picker_preview(frame, preview_area, picker, app, palette);
 
     list_area
+}
+
+/// パス直接入力欄。[`crate::lists`] のタイトル/acct 入力と同じ
+/// 「ラベル + buffer + カーソル `_`」の組み立て。
+fn render_picker_path_input(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    input: &crate::picker::PathInput,
+    palette: &Palette,
+) {
+    let line = Line::from(vec![
+        Span::styled("  path: ", Style::default().fg(palette.muted)),
+        Span::styled(
+            input.buffer.clone(),
+            Style::default().fg(palette.foreground),
+        ),
+        Span::styled("_", Style::default().fg(palette.accent)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_picker_list(
