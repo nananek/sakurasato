@@ -76,6 +76,18 @@ pub enum Action {
     PickerToggleHidden,
     /// Esc ── ピッカを閉じる。
     PickerCancel,
+    /// `/` ── パス直接入力モードに入る。
+    PickerPathOpen,
+    /// パス入力中の文字入力。
+    PickerPathChar(char),
+    /// パス入力中の Backspace。
+    PickerPathBackspace,
+    /// Tab ── パス補完。
+    PickerPathComplete,
+    /// Enter ── 入力パスを確定 (descend / select)。
+    PickerPathSubmit,
+    /// Esc ── パス入力をキャンセルし、通常ブラウズに戻る。
+    PickerPathCancel,
     /// M7: 直近の添付を 1 件外す (compose focus 中)。
     PopAttachment,
     /// M9 PR2: 視覚刺激抑制 overlay を開く / 閉じる。
@@ -258,21 +270,29 @@ pub enum Action {
     reason = "値で渡す `Event` を tests でも自然に書きたい"
 )]
 pub fn translate(event: Event, focus: Focus) -> Action {
-    translate_with_context(event, focus, false)
+    translate_with_context(event, focus, false, false)
 }
 
 /// [`translate`] の拡張版。`lists_input_active` は `Focus::Lists` 中に
 /// [`crate::lists::ListsScreen::input`] が `Some` かどうか (= タイトル/acct
 /// 入力 overlay 中は文字キーを全部テキスト入力として扱う必要があり、
 /// `translate_lists_key` だけ呼び出し側の app 状態を要求するため)。
-/// それ以外の focus では無視される。
+/// `picker_path_input_active` は同じ理由で `Focus::Picker` 中に
+/// [`crate::picker::FilePicker::path_input`] が `Some` かどうか (=
+/// `/` で開いたパス直接入力中は文字キーを全部テキスト入力として扱う)。
+/// それぞれ対応する focus 以外では無視される。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "値で渡す `Event` を tests でも自然に書きたい"
 )]
-pub fn translate_with_context(event: Event, focus: Focus, lists_input_active: bool) -> Action {
+pub fn translate_with_context(
+    event: Event,
+    focus: Focus,
+    lists_input_active: bool,
+    picker_path_input_active: bool,
+) -> Action {
     match event {
-        Event::Key(k) => translate_key(k, focus, lists_input_active),
+        Event::Key(k) => translate_key(k, focus, lists_input_active, picker_path_input_active),
         Event::Mouse(m) => translate_mouse(m),
         Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
             Action::Noop
@@ -280,7 +300,12 @@ pub fn translate_with_context(event: Event, focus: Focus, lists_input_active: bo
     }
 }
 
-fn translate_key(k: KeyEvent, focus: Focus, lists_input_active: bool) -> Action {
+fn translate_key(
+    k: KeyEvent,
+    focus: Focus,
+    lists_input_active: bool,
+    picker_path_input_active: bool,
+) -> Action {
     if k.kind == KeyEventKind::Release {
         return Action::Noop;
     }
@@ -296,7 +321,7 @@ fn translate_key(k: KeyEvent, focus: Focus, lists_input_active: bool) -> Action 
         Focus::Timeline => translate_timeline_key(k),
         Focus::Compose => translate_compose_key(k),
         Focus::Help => translate_help_key(k),
-        Focus::Picker => translate_picker_key(k),
+        Focus::Picker => translate_picker_key(k, picker_path_input_active),
         Focus::Suppression => translate_suppression_key(k),
         Focus::AltPrompt => translate_alt_prompt_key(k),
         Focus::Profile => translate_profile_key(k),
@@ -572,7 +597,21 @@ fn translate_help_key(k: KeyEvent) -> Action {
     }
 }
 
-fn translate_picker_key(k: KeyEvent) -> Action {
+fn translate_picker_key(k: KeyEvent, path_input_active: bool) -> Action {
+    if path_input_active {
+        // [`crate::lists`] のタイトル/acct 入力と同じパターン: 開いている
+        // 間は文字キーを全部テキスト入力として扱い、j/k 等の一覧ナビゲーション
+        // には回さない。
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        return match k.code {
+            KeyCode::Esc => Action::PickerPathCancel,
+            KeyCode::Enter => Action::PickerPathSubmit,
+            KeyCode::Backspace => Action::PickerPathBackspace,
+            KeyCode::Tab => Action::PickerPathComplete,
+            KeyCode::Char(c) if !ctrl => Action::PickerPathChar(c),
+            _ => Action::Noop,
+        };
+    }
     match (k.code, k.modifiers) {
         (KeyCode::Esc, _) => Action::PickerCancel,
         (KeyCode::Char('q'), m) if m.is_empty() => Action::PickerCancel,
@@ -584,6 +623,8 @@ fn translate_picker_key(k: KeyEvent) -> Action {
         (KeyCode::Backspace, _) => Action::PickerParent,
         // `.` で隠しファイルトグル ── vim の :set hidden! 風。
         (KeyCode::Char('.'), m) if m.is_empty() => Action::PickerToggleHidden,
+        // `/` でパス直接入力モードへ。
+        (KeyCode::Char('/'), m) if m.is_empty() => Action::PickerPathOpen,
         _ => Action::Noop,
     }
 }
@@ -1164,5 +1205,92 @@ mod tests {
                 Action::ForceRedraw,
             ));
         }
+    }
+
+    // ─── picker: 通常ブラウズ / パス直接入力 ────────────────────────────
+
+    #[test]
+    fn picker_slash_opens_path_input() {
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Char('/'), KeyModifiers::NONE), false),
+            Action::PickerPathOpen,
+        ));
+    }
+
+    #[test]
+    fn picker_normal_mode_keys_unchanged() {
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Char('j'), KeyModifiers::NONE), false),
+            Action::PickerNext,
+        ));
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Enter, KeyModifiers::NONE), false),
+            Action::PickerActivate,
+        ));
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Esc, KeyModifiers::NONE), false),
+            Action::PickerCancel,
+        ));
+    }
+
+    #[test]
+    fn picker_path_input_mode_captures_text_keys() {
+        // path input 中は j/k のようなナビゲーションキーもテキストとして
+        // 入力される (= lists のタイトル入力と同じ挙動)。
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Char('j'), KeyModifiers::NONE), true),
+            Action::PickerPathChar('j'),
+        ));
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Char('/'), KeyModifiers::NONE), true),
+            Action::PickerPathChar('/'),
+        ));
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Backspace, KeyModifiers::NONE), true),
+            Action::PickerPathBackspace,
+        ));
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Tab, KeyModifiers::NONE), true),
+            Action::PickerPathComplete,
+        ));
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Enter, KeyModifiers::NONE), true),
+            Action::PickerPathSubmit,
+        ));
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Esc, KeyModifiers::NONE), true),
+            Action::PickerPathCancel,
+        ));
+    }
+
+    #[test]
+    fn picker_path_input_mode_ignores_ctrl_chars() {
+        // Ctrl-C はグローバルガードで Quit に化けるので translate_picker_key
+        // には来ないが、他の Ctrl 組み合わせ (テキストではない) は Noop。
+        assert!(matches!(
+            translate_picker_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL), true),
+            Action::Noop,
+        ));
+    }
+
+    #[test]
+    fn translate_with_context_routes_picker_path_input_flag() {
+        // `translate` (= context 無し) は常に false 扱いで通常ブラウズになる。
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)),
+                Focus::Picker,
+            ),
+            Action::PickerNext,
+        ));
+        assert!(matches!(
+            translate_with_context(
+                Event::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)),
+                Focus::Picker,
+                false,
+                true,
+            ),
+            Action::PickerPathChar('j'),
+        ));
     }
 }

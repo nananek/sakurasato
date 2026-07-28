@@ -9,9 +9,9 @@
 //!   レンダリングはランタイム側 ([`crate::runtime`]) が `ImageCache` を使って
 //!   行うので、本モジュールは「選択ファイルのパス」だけ握る。
 //! - **キーバインド**: Up/Down (j/k) で選択、Enter で descend or select、
-//!   Backspace で親に上がる、Esc で picker を閉じる、Tab で隠しファイル
-//!   トグル。直接編集モード (`/` を押すと path text field に切り替え) は
-//!   将来実装する (現状はパス文字列を初期値として渡せば十分)。
+//!   Backspace で親に上がる、Esc で picker を閉じる、`.` で隠しファイル
+//!   トグル、`/` でパス直接入力モードに切り替え (Tab で補完、Enter で確定、
+//!   Esc でキャンセルして通常ブラウズに戻る)。
 //!
 //! セキュリティ:
 //! - シンボリックリンクはたどる ── お一人様サーバなので想定リスクは低い。
@@ -113,6 +113,43 @@ pub struct FilePicker {
     pub truncated: bool,
     /// 直近の I/O エラー文字列 (`read_dir` 失敗等)。
     pub last_error: Option<String>,
+    /// `/` で入るパス直接入力モード。`Some` の間は j/k 等の一覧ナビゲーション
+    /// キーを止めてテキスト入力に回す ([`crate::event::translate_picker_key`]
+    /// 参照)。
+    pub path_input: Option<PathInput>,
+}
+
+/// [`FilePicker::path_input`] の編集 buffer。[`crate::lists::ListsInput`] /
+/// [`crate::alt_prompt::AltPrompt`] と同じ「1 行バッファ + カーソルは常に
+/// 末尾」の最小実装 (= 挿入位置を可変にするほどの入力長は想定しない)。
+#[derive(Debug, Clone, Default)]
+pub struct PathInput {
+    pub buffer: String,
+}
+
+impl PathInput {
+    pub fn insert_char(&mut self, c: char) {
+        self.buffer.push(c);
+    }
+
+    pub fn backspace(&mut self) {
+        self.buffer.pop();
+    }
+}
+
+/// [`FilePicker::submit_path_input`] の結果。
+#[derive(Debug)]
+pub enum PathInputOutcome {
+    /// 入力が空 / picker 自体が無かった。
+    Noop,
+    /// ディレクトリへ descend 済み (= `set_cwd` 実行済み)。
+    Descended,
+    /// ファイルを指していた。呼び出し側は [`Activation::Selected`] と同じ
+    /// 経路 (upload kick) に合流させる。
+    Selected(PathBuf),
+    /// 存在しない / 読めないパス。`String` はユーザ向けエラーメッセージ。
+    /// 入力 buffer は破棄せず維持する (= 打ち直しではなく訂正できるように)。
+    Invalid(String),
 }
 
 impl FilePicker {
@@ -126,6 +163,7 @@ impl FilePicker {
             show_hidden: false,
             truncated: false,
             last_error: None,
+            path_input: None,
         };
         // `set_cwd` は失敗時に親 → home → `/` を試す。
         picker.set_cwd(start);
@@ -283,6 +321,156 @@ impl FilePicker {
             self.set_cwd(p);
         }
     }
+
+    /// `/` ── パス直接入力モードに入る。現在の `cwd` を初期値にする (=
+    /// ゼロから打ち直さず、末尾だけ書き換えれば近隣ディレクトリに移動できる)。
+    pub fn open_path_input(&mut self) {
+        let mut buffer = self.cwd.to_string_lossy().into_owned();
+        if !buffer.ends_with('/') {
+            buffer.push('/');
+        }
+        self.path_input = Some(PathInput { buffer });
+    }
+
+    /// Esc ── パス入力をキャンセルし、通常ブラウズに戻る (`cwd` は不変)。
+    pub fn cancel_path_input(&mut self) {
+        self.path_input = None;
+    }
+
+    /// Tab ── 入力中のパスを補完する。最後の `/` より後ろを prefix として、
+    /// その手前のディレクトリの子から前方一致するものを探し、共通の最長
+    /// 一致まで埋める (= shell の標準的な補完挙動)。候補が唯一かつ
+    /// ディレクトリなら末尾に `/` を付けて続けて補完できるようにする。
+    /// 候補が無ければ何もしない (= 誤入力の合図として buffer をそのまま残す)。
+    pub fn complete_path_input(&mut self) {
+        let Some(input) = self.path_input.as_mut() else {
+            return;
+        };
+        let expanded = expand_tilde(&input.buffer);
+        let (dir, prefix) = split_path_prefix(&expanded);
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut candidates: Vec<(String, bool)> = read
+            .filter_map(Result::ok)
+            .filter_map(|dent| {
+                let name = dent.file_name().to_string_lossy().into_owned();
+                if !prefix.is_empty() && !name.starts_with(&prefix) {
+                    return None;
+                }
+                if prefix.is_empty() && name.starts_with('.') {
+                    // 空 prefix (= "dir/" の直後で Tab) では隠しファイルを
+                    // 候補から除く ── show_hidden 設定に関わらず、うっかり
+                    // Tab連打で `.ssh` 等に踏み込まないための安全側デフォルト。
+                    return None;
+                }
+                let is_dir = dent.file_type().is_ok_and(|t| t.is_dir());
+                Some((name, is_dir))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        candidates.sort();
+        let common = longest_common_prefix(candidates.iter().map(|(name, _)| name.as_str()));
+        if common.is_empty() {
+            return;
+        }
+        let mut new_buffer = dir.to_string_lossy().into_owned();
+        if !new_buffer.ends_with('/') {
+            new_buffer.push('/');
+        }
+        new_buffer.push_str(&common);
+        if candidates.len() == 1 && candidates[0].1 {
+            new_buffer.push('/');
+        }
+        input.buffer = new_buffer;
+    }
+
+    /// Enter ── 入力中のパスを確定する。ディレクトリなら descend
+    /// (`set_cwd` 済み)、ファイルなら [`PathInputOutcome::Selected`] を返し
+    /// 呼び出し側で `Activation::Selected` と同じ経路に合流させる。存在し
+    /// ない / 読めないパスは入力を維持したまま [`PathInputOutcome::Invalid`]
+    /// を返す (= 打ち直しではなく訂正できるように)。
+    pub fn submit_path_input(&mut self) -> PathInputOutcome {
+        let Some(input) = self.path_input.take() else {
+            return PathInputOutcome::Noop;
+        };
+        if input.buffer.trim().is_empty() {
+            return PathInputOutcome::Noop;
+        }
+        let path = expand_tilde(&input.buffer);
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                self.set_cwd(path);
+                PathInputOutcome::Descended
+            }
+            Ok(meta) if meta.is_file() => PathInputOutcome::Selected(path),
+            Ok(_) => {
+                // ソケット / デバイスファイル等、file でも dir でもないもの。
+                let msg = format!("not a regular file or directory: {}", path.display());
+                self.path_input = Some(input);
+                PathInputOutcome::Invalid(msg)
+            }
+            Err(err) => {
+                let msg = format!("{}: {err}", path.display());
+                self.path_input = Some(input);
+                PathInputOutcome::Invalid(msg)
+            }
+        }
+    }
+}
+
+/// `~` / `~/...` を `$HOME` に展開する。`HOME` 未設定ならそのまま
+/// (= 大抵は存在しないパスとして `metadata()` が失敗し、呼び出し側で
+/// エラー表示される)。
+fn expand_tilde(input: &str) -> PathBuf {
+    if let Some(rest) = input.strip_prefix('~')
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        let rest = rest.strip_prefix('/').unwrap_or(rest);
+        if rest.is_empty() {
+            return PathBuf::from(home);
+        }
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(input)
+}
+
+/// 入力 buffer を「補完対象の親ディレクトリ」と「マッチさせる prefix
+/// (最後の `/` より後ろ)」に分ける。`/` が無ければ親を `.` (カレント) とする。
+fn split_path_prefix(path: &Path) -> (PathBuf, String) {
+    let s = path.to_string_lossy();
+    match s.rfind('/') {
+        Some(pos) => {
+            let dir = if pos == 0 {
+                "/".to_string()
+            } else {
+                s[..pos].to_string()
+            };
+            (PathBuf::from(dir), s[pos + 1..].to_string())
+        }
+        None => (PathBuf::from("."), s.into_owned()),
+    }
+}
+
+/// 候補文字列群の最長共通 prefix。空集合なら空文字列。
+fn longest_common_prefix<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let mut common: Option<String> = None;
+    for name in names {
+        common = Some(match common {
+            None => name.to_string(),
+            Some(prev) => {
+                let len = prev
+                    .chars()
+                    .zip(name.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                prev.chars().take(len).collect()
+            }
+        });
+    }
+    common.unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -455,5 +643,200 @@ mod tests {
         // `..` は常に None 固定。
         assert_eq!(picker.entries[0].name, "..");
         assert_eq!(picker.entries[0].created, None);
+    }
+
+    // ─── パス直接入力 (`/` → Tab 補完 → Enter) ──────────────────────────
+
+    #[test]
+    fn open_path_input_seeds_buffer_with_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let mut picker = FilePicker::new(PickerMode::Attachment, tmp.path().join("photos"));
+        picker.open_path_input();
+        let input = picker.path_input.as_ref().expect("path input open");
+        assert!(input.buffer.ends_with('/'));
+        assert!(
+            input
+                .buffer
+                .starts_with(&*tmp.path().join("photos").to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn cancel_path_input_clears_state_without_touching_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let mut picker = FilePicker::new(PickerMode::Attachment, tmp.path().join("photos"));
+        let cwd_before = picker.cwd.clone();
+        picker.open_path_input();
+        picker.cancel_path_input();
+        assert!(picker.path_input.is_none());
+        assert_eq!(picker.cwd, cwd_before);
+    }
+
+    #[test]
+    fn complete_path_input_completes_unique_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let mut picker = FilePicker::new(PickerMode::Attachment, tmp.path().to_path_buf());
+        picker.path_input = Some(PathInput {
+            buffer: format!("{}/rea", tmp.path().display()),
+        });
+        picker.complete_path_input();
+        let buffer = picker.path_input.as_ref().unwrap().buffer.clone();
+        assert!(
+            buffer.ends_with("readme.txt"),
+            "expected completion to readme.txt, got {buffer}"
+        );
+    }
+
+    #[test]
+    fn complete_path_input_stops_at_common_prefix_for_multiple_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        // "photos" と並んで前方一致する 2 件目を追加する ("ph" までは共通)。
+        create_dir_all(tmp.path().join("physics")).unwrap();
+        let mut picker = FilePicker::new(PickerMode::Attachment, tmp.path().to_path_buf());
+        picker.path_input = Some(PathInput {
+            buffer: format!("{}/ph", tmp.path().display()),
+        });
+        picker.complete_path_input();
+        let buffer = picker.path_input.as_ref().unwrap().buffer.clone();
+        assert!(
+            buffer.ends_with("/ph"),
+            "should stop at common prefix 'ph' (photos vs physics), got {buffer}"
+        );
+    }
+
+    #[test]
+    fn complete_path_input_appends_slash_for_sole_directory_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let mut picker = FilePicker::new(PickerMode::Attachment, tmp.path().to_path_buf());
+        picker.path_input = Some(PathInput {
+            buffer: format!("{}/pho", tmp.path().display()),
+        });
+        picker.complete_path_input();
+        let buffer = picker.path_input.as_ref().unwrap().buffer.clone();
+        assert!(
+            buffer.ends_with("photos/"),
+            "sole directory match should gain trailing slash, got {buffer}"
+        );
+    }
+
+    #[test]
+    fn complete_path_input_no_match_leaves_buffer_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let mut picker = FilePicker::new(PickerMode::Attachment, tmp.path().to_path_buf());
+        let original = format!("{}/zzz_no_such", tmp.path().display());
+        picker.path_input = Some(PathInput {
+            buffer: original.clone(),
+        });
+        picker.complete_path_input();
+        assert_eq!(picker.path_input.as_ref().unwrap().buffer, original);
+    }
+
+    #[test]
+    fn submit_path_input_descends_into_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let mut picker = FilePicker::new(PickerMode::Attachment, tmp.path().to_path_buf());
+        picker.path_input = Some(PathInput {
+            buffer: tmp
+                .path()
+                .join("photos/cats")
+                .to_string_lossy()
+                .into_owned(),
+        });
+        let outcome = picker.submit_path_input();
+        assert!(matches!(outcome, PathInputOutcome::Descended));
+        assert!(picker.cwd.ends_with("cats"));
+        assert!(picker.path_input.is_none());
+    }
+
+    #[test]
+    fn submit_path_input_selects_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let mut picker = FilePicker::new(PickerMode::Attachment, tmp.path().to_path_buf());
+        picker.path_input = Some(PathInput {
+            buffer: tmp.path().join("readme.txt").to_string_lossy().into_owned(),
+        });
+        match picker.submit_path_input() {
+            PathInputOutcome::Selected(path) => assert!(path.ends_with("readme.txt")),
+            other => panic!("expected Selected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_path_input_invalid_path_keeps_buffer_for_correction() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let mut picker = FilePicker::new(PickerMode::Attachment, tmp.path().to_path_buf());
+        let bogus = format!("{}/does-not-exist", tmp.path().display());
+        picker.path_input = Some(PathInput {
+            buffer: bogus.clone(),
+        });
+        match picker.submit_path_input() {
+            PathInputOutcome::Invalid(_) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert_eq!(
+            picker.path_input.as_ref().map(|p| p.buffer.clone()),
+            Some(bogus),
+            "buffer must survive an invalid submission so the user can correct it"
+        );
+    }
+
+    #[test]
+    fn submit_path_input_empty_buffer_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let mut picker = FilePicker::new(PickerMode::Attachment, tmp.path().to_path_buf());
+        picker.path_input = Some(PathInput {
+            buffer: "   ".to_string(),
+        });
+        assert!(matches!(picker.submit_path_input(), PathInputOutcome::Noop));
+    }
+
+    #[test]
+    fn expand_tilde_uses_home_env() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return; // HOME 未設定環境ではこのテストは意味を持たないので skip。
+        };
+        let home_path = PathBuf::from(&home);
+        assert_eq!(expand_tilde("~"), home_path);
+        assert_eq!(expand_tilde("~/foo"), home_path.join("foo"));
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn split_path_prefix_splits_on_last_slash() {
+        assert_eq!(
+            split_path_prefix(Path::new("/a/b/c")),
+            (PathBuf::from("/a/b"), "c".to_string())
+        );
+        assert_eq!(
+            split_path_prefix(Path::new("/a/b/")),
+            (PathBuf::from("/a/b"), String::new())
+        );
+        assert_eq!(
+            split_path_prefix(Path::new("noslash")),
+            (PathBuf::from("."), "noslash".to_string())
+        );
+    }
+
+    #[test]
+    fn longest_common_prefix_basic() {
+        assert_eq!(
+            longest_common_prefix(["photos", "physics"].into_iter()),
+            "ph"
+        );
+        assert_eq!(longest_common_prefix(["only"].into_iter()), "only");
+        assert_eq!(
+            longest_common_prefix(std::iter::empty::<&str>()),
+            String::new()
+        );
     }
 }
