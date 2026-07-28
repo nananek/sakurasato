@@ -44,6 +44,24 @@ const UNFOCUSED_BODY_LINES: usize = 2;
 /// 閲覧できる量を確保しつつ、Timeline 1 画面に複数 note が並ぶ余地を残す。
 const FOCUSED_BODY_LINES: usize = 5;
 
+/// Issue #133 (5) / インライン custom emoji 画像を埋め込む幅 (cell 数)、
+/// 高さは常に 1 行。avatar (4 セル × 2 行) と違い、リアクション/絵文字
+/// ギャラリーは横一列に並ぶテキストの一部なので、行の流れを崩さないよう
+/// 高さ 1 行に収める (= Kitty/Sixel の解像度的にはかなり小さくなるが、
+/// 文中インラインという制約上の妥協)。
+const INLINE_EMOJI_CELLS: u16 = 2;
+
+/// [`reaction_line`] / [`emoji_gallery_line`] が構築時に積む、custom emoji の
+/// インライン画像を重ねるべき位置。行内の列オフセット (leading pad 込み) と
+/// 画像 URL のみを持ち、実際の overlay 描画は呼び出し側 (Note 詳細モーダル)
+/// が行分の wrap 後高さを積算して絶対座標に変換してから行う
+/// ([`render_inline_emoji_overlays`] 参照)。
+#[derive(Debug, Clone)]
+struct InlineEmojiSpot {
+    col: u16,
+    url: String,
+}
+
 pub mod hit;
 
 /// 描画したパネルの矩形 (マウスヒット判定用)。
@@ -1039,7 +1057,9 @@ fn profile_note_lines(
         ]));
     }
     if !note.reactions.is_empty() {
-        out.push(reaction_line(note, palette, ""));
+        // Profile 一覧は可変高さでスクロールするため画像 overlay は対象外
+        // (= `reaction_line` の doc 参照)。
+        out.push(reaction_line(note, palette, "", false).0);
     }
     if note.announce_count > 0 {
         out.push(renote_line(note, palette, ""));
@@ -1785,7 +1805,9 @@ fn note_lines(
         ]));
     }
     if !note.reactions.is_empty() {
-        out.push(reaction_line(note, palette, &pad));
+        // Timeline は可変高さでスクロールするため画像 overlay は対象外
+        // (= `reaction_line` の doc 参照)。
+        out.push(reaction_line(note, palette, &pad, false).0);
     }
     if note.announce_count > 0 {
         out.push(renote_line(note, palette, &pad));
@@ -1798,28 +1820,64 @@ fn note_lines(
 ///
 /// 表示例: ` :blob_party: 3   👍 1   :tada@misskey.io: 2 `。content 文字列は
 /// AP からそのまま (= shortcode 形式は `:foo:`、Unicode はそのまま)。
-/// アイコンのインライン画像描画は M? で別途 (現状は shortcode テキストのみ)。
-fn reaction_line(note: &TimelineNote, palette: &Palette, pad: &str) -> Line<'static> {
+///
+/// `show_images` が true かつ custom emoji (= `emoji_image_url` を持つ) の
+/// 場合、shortcode テキストの代わりに [`INLINE_EMOJI_CELLS`] 幅の空白
+/// placeholder を積み、その列位置を戻り値の [`InlineEmojiSpot`] に記録する
+/// (= 呼び出し側が Paragraph 描画後に実画像を重ねる、Note 詳細モーダル専用)。
+/// `false` (Timeline / Profile) では従来通り shortcode テキストのみで
+/// overlay は行わない ── 可変高さでスクロールする一覧で行ごとの絶対座標を
+/// 追跡するコストとリスクに見合わないため (= Issue #133 (5) では Note 詳細
+/// モーダルのみ対応するスコープ判断)。
+fn reaction_line(
+    note: &TimelineNote,
+    palette: &Palette,
+    pad: &str,
+    show_images: bool,
+) -> (Line<'static>, Vec<InlineEmojiSpot>) {
+    use unicode_width::UnicodeWidthStr;
+
     let mut spans: Vec<Span<'static>> =
         Vec::with_capacity(note.reactions.len().saturating_mul(2).saturating_add(1));
-    spans.push(Span::raw(format!("{pad}  ")));
+    let mut spots = Vec::new();
+    let mut col: u16 = 0;
+
+    let lead = format!("{pad}  ");
+    col = col.saturating_add(u16::try_from(lead.width()).unwrap_or(u16::MAX));
+    spans.push(Span::raw(lead));
+
     for (i, r) in note.reactions.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("  ", Style::default().fg(palette.muted)));
+            col = col.saturating_add(2);
         }
-        let label = reaction_label(&r.content);
-        spans.push(Span::styled(
-            label,
-            Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            format!(" ×{}", r.count),
-            Style::default().fg(palette.muted),
-        ));
+        let custom_url = show_images
+            .then_some(r.emoji_image_url.as_deref())
+            .flatten()
+            .filter(|u| !u.is_empty());
+        if let Some(url) = custom_url {
+            spots.push(InlineEmojiSpot {
+                col,
+                url: url.to_string(),
+            });
+            let placeholder = " ".repeat(usize::from(INLINE_EMOJI_CELLS));
+            col = col.saturating_add(INLINE_EMOJI_CELLS);
+            spans.push(Span::raw(placeholder));
+        } else {
+            let label = reaction_label(&r.content);
+            col = col.saturating_add(u16::try_from(label.width()).unwrap_or(u16::MAX));
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let count = format!(" ×{}", r.count);
+        col = col.saturating_add(u16::try_from(count.width()).unwrap_or(u16::MAX));
+        spans.push(Span::styled(count, Style::default().fg(palette.muted)));
     }
-    Line::from(spans)
+    (Line::from(spans), spots)
 }
 
 /// #151: 1 件の Note の renote (Announce) 集計を 1 行にまとめる。
@@ -2058,9 +2116,22 @@ fn render_note_detail(
         // 任せて、Timeline と同じ width / palette 経路で描く。
         append_folded_body(&mut lines, &body_text, "", body_rect.width, 0, palette);
     }
+    // Issue #133 (5): reaction / emoji ギャラリーは custom emoji を実画像で
+    // 見られる唯一の場所 (= 本文自体は wrap 位置を追跡できないため shortcode
+    // テキストのまま)。画像を重ねるには Paragraph 描画後に絶対座標が要るので、
+    // 行を積んだ index を覚えておき、スクロール分を差し引いた visual row を
+    // 後段で `locate_visual_row` により算出する。
+    let show_emoji_images = app.suppression.emoji && app.images.enabled();
+    let mut reaction_spots: Option<(usize, Vec<InlineEmojiSpot>)> = None;
+    let mut gallery_spots: Option<(usize, Vec<InlineEmojiSpot>)> = None;
     if !note.reactions.is_empty() {
         lines.push(Line::from(""));
-        lines.push(reaction_line(note, palette, ""));
+        let idx = lines.len();
+        let (line, spots) = reaction_line(note, palette, "", show_emoji_images);
+        lines.push(line);
+        if !spots.is_empty() {
+            reaction_spots = Some((idx, spots));
+        }
     }
     if note.announce_count > 0 {
         lines.push(Line::from(""));
@@ -2072,7 +2143,12 @@ fn render_note_detail(
     // docstring も「on のとき」と書いているが実装側で逃げていなかった。
     if !note.emojis.is_empty() && app.suppression.emoji {
         lines.push(Line::from(""));
-        lines.push(emoji_gallery_line(note, palette));
+        let idx = lines.len();
+        let (line, spots) = emoji_gallery_line(note, palette, app.images.enabled());
+        lines.push(line);
+        if !spots.is_empty() {
+            gallery_spots = Some((idx, spots));
+        }
     }
     if !note.attachments.is_empty() {
         lines.push(Line::from(""));
@@ -2128,10 +2204,42 @@ fn render_note_detail(
         }
     }
 
+    // 画像 overlay の絶対行を、Paragraph が `lines` を消費する前に算出する
+    // (= wrap 後の高さ積算が必要なので、行の内容が要る)。
+    let reaction_row = reaction_spots.as_ref().and_then(|(idx, _)| {
+        locate_visual_row(
+            &lines,
+            *idx,
+            state.scroll,
+            body_rect.width,
+            body_rect.height,
+        )
+    });
+    let gallery_row = gallery_spots.as_ref().and_then(|(idx, _)| {
+        locate_visual_row(
+            &lines,
+            *idx,
+            state.scroll,
+            body_rect.width,
+            body_rect.height,
+        )
+    });
+
     // スクロール: state.scroll 行分先頭をスキップする。
     let skipped: Vec<Line<'static>> = lines.into_iter().skip(state.scroll).collect();
     let p = Paragraph::new(skipped).wrap(Wrap { trim: false });
     frame.render_widget(p, body_rect);
+
+    if let Some(row) = reaction_row
+        && let Some((_, spots)) = reaction_spots.as_ref()
+    {
+        render_inline_emoji_overlays(frame, app, body_rect, row, spots);
+    }
+    if let Some(row) = gallery_row
+        && let Some((_, spots)) = gallery_spots.as_ref()
+    {
+        render_inline_emoji_overlays(frame, app, body_rect, row, spots);
+    }
 
     // 添付プレビュー (画像)。
     if preview_height > 0 {
@@ -2153,6 +2261,66 @@ fn render_note_detail(
         Style::default().fg(palette.muted),
     )));
     frame.render_widget(f, footer_rect);
+}
+
+/// `lines[target_idx]` が `scroll` 行スキップ後の viewport で何行目 (0-based、
+/// `body_rect` 起点) に来るかを、各行の wrap 後高さ ([`wrapped_line_height`])
+/// を積算して求める。`scroll` より前の行 (= まだ表示されていない) か、
+/// 積算した行が viewport 高さを超えたら `None` を返す。
+///
+/// 注: `lines[target_idx]` 自身が wrap するほど長い行 (= 大量のリアクション/
+/// 絵文字が並ぶ) の場合でも行頭の row のみを返す ── その行の内部での折返し
+/// 位置までは追わない。実運用でここまでの量に達するケースは稀と判断した
+/// 割り切り (= `Issue #144` 系で既に許容されている近似と同種)。
+fn locate_visual_row(
+    lines: &[Line<'static>],
+    target_idx: usize,
+    scroll: usize,
+    width: u16,
+    viewport_height: u16,
+) -> Option<u16> {
+    if target_idx < scroll {
+        return None;
+    }
+    let mut row: u16 = 0;
+    for line in &lines[scroll..target_idx] {
+        if row >= viewport_height {
+            return None;
+        }
+        row = row.saturating_add(wrapped_line_height(line, width));
+    }
+    (row < viewport_height).then_some(row)
+}
+
+/// [`InlineEmojiSpot`] の記録位置に custom emoji の実画像を重ねる。`row` は
+/// `area` 起点の相対行 ([`locate_visual_row`] が返す値)。avatar (4 セル ×
+/// 2 行) と違い、文中インラインは高さ 1 行に収める制約上、画像はかなり
+/// 小さくなる。
+fn render_inline_emoji_overlays(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    row: u16,
+    spots: &[InlineEmojiSpot],
+) {
+    if row >= area.height {
+        return;
+    }
+    let abs_y = area.y + row;
+    for spot in spots {
+        if spot.col >= area.width {
+            continue;
+        }
+        let x = area.x + spot.col;
+        let width = INLINE_EMOJI_CELLS.min(area.width - spot.col);
+        let img_area = Rect::new(x, abs_y, width, 1);
+        app.images
+            .ensure_with_variant(&spot.url, img_area, crate::image_cache::VARIANT_EMOJI);
+        if let Some(proto) = app.images.get(&spot.url) {
+            frame.render_widget(Image::new(proto.as_ref()), img_area);
+        }
+        // 取得中は placeholder の空白セルのまま (= 次フレームで再試行される)。
+    }
 }
 
 /// Issue #133 (4): 詳細モーダル下半分の添付プレビュー。`sensitive` Note の
@@ -2247,15 +2415,28 @@ fn render_note_detail_preview(
 }
 
 /// Issue #133 (5): 詳細モーダル本文に挟む emoji ギャラリー行。本文中の
-/// `:shortcode:` に対応する custom emoji を `:foo:` の形で一覧表示する。
+/// `:shortcode:` に対応する custom emoji を一覧表示する ── ratatui の
+/// テキスト Span に画像を直接埋め込むことはできないため、本文自体は
+/// shortcode テキストのまま (`crate::content::to_plain_text`) で、この
+/// ギャラリー行だけが「本文で使われている絵文字を実画像で見る」窓になる。
 ///
-/// MVP: ratatui のテキスト Span に画像を埋め込めないため、まずは shortcode
-/// テキストだけを accent 色で並べる ── 将来的に行下に小さい画像ストリップ
-/// を `ratatui-image` で描く方針 (= reaction 画像と同じパターン)。
-fn emoji_gallery_line(note: &TimelineNote, palette: &Palette) -> Line<'static> {
+/// `show_images` が true なら各絵文字の直前に [`INLINE_EMOJI_CELLS`] 幅の
+/// placeholder を積み、列位置を [`InlineEmojiSpot`] に記録する (呼び出し側が
+/// Note 詳細モーダルで画像を重ねる、[`reaction_line`] と同じパターン)。
+/// `false` では shortcode テキストのみ (画像取得無効時のフォールバック)。
+fn emoji_gallery_line(
+    note: &TimelineNote,
+    palette: &Palette,
+    show_images: bool,
+) -> (Line<'static>, Vec<InlineEmojiSpot>) {
+    use unicode_width::UnicodeWidthStr;
+
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(note.emojis.len() * 2 + 1);
+    let mut spots = Vec::new();
+    let header = format!("🌸 emojis ({}): ", note.emojis.len());
+    let mut col = u16::try_from(header.width()).unwrap_or(u16::MAX);
     spans.push(Span::styled(
-        format!("🌸 emojis ({}): ", note.emojis.len()),
+        header,
         Style::default()
             .fg(palette.muted)
             .add_modifier(Modifier::BOLD),
@@ -2263,7 +2444,24 @@ fn emoji_gallery_line(note: &TimelineNote, palette: &Palette) -> Line<'static> {
     for (i, e) in note.emojis.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
+            col = col.saturating_add(2);
         }
+        let url = show_images
+            .then_some(e.image_url.as_deref())
+            .flatten()
+            .filter(|u| !u.is_empty());
+        if let Some(url) = url {
+            spots.push(InlineEmojiSpot {
+                col,
+                url: url.to_string(),
+            });
+            let placeholder = " ".repeat(usize::from(INLINE_EMOJI_CELLS));
+            col = col.saturating_add(INLINE_EMOJI_CELLS);
+            spans.push(Span::raw(placeholder));
+            spans.push(Span::raw(" "));
+            col = col.saturating_add(1);
+        }
+        col = col.saturating_add(u16::try_from(e.shortcode.width()).unwrap_or(u16::MAX));
         spans.push(Span::styled(
             e.shortcode.clone(),
             Style::default()
@@ -2271,7 +2469,7 @@ fn emoji_gallery_line(note: &TimelineNote, palette: &Palette) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    Line::from(spans)
+    (Line::from(spans), spots)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3232,5 +3430,157 @@ mod tests {
             "last line must keep indicator regardless of truncate: {last:?}"
         );
         // 本文側が短すぎて全部 truncate されたとしても indicator は残る。
+    }
+
+    // ─── インライン custom emoji (reaction / gallery / Note 詳細 overlay) ──
+
+    fn note_with(
+        reactions: Vec<crate::client::ReactionSummary>,
+        emojis: Vec<crate::client::Emoji>,
+    ) -> TimelineNote {
+        TimelineNote {
+            id: 1,
+            ap_id: "https://x.test/notes/1".into(),
+            url: None,
+            actor_id: 1,
+            actor_ap_id: "https://x.test/users/me".into(),
+            actor_preferred_username: "me".into(),
+            actor_display_name: None,
+            actor_icon_url: None,
+            content: "hello".into(),
+            summary: None,
+            language: None,
+            visibility: "public".into(),
+            sensitive: false,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            published_at: chrono::Utc::now(),
+            is_local: true,
+            reactions,
+            attachments: Vec::new(),
+            emojis,
+            announce_count: 0,
+            viewer_renoted: false,
+            renote: None,
+        }
+    }
+
+    fn custom_reaction(content: &str, count: i64, url: &str) -> crate::client::ReactionSummary {
+        crate::client::ReactionSummary {
+            content: content.into(),
+            count,
+            emoji_image_url: Some(url.into()),
+            emoji_media_type: Some("image/webp".into()),
+            emoji_is_local: Some(true),
+        }
+    }
+
+    fn unicode_reaction(content: &str, count: i64) -> crate::client::ReactionSummary {
+        crate::client::ReactionSummary {
+            content: content.into(),
+            count,
+            emoji_image_url: None,
+            emoji_media_type: None,
+            emoji_is_local: None,
+        }
+    }
+
+    #[test]
+    fn reaction_line_show_images_false_never_produces_spots() {
+        let theme = test_palette();
+        let note = note_with(
+            vec![custom_reaction(":sakura:", 3, "https://x.test/e.webp")],
+            vec![],
+        );
+        let (line, spots) = reaction_line(&note, &theme.palette, "", false);
+        assert!(spots.is_empty(), "show_images=false must not record spots");
+        assert!(
+            body_text_of(&line).contains(":sakura:"),
+            "custom emoji falls back to shortcode text when images disabled"
+        );
+    }
+
+    #[test]
+    fn reaction_line_show_images_true_records_spot_for_custom_only() {
+        let theme = test_palette();
+        let note = note_with(
+            vec![
+                custom_reaction(":sakura:", 3, "https://x.test/e.webp"),
+                unicode_reaction("👍", 1),
+            ],
+            vec![],
+        );
+        let (line, spots) = reaction_line(&note, &theme.palette, "", true);
+        assert_eq!(spots.len(), 1, "only the custom emoji reaction gets a spot");
+        assert_eq!(spots[0].url, "https://x.test/e.webp");
+        // custom emoji のテキストは placeholder に置き換わり shortcode は消える。
+        assert!(!body_text_of(&line).contains(":sakura:"));
+        // Unicode 側は従来通りテキストで残る。
+        assert!(body_text_of(&line).contains('👍'));
+        assert!(body_text_of(&line).contains("×3"));
+        assert!(body_text_of(&line).contains("×1"));
+    }
+
+    #[test]
+    fn emoji_gallery_line_show_images_true_records_spot_with_shortcode_kept() {
+        let theme = test_palette();
+        let note = note_with(
+            vec![],
+            vec![crate::client::Emoji {
+                shortcode: ":sakura:".into(),
+                image_url: Some("https://x.test/e.webp".into()),
+                media_type: Some("image/webp".into()),
+                is_local: Some(true),
+            }],
+        );
+        let (line, spots) = emoji_gallery_line(&note, &theme.palette, true);
+        assert_eq!(spots.len(), 1);
+        assert_eq!(spots[0].url, "https://x.test/e.webp");
+        // shortcode 自体はギャラリーではラベルとして残す (画像だけでなく
+        // どの絵文字かも分かるように)。
+        assert!(body_text_of(&line).contains(":sakura:"));
+    }
+
+    #[test]
+    fn emoji_gallery_line_no_url_skips_spot() {
+        let theme = test_palette();
+        let note = note_with(
+            vec![],
+            vec![crate::client::Emoji {
+                shortcode: ":sakura:".into(),
+                image_url: None,
+                media_type: None,
+                is_local: Some(true),
+            }],
+        );
+        let (_, spots) = emoji_gallery_line(&note, &theme.palette, true);
+        assert!(spots.is_empty(), "no image_url means nothing to overlay");
+    }
+
+    #[test]
+    fn locate_visual_row_before_scroll_is_none() {
+        let lines = vec![Line::from("a"), Line::from("b"), Line::from("c")];
+        assert_eq!(locate_visual_row(&lines, 0, 1, 80, 10), None);
+    }
+
+    #[test]
+    fn locate_visual_row_sums_single_height_lines() {
+        let lines = vec![
+            Line::from("a"),
+            Line::from("b"),
+            Line::from("c"),
+            Line::from("d"),
+        ];
+        // scroll=1 (先頭 "a" を隠す) で target=3 ("d") は、間の "b"/"c" 分
+        // (各 1 行) 進んだ row=2 に来る。
+        assert_eq!(locate_visual_row(&lines, 3, 1, 80, 10), Some(2));
+    }
+
+    #[test]
+    fn locate_visual_row_beyond_viewport_is_none() {
+        let lines = vec![Line::from("a"), Line::from("b"), Line::from("c")];
+        // viewport 高さ 2 に対して target の手前だけで 2 行消費するので、
+        // target 自体は画面外。
+        assert_eq!(locate_visual_row(&lines, 2, 0, 80, 2), None);
     }
 }
