@@ -710,3 +710,78 @@ pub async fn list_by_author_window(
     .fetch_all(pool)
     .await
 }
+
+/// **#150 (Aria fix)** ── `notes/mentions` 用: viewer が明示的に宛先
+/// (`to`/`cc`) に含まれる他者の note を時刻窓で列挙する。
+///
+/// mention 判定は [`list_by_author_window`] の direct-visibility 節と同じ
+/// `to_recipients @> viewer_ap_id` / `cc_recipients @> viewer_ap_id` 述語を
+/// 使う ── inbound `Create` 受領時の「我々宛」判定
+/// ([`crate::dispatch` 相当, `addresses_us`]) と同一の定義に揃えることで、
+/// 受信して保存した note と一覧に出る note の集合が食い違わない。
+///
+/// - `n.actor_id <> viewer_actor_id` で自分自身の note (自己 mention) を除く。
+/// - `following_only` (Misskey `following` パラメータ) で著者を `accepted`
+///   follow しているものだけに絞れる。
+/// - `visibility_filter` (Misskey `visibility` パラメータ) は呼び出し側で
+///   Misskey 語彙 → 内部語彙に変換済みの文字列を渡す。`None` なら無指定。
+/// - visibility による可視性ゲートは行わない ── 定義上 viewer が to/cc に
+///   含まれる note は常に viewer に見える。
+#[allow(clippy::too_many_arguments)]
+pub async fn list_mentions_window(
+    pool: &PgPool,
+    viewer_actor_id: i64,
+    viewer_ap_id: &str,
+    following_only: bool,
+    visibility_filter: Option<&str>,
+    since_date: Option<DateTime<Utc>>,
+    until_date: Option<DateTime<Utc>>,
+    limit: i64,
+) -> sqlx::Result<Vec<TimelineEntry>> {
+    let viewer_inbox_array =
+        serde_json::to_value([viewer_ap_id]).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query_as!(
+        TimelineEntry,
+        r#"
+        SELECT
+            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,
+            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,
+            n.to_recipients as "to_recipients: Json<Vec<String>>",
+            n.cc_recipients as "cc_recipients: Json<Vec<String>>",
+            n.attachments as "attachments: Json<JsonValue>",
+            n.tags as "tags: Json<JsonValue>",
+            n.is_local, n.url, n.published_at, n.edited_at, n.created_at, n.updated_at,
+            a.ap_id AS actor_ap_id,
+            a.preferred_username AS actor_preferred_username,
+            a.display_name AS actor_display_name,
+            a.icon_url AS actor_icon_url
+        FROM note n
+        JOIN actor a ON a.id = n.actor_id
+        WHERE n.actor_id <> $1
+          AND (n.to_recipients @> $2::jsonb OR n.cc_recipients @> $2::jsonb)
+          AND (
+            NOT $3
+            OR EXISTS (
+              SELECT 1 FROM follow
+              WHERE follower_actor_id = $1
+                AND followed_actor_id = n.actor_id
+                AND state = 'accepted'
+            )
+          )
+          AND ($4::TEXT IS NULL OR n.visibility = $4)
+          AND ($5::TIMESTAMPTZ IS NULL OR n.published_at > $5)
+          AND ($6::TIMESTAMPTZ IS NULL OR n.published_at < $6)
+        ORDER BY n.published_at DESC, n.id DESC
+        LIMIT $7
+        "#,
+        viewer_actor_id,
+        viewer_inbox_array,
+        following_only,
+        visibility_filter,
+        since_date,
+        until_date,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}

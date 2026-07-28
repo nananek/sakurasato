@@ -1059,6 +1059,232 @@ async fn notes_show_direct_in_cc_also_returns_200(pool: PgPool) {
     assert_eq!(note["text"], "dm-via-cc");
 }
 
+// ─── #150 (Aria fix): notes/mentions ───────────────────────────────────────
+//
+// 未実装だと Aria の `MisskeyNotes.mentions` → `TimelineNotesNotifier` が
+// 404 を Misskey エラー body としてパース出来ず `ApiService.post` で crash
+// する。mention の定義は inbound `Create` の「我々宛」判定と揃えてある
+// ([`repo::note::list_mentions_window`])。
+
+/// viewer が `to` に明示された public note は mentions に載る。viewer に
+/// 触れていない public note は載らない。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn mentions_returns_notes_addressed_to_viewer(pool: PgPool) {
+    let _viewer_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let author_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let viewer_uri = "https://sakurasato.test/users/alice".to_string();
+    let mention_id = seed_note_with_audience(
+        &pool,
+        author_id,
+        "misskey.io",
+        "hi @alice",
+        Visibility::Public,
+        vec![
+            "https://www.w3.org/ns/activitystreams#Public".into(),
+            viewer_uri,
+        ],
+        vec![],
+    )
+    .await;
+    // viewer に触れていない public note (= mentions には出ない)。
+    let _unrelated = seed_note(
+        &pool,
+        author_id,
+        "misskey.io",
+        "unrelated",
+        Visibility::Public,
+    )
+    .await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/mentions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["id"], mention_id.to_string());
+    assert_eq!(notes[0]["text"], "hi @alice");
+}
+
+/// viewer 自身が投稿した note (自己 mention) は除外される。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn mentions_excludes_own_notes(pool: PgPool) {
+    let viewer_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let viewer_uri = "https://sakurasato.test/users/alice".to_string();
+    let _own = seed_note_with_audience(
+        &pool,
+        viewer_id,
+        "sakurasato.test",
+        "self mention",
+        Visibility::Public,
+        vec![
+            "https://www.w3.org/ns/activitystreams#Public".into(),
+            viewer_uri,
+        ],
+        vec![],
+    )
+    .await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/mentions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    assert_eq!(arr.as_array().unwrap().len(), 0);
+}
+
+/// `following: true` は著者を `accepted` follow している mention だけに絞る。
+#[allow(clippy::similar_names, reason = "followed / not_followed の対比")]
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn mentions_following_filter(pool: PgPool) {
+    let viewer_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let viewer_uri = "https://sakurasato.test/users/alice".to_string();
+    let followed_author = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let not_followed_author = seed_remote_actor(&pool, "misskey.io", "carol").await;
+    seed_accepted_follow(&pool, viewer_id, followed_author).await;
+
+    let from_followed = seed_note_with_audience(
+        &pool,
+        followed_author,
+        "misskey.io",
+        "from followed",
+        Visibility::Public,
+        vec![
+            "https://www.w3.org/ns/activitystreams#Public".into(),
+            viewer_uri.clone(),
+        ],
+        vec![],
+    )
+    .await;
+    let _from_not_followed = seed_note_with_audience(
+        &pool,
+        not_followed_author,
+        "misskey.io",
+        "from stranger",
+        Visibility::Public,
+        vec![
+            "https://www.w3.org/ns/activitystreams#Public".into(),
+            viewer_uri,
+        ],
+        vec![],
+    )
+    .await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "following": true});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/mentions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["id"], from_followed.to_string());
+}
+
+/// `visibility: "specified"` (= Misskey 語彙の direct) で direct mention だけに絞る。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn mentions_visibility_filter_specified(pool: PgPool) {
+    let _viewer_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let author_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let viewer_uri = "https://sakurasato.test/users/alice".to_string();
+    let dm_id = seed_note_with_audience(
+        &pool,
+        author_id,
+        "misskey.io",
+        "dm",
+        Visibility::Direct,
+        vec![viewer_uri.clone()],
+        vec![],
+    )
+    .await;
+    let _public_mention = seed_note_with_audience(
+        &pool,
+        author_id,
+        "misskey.io",
+        "public mention",
+        Visibility::Public,
+        vec![
+            "https://www.w3.org/ns/activitystreams#Public".into(),
+            viewer_uri,
+        ],
+        vec![],
+    )
+    .await;
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "visibility": "specified"});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/mentions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = read_json(resp).await;
+    let notes = arr.as_array().unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["id"], dm_id.to_string());
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn mentions_without_scope_returns_401(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &[]).await;
+
+    let body = json!({"i": token});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/mentions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 // ─── M14 #170: HTML タグが MissNote.text に流れない ───────────────────────
 
 /// AP `Note.content` (= HTML) が `MissNote.text` で plain text に倒される。
