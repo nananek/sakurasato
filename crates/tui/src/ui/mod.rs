@@ -71,6 +71,9 @@ pub struct PanelRects {
     /// リスト機能の一覧 / メンバー一覧領域 (= `ensure_visible` 用)。
     /// 非表示時は zero rect。
     pub lists: Rect,
+    /// Profile 画面の notes 一覧の各行ヒット位置。`timeline_rows` と同じ理由
+    /// (可変高さ note を線形探索で解決する) で必要。非表示時は空。
+    pub profile_notes_rows: ScrollHits,
 }
 
 /// タイムラインのスクロール可能領域内に並んだ note の行位置をビット圧縮せず
@@ -102,6 +105,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
     // 戻る視覚的連続性のため)。M13 PR5 で FollowList も同様に Timeline 領域を
     // 占有する画面として描く。
     let mut profile_notes_rect = Rect::default();
+    let mut profile_notes_rows = ScrollHits::default();
     let mut follow_requests_rect = Rect::default();
     let mut notifications_rect = Rect::default();
     let mut follow_list_rect = Rect::default();
@@ -109,7 +113,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
     let rows = if matches!(app.focus, Focus::Profile)
         && let Some(profile) = app.current_profile()
     {
-        profile_notes_rect = render_profile_screen(frame, timeline_area, app, profile);
+        (profile_notes_rect, profile_notes_rows) =
+            render_profile_screen(frame, timeline_area, app, profile);
         ScrollHits::default()
     } else if matches!(app.focus, Focus::FollowList)
         && let Some(fl) = app.follow_list.as_ref()
@@ -206,6 +211,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
         notifications: notifications_rect,
         follow_list: follow_list_rect,
         lists: lists_rect,
+        profile_notes_rows,
     }
 }
 
@@ -737,14 +743,15 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, app: &App) -> ScrollHits {
 /// 上段: ヘッダ画像帯 (2 行、画像があれば 1 行使う) + プロフィール (アバター +
 /// 名前 + acct + 状態 + bio + counts)。下段: notes 一覧。
 ///
-/// 返り値は notes 一覧領域の矩形 (= `PanelRects::profile_notes` に保存)。
+/// 返り値は notes 一覧領域の矩形と各行ヒット位置 (= `PanelRects::profile_notes`
+/// / `profile_notes_rows` に保存)。
 #[allow(clippy::too_many_lines, reason = "Profile 1 画面分の宣言的描画")]
 fn render_profile_screen(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &App,
     profile: &ProfileScreen,
-) -> Rect {
+) -> (Rect, ScrollHits) {
     let palette = &app.theme.palette;
     let title_acct = profile.acct();
     let block = Block::default()
@@ -912,20 +919,23 @@ fn render_profile_screen(
     }
 
     // notes 一覧。
-    render_profile_notes(frame, notes_rect, profile, palette);
-    notes_rect
+    let notes_rows = render_profile_notes(frame, notes_rect, profile, palette);
+    (notes_rect, notes_rows)
 }
 
 /// Profile 画面の下半分: notes 一覧。Timeline の `note_lines` と同様だが
 /// avatar 描画は省く (= author は profile ヘッダで既に明示されている)。
+/// 返り値は各行のヒット位置 ([`render_timeline`] と同じパターン、マウス
+/// クリックでの note 選択に使う)。
 fn render_profile_notes(
     frame: &mut Frame<'_>,
     area: Rect,
     profile: &ProfileScreen,
     palette: &Palette,
-) {
+) -> ScrollHits {
+    let mut hits = ScrollHits::default();
     if area.width == 0 || area.height == 0 {
-        return;
+        return hits;
     }
     if profile.notes.is_empty() {
         let msg = if profile.notes_exhausted {
@@ -938,7 +948,7 @@ fn render_profile_notes(
             Style::default().fg(palette.muted),
         )));
         frame.render_widget(p, area);
-        return;
+        return hits;
     }
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
     let mut row_cursor: u16 = 0;
@@ -957,6 +967,10 @@ fn render_profile_notes(
             .iter()
             .map(|l| wrapped_line_height(l, area.width))
             .collect();
+        let consumed_total: u16 = line_heights.iter().copied().fold(0u16, u16::saturating_add);
+        let visible_top = area.y + row_cursor;
+        let visible_height = consumed_total.min(area.height - row_cursor);
+        hits.push(idx, visible_top, visible_height);
         for (l, h) in block_lines.into_iter().zip(line_heights) {
             if row_cursor >= area.height {
                 break;
@@ -968,6 +982,7 @@ fn render_profile_notes(
     }
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(p, area);
+    hits
 }
 
 /// Profile 内 notes 一覧の 1 件分。Timeline と異なり avatar indent は不要、
