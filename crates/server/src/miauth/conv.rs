@@ -884,6 +884,11 @@ fn entry_to_actor_lite(entry: &TimelineEntry) -> ActorRow {
         is_local: false,
         actor_type: "Person".into(),
         manually_approves_followers: false,
+        birthday: None,
+        location: None,
+        lang: None,
+        followed_message: None,
+        fields: SqlxJson(vec![]),
         fetched_at: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -941,6 +946,44 @@ pub fn from_actor_detailed(
         let is_bot = matches!(actor.actor_type.as_str(), "Service" | "Application" | "Bot");
         map.insert("isBot".to_string(), JsonValue::Bool(is_bot));
         map.insert("isCat".to_string(), JsonValue::Bool(false));
+
+        // `birthday` / `location` / `lang` / `fields` は misskey-dart の
+        // `UserDetailed` 共有 interface (= Me / NotMe 両方) が持つフィールド
+        // なので、Me 専用ではなくここ (基底) に置く。MiAuth `i/update`
+        // (`crate::miauth::i::update`) が書き込む実データをそのまま返す。
+        // remote actor はこれらの列を書き込む経路が無いため常に空/null。
+        map.insert(
+            "birthday".to_string(),
+            actor
+                .birthday
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        );
+        map.insert(
+            "location".to_string(),
+            actor
+                .location
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        );
+        map.insert(
+            "lang".to_string(),
+            actor
+                .lang
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        );
+        map.insert(
+            "fields".to_string(),
+            JsonValue::Array(
+                actor
+                    .fields
+                    .0
+                    .iter()
+                    .map(|f| json!({ "name": f.name, "value": f.value }))
+                    .collect(),
+            ),
+        );
 
         // misskey-dart の `UserDetailedNotMe` で **required bool** (= 非 null,
         // default 無し) なのに `/api/users/show` / `/api/users/{following,
@@ -1052,7 +1095,8 @@ pub fn from_actor_me_detailed(
         );
         map.insert("pinnedNoteIds".to_string(), JsonValue::Array(vec![]));
         map.insert("pinnedNotes".to_string(), JsonValue::Array(vec![]));
-        map.insert("fields".to_string(), JsonValue::Array(vec![]));
+        // `fields` は `UserDetailed` 共有フィールドなので [`from_actor_detailed`]
+        // (基底) で実データを挿入済み ── ここで空配列に上書きしない。
 
         // object 系。
         map.insert("emojis".to_string(), serde_json::json!({}));
@@ -1066,9 +1110,19 @@ pub fn from_actor_me_detailed(
         // Me 専用の付加情報。
         map.insert("email".to_string(), JsonValue::Null);
         map.insert("emailVerified".to_string(), JsonValue::Bool(false));
-        map.insert("birthday".to_string(), JsonValue::Null);
-        map.insert("location".to_string(), JsonValue::Null);
-        map.insert("lang".to_string(), JsonValue::Null);
+        // `birthday` / `location` / `lang` は `UserDetailed` 共有フィールド
+        // なので [`from_actor_detailed`] (基底) で実データを挿入済み。
+        // `followedMessage` は Me / `UserDetailedNotMeWithRelations` のみが
+        // 持つフィールド (base `UserDetailed` には無い) で、Sakurasato は
+        // 後者の「相手との関係付き NotMe」emission 経路を持たないため、実質
+        // ここ (self) でのみ実データを返す。
+        map.insert(
+            "followedMessage".to_string(),
+            actor
+                .followed_message
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        );
         map.insert("twoFactorEnabled".to_string(), JsonValue::Bool(false));
         map.insert("usePasswordLessLogin".to_string(), JsonValue::Bool(false));
         map.insert("securityKeys".to_string(), JsonValue::Bool(false));
@@ -1177,6 +1231,11 @@ mod tests {
             is_local,
             actor_type: "Person".into(),
             manually_approves_followers: locked,
+            birthday: None,
+            location: None,
+            lang: None,
+            followed_message: None,
+            fields: SqlxJson(vec![]),
             fetched_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

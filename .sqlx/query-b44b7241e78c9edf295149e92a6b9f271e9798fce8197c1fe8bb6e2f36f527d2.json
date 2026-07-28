@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            fetched_at, created_at, updated_at\n        FROM actor WHERE id = $1\n        ",
+  "query": "\n        SELECT\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            birthday, location, lang, followed_message,\n            fields as \"fields: Json<Vec<crate::model::ActorField>>\",\n            fetched_at, created_at, updated_at\n        FROM actor WHERE is_local = TRUE\n        ORDER BY id ASC\n        ",
   "describe": {
     "columns": [
       {
@@ -269,6 +269,61 @@
       },
       {
         "ordinal": 24,
+        "name": "birthday",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "birthday"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "location",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
+        "name": "lang",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "lang"
+          }
+        }
+      },
+      {
+        "ordinal": 27,
+        "name": "followed_message",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "followed_message"
+          }
+        }
+      },
+      {
+        "ordinal": 28,
+        "name": "fields: Json<Vec<crate::model::ActorField>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "fields"
+          }
+        }
+      },
+      {
+        "ordinal": 29,
         "name": "fetched_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -279,7 +334,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 30,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -290,7 +345,7 @@
         }
       },
       {
-        "ordinal": 26,
+        "ordinal": 31,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -302,9 +357,7 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Int8"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
@@ -332,9 +385,14 @@
       false,
       false,
       true,
+      true,
+      true,
+      true,
+      false,
+      true,
       false,
       false
     ]
   },
-  "hash": "2c35891a2751df7be312e3dd6051d5860dbcae64f829030d5503c3cdffc51f2e"
+  "hash": "b44b7241e78c9edf295149e92a6b9f271e9798fce8197c1fe8bb6e2f36f527d2"
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO actor (\n            ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as, moved_to_ap_id, is_local, actor_type,\n            manually_approves_followers\n        )\n        VALUES (\n            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,\n            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23\n        )\n        RETURNING\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            fetched_at, created_at, updated_at\n        ",
+  "query": "\n        UPDATE actor SET\n            preferred_username = $1,\n            host = $2,\n            display_name = $3,\n            summary = $4,\n            icon_url = $5,\n            image_url = $6,\n            inbox_url = $7,\n            shared_inbox_url = $8,\n            outbox_url = $9,\n            followers_url = $10,\n            following_url = $11,\n            public_key_id = $12,\n            public_key_pem = $13,\n            ed25519_public_key_id = $14,\n            ed25519_public_key_pem = $15,\n            also_known_as = $16,\n            moved_to_ap_id = $17,\n            actor_type = $18,\n            manually_approves_followers = $19,\n            updated_at = now()\n        WHERE id = $20\n        RETURNING\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: sqlx::types::Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            birthday, location, lang, followed_message,\n            fields as \"fields: sqlx::types::Json<Vec<ActorField>>\",\n            fetched_at, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -214,7 +214,7 @@
       },
       {
         "ordinal": 19,
-        "name": "also_known_as: Json<Vec<String>>",
+        "name": "also_known_as: sqlx::types::Json<Vec<String>>",
         "type_info": "Jsonb",
         "origin": {
           "Table": {
@@ -269,6 +269,61 @@
       },
       {
         "ordinal": 24,
+        "name": "birthday",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "birthday"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "location",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
+        "name": "lang",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "lang"
+          }
+        }
+      },
+      {
+        "ordinal": 27,
+        "name": "followed_message",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "followed_message"
+          }
+        }
+      },
+      {
+        "ordinal": 28,
+        "name": "fields: sqlx::types::Json<Vec<ActorField>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "fields"
+          }
+        }
+      },
+      {
+        "ordinal": 29,
         "name": "fetched_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -279,7 +334,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 30,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -290,7 +345,7 @@
         }
       },
       {
-        "ordinal": 26,
+        "ordinal": 31,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -318,14 +373,11 @@
         "Text",
         "Text",
         "Text",
-        "Text",
-        "Text",
-        "Text",
         "Jsonb",
         "Text",
-        "Bool",
         "Text",
-        "Bool"
+        "Bool",
+        "Int8"
       ]
     },
     "nullable": [
@@ -354,9 +406,14 @@
       false,
       false,
       true,
+      true,
+      true,
+      true,
+      false,
+      true,
       false,
       false
     ]
   },
-  "hash": "bc7550f82071e122499a755b7b831098d430027fdabd01f0f5969ab18b2631dc"
+  "hash": "3e393f87e728e25ed33347d261fb73f13676c3fe9ab785cc1e81dc9c23555065"
 }

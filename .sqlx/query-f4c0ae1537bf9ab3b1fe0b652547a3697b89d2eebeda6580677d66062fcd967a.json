@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            f.id           AS \"follow_id!\",\n            f.state        AS \"follow_state!\",\n            f.created_at   AS \"follow_created_at!\",\n            a.id           AS \"actor_id!\",\n            a.ap_id        AS \"actor_ap_id!\",\n            a.preferred_username,\n            a.host,\n            a.display_name,\n            a.summary,\n            a.icon_url,\n            a.image_url,\n            a.inbox_url,\n            a.shared_inbox_url,\n            a.outbox_url,\n            a.followers_url,\n            a.following_url,\n            a.public_key_id,\n            a.public_key_pem,\n            a.ed25519_public_key_id,\n            a.ed25519_public_key_pem,\n            a.also_known_as as \"also_known_as: Json<Vec<String>>\",\n            a.moved_to_ap_id,\n            a.is_local,\n            a.actor_type,\n            a.manually_approves_followers,\n            a.fetched_at,\n            a.created_at   AS \"actor_created_at!\",\n            a.updated_at   AS \"actor_updated_at!\"\n        FROM follow f\n        JOIN actor a ON a.id = f.followed_actor_id\n        WHERE f.follower_actor_id = $1\n          AND f.state = 'accepted'\n          AND ($2::BIGINT IS NULL OR f.id < $2)\n        ORDER BY f.id DESC\n        LIMIT $3\n        ",
+  "query": "\n        SELECT\n            f.id           AS \"follow_id!\",\n            f.state        AS \"follow_state!\",\n            f.created_at   AS \"follow_created_at!\",\n            a.id           AS \"actor_id!\",\n            a.ap_id        AS \"actor_ap_id!\",\n            a.preferred_username,\n            a.host,\n            a.display_name,\n            a.summary,\n            a.icon_url,\n            a.image_url,\n            a.inbox_url,\n            a.shared_inbox_url,\n            a.outbox_url,\n            a.followers_url,\n            a.following_url,\n            a.public_key_id,\n            a.public_key_pem,\n            a.ed25519_public_key_id,\n            a.ed25519_public_key_pem,\n            a.also_known_as as \"also_known_as: Json<Vec<String>>\",\n            a.moved_to_ap_id,\n            a.is_local,\n            a.actor_type,\n            a.manually_approves_followers,\n            a.birthday,\n            a.location,\n            a.lang,\n            a.followed_message,\n            a.fields as \"fields: Json<Vec<crate::model::ActorField>>\",\n            a.fetched_at,\n            a.created_at   AS \"actor_created_at!\",\n            a.updated_at   AS \"actor_updated_at!\"\n        FROM follow f\n        JOIN actor a ON a.id = f.follower_actor_id\n        WHERE f.followed_actor_id = $1\n          AND f.state = 'accepted'\n          AND ($2::BIGINT IS NULL OR f.id < $2)\n        ORDER BY f.id DESC\n        LIMIT $3\n        ",
   "describe": {
     "columns": [
       {
@@ -280,6 +280,61 @@
       },
       {
         "ordinal": 25,
+        "name": "birthday",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "birthday"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
+        "name": "location",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 27,
+        "name": "lang",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "lang"
+          }
+        }
+      },
+      {
+        "ordinal": 28,
+        "name": "followed_message",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "followed_message"
+          }
+        }
+      },
+      {
+        "ordinal": 29,
+        "name": "fields: Json<Vec<crate::model::ActorField>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "fields"
+          }
+        }
+      },
+      {
+        "ordinal": 30,
         "name": "fetched_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -290,7 +345,7 @@
         }
       },
       {
-        "ordinal": 26,
+        "ordinal": 31,
         "name": "actor_created_at!",
         "type_info": "Timestamptz",
         "origin": {
@@ -301,7 +356,7 @@
         }
       },
       {
-        "ordinal": 27,
+        "ordinal": 32,
         "name": "actor_updated_at!",
         "type_info": "Timestamptz",
         "origin": {
@@ -346,9 +401,14 @@
       false,
       false,
       true,
+      true,
+      true,
+      true,
+      false,
+      true,
       false,
       false
     ]
   },
-  "hash": "fb2aaeded8b3514fe08d951867d0f64bcb12f7ef1a7a4f602a59275751f794f5"
+  "hash": "f4c0ae1537bf9ab3b1fe0b652547a3697b89d2eebeda6580677d66062fcd967a"
 }

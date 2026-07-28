@@ -66,6 +66,8 @@ const SUPPORTED_ENDPOINTS: &[&str] = &[
     "stats",
     // session whoami (= #158)。
     "i",
+    // プロフィール編集 (Aria の setName/setDescription/setIsLocked 等)。
+    "i/update",
     // in-app 通知フィード (= #206 PR2、Aria 通知タブ)。
     "i/notifications",
     "notifications/mark-all-as-read",

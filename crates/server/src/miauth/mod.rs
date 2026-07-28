@@ -99,6 +99,11 @@ pub fn router(state: AppState) -> Router {
         .route("/miauth/{uuid}", get(session::handle))
         .route("/api/miauth/{uuid}/check", post(check::handle))
         .route("/api/i", post(i::handle))
+        // プロフィール編集 (Aria の `INotifier.setName`/`setDescription`/
+        // `setIsLocked` 等が集約される endpoint)。未実装だと `ApiService.post`
+        // が 404 を投げ、プロフィール編集画面が crash する。詳細は
+        // [`i::update`] 参照。
+        .route("/api/i/update", post(i::update))
         // #206 PR2 ── in-app 通知フィード (Aria 通知タブ)
         .route("/api/i/notifications", post(notifications::list))
         .route(

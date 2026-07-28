@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use reqwest::StatusCode;
-use sakurasato_core::model::ActorRow;
+use sakurasato_core::model::{ActorField, ActorRow};
 use sakurasato_core::repo;
 use serde_json::Value as JsonValue;
 use thiserror::Error;
@@ -538,6 +538,8 @@ async fn update_existing(
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: sqlx::types::Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: sqlx::types::Json<Vec<ActorField>>",
             fetched_at, created_at, updated_at
         "#,
         parsed.preferred_username,

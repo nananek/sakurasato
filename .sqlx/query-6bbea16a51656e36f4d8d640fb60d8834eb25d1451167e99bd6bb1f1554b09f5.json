@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE actor SET\n            also_known_as = $2,\n            updated_at = now()\n        WHERE id = $1\n        RETURNING\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            fetched_at, created_at, updated_at\n        ",
+  "query": "\n        UPDATE actor SET\n            manually_approves_followers = $2,\n            updated_at = now()\n        WHERE id = $1\n        RETURNING\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            birthday, location, lang, followed_message,\n            fields as \"fields: Json<Vec<crate::model::ActorField>>\",\n            fetched_at, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -269,6 +269,61 @@
       },
       {
         "ordinal": 24,
+        "name": "birthday",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "birthday"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "location",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
+        "name": "lang",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "lang"
+          }
+        }
+      },
+      {
+        "ordinal": 27,
+        "name": "followed_message",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "followed_message"
+          }
+        }
+      },
+      {
+        "ordinal": 28,
+        "name": "fields: Json<Vec<crate::model::ActorField>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "fields"
+          }
+        }
+      },
+      {
+        "ordinal": 29,
         "name": "fetched_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -279,7 +334,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 30,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -290,7 +345,7 @@
         }
       },
       {
-        "ordinal": 26,
+        "ordinal": 31,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -304,7 +359,7 @@
     "parameters": {
       "Left": [
         "Int8",
-        "Jsonb"
+        "Bool"
       ]
     },
     "nullable": [
@@ -333,9 +388,14 @@
       false,
       false,
       true,
+      true,
+      true,
+      true,
+      false,
+      true,
       false,
       false
     ]
   },
-  "hash": "573ed86723a30b8af89f30f532f37a113967c6376053b3242578c8af638969ca"
+  "hash": "6bbea16a51656e36f4d8d640fb60d8834eb25d1451167e99bd6bb1f1554b09f5"
 }
