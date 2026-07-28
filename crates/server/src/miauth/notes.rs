@@ -413,6 +413,140 @@ pub async fn timeline(
     Json(notes).into_response()
 }
 
+/// Misskey `notes/mentions` body。
+///
+/// 対象 note は「viewer が `to`/`cc` に明示された note」(= mention/reply/DM)。
+/// `markAsRead` は Misskey 本家では note ごとの既読管理と連動するが、
+/// Sakurasato の `note` テーブルに既読フラグの概念が無いため受理はするが
+/// 無視する (= no-op。Aria 側の未読バッジ計算は `notifications` 系で別途行う)。
+#[derive(Debug, Deserialize, Default)]
+pub struct MentionsBody {
+    #[serde(default)]
+    pub i: Option<String>,
+    /// Misskey 既定 `false` ── `true` で著者を `accepted` follow している
+    /// mention だけに絞る。
+    #[serde(default)]
+    pub following: bool,
+    /// Misskey visibility 語彙 (`public`/`home`/`followers`/`specified`)。
+    /// 未指定なら絞り込みなし。
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(rename = "sinceId", default)]
+    pub since_id: Option<String>,
+    #[serde(rename = "untilId", default)]
+    pub until_id: Option<String>,
+}
+
+/// `POST /api/notes/mentions` handler ── 自分宛メンション一覧
+/// (= Aria の `MisskeyNotes.mentions` / `TimelineNotesNotifier` mentions タブ)。
+///
+/// 未実装だと Aria が 404 を Misskey エラー body としてパース出来ず
+/// `ApiService.post` で crash する (= `following/requests/*` と同じ crash 形)。
+///
+/// mention の定義は inbound `Create` 受領時の「我々宛」判定
+/// ([`crate::dispatch::note::handle_create`] の `addresses_us`、= `to`/`cc` に
+/// local actor の `ap_id` が含まれる) と揃えてある
+/// ([`repo::note::list_mentions_window`] 参照)。renote (Announce) は Misskey
+/// 本家でも `notes/mentions` の対象外なので、[`timeline`] と違い note のみを
+/// 返す (renote マージをしない)。
+pub async fn mentions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<MentionsBody>>,
+) -> Response {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    let Some(_token_row) =
+        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
+    else {
+        return auth::unauthorized("invalid or revoked token");
+    };
+
+    let Some(viewer) = resolve_self_actor(&state).await else {
+        return error_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor initialization failed",
+        );
+    };
+
+    let limit = body
+        .limit
+        .unwrap_or(TIMELINE_LIMIT_DEFAULT)
+        .clamp(1, TIMELINE_LIMIT_MAX);
+
+    // Misskey visibility 語彙 → 内部語彙。`notes/create` の
+    // `translate_create_body` と同じ変換表。
+    let visibility_filter = match body.visibility.as_deref() {
+        None => None,
+        Some("public") => Some("public"),
+        Some("home") => Some("unlisted"),
+        Some("followers") => Some("followers"),
+        Some("specified") => Some("direct"),
+        Some(other) => {
+            return error_resp(
+                StatusCode::BAD_REQUEST,
+                "INVALID_PARAM",
+                &format!("unknown visibility: {other:?}"),
+            );
+        }
+    };
+
+    // カーソル: id を境界 **時刻** に解決する (= notes/timeline と同じ流儀)。
+    // mentions は renote を含まないが、id 文字列は note id のみを想定するので
+    // "rn:" prefix は付かない前提 (来ても resolve_cursor_ts が announce 解決に
+    // フォールバックするだけで実害は無い)。
+    let until_ts = match body.until_id.as_deref() {
+        Some(s) => resolve_cursor_ts(&state, s).await,
+        None => None,
+    };
+    let since_ts = match body.since_id.as_deref() {
+        Some(s) => resolve_cursor_ts(&state, s).await,
+        None => None,
+    };
+
+    let entries = match repo::note::list_mentions_window(
+        state.pool(),
+        viewer.id,
+        &viewer.ap_id,
+        body.following,
+        visibility_filter,
+        since_ts,
+        until_ts,
+        limit,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(?err, "miauth notes/mentions: query failed");
+            return error_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "mentions query failed",
+            );
+        }
+    };
+
+    let ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
+    let summaries = bulk_load_note_summaries(state.pool(), &ids, viewer.id).await;
+    let empty = NoteSummary {
+        reactions: Vec::new(),
+        announce: None,
+        my_reaction: None,
+    };
+    let host = &state.config().server.host;
+    let notes: Vec<MissNote> = entries
+        .iter()
+        .map(|e| {
+            let summary = summaries.get(&e.id).unwrap_or(&empty);
+            timeline_entry_to_miss_note(e, summary, host)
+        })
+        .collect();
+    Json(notes).into_response()
+}
+
 /// home timeline のカーソル id 文字列を境界 `published_at` に解決する。
 ///
 /// `"rn:<announce_id>"` なら announce、それ以外は note id として扱う。混合
