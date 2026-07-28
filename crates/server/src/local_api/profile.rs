@@ -29,8 +29,12 @@ use crate::local_api::media::build_media_url;
 use crate::routes::actor::build_actor_json;
 use crate::state::AppState;
 
-const DISPLAY_NAME_MAX: usize = 100;
-const SUMMARY_MAX: usize = 5_000;
+/// `crate::miauth::i::update` (Misskey 互換 `i/update`) も同じ上限を共有する
+/// ── 同じ `actor.display_name` 列に書くので、書き込み経路ごとに上限が
+/// 違うと片方だけ通ってもう片方で 400 になる不整合が起きる。
+pub(crate) const DISPLAY_NAME_MAX: usize = 100;
+/// [`DISPLAY_NAME_MAX`] と同じ理由で `crate::miauth::i::update` と共有。
+pub(crate) const SUMMARY_MAX: usize = 5_000;
 const PUBLIC_URI: &str = "https://www.w3.org/ns/activitystreams#Public";
 
 /// PATCH ボディ。
@@ -145,13 +149,19 @@ pub async fn patch(State(state): State<AppState>, Json(req): Json<ProfileUpdate>
         })
     };
 
+    // TUI は birthday/location/lang/followedMessage/fields の編集 UI を持たない
+    // (= MiAuth `i/update` 専用フィールド、`crate::miauth::i::update` 参照) ──
+    // `..Default::default()` で常に「触らない」に倒す。
     let updated = match repo::actor::update_profile(
         state.pool(),
         local_actor.id,
-        display_name,
-        summary,
-        icon_url,
-        image_url,
+        repo::actor::ProfilePatch {
+            display_name,
+            summary,
+            icon_url,
+            image_url,
+            ..Default::default()
+        },
     )
     .await
     {
@@ -294,7 +304,9 @@ pub(crate) fn build_update_activity(actor: &ActorRow) -> JsonValue {
     })
 }
 
-async fn enqueue_to_followers(
+/// `crate::miauth::i::update` (Misskey 互換 `i/update`) からも呼ばれる ──
+/// プロフィール変更後のフォロワー配送は書き込み経路によらず同じ挙動にする。
+pub(crate) async fn enqueue_to_followers(
     state: &AppState,
     local_actor: &ActorRow,
     activity: &JsonValue,

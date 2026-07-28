@@ -9,6 +9,15 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use sqlx::types::Json;
 
+/// 1 件のプロフィール「カスタム項目」(Misskey `i/update` の `fields`)。
+/// `actor.fields` JSONB 列の要素形。任意の名前/値ペア (例: `"Website"` /
+/// `"https://..."`) をプロフィールに追加できる Misskey 独自機能。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActorField {
+    pub name: String,
+    pub value: String,
+}
+
 /// Row of the `actor` table.
 ///
 /// `private_key_pem` is intentionally excluded from `Serialize` and redacted
@@ -64,6 +73,23 @@ pub struct ActorRow {
     /// 自分の `manuallyApprovesFollowers` をどう扱うかは我々の管轄外。
     /// remote 側はキャッシュとして保持しておくに留める。
     pub manually_approves_followers: bool,
+    /// 誕生日 (Misskey `i/update` の `birthday`)。`"YYYY-MM-DD"` 形式の文字列を
+    /// そのまま保持する ── DATE 型にせず TEXT にすることで往復変換の手間と
+    /// タイムゾーンずれを避ける。フォーマット検証は書き込み経路
+    /// (`crate::miauth::i::update`, サーバ crate側) で行う。
+    pub birthday: Option<String>,
+    /// 所在地 (Misskey `i/update` の `location`)。自由記述、検証無し。
+    pub location: Option<String>,
+    /// 言語コード (Misskey `i/update` の `lang`)。自由記述、検証無し
+    /// (BCP-47 のような厳密な形式チェックはしない)。
+    pub lang: Option<String>,
+    /// フォローされた時に表示するメッセージ (Misskey `i/update` の
+    /// `followedMessage`)。
+    pub followed_message: Option<String>,
+    /// プロフィールのカスタム項目一覧 (Misskey `i/update` の `fields`)。
+    /// JSONB 配列で `NOT NULL DEFAULT '[]'` ── nullable にせず「項目無し」を
+    /// 空配列で表現する (Misskey wire も `fields` を常に配列で返す)。
+    pub fields: Json<Vec<ActorField>>,
     pub fetched_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -105,6 +131,11 @@ impl std::fmt::Debug for ActorRow {
                 "manually_approves_followers",
                 &self.manually_approves_followers,
             )
+            .field("birthday", &self.birthday)
+            .field("location", &self.location)
+            .field("lang", &self.lang)
+            .field("followed_message", &self.followed_message)
+            .field("fields", &self.fields)
             .field("fetched_at", &self.fetched_at)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)

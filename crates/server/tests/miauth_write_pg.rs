@@ -14,6 +14,9 @@
 //! - `reactions/delete { i, noteId }` で自分の reaction を消す
 //! - `following/create { i, userId }` で Follow 配送、`delivery_queue` に行が積まれる
 //! - `following/delete { i, userId }` で Undo Follow 配送
+//! - `i/update { i, description, avatarId, bannerId, isLocked, birthday, ... }`
+//!   でプロフィール編集 (Aria `INotifier` の crash fix)、`MeDetailed` を返し
+//!   `Update` activity をフォロワーに配送する
 //! - scope 細分化: `write:reactions` のみの token で `notes/create` が 401
 //!
 //! ## AGPL discipline
@@ -1238,5 +1241,388 @@ async fn following_requests_accept_already_accepted_returns_400(pool: PgPool) {
     assert_eq!(
         read_json(resp).await["error"]["code"],
         "FOLLOW_REQUEST_NOT_FOUND"
+    );
+}
+
+// ─── i/update (プロフィール編集 / Aria `INotifier` crash fix) ──────────────
+
+async fn seed_media(pool: &PgPool, owner: i64, key: &str) -> i64 {
+    repo::media::insert(
+        pool,
+        repo::media::NewMedia {
+            storage_key: key.into(),
+            media_type: "image/webp".into(),
+            width: 256,
+            height: 256,
+            byte_size: 2048,
+            kind: "attachment".into(),
+            alt_text: None,
+            owner_actor_id: owner,
+            duration_ms: None,
+        },
+    )
+    .await
+    .expect("seed media")
+    .id
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_sets_description_and_returns_me_detailed(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({"i": token, "description": "new bio"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    // Aria の `INotifier` は応答を `MeDetailed.fromJson` でパースするため、
+    // required bool が欠落すると crash する ── ここで代表的な数件を確認する。
+    assert_eq!(v["description"], "new bio");
+    assert!(v["isBot"].is_boolean());
+    assert!(v["isCat"].is_boolean());
+    assert!(v["isAdmin"].is_boolean());
+
+    let row = repo::actor::get_by_id(&pool, alice_id)
+        .await
+        .unwrap()
+        .expect("actor row must exist");
+    assert_eq!(row.summary.as_deref(), Some("new bio"));
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_clears_description_with_null(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({"i": token, "description": null}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(read_json(resp).await["description"].is_null());
+
+    let row = repo::actor::get_by_id(&pool, alice_id)
+        .await
+        .unwrap()
+        .expect("actor row must exist");
+    assert_eq!(row.summary, None);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_sets_birthday(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({"i": token, "birthday": "2000-01-02"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(read_json(resp).await["birthday"], "2000-01-02");
+
+    let row = repo::actor::get_by_id(&pool, alice_id)
+        .await
+        .unwrap()
+        .expect("actor row must exist");
+    assert_eq!(row.birthday.as_deref(), Some("2000-01-02"));
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_rejects_malformed_birthday(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({"i": token, "birthday": "not-a-date"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(read_json(resp).await["error"]["code"], "INVALID_PARAM");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_clears_birthday_with_null(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let _ = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({"i": token.clone(), "birthday": "2000-01-02"}),
+    )
+    .await;
+    let resp = post_json(app, "/api/i/update", json!({"i": token, "birthday": null})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(read_json(resp).await["birthday"].is_null());
+
+    let row = repo::actor::get_by_id(&pool, alice_id)
+        .await
+        .unwrap()
+        .expect("actor row must exist");
+    assert_eq!(row.birthday, None);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_sets_location_lang_and_followed_message(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({
+            "i": token,
+            "location": "Kyoto",
+            "lang": "ja-JP",
+            "followedMessage": "よろしくお願いします",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["location"], "Kyoto");
+    assert_eq!(v["lang"], "ja-JP");
+    assert_eq!(v["followedMessage"], "よろしくお願いします");
+
+    let row = repo::actor::get_by_id(&pool, alice_id)
+        .await
+        .unwrap()
+        .expect("actor row must exist");
+    assert_eq!(row.location.as_deref(), Some("Kyoto"));
+    assert_eq!(row.lang.as_deref(), Some("ja-JP"));
+    assert_eq!(
+        row.followed_message.as_deref(),
+        Some("よろしくお願いします")
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_sets_fields(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({
+            "i": token,
+            "fields": [
+                {"name": "Website", "value": "https://example.test"},
+                {"name": "Pronouns", "value": "she/her"},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["fields"][0]["name"], "Website");
+    assert_eq!(v["fields"][0]["value"], "https://example.test");
+    assert_eq!(v["fields"][1]["name"], "Pronouns");
+
+    let row = repo::actor::get_by_id(&pool, alice_id)
+        .await
+        .unwrap()
+        .expect("actor row must exist");
+    assert_eq!(row.fields.0.len(), 2);
+    assert_eq!(row.fields.0[0].name, "Website");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_fields_rejects_too_many_entries(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let fields: Vec<_> = (0..5)
+        .map(|i| json!({"name": format!("f{i}"), "value": "v"}))
+        .collect();
+    let resp = post_json(app, "/api/i/update", json!({"i": token, "fields": fields})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(read_json(resp).await["error"]["code"], "INVALID_PARAM");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_fields_empty_array_clears(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let _ = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({"i": token.clone(), "fields": [{"name": "a", "value": "b"}]}),
+    )
+    .await;
+    let resp = post_json(app, "/api/i/update", json!({"i": token, "fields": []})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(read_json(resp).await["fields"].as_array().unwrap().len(), 0);
+
+    let row = repo::actor::get_by_id(&pool, alice_id)
+        .await
+        .unwrap()
+        .expect("actor row must exist");
+    assert!(row.fields.0.is_empty());
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_unknown_fields_are_accepted_and_ignored(pool: PgPool) {
+    // Misskey クライアントの設定画面は40以上の項目を一括 PATCH で送る。
+    // Sakurasato がバックエンド列を持たない項目 (isBot 等) で 400 を返すと
+    // 画面全体が壊れるため、黙って無視して 200 を返すことを確認する。
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({
+            "i": token,
+            "isBot": true,
+            "isExplorable": false,
+            "mutedWords": [],
+            "fields": [{"name": "a", "value": "b"}],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_name_exceeds_limit_returns_400(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({"i": token, "name": "x".repeat(101)}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(read_json(resp).await["error"]["code"], "INVALID_PARAM");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_without_write_account_scope_is_401(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    // read:account だけでは書き込みできない。
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({"i": token, "description": "x"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_avatar_id_sets_icon_url(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let media_id = seed_media(&pool, alice_id, "avatar.webp").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({"i": token, "avatarId": media_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["avatarUrl"], "https://sakurasato.test/media/avatar.webp");
+
+    let row = repo::actor::get_by_id(&pool, alice_id)
+        .await
+        .unwrap()
+        .expect("actor row must exist");
+    assert_eq!(
+        row.icon_url.as_deref(),
+        Some("https://sakurasato.test/media/avatar.webp")
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_avatar_id_not_owned_returns_404(pool: PgPool) {
+    let _alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let bob_media_id = seed_media(&pool, bob_id, "bob-avatar.webp").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/i/update",
+        json!({"i": token, "avatarId": bob_media_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(read_json(resp).await["error"]["code"], "NO_SUCH_FILE");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn i_update_is_locked_flips_flag_and_enqueues_update_for_followers(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    accepted_follow(&pool, bob_id, alice_id).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    let resp = post_json(app, "/api/i/update", json!({"i": token, "isLocked": true})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(read_json(resp).await["isLocked"], true);
+
+    let row = repo::actor::get_by_id(&pool, alice_id)
+        .await
+        .unwrap()
+        .expect("actor row must exist");
+    assert!(row.manually_approves_followers);
+
+    // 鍵アカ切替 (= `actor lock`) と同じく、bob の inbox に Update が積まれる。
+    let queued: i64 = sqlx::query_scalar!("SELECT count(*) FROM delivery_queue")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert!(
+        queued >= 1,
+        "delivery_queue should have the Update activity"
     );
 }

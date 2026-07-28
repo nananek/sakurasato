@@ -55,6 +55,10 @@ mod tests {
         //   emoji.license TEXT + emoji.is_sensitive BOOLEAN を追加)
         // 0025 user_list (= リスト機能: user_list + user_list_member テーブルを追加)
         // 0026 video_media (= 動画添付対応: media.duration_ms / poster_storage_key を追加)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 26);
+        // 0027 actor_birthday (= MiAuth `i/update` の `birthday` フィールド用に
+        //   actor.birthday TEXT を追加。"YYYY-MM-DD" ISO 日付文字列)
+        // 0028 actor_profile_fields (= MiAuth `i/update` の location/lang/
+        //   followedMessage/fields 用に actor へ 4 列追加。fields は JSONB 配列)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 28);
     }
 }

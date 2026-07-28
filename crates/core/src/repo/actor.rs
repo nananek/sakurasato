@@ -118,6 +118,8 @@ where
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         "#,
         new.ap_id,
@@ -161,6 +163,8 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<ActorRow>>
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         FROM actor WHERE id = $1
         "#,
@@ -188,6 +192,8 @@ pub async fn list_by_ids(pool: &PgPool, ids: &[i64]) -> sqlx::Result<Vec<ActorRo
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         FROM actor WHERE id = ANY($1)
         "#,
@@ -214,6 +220,8 @@ pub async fn list_local(pool: &PgPool) -> sqlx::Result<Vec<ActorRow>> {
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         FROM actor WHERE is_local = TRUE
         ORDER BY id ASC
@@ -236,6 +244,8 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Act
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         FROM actor WHERE ap_id = $1
         "#,
@@ -263,6 +273,8 @@ pub async fn get_by_username_host(
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         FROM actor WHERE preferred_username = $1 AND host = $2
         "#,
@@ -300,6 +312,8 @@ pub async fn search_by_username_host(
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         FROM actor
         WHERE
@@ -344,6 +358,8 @@ pub async fn search(
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         FROM actor
         WHERE
@@ -373,30 +389,73 @@ pub async fn mark_fetched(pool: &PgPool, id: i64) -> sqlx::Result<()> {
     .map(|_| ())
 }
 
-/// Update the editable profile fields of a local actor (M7).
+/// [`update_profile`] のパラメータ。フィールドが増えるたびに引数を足すと
+/// 位置引数の順序ミスを踏みやすくなる (すべて `Option<Option<String>>` で
+/// 型システムが取り違えを検出できない) ため、構造体にまとめる。
 ///
-/// `display_name` / `summary` / `icon_url` / `image_url` のうち `Some` を
-/// 渡したフィールドだけ書き換える。`None` は「触らない」を意味する
-/// (= NULL を入れたいときは `Some(None)` を渡す ─ そのため Option<Option<...>>)。
+/// 各フィールド: 外側 `None` = 「触らない」、`Some(None)` = NULL に戻す
+/// (= クリア)、`Some(Some(v))` = `v` を設定。`fields` だけ列が `NOT NULL
+/// DEFAULT '[]'` (nullable ではない) なので二重 Option ではなく
+/// `Option<Vec<ActorField>>` ── `None` = 触らない、`Some(vec)` = 丸ごと置換
+/// (空 `vec![]` で全項目クリアに相当)。
+#[derive(Debug, Default)]
+pub struct ProfilePatch {
+    pub display_name: Option<Option<String>>,
+    pub summary: Option<Option<String>>,
+    pub icon_url: Option<Option<String>>,
+    pub image_url: Option<Option<String>>,
+    pub birthday: Option<Option<String>>,
+    pub location: Option<Option<String>>,
+    pub lang: Option<Option<String>>,
+    pub followed_message: Option<Option<String>>,
+    pub fields: Option<Vec<crate::model::ActorField>>,
+}
+
+impl ProfilePatch {
+    /// いずれか 1 フィールドでも `Some` (= 変更対象) なら `true`。呼び出し側が
+    /// 「DB 更新 + `Update` activity 配送が必要か」を判定するのに使う
+    /// (`crate::miauth::i::update` 参照)。
+    #[must_use]
+    pub fn has_changes(&self) -> bool {
+        self.display_name.is_some()
+            || self.summary.is_some()
+            || self.icon_url.is_some()
+            || self.image_url.is_some()
+            || self.birthday.is_some()
+            || self.location.is_some()
+            || self.lang.is_some()
+            || self.followed_message.is_some()
+            || self.fields.is_some()
+    }
+}
+
+/// Update the editable profile fields of a local actor (M7、`birthday` は
+/// M14 `i/update` で追加、`location`/`lang`/`followed_message`/`fields` も同)。
 ///
+/// [`ProfilePatch`] で指定した (= `Some` の) フィールドだけ書き換える。
 /// 返り値は更新後の actor 行。
 pub async fn update_profile(
     pool: &PgPool,
     id: i64,
-    display_name: Option<Option<String>>,
-    summary: Option<Option<String>>,
-    icon_url: Option<Option<String>>,
-    image_url: Option<Option<String>>,
+    patch: ProfilePatch,
 ) -> sqlx::Result<crate::model::ActorRow> {
+    let fields_flag = patch.fields.is_some();
+    let fields_value = serde_json::to_value(patch.fields.unwrap_or_default())
+        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
     sqlx::query_as!(
         crate::model::ActorRow,
         r#"
         UPDATE actor SET
-            display_name = CASE WHEN $2::BOOLEAN THEN $3 ELSE display_name END,
-            summary      = CASE WHEN $4::BOOLEAN THEN $5 ELSE summary      END,
-            icon_url     = CASE WHEN $6::BOOLEAN THEN $7 ELSE icon_url     END,
-            image_url    = CASE WHEN $8::BOOLEAN THEN $9 ELSE image_url    END,
-            updated_at   = now()
+            display_name     = CASE WHEN $2::BOOLEAN  THEN $3  ELSE display_name     END,
+            summary          = CASE WHEN $4::BOOLEAN  THEN $5  ELSE summary          END,
+            icon_url         = CASE WHEN $6::BOOLEAN  THEN $7  ELSE icon_url         END,
+            image_url        = CASE WHEN $8::BOOLEAN  THEN $9  ELSE image_url        END,
+            birthday         = CASE WHEN $10::BOOLEAN THEN $11 ELSE birthday         END,
+            location         = CASE WHEN $12::BOOLEAN THEN $13 ELSE location         END,
+            lang             = CASE WHEN $14::BOOLEAN THEN $15 ELSE lang             END,
+            followed_message = CASE WHEN $16::BOOLEAN THEN $17 ELSE followed_message END,
+            fields           = CASE WHEN $18::BOOLEAN THEN $19 ELSE fields           END,
+            updated_at       = now()
         WHERE id = $1
         RETURNING
             id, ap_id, preferred_username, host, display_name, summary,
@@ -406,17 +465,29 @@ pub async fn update_profile(
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         "#,
         id,
-        display_name.is_some(),
-        display_name.flatten(),
-        summary.is_some(),
-        summary.flatten(),
-        icon_url.is_some(),
-        icon_url.flatten(),
-        image_url.is_some(),
-        image_url.flatten(),
+        patch.display_name.is_some(),
+        patch.display_name.flatten(),
+        patch.summary.is_some(),
+        patch.summary.flatten(),
+        patch.icon_url.is_some(),
+        patch.icon_url.flatten(),
+        patch.image_url.is_some(),
+        patch.image_url.flatten(),
+        patch.birthday.is_some(),
+        patch.birthday.flatten(),
+        patch.location.is_some(),
+        patch.location.flatten(),
+        patch.lang.is_some(),
+        patch.lang.flatten(),
+        patch.followed_message.is_some(),
+        patch.followed_message.flatten(),
+        fields_flag,
+        fields_value,
     )
     .fetch_one(pool)
     .await
@@ -448,6 +519,8 @@ pub async fn set_also_known_as(
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         "#,
         id,
@@ -483,6 +556,8 @@ pub async fn set_moved_to(
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         "#,
         id,
@@ -517,6 +592,8 @@ pub async fn set_manually_approves_followers(
             ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,
             also_known_as as "also_known_as: Json<Vec<String>>",
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
+            birthday, location, lang, followed_message,
+            fields as "fields: Json<Vec<crate::model::ActorField>>",
             fetched_at, created_at, updated_at
         "#,
         id,
