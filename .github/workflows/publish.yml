@@ -85,11 +85,15 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # GitHub Actions cache を BuildKit に橋渡し ── server / media-proxy
-          # の Rust 段は cargo registry + target ディレクトリ重め。
-          # `scope=<name>` で 3 イメージ間のキャッシュ干渉を分ける。
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          # ビルドキャッシュは ghcr 上の専用イメージ (`sakurasato-cache-<name>`)
+          # に置く registry cache backend を使う ── `type=gha` はブランチ単位で
+          # スコープが分離され、defaultブランチ (develop) 以外の ref (develop
+          # 向け PR の feature branch 等) で書いたキャッシュが develop push の
+          # 実行に引き継がれない制約がある (build-cache-warm.yml 参照)。
+          # `type=registry` はブランチに依存しない共有キャッシュなので、PR で
+          # 温めたキャッシュがそのまま develop push (= 本 job) でヒットする。
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/sakurasato-cache-${{ matrix.name }}
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/sakurasato-cache-${{ matrix.name }},mode=max
           # provenance / sbom は M10+ で別 issue 化する (本 workflow は最小スコープ)。
           provenance: false
           sbom: false

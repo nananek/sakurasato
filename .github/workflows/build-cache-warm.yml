@@ -2,20 +2,36 @@ name: Build cache warm (develop PR)
 
 # develop 向け PR で 4 イメージ (server / media-proxy / versitygw / tui) を
 # push せず build するだけの軽量ジョブ。狙いは唯一つ ── **`publish.yml` と
-# 同じ GHA cache scope (`scope=<name>`, プレフィックス無し) に書き込んで
+# 同じ registry キャッシュ (`ghcr.io/.../sakurasato-cache-<name>`) に書き込んで
 # おくこと**。これにより、この PR が develop にマージされた瞬間に走る
 # `publish.yml` の実 build は cache-from でほぼ全レイヤーをヒットし、
 # 「マージしてから GHCR に上がるまで」の待ち時間を大きく縮める。
 #
-# `release-validation.yml` (main PR 専用) の `build-images` ジョブと構成は
-# 似ているが、あちらは `scope=release-validation-<name>` という**別**
-# scope を使い publish 用キャッシュを汚さない設計 (= 「壊れていないかの検証」
-# が目的なので副作用を避ける)。本 workflow は逆に「publish 用キャッシュを
-# 前倒しで温める」ことそのものが目的なので、意図的に scope を共有する。
+# **キャッシュ backend は `type=registry` (ghcr 上の専用イメージ) を使う。**
+# 当初 `type=gha` (GitHub Actions cache) で実装したが、GHA cache は
+# **ブランチ (ref) 単位でスコープが分離**されており、defaultブランチ
+# (= develop) で書かれたキャッシュは全ブランチから読めるものの、逆に
+# 非defaultブランチ (= develop 向け PR の feature branch) で書かれたキャッシュ
+# は「そのブランチ自身」と「そのブランチを head/base とする PR の実行」からしか
+# 読めない、という非対称な制約がある。このため `scope=<name>` を publish.yml
+# と揃えても、feature branch 上で書いたキャッシュは develop push (= 別 ref)
+# の実行には引き継がれず、実測でも改善が見られなかった (PR #330 の実測:
+# warm 導入前 9m37s〜10m50s、導入後 10m22s ── 誤差の範囲で無改善)。
+# `type=registry` はブランチに依存しない共有キャッシュなので、この制約を
+# 受けない。
 #
-# push しない (load のみ) ので GHCR への書き込み権限は不要。失敗しても
-# develop への PR マージ自体は妨げない (required check には登録しない) ──
-# あくまでキャッシュ最適化の補助ジョブなので、CI 本体の合否とは独立させる。
+# `release-validation.yml` (main PR 専用) の `build-images` ジョブとは別の
+# キャッシュ ref (`release-validation-<name>`) を使い、publish 用キャッシュを
+# 汚さない設計は維持する。
+#
+# push しない (load のみ、イメージ自体は publish しない) が、キャッシュ書き込み
+# のため ghcr への `packages: write` が必要。fork PR (= head repo が本リポジトリ
+# と異なる) では secrets / write 権限が GitHub 側で絞られる想定だが、念のため
+# job レベルで明示的にスキップする (= 意図しない ghcr 書き込み試行自体を防ぐ)。
+#
+# 失敗しても develop への PR マージ自体は妨げない (required check には登録
+# しない) ── あくまでキャッシュ最適化の補助ジョブなので、CI 本体の合否とは
+# 独立させる。
 on:
   pull_request:
     branches: [develop]
@@ -30,6 +46,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 # 同 PR への push 連発で並列起動しないよう PR 単位で集約する。
 concurrency:
@@ -40,6 +57,8 @@ jobs:
   warm:
     name: Warm ${{ matrix.name }}
     runs-on: ubuntu-latest
+    # fork からの PR には ghcr 書き込み権限を渡さない (defense-in-depth)。
+    if: github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -59,6 +78,13 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build ${{ matrix.name }} (no push, cache warm only)
         uses: docker/build-push-action@v7
         with:
@@ -68,8 +94,9 @@ jobs:
           push: false
           load: true
           tags: sakurasato-${{ matrix.name }}:build-cache-warm
-          # publish.yml と同じ scope。ここが本 workflow の唯一の目的。
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          # publish.yml と同じ registry キャッシュ ref。ここが本 workflow の
+          # 唯一の目的 (ブランチスコープに依存しない共有キャッシュへの書き込み)。
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/sakurasato-cache-${{ matrix.name }}
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/sakurasato-cache-${{ matrix.name }},mode=max
           provenance: false
           sbom: false
