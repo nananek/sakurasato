@@ -44,6 +44,7 @@ pub mod client;
 pub mod command;
 pub mod compose;
 pub mod content;
+pub mod emoji_admin;
 pub mod emoji_suggest;
 pub mod event;
 pub mod follow_list;

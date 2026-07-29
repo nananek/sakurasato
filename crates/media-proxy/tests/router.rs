@@ -15,7 +15,8 @@ use http_body_util::BodyExt;
 use image::{ImageBuffer, ImageFormat, Rgba};
 use sakurasato_core::Config;
 use sakurasato_core::config::{
-    DatabaseConfig, MediaProxyConfig, ServerConfig, ServerInfo, StorageConfig, VideoConfig,
+    DatabaseConfig, EmojiImportConfig, MediaProxyConfig, ServerConfig, ServerInfo, StorageConfig,
+    VideoConfig,
 };
 use sakurasato_media_proxy::ProxyState;
 use serde_json::Value;
@@ -53,6 +54,7 @@ fn make_config() -> Config {
             max_bytes: 4 * 1024 * 1024,
             max_pixels: 16_000_000,
             video: VideoConfig::default(),
+            emoji_import: EmojiImportConfig::default(),
         },
         miauth: None,
     }

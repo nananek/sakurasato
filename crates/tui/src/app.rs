@@ -145,6 +145,12 @@ pub enum Focus {
     /// 内部の state (`members` / `input`) で切り替わる (= 追加の `Focus`
     /// variant は増やさない)。
     Lists,
+    /// 絵文字管理画面 (Issue #328 系)。`:emojis` で開く。
+    /// `App::emoji_admin` が `Some` のときのみ取りうる。Local (自分の絵文字)
+    /// / Remote (DB キャッシュ済みリモート絵文字の検索+コピー) の 2 タブが
+    /// [`crate::emoji_admin::EmojiAdminScreen`] 内部の `tab` で切り替わる
+    /// (= `Lists` と同じ「画面内タブ、Focus は増やさない」設計)。
+    EmojiAdmin,
 }
 
 /// 現在 `App::notes` / `next_before_ts_ms` / `timeline_exhausted` が表示して
@@ -254,6 +260,9 @@ pub struct App {
     /// リスト機能の画面 state。`:lists` で開く。`Focus::Lists` のあいだ
     /// だけ `Some`。
     pub lists: Option<crate::lists::ListsScreen>,
+    /// 絵文字管理画面の state。`:emojis` で開く。`Focus::EmojiAdmin` の
+    /// あいだだけ `Some`。
+    pub emoji_admin: Option<crate::emoji_admin::EmojiAdminScreen>,
     /// Help overlay の scroll 状態。`Focus::Help` の入り口で `scroll = 0` に
     /// リセットされる ── 毎回先頭から読めるようにする。
     pub help_state: HelpState,
@@ -324,6 +333,7 @@ impl App {
             emoji_suggest: None,
             note_detail: None,
             lists: None,
+            emoji_admin: None,
             help_state: HelpState::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             last_compose_defaults,

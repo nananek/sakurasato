@@ -120,7 +120,9 @@ struct MisskeyEmojiBody {
 }
 
 /// 1 zip 全体の処理結果サマリ。CLI 出力 / テスト assertion 用。
-#[derive(Debug, Default, PartialEq, Eq)]
+/// `Serialize` はローカル API (`POST /api/v1/emojis/import`) が JSON として
+/// そのまま返すため (Issue #328 系)。
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ImportSummary {
     /// 成功して DB upsert + versitygw PUT まで完了した件数。
     pub imported: usize,
@@ -165,11 +167,14 @@ async fn run_import(config: Config, args: EmojiImportArgs) -> anyhow::Result<()>
 
 /// テスト・本番共通の主処理。`state` から media-proxy / DB / S3 client を引き、
 /// 任意の `Read + Seek` ベースの zip を 1 つ処理する。
+///
+/// `pub(crate)`: CLI (`run_import`) に加え、ローカル API
+/// (`local_api::emoji_admin::import`) からも同じロジックを呼ぶ (Issue #328 系)。
 #[allow(
     clippy::too_many_lines,
     reason = "single straight-line loop over emoji entries"
 )]
-async fn import_archive<R: Read + Seek>(
+pub(crate) async fn import_archive<R: Read + Seek>(
     state: &AppState,
     archive: &mut zip::ZipArchive<R>,
 ) -> anyhow::Result<ImportSummary> {

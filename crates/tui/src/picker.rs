@@ -34,23 +34,43 @@ pub enum PickerMode {
     Avatar,
     Header,
     Attachment,
+    /// 絵文字管理画面 (Issue #328 系) からの Misskey 形式 zip インポート。
+    /// `POST /api/v1/media` は叩かない (= `run_emoji_zip_import` が
+    /// `POST /api/v1/emojis/import` に raw zip を送る別経路)。
+    EmojiZip,
 }
 
 impl PickerMode {
     /// `POST /api/v1/media` の `kind` クエリ文字列。サーバ受理は
     /// `avatar|header|attachment` の 3 値固定 ([`crate::client::upload_media`])。
+    /// `EmojiZip` はこの API を叩かないため呼ばれない想定 (exhaustive match
+    /// のため値だけ埋める)。
     pub fn as_kind(self) -> &'static str {
         match self {
             Self::Avatar => "avatar",
             Self::Header => "header",
             Self::Attachment => "attachment",
+            Self::EmojiZip => "emoji_zip",
         }
     }
 
     /// UI 表示用ラベル。今は `as_kind` と同値だが、将来 `添付` のように
     /// ローカライズしたいときに分岐させる用に別関数で持つ。
     pub fn label(self) -> &'static str {
-        self.as_kind()
+        match self {
+            Self::EmojiZip => "emoji zip",
+            _ => self.as_kind(),
+        }
+    }
+
+    /// ファイル一覧に表示する拡張子フィルタ (小文字、`.` 無し)。`None` なら
+    /// 全ファイルを表示 (Avatar/Header/Attachment の従来挙動)。`EmojiZip` は
+    /// `.zip` 以外を隠し、誤選択を防ぐ。ディレクトリは常に表示するので対象外。
+    pub fn extension_filter(self) -> Option<&'static str> {
+        match self {
+            Self::EmojiZip => Some("zip"),
+            _ => None,
+        }
     }
 }
 
@@ -234,6 +254,14 @@ impl FilePicker {
             }
             // file_type は symlink を fail-open に扱う (= 通常 file/dir として判定)。
             let is_dir = dent.file_type().is_ok_and(|t| t.is_dir());
+            // 拡張子フィルタ (Issue #328 系: `EmojiZip` モードは `.zip` 以外を
+            // 隠す)。ディレクトリは常に descend 可能なので対象外。
+            if !is_dir
+                && let Some(ext) = self.mode.extension_filter()
+                && !name.to_ascii_lowercase().ends_with(&format!(".{ext}"))
+            {
+                continue;
+            }
             // metadata は render 前に一度読んでキャッシュ。`DirEntry::metadata`
             // は OS によっては readdir で得た値をそのまま使う最適化があるので、
             // `fs::metadata` を別途呼ぶより安い。render 時に同期 stat を走らせ
@@ -559,6 +587,48 @@ mod tests {
         assert_eq!(PickerMode::Avatar.as_kind(), "avatar");
         assert_eq!(PickerMode::Header.as_kind(), "header");
         assert_eq!(PickerMode::Attachment.as_kind(), "attachment");
+    }
+
+    #[test]
+    fn emoji_zip_mode_hides_non_zip_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_dir_all(tmp.path().join("emojis")).unwrap();
+        File::create(tmp.path().join("emojis/pack.zip")).unwrap();
+        File::create(tmp.path().join("emojis/PACK2.ZIP")).unwrap();
+        File::create(tmp.path().join("emojis/readme.txt")).unwrap();
+        File::create(tmp.path().join("emojis/cats")).unwrap();
+        let picker = FilePicker::new(PickerMode::EmojiZip, tmp.path().join("emojis"));
+        let names: Vec<&str> = picker.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"pack.zip"));
+        assert!(
+            names.contains(&"PACK2.ZIP"),
+            "extension match is case-insensitive"
+        );
+        assert!(!names.contains(&"readme.txt"));
+        assert!(!names.contains(&"cats"), "non-zip file must be hidden");
+    }
+
+    #[test]
+    fn emoji_zip_mode_still_shows_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_dir_all(tmp.path().join("root/subdir")).unwrap();
+        File::create(tmp.path().join("root/not-a-zip.txt")).unwrap();
+        let picker = FilePicker::new(PickerMode::EmojiZip, tmp.path().join("root"));
+        let names: Vec<&str> = picker.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"subdir"),
+            "directories bypass the extension filter"
+        );
+        assert!(!names.contains(&"not-a-zip.txt"));
+    }
+
+    #[test]
+    fn other_modes_are_unaffected_by_extension_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_tree(tmp.path());
+        let picker = FilePicker::new(PickerMode::Attachment, tmp.path().join("photos"));
+        let names: Vec<&str> = picker.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"dog.jpg"));
     }
 
     #[test]

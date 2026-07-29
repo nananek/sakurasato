@@ -97,6 +97,7 @@ fn make_config(host: &str) -> sakurasato_core::Config {
                 max_bytes: 1_000,
                 max_duration_secs: 300,
             },
+            emoji_import: sakurasato_core::config::EmojiImportConfig::default(),
         },
         miauth: None,
     }

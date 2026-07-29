@@ -89,6 +89,9 @@ pub struct PanelRects {
     /// リスト機能の一覧 / メンバー一覧領域 (= `ensure_visible` 用)。
     /// 非表示時は zero rect。
     pub lists: Rect,
+    /// 絵文字管理画面の一覧領域 (Local/Remote 共通、= `ensure_visible` 用)。
+    /// 非表示時は zero rect。
+    pub emoji_admin: Rect,
     /// Profile 画面の notes 一覧の各行ヒット位置。`timeline_rows` と同じ理由
     /// (可変高さ note を線形探索で解決する) で必要。非表示時は空。
     pub profile_notes_rows: ScrollHits,
@@ -102,6 +105,10 @@ pub type ScrollHits = hit::ScrollHits;
 ///
 /// `app` は `&mut` ── Help overlay scroll で、描画した content の総行数 /
 /// viewport を [`crate::app::HelpState`] に書き戻すため。
+#[allow(
+    clippy::too_many_lines,
+    reason = "各 overlay/画面の分岐を素直に並べているだけの straight-line 関数"
+)]
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
     let area = frame.area();
 
@@ -128,6 +135,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
     let mut notifications_rect = Rect::default();
     let mut follow_list_rect = Rect::default();
     let mut lists_rect = Rect::default();
+    let mut emoji_admin_rect = Rect::default();
     let rows = if matches!(app.focus, Focus::Profile)
         && let Some(profile) = app.current_profile()
     {
@@ -153,6 +161,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
         && let Some(ls) = app.lists.as_ref()
     {
         lists_rect = render_lists_screen(frame, timeline_area, app, ls);
+        ScrollHits::default()
+    } else if matches!(app.focus, Focus::EmojiAdmin)
+        && let Some(ea) = app.emoji_admin.as_ref()
+    {
+        emoji_admin_rect = render_emoji_admin_screen(frame, timeline_area, app, ea);
         ScrollHits::default()
     } else {
         render_timeline(frame, timeline_area, app)
@@ -229,6 +242,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
         notifications: notifications_rect,
         follow_list: follow_list_rect,
         lists: lists_rect,
+        emoji_admin: emoji_admin_rect,
         profile_notes_rows,
     }
 }
@@ -1517,6 +1531,179 @@ fn render_lists_screen(
     list_rect
 }
 
+/// 絵文字管理画面。Local (自分の絵文字) / Remote (DB キャッシュ済みリモート
+/// 絵文字の検索+コピー) の 2 タブを内部 state で描き分ける ──
+/// [`render_lists_screen`] と同じ組み立て。検索窓は入力中のみヘッダ行に出す。
+#[allow(
+    clippy::too_many_lines,
+    reason = "Local/Remote タブ + 検索窓を 1 関数に集約"
+)]
+fn render_emoji_admin_screen(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    ea: &crate::emoji_admin::EmojiAdminScreen,
+) -> Rect {
+    use crate::emoji_admin::EmojiAdminTab;
+
+    let palette = &app.theme.palette;
+    let tab_label = match ea.tab {
+        EmojiAdminTab::Local => "local",
+        EmojiAdminTab::Remote => "remote",
+    };
+    let count = match ea.tab {
+        EmojiAdminTab::Local => ea.local_items.len(),
+        EmojiAdminTab::Remote => ea.remote_items.len(),
+    };
+    let title = format!("  emojis — {tab_label} ({count})  ");
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style(palette, app.focus == Focus::EmojiAdmin))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let header_rect = Rect::new(inner.x, inner.y, inner.width, 1.min(inner.height));
+    if let Some(input) = ea.query_input.as_ref() {
+        let line = Line::from(vec![
+            Span::styled("  search: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                input.buffer.clone(),
+                Style::default().fg(palette.foreground),
+            ),
+            Span::styled("_", Style::default().fg(palette.accent)),
+        ]);
+        frame.render_widget(Paragraph::new(line), header_rect);
+    } else {
+        let hint = match ea.tab {
+            EmojiAdminTab::Local => {
+                "  [j/k=move  t=tab  i=import zip  /=search  r=refresh  Esc=close]"
+            }
+            EmojiAdminTab::Remote => {
+                "  [j/k=move  t=tab  Enter=copy to local  /=search  r=refresh  Esc=close]"
+            }
+        };
+        let header = Line::from(vec![Span::styled(hint, Style::default().fg(palette.muted))]);
+        frame.render_widget(Paragraph::new(header), header_rect);
+    }
+
+    let list_top = inner.y + header_rect.height;
+    let list_height = inner.height.saturating_sub(header_rect.height);
+    let list_rect = Rect::new(inner.x, list_top, inner.width, list_height);
+    if list_rect.height == 0 {
+        return list_rect;
+    }
+    let visible = list_rect.height as usize;
+
+    match ea.tab {
+        EmojiAdminTab::Local => {
+            if ea.local_items.is_empty() {
+                let msg = if ea.fetching {
+                    "  loading…"
+                } else {
+                    "  (no local emojis — press i to import a zip)"
+                };
+                let para = Paragraph::new(Line::from(Span::styled(
+                    msg.to_string(),
+                    Style::default().fg(palette.muted),
+                )));
+                frame.render_widget(para, list_rect);
+                return list_rect;
+            }
+            let top = ea.local_top.min(ea.local_items.len().saturating_sub(1));
+            let lines: Vec<Line<'static>> = ea
+                .local_items
+                .iter()
+                .enumerate()
+                .skip(top)
+                .take(visible)
+                .map(|(idx, item)| {
+                    let selected = idx == ea.local_cursor;
+                    let marker = if selected { "▶ " } else { "  " };
+                    let marker_style = if selected {
+                        Style::default()
+                            .fg(palette.accent_strong)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.muted)
+                    };
+                    Line::from(vec![
+                        Span::styled(marker.to_string(), marker_style),
+                        Span::styled(
+                            format!(":{}:", item.shortcode),
+                            Style::default().fg(palette.foreground),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            item.category.clone().unwrap_or_default(),
+                            Style::default().fg(palette.muted),
+                        ),
+                    ])
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), list_rect);
+        }
+        EmojiAdminTab::Remote => {
+            if ea.remote_items.is_empty() {
+                let msg = if ea.fetching {
+                    "  loading…"
+                } else {
+                    "  (no cached remote emojis — react to a remote post first)"
+                };
+                let para = Paragraph::new(Line::from(Span::styled(
+                    msg.to_string(),
+                    Style::default().fg(palette.muted),
+                )));
+                frame.render_widget(para, list_rect);
+                return list_rect;
+            }
+            let top = ea.remote_top.min(ea.remote_items.len().saturating_sub(1));
+            let lines: Vec<Line<'static>> = ea
+                .remote_items
+                .iter()
+                .enumerate()
+                .skip(top)
+                .take(visible)
+                .map(|(idx, item)| {
+                    let selected = idx == ea.remote_cursor;
+                    let marker = if selected { "▶ " } else { "  " };
+                    let marker_style = if selected {
+                        Style::default()
+                            .fg(palette.accent_strong)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.muted)
+                    };
+                    Line::from(vec![
+                        Span::styled(marker.to_string(), marker_style),
+                        Span::styled(
+                            format!(":{}:", item.shortcode),
+                            Style::default().fg(palette.foreground),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("@{}", item.host),
+                            Style::default().fg(palette.muted),
+                        ),
+                    ])
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), list_rect);
+        }
+    }
+    list_rect
+}
+
 /// #206 PR3: 通知一覧画面。1 件 1 行 (= wrap しない、`ensure_visible` の viewport
 /// = 行数前提)。各行は「カーソル ▶ / 未読 ● / 種別 glyph / notifier / 動詞 /
 /// reaction / 本文プレビュー」。色は全て theme palette 経由。
@@ -2660,6 +2847,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::EmojiSearch => "emoji",
         Focus::NoteDetail => "note",
         Focus::Lists => "lists",
+        Focus::EmojiAdmin => "emojis",
     };
     // Issue #131: in-flight な async 操作があれば左端 3 cells に spinner を
     // 出す。0 件のときも 3 cells 確保して後続 span の位置を揺らさない。
@@ -2851,6 +3039,11 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         help_entry(palette, ":unlock", "key-only mode off"),
         help_entry(palette, ":requests", "pending follow requests"),
         help_entry(palette, ":lists", "open lists screen"),
+        help_entry(
+            palette,
+            ":emojis",
+            "open emoji admin (import zip / copy remote)",
+        ),
         help_entry(palette, ":home", "back to home timeline"),
         help_entry(palette, ":q / :quit", "exit TUI"),
         help_entry(palette, "Tab", "complete command head"),
@@ -2873,6 +3066,15 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         help_entry(palette, "x", "remove member (in member list)"),
         help_entry(palette, "r", "refresh"),
         help_entry(palette, "Esc / q", "back (member list -> list, or close)"),
+        Line::from(""),
+        Line::from(Span::styled("emoji admin", help_section(palette))),
+        help_entry(palette, "j / k", "next / prev emoji"),
+        help_entry(palette, "t", "switch local / remote tab"),
+        help_entry(palette, "i", "import Misskey-format zip (file picker)"),
+        help_entry(palette, "Enter", "(remote tab) copy selected to local"),
+        help_entry(palette, "/", "search current tab"),
+        help_entry(palette, "r", "refresh current tab"),
+        help_entry(palette, "Esc / q", "back to timeline"),
         Line::from(""),
         Line::from(Span::styled("compose alt submit", help_section(palette))),
         help_entry(palette, "F2", "send (always works)"),

@@ -94,6 +94,7 @@ fn make_config(host: &str, media_socket: &str) -> sakurasato_core::Config {
             max_bytes: 4 * 1024 * 1024,
             max_pixels: 16_000_000,
             video: sakurasato_core::config::VideoConfig::default(),
+            emoji_import: sakurasato_core::config::EmojiImportConfig::default(),
         },
         miauth: None,
     }

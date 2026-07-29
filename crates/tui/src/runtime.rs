@@ -70,6 +70,14 @@ enum UploadOutcome {
         kind: PickerMode,
         message: String,
     },
+    /// 絵文字管理画面からの Misskey 形式 zip インポート成功。Local タブの
+    /// 一覧を差し替えるための再 fetch 結果も一緒に運ぶ (再 fetch 自体が
+    /// 失敗しても import は成功しているので空 `Vec` で運ぶ)。
+    EmojiZipImported {
+        summary: crate::client::EmojiImportSummary,
+        refreshed_local: Vec<crate::client::EmojiItem>,
+        label: String,
+    },
 }
 
 /// メイン関数。`main.rs` から呼ぶ唯一のエントリ。
@@ -223,6 +231,11 @@ async fn main_loop(
                 None => ls.ensure_visible(viewport),
             }
         }
+        // 絵文字管理画面のスクロール追従 (Local/Remote とも 1 件 1 行)。
+        if let Some(ea) = app.emoji_admin.as_mut() {
+            let viewport = last_rects.emoji_admin.height as usize;
+            ea.ensure_visible(viewport);
+        }
         // Issue #115: FollowList 画面のスクロール追従。avatar 表示時は 1 件 2 行、
         // 抑制時は 1 件 1 行 (= render_follow_list_screen と同じ row_step 計算)。
         // `last_rects.follow_list` は直前フレームで確定した一覧領域の Rect。
@@ -318,11 +331,16 @@ async fn handle_event(
     let before_focus = app.focus;
     let lists_input_active = app.lists.as_ref().is_some_and(|s| s.input.is_some());
     let picker_path_input_active = app.picker.as_ref().is_some_and(|p| p.path_input.is_some());
+    let emoji_admin_search_active = app
+        .emoji_admin
+        .as_ref()
+        .is_some_and(|s| s.query_input.is_some());
     let action = crate::event::translate_with_context(
         event,
         app.focus,
         lists_input_active,
         picker_path_input_active,
+        emoji_admin_search_active,
     );
     apply_action(action, app, api, page_size, rects, upload_tx).await;
     if images_active && app.focus != before_focus {
@@ -987,6 +1005,54 @@ async fn apply_action(
                 s.toggle_reveal();
             }
         }
+        Action::OpenEmojiAdmin => command_open_emoji_admin(app, api).await,
+        Action::EmojiAdminToggleTab => {
+            if let Some(s) = app.emoji_admin.as_mut() {
+                s.toggle_tab();
+            }
+        }
+        Action::EmojiAdminSelectNext => {
+            if let Some(s) = app.emoji_admin.as_mut() {
+                s.select_next();
+            }
+        }
+        Action::EmojiAdminSelectPrev => {
+            if let Some(s) = app.emoji_admin.as_mut() {
+                s.select_prev();
+            }
+        }
+        Action::EmojiAdminRefresh => emoji_admin_refresh(app, api).await,
+        Action::EmojiAdminStartImport => open_picker(app, PickerMode::EmojiZip),
+        Action::EmojiAdminCopySelected => emoji_admin_copy_selected(app, api).await,
+        Action::EmojiAdminClose => {
+            app.emoji_admin = None;
+            app.focus = Focus::Timeline;
+        }
+        Action::EmojiAdminSearchOpen => {
+            if let Some(s) = app.emoji_admin.as_mut() {
+                s.query_input = Some(crate::emoji_admin::QueryInput::new());
+            }
+        }
+        Action::EmojiAdminSearchChar(c) => {
+            if let Some(s) = app.emoji_admin.as_mut()
+                && let Some(input) = s.query_input.as_mut()
+            {
+                input.insert_char(c);
+            }
+        }
+        Action::EmojiAdminSearchBackspace => {
+            if let Some(s) = app.emoji_admin.as_mut()
+                && let Some(input) = s.query_input.as_mut()
+            {
+                input.backspace();
+            }
+        }
+        Action::EmojiAdminSearchSubmit => emoji_admin_search_submit(app, api).await,
+        Action::EmojiAdminSearchCancel => {
+            if let Some(s) = app.emoji_admin.as_mut() {
+                s.query_input = None;
+            }
+        }
     }
 }
 
@@ -1578,11 +1644,14 @@ fn open_picker(app: &mut App, mode: PickerMode) {
 
 /// `keep_compose = true` のときはピッカ閉じて Compose に戻る。Attachment
 /// モードでキャンセル / 完了したときに使う ── ピッカ前の入力中だった本文
-/// を失わないため (PR #43 review Minor)。
+/// を失わないため (PR #43 review Minor)。`EmojiZip` は絵文字管理画面から
+/// 開いたので、閉じたら (Timeline ではなく) `Focus::EmojiAdmin` に戻す。
 fn close_picker(app: &mut App, keep_compose: bool) {
     let mode = app.picker.as_ref().map(|p| p.mode);
     app.picker = None;
-    app.focus = if keep_compose || matches!(mode, Some(PickerMode::Attachment)) {
+    app.focus = if matches!(mode, Some(PickerMode::EmojiZip)) {
+        Focus::EmojiAdmin
+    } else if keep_compose || matches!(mode, Some(PickerMode::Attachment)) {
         Focus::Compose
     } else {
         Focus::Timeline
@@ -1658,6 +1727,19 @@ fn picker_select_file(
             StatusKind::Info,
             None,
         );
+        return;
+    }
+    if mode == PickerMode::EmojiZip {
+        close_picker(app, false);
+        app.set_status(format!("importing {label}..."), StatusKind::Info, None);
+        let api = api.clone();
+        let tx = upload_tx.clone();
+        let guard = InFlightGuard::new(app.in_flight.clone());
+        tokio::spawn(async move {
+            let _g = guard;
+            let outcome = run_emoji_zip_import(api, path, label).await;
+            let _ = tx.send(outcome).await;
+        });
         return;
     }
     app.pending_uploads = app.pending_uploads.saturating_add(1);
@@ -1852,6 +1934,72 @@ async fn run_upload(
                 },
             }
         }
+        PickerMode::EmojiZip => {
+            unreachable!("EmojiZip is intercepted in picker_select_file before run_upload")
+        }
+    }
+}
+
+/// 絵文字管理画面からの zip アップロード上限 (100 MiB)。
+/// `config/default.toml` の `media_proxy.emoji_import.max_zip_bytes` (既定値)
+/// と揃える ([`MAX_UPLOAD_BYTES`] と同じ「TUI 側でも先に弾く」設計)。
+const MAX_EMOJI_ZIP_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// 絵文字管理画面 (`Focus::EmojiAdmin`) からの zip インポートの本体。
+/// bytes を読み、`POST /api/v1/emojis/import` で取り込んだ後、Local タブの
+/// 一覧を再取得して差し替え結果ごと返す。
+async fn run_emoji_zip_import(
+    api: LocalApi,
+    path: std::path::PathBuf,
+    label: String,
+) -> UploadOutcome {
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.len() > MAX_EMOJI_ZIP_UPLOAD_BYTES => {
+            return UploadOutcome::Failed {
+                kind: PickerMode::EmojiZip,
+                message: format!(
+                    "file too large: {} bytes (max {MAX_EMOJI_ZIP_UPLOAD_BYTES})",
+                    meta.len()
+                ),
+            };
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return UploadOutcome::Failed {
+                kind: PickerMode::EmojiZip,
+                message: format!("stat {}: {err}", path.display()),
+            };
+        }
+    }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(err) => {
+            return UploadOutcome::Failed {
+                kind: PickerMode::EmojiZip,
+                message: format!("read {}: {err}", path.display()),
+            };
+        }
+    };
+    let summary = match api.import_emoji_zip(bytes).await {
+        Ok(s) => s,
+        Err(err) => {
+            return UploadOutcome::Failed {
+                kind: PickerMode::EmojiZip,
+                message: format!("import: {err}"),
+            };
+        }
+    };
+    // 再取得が失敗しても import 自体は成功済みなので、Local タブは空のまま
+    // (次の手動 refresh に任せる) にして成功扱いを維持する。
+    let refreshed_local = api
+        .list_emojis("", crate::emoji_suggest::FETCH_LIMIT)
+        .await
+        .map(|resp| resp.items)
+        .unwrap_or_default();
+    UploadOutcome::EmojiZipImported {
+        summary,
+        refreshed_local,
+        label,
     }
 }
 
@@ -1902,6 +2050,29 @@ fn handle_upload_outcome(app: &mut App, outcome: UploadOutcome) {
                 format!("{} upload failed: {message}", kind.label()),
                 StatusKind::Error,
                 Some(Duration::from_secs(8)),
+            );
+        }
+        UploadOutcome::EmojiZipImported {
+            summary,
+            refreshed_local,
+            label,
+        } => {
+            if let Some(s) = app.emoji_admin.as_mut() {
+                s.replace_local(refreshed_local);
+            }
+            app.set_status(
+                format!(
+                    "{label}: imported {} emojis ({} skipped, {} failed)",
+                    summary.imported,
+                    summary.skipped_not_downloaded + summary.skipped_invalid,
+                    summary.failed,
+                ),
+                if summary.failed > 0 {
+                    StatusKind::Warning
+                } else {
+                    StatusKind::Success
+                },
+                Some(Duration::from_secs(6)),
             );
         }
     }
@@ -2206,6 +2377,7 @@ async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
         Command::OpenRequests => command_open_requests(app, api).await,
         Command::OpenNotifications => command_open_notifications(app, api).await,
         Command::OpenLists => command_open_lists(app, api).await,
+        Command::OpenEmojiAdmin => command_open_emoji_admin(app, api).await,
         Command::HomeTimeline => command_home_timeline(app, api, page_size).await,
         Command::Renote => send_renote(app, api, page_size).await,
         Command::Unrenote => undo_renote(app, api, page_size).await,
@@ -2590,6 +2762,153 @@ async fn command_home_timeline(app: &mut App, api: &LocalApi, page_size: i64) {
         Err(err) => {
             app.set_status(
                 format!("home timeline fetch failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+// ─── 絵文字管理画面 (Issue #328 系) ─────────────────────────────────────
+
+/// `:emojis` ── 絵文字管理画面を開く + Local タブの初回 fetch。失敗しても
+/// 画面は開く (= 空表示でユーザに通知)。[`command_open_lists`] と同じ組み立て。
+async fn command_open_emoji_admin(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let mut screen = crate::emoji_admin::EmojiAdminScreen::new();
+    screen.fetching = true;
+    app.emoji_admin = Some(screen);
+    app.focus = Focus::EmojiAdmin;
+    match api.list_emojis("", crate::emoji_suggest::FETCH_LIMIT).await {
+        Ok(resp) => {
+            if let Some(s) = app.emoji_admin.as_mut() {
+                s.replace_local(resp.items);
+            }
+        }
+        Err(err) => {
+            if let Some(s) = app.emoji_admin.as_mut() {
+                s.fetching = false;
+            }
+            app.set_status(
+                format!(":emojis fetch failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `r` ── 現在タブ (Local/Remote) を、直近確定した検索クエリで再取得する。
+async fn emoji_admin_refresh(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(screen) = app.emoji_admin.as_ref() else {
+        return;
+    };
+    let tab = screen.tab;
+    let query = screen.committed_query.clone();
+    if let Some(s) = app.emoji_admin.as_mut() {
+        s.fetching = true;
+    }
+    match tab {
+        crate::emoji_admin::EmojiAdminTab::Local => {
+            match api
+                .search_local_emojis(&query, crate::emoji_suggest::FETCH_LIMIT)
+                .await
+            {
+                Ok(resp) => {
+                    if let Some(s) = app.emoji_admin.as_mut() {
+                        s.replace_local(resp.items);
+                    }
+                }
+                Err(err) => {
+                    if let Some(s) = app.emoji_admin.as_mut() {
+                        s.fetching = false;
+                    }
+                    app.set_status(
+                        format!("refresh failed: {err}"),
+                        StatusKind::Error,
+                        Some(Duration::from_secs(6)),
+                    );
+                }
+            }
+        }
+        crate::emoji_admin::EmojiAdminTab::Remote => {
+            match api
+                .search_remote_emojis(&query, crate::emoji_suggest::FETCH_LIMIT)
+                .await
+            {
+                Ok(resp) => {
+                    if let Some(s) = app.emoji_admin.as_mut() {
+                        s.replace_remote(resp.items);
+                    }
+                }
+                Err(err) => {
+                    if let Some(s) = app.emoji_admin.as_mut() {
+                        s.fetching = false;
+                    }
+                    app.set_status(
+                        format!("refresh failed: {err}"),
+                        StatusKind::Error,
+                        Some(Duration::from_secs(6)),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 検索窓 `Enter` ── 入力を確定し、現在タブを新しいクエリで再取得する。
+async fn emoji_admin_search_submit(app: &mut App, api: &LocalApi) {
+    let Some(query) = app
+        .emoji_admin
+        .as_ref()
+        .and_then(|s| s.query_input.as_ref())
+        .map(|q| q.value().to_string())
+    else {
+        return;
+    };
+    if let Some(s) = app.emoji_admin.as_mut() {
+        s.committed_query = query;
+        s.query_input = None;
+    }
+    emoji_admin_refresh(app, api).await;
+}
+
+/// Remote タブ `Enter` ── 選択中のリモート絵文字を確認プロンプト無しで
+/// 即座にローカルへコピーする ([`requests_mutate_selected`] の `a` と同じ
+/// 「即時実行」パターン、shortcode はリネームせず元のまま)。
+async fn emoji_admin_copy_selected(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(screen) = app.emoji_admin.as_ref() else {
+        return;
+    };
+    if screen.tab != crate::emoji_admin::EmojiAdminTab::Remote {
+        return;
+    }
+    let Some(target) = screen.current_remote() else {
+        app.set_status(
+            "no remote emoji selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(4)),
+        );
+        return;
+    };
+    let id = target.id;
+    let shortcode = target.shortcode.clone();
+    match api.copy_remote_emoji_to_local(id).await {
+        Ok(item) => {
+            if let Some(s) = app.emoji_admin.as_mut() {
+                s.upsert_local(item);
+            }
+            app.set_status(
+                format!("copied :{shortcode}: to local emojis"),
+                StatusKind::Success,
+                Some(Duration::from_secs(5)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("copy failed: {err}"),
                 StatusKind::Error,
                 Some(Duration::from_secs(6)),
             );

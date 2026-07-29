@@ -539,6 +539,66 @@ impl LocalApi {
         self.get_json(&path).await
     }
 
+    /// `GET /api/v1/emojis?q=&limit=` ── 絵文字管理画面 Local タブの部分一致
+    /// 検索。既存 [`Self::list_emojis`] (emoji サジェスト用、前方一致固定)
+    /// とは別に、ユーザー入力をそのまま `q` (ILIKE 部分一致) で投げる。
+    pub async fn search_local_emojis(
+        &self,
+        q: &str,
+        limit: i64,
+    ) -> Result<EmojiListResponse, ApiError> {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("q", q)
+            .append_pair("limit", &limit.to_string())
+            .finish();
+        let path = format!("/api/v1/emojis?{query}");
+        self.get_json(&path).await
+    }
+
+    /// `POST /api/v1/emojis/import` ── 絵文字管理画面からの Misskey 形式 zip
+    /// アップロード。raw body で zip バイト列をそのまま送る (`upload_media`
+    /// と同じ raw POST パターン)。
+    pub async fn import_emoji_zip(&self, body: Vec<u8>) -> Result<EmojiImportSummary, ApiError> {
+        let request = self
+            .request_builder(Method::POST, "/api/v1/emojis/import")?
+            .header(CONTENT_TYPE, "application/zip")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// `GET /api/v1/emojis/remote?q=&limit=` ── DB にキャッシュ済みの
+    /// リモート絵文字を検索する (新規に外部インスタンスへ fetch はしない)。
+    pub async fn search_remote_emojis(
+        &self,
+        q: &str,
+        limit: i64,
+    ) -> Result<RemoteEmojiListResponse, ApiError> {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("q", q)
+            .append_pair("limit", &limit.to_string())
+            .finish();
+        let path = format!("/api/v1/emojis/remote?{query}");
+        self.get_json(&path).await
+    }
+
+    /// `POST /api/v1/emojis/local/from-remote` ── リモート絵文字をローカルに
+    /// コピーする (shortcode はリネームせず元のまま)。
+    pub async fn copy_remote_emoji_to_local(
+        &self,
+        remote_emoji_id: i64,
+    ) -> Result<EmojiItem, ApiError> {
+        let body = serde_json::to_vec(&CopyRemoteEmojiRequest { remote_emoji_id })?;
+        let request = self
+            .request_builder(Method::POST, "/api/v1/emojis/local/from-remote")?
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
     /// `POST /api/v1/actor/lock` ── 鍵アカ運用に切替 (Issue #66 / M12)。
     pub async fn actor_lock(&self) -> Result<LockResponse, ApiError> {
         self.post_json_no_body("/api/v1/actor/lock").await
@@ -1141,6 +1201,41 @@ impl EmojiItem {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmojiListResponse {
     pub items: Vec<EmojiItem>,
+}
+
+/// `POST /api/v1/emojis/import` のレスポンス。
+/// `server::emoji_import::ImportSummary` と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmojiImportSummary {
+    pub imported: usize,
+    pub skipped_not_downloaded: usize,
+    pub skipped_invalid: usize,
+    pub failed: usize,
+}
+
+/// `GET /api/v1/emojis/remote` の各要素。
+/// `server::local_api::emoji_admin::RemoteEmojiItem` と JSON 形を合わせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteEmojiItem {
+    pub id: i64,
+    pub shortcode: String,
+    pub host: String,
+    pub url: String,
+    pub media_type: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteEmojiListResponse {
+    pub items: Vec<RemoteEmojiItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct CopyRemoteEmojiRequest {
+    remote_emoji_id: i64,
 }
 
 /// `POST /api/v1/actor/{lock,unlock}` のレスポンス。

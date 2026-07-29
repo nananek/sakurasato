@@ -45,6 +45,12 @@
 //! - `POST /api/v1/lists/{id}/members` / `DELETE /api/v1/lists/{id}/members/{actor_id}`
 //!   ── リストメンバー追加・削除
 //! - `GET /api/v1/timeline/list/{id}` ── リストタイムライン ([`user_list`])
+//! - `POST /api/v1/emojis/import` ── TUI 絵文字管理画面からの Misskey 形式
+//!   zip アップロード + インポート ([`emoji_admin`])
+//! - `GET /api/v1/emojis/remote?q=&limit=` ── DB キャッシュ済みリモート絵文字
+//!   の検索 ([`emoji_admin`])
+//! - `POST /api/v1/emojis/local/from-remote` ── リモート絵文字をローカルに
+//!   コピー (リネーム無し、[`emoji_admin`])
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -61,6 +67,7 @@ use crate::state::AppState;
 pub mod actor;
 pub mod actor_admin;
 pub mod auth;
+pub mod emoji_admin;
 pub mod emoji_tag;
 pub mod emojis;
 pub mod follow;
@@ -94,6 +101,11 @@ pub fn router(state: AppState) -> Router {
             .max(state.config().media_proxy.video.max_bytes),
     )
     .unwrap_or(usize::MAX);
+    // TUI 絵文字管理画面からの Misskey 形式 zip アップロード上限。画像/動画
+    // アップロードとは別枠 (§9 `emoji_import.max_zip_bytes`、既定 100 MiB)。
+    let emoji_zip_upload_max =
+        usize::try_from(state.config().media_proxy.emoji_import.max_zip_bytes)
+            .unwrap_or(usize::MAX);
 
     Router::new()
         .route("/api/v1/whoami", get(whoami::handle))
@@ -128,6 +140,18 @@ pub fn router(state: AppState) -> Router {
         // M8: ローカル user が自分の Note にリアクションを付けて連合先に通知。
         // POST = 作成 (EmojiReact / Like)、DELETE = 取り消し (Undo)。
         .route("/api/v1/emojis", get(emojis::list))
+        // TUI 絵文字管理画面 (`:emojis`)。zip インポートはボディサイズ上限を
+        // 画像/動画アップロードとは別枠 (`emoji_import.max_zip_bytes`) で拡張する。
+        .route(
+            "/api/v1/emojis/import",
+            post(emoji_admin::import)
+                .layer(axum::extract::DefaultBodyLimit::max(emoji_zip_upload_max)),
+        )
+        .route("/api/v1/emojis/remote", get(emoji_admin::search_remote))
+        .route(
+            "/api/v1/emojis/local/from-remote",
+            post(emoji_admin::copy_from_remote),
+        )
         .route("/api/v1/reactions", post(reactions::create))
         .route(
             "/api/v1/reactions/{id}",
