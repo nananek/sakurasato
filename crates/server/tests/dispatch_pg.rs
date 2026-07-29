@@ -2639,6 +2639,99 @@ async fn create_with_multiple_emoji_tags_learns_all(pool: PgPool) {
     );
 }
 
+/// [[claude-review-330]]: Note本文の Emoji tag 学習には上限
+/// (`emoji_learn::MAX_EMOJI_TAGS_PER_NOTE` = 32) があり、超過分は学習
+/// されない。上限が無いと、未キャッシュの tag ごとに media-proxy fetch を
+/// 直列 await するため、悪意ある大量 tag で inbox 処理を長時間ブロック
+/// させる増幅型 `DoS` になりうる (最小の Emoji tag は ~150 バイトなので
+/// inbox body 上限 1MiB に対し数千件詰め込める)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_with_emoji_tags_exceeding_cap_only_learns_up_to_max(pool: PgPool) {
+    // MAX_EMOJI_TAGS_PER_NOTE (32) を超える件数を仕込む。
+    const TAG_COUNT: usize = 35;
+    const EXPECTED_LEARNED: usize = 32;
+
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let follow_ap = format!("https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-bob-e3");
+    let f = repo::follow::insert_pending(&pool, &follow_ap, local.id, remote.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, f.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let tags: Vec<serde_json::Value> = (0..TAG_COUNT)
+        .map(|i| {
+            serde_json::json!({
+                "type": "Emoji",
+                "id": format!("https://remote.test/emojis/cap_{i}"),
+                "name": format!(":cap_{i}:"),
+                "icon": {"type": "Image", "mediaType": "image/png", "url": format!("https://remote.test/files/cap_{i}.png")},
+            })
+        })
+        .collect();
+
+    let note_id = "https://remote.test/notes/note-with-many-emojis";
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.test/users/bob/activities/create-emoji-cap",
+        "type": "Create",
+        "actor": remote.ap_id,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": {
+            "id": note_id,
+            "type": "Note",
+            "attributedTo": remote.ap_id,
+            "content": "many emojis",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "published": "2026-05-31T12:00:00Z",
+            "tag": tags,
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let mut learned_count = 0;
+    for i in 0..TAG_COUNT {
+        let ap_id = format!("https://remote.test/emojis/cap_{i}");
+        if repo::emoji::get_by_ap_id(&pool, &ap_id)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            learned_count += 1;
+        }
+    }
+    assert_eq!(
+        learned_count, EXPECTED_LEARNED,
+        "only up to the per-note cap should be learned"
+    );
+}
+
 /// Update.object.tag に Emoji があれば学習される。`update_content` による
 /// content/summary 更新とは独立した経路であることを確認する。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

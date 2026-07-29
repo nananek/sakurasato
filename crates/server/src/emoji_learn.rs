@@ -296,10 +296,25 @@ async fn fetch_and_cache_remote_emoji(
     Ok((storage_key, media_type))
 }
 
+/// 1 Note あたりに学習する Emoji tag の上限。
+///
+/// reaction 学習 (`dispatch/reaction.rs::learn_emoji_tag`) は content と
+/// 一致する 1 件だけを処理するためこの種の上限が要らなかったが、Note 本文の
+/// 全件学習 ([`learn_note_emoji_tags`]) にはその歯止めが無い。inbox の body
+/// サイズ上限は 1 MiB (`extract.rs`) だが、最小限の Emoji tag オブジェクト
+/// (`{"type":"Emoji","id":"...","name":":x:","icon":{"url":"...","mediaType":"..."}}`)
+/// は 150 バイト程度に収まるため、1 リクエストに数千件詰め込める。未キャッシュ
+/// の tag ごとに `learn_emoji_tag_object` → media-proxy fetch (per-request
+/// timeout) を **同期的に直列 fetch** するため、上限が無いと inbox 処理が
+/// 長時間ブロックされる増幅型の可用性攻撃になりうる。超過分は学習せず
+/// `warn!` ログのみ残す (= silent に切り捨てない、運用者が気付けるように)。
+const MAX_EMOJI_TAGS_PER_NOTE: usize = 32;
+
 /// Note (Create/Update/Announce fetch-store 共通) の `tag` 配列から remote
-/// custom emoji を **全件** 学習する。reaction 用 (`dispatch/reaction.rs::
-/// learn_emoji_tag`) と異なり content との shortcode 一致は見ない ──
-/// 投稿本文には複数のカスタム絵文字が使われうるため。
+/// custom emoji を学習する (上限 [`MAX_EMOJI_TAGS_PER_NOTE`] 件まで)。
+/// reaction 用 (`dispatch/reaction.rs::learn_emoji_tag`) と異なり content
+/// との shortcode 一致は見ない ── 投稿本文には複数のカスタム絵文字が使われ
+/// うるため。
 ///
 /// `author_ap_id`の host 抽出に失敗したら (= 不正な URL 等) 即 default
 /// (silent no-op)。`tags`が配列でなければ同様に no-op。
@@ -324,6 +339,14 @@ pub(crate) async fn learn_note_emoji_tags(
     for tag in tag_array {
         if !is_emoji_tag(tag) {
             continue;
+        }
+        if summary.emoji_tags_seen >= MAX_EMOJI_TAGS_PER_NOTE {
+            warn!(
+                author_host,
+                max = MAX_EMOJI_TAGS_PER_NOTE,
+                "Note has more Emoji tags than the per-note learning cap; remaining tags skipped"
+            );
+            break;
         }
         summary.emoji_tags_seen += 1;
         if learn_emoji_tag_object(state, &author_host, tag)
