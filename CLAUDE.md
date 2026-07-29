@@ -313,7 +313,8 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 ### CI / 自動化（`.github/`）
 - **CI** (`ci.yml`): `cargo fmt --check` / `clippy -D warnings` / `test`。`main`・`develop` の push と PR。required status check = `ci`。`Cargo.toml` が無い間はスキップして緑（M1 で本稼働）。
 - **Publish** (`publish.yml`): タグ push (`YYYY.MM.patch`) と `develop` push で発火。ghcr に `sakurasato-{server,media-proxy,versitygw}` を public で push する。BuildKit + GitHub Actions cache (`type=gha,scope=<name>`) を使うことで 3 イメージ並列ビルドが現実時間内に収まる。**新しい deploy host は `docker compose -f docker-compose.yml -f docker-compose.ghcr.yml pull` で取得**（§9 参照）。
-- **Release Validation** (`release-validation.yml`): **`main` 向け PR でのみ発火** する重量級ゲート。`develop` 内 PR では発火しない（= 開発体験は ci.yml + claude-review に任せる）。2 ジョブ:
+- **Build cache warm** (`build-cache-warm.yml`): `develop` 向け PR で発火。server / media-proxy / versitygw / tui の 4 Dockerfile を push せず build するだけの補助ジョブ（load only、ghcr への書き込み権限は不要）。`publish.yml` と**同じ** GHA cache scope (`scope=<name>`、`release-validation.yml` の `release-validation-<name>` とは別) に書き込むことが唯一の目的 ── develop へのマージ直後に走る `publish.yml` の実 build がこのキャッシュにヒットし、「マージしてから GHCR に上がるまで」の待ち時間を縮める。required status check には登録しない（失敗しても PR マージを妨げない、あくまでキャッシュ最適化）。
+- **Release Validation** (`release-validation.yml`): **`main` 向け PR でのみ発火** する重量級ゲート。`develop` 内 PR では発火しない（= 開発体験は ci.yml + claude-review + build-cache-warm.yml に任せる）。2 ジョブ:
   - `build-images` — server / media-proxy / versitygw / tui の 4 Dockerfile を `linux/amd64` で並列 build (load only、ghcr push なし)。どの 1 つが壊れたかが matrix UI で即わかる。
   - `stack-smoke` — secrets を ephemeral 生成 → `docker compose up -d --build` (dev overlay で 8080/5432/7070 を 127.0.0.1 露出) → `/.well-known/nodeinfo` と `/nodeinfo/2.1` を curl --retry で probe → `down -v`。「binary が起動しない / config パース不能 / DB migration 失敗」を release 前に検出する。
 - **CodeQL** (`codeql.yml`): Rust SAST（`build-mode: none`）。`.rs`/`Cargo.*` 変更時と週次。

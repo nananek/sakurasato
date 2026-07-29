@@ -1,0 +1,75 @@
+name: Build cache warm (develop PR)
+
+# develop 向け PR で 4 イメージ (server / media-proxy / versitygw / tui) を
+# push せず build するだけの軽量ジョブ。狙いは唯一つ ── **`publish.yml` と
+# 同じ GHA cache scope (`scope=<name>`, プレフィックス無し) に書き込んで
+# おくこと**。これにより、この PR が develop にマージされた瞬間に走る
+# `publish.yml` の実 build は cache-from でほぼ全レイヤーをヒットし、
+# 「マージしてから GHCR に上がるまで」の待ち時間を大きく縮める。
+#
+# `release-validation.yml` (main PR 専用) の `build-images` ジョブと構成は
+# 似ているが、あちらは `scope=release-validation-<name>` という**別**
+# scope を使い publish 用キャッシュを汚さない設計 (= 「壊れていないかの検証」
+# が目的なので副作用を避ける)。本 workflow は逆に「publish 用キャッシュを
+# 前倒しで温める」ことそのものが目的なので、意図的に scope を共有する。
+#
+# push しない (load のみ) ので GHCR への書き込み権限は不要。失敗しても
+# develop への PR マージ自体は妨げない (required check には登録しない) ──
+# あくまでキャッシュ最適化の補助ジョブなので、CI 本体の合否とは独立させる。
+on:
+  pull_request:
+    branches: [develop]
+    paths-ignore:
+      # Dockerfile が読む成果物 (crates/config/migrations/vendor) に無関係な
+      # 変更ではキャッシュを温める意味が薄い。ci.yml と揃える。
+      - "compose/docker-compose.federation-*.yml"
+      - "compose/federation-test/**"
+      - "scripts/federation-test/**"
+      - "tests/federation/**"
+      - "**/*.md"
+
+permissions:
+  contents: read
+
+# 同 PR への push 連発で並列起動しないよう PR 単位で集約する。
+concurrency:
+  group: build-cache-warm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    name: Warm ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            dockerfile: docker/server.Dockerfile
+          - name: media-proxy
+            dockerfile: docker/media-proxy.Dockerfile
+          - name: versitygw
+            dockerfile: docker/versitygw.Dockerfile
+          - name: tui
+            dockerfile: docker/tui.Dockerfile
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build ${{ matrix.name }} (no push, cache warm only)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: sakurasato-${{ matrix.name }}:build-cache-warm
+          # publish.yml と同じ scope。ここが本 workflow の唯一の目的。
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          provenance: false
+          sbom: false
