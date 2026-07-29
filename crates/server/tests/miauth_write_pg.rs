@@ -76,6 +76,7 @@ mod common {
                 max_bytes: 1024 * 1024,
                 max_pixels: 1_000_000,
                 video: sakurasato_core::config::VideoConfig::default(),
+                emoji_import: sakurasato_core::config::EmojiImportConfig::default(),
             },
             miauth: Some(MiAuthConfig {
                 listen: "unix:/tmp/miauth.sock".into(),

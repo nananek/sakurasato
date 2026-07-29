@@ -472,6 +472,11 @@ pub struct MediaProxyConfig {
     /// [`VideoConfig::default`] に倒れる (= 既存 deploy への影響ゼロ)。
     #[serde(default)]
     pub video: VideoConfig,
+    /// Misskey 形式絵文字 zip インポートの上限。`[media_proxy.emoji_import]`
+    /// を config.toml に書かなければ [`EmojiImportConfig::default`] に倒れる
+    /// (= 既存 deploy への影響ゼロ)。
+    #[serde(default)]
+    pub emoji_import: EmojiImportConfig,
 }
 
 /// 動画添付 (`video/mp4` / `video/webm`) の上限設定。
@@ -505,6 +510,30 @@ fn default_video_max_bytes() -> u64 {
 
 fn default_video_max_duration_secs() -> u64 {
     300 // 5 分
+}
+
+/// TUI からの Misskey 形式絵文字 zip アップロードの上限設定。
+///
+/// zip 内部の 1 emoji あたりの上限 (`emoji_import::MAX_IMAGE_BYTES` = 2 MiB) や
+/// 件数上限 (`MAX_EMOJIS` = 10,000) とは別に、リクエストボディ全体 (= zip
+/// ファイルそのもの) のサイズを axum `DefaultBodyLimit` で先に弾く。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmojiImportConfig {
+    /// zip アップロードの最大バイト数。既定 100 MiB。
+    #[serde(default = "default_emoji_import_max_zip_bytes")]
+    pub max_zip_bytes: u64,
+}
+
+impl Default for EmojiImportConfig {
+    fn default() -> Self {
+        Self {
+            max_zip_bytes: default_emoji_import_max_zip_bytes(),
+        }
+    }
+}
+
+fn default_emoji_import_max_zip_bytes() -> u64 {
+    104_857_600 // 100 MiB
 }
 
 /// `MiAuth` 互換 API endpoint (= 親 issue #150 / M14 #157) の設定。

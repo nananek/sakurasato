@@ -78,6 +78,7 @@ mod common {
                 max_bytes: 1024 * 1024,
                 max_pixels: 1_000_000,
                 video: sakurasato_core::config::VideoConfig::default(),
+                emoji_import: sakurasato_core::config::EmojiImportConfig::default(),
             },
             // `/miauth/{uuid}` handler が session ttl を参照するため `Some` で
             // 入れる ── 値はテスト内で寿命を切るかどうか分岐する。

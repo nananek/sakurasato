@@ -287,6 +287,69 @@ pub async fn upsert_remote(pool: &PgPool, new: NewRemoteEmoji) -> sqlx::Result<E
     .await
 }
 
+/// versitygw にキャッシュ済み (`image_key IS NOT NULL`) のリモート emoji を
+/// host, shortcode 順で列挙する。TUI の絵文字管理画面「リモート絵文字を
+/// ローカルにコピー」機能 (Issue #328 系) が対象を絞り込む母集団。
+///
+/// `image_key IS NULL` (= fetch 失敗キャッシュ、`should_skip_fetch` 参照) は
+/// コピー元になれないためここで除外する ── 呼び出し側が毎回 filter する
+/// 手間を省く。
+pub async fn list_remote_cached(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<EmojiRow>> {
+    sqlx::query_as!(
+        EmojiRow,
+        r#"
+        SELECT
+            id, shortcode, host, category,
+            aliases as "aliases: Json<Vec<String>>",
+            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at
+        FROM emoji
+        WHERE host IS NOT NULL AND image_key IS NOT NULL
+        ORDER BY host ASC, shortcode ASC
+        LIMIT $1
+        "#,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// リモート emoji を shortcode / host の部分一致で検索する。
+/// [`search_local_by_substring`] のリモート版 (`escape_like` 共有)。
+///
+/// `query` が空なら [`list_remote_cached`] にフォールバックする。
+pub async fn search_remote_cached(
+    pool: &PgPool,
+    query: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<EmojiRow>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return list_remote_cached(pool, limit).await;
+    }
+    let pat = format!("%{}%", escape_like(q));
+    sqlx::query_as!(
+        EmojiRow,
+        r#"
+        SELECT
+            id, shortcode, host, category,
+            aliases as "aliases: Json<Vec<String>>",
+            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at
+        FROM emoji
+        WHERE host IS NOT NULL AND image_key IS NOT NULL
+          AND (
+              shortcode ILIKE $1 ESCAPE '\'
+              OR host ILIKE $1 ESCAPE '\'
+          )
+        ORDER BY host ASC, shortcode ASC
+        LIMIT $2
+        "#,
+        pat,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// `id` で 1 行引く。`reaction.emoji_id` を Activity 再構築する経路で使う
 /// (例: Undo の `object` を inline 化するときに元の `Emoji` tag を組み立てる)。
 pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<EmojiRow>> {

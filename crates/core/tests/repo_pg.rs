@@ -1596,3 +1596,74 @@ async fn notification_feed_round_trip(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(notification::count_unread(&pool, me.id).await?, 0);
     Ok(())
 }
+
+/// [`repo::emoji::list_remote_cached`] / [`repo::emoji::search_remote_cached`]
+/// が local emoji と fetch 失敗 (`image_key IS NULL`) の remote emoji を除外し、
+/// キャッシュ済み remote emoji のみ shortcode/host 部分一致で返すこと (TUI
+/// 絵文字管理画面のリモートコピー機能の母集団)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn emoji_remote_cached_excludes_local_and_uncached(pool: PgPool) -> sqlx::Result<()> {
+    let cached = repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "blobcat".into(),
+            ap_id: "https://misskey.io/emojis/blobcat".into(),
+            host: "misskey.io".into(),
+            image_key: Some("emoji/remote/misskey.io/blobcat.webp".into()),
+            media_type: "image/webp".into(),
+            last_failed_at: None,
+        },
+    )
+    .await?;
+    // fetch 失敗キャッシュ (image_key None) はコピー元になれないので除外される。
+    repo::emoji::upsert_remote(
+        &pool,
+        repo::emoji::NewRemoteEmoji {
+            shortcode: "uncached".into(),
+            ap_id: "https://misskey.io/emojis/uncached".into(),
+            host: "misskey.io".into(),
+            image_key: None,
+            media_type: "application/octet-stream".into(),
+            last_failed_at: Some(chrono::Utc::now()),
+        },
+    )
+    .await?;
+    // local emoji は host IS NULL なので対象外。
+    repo::emoji::upsert_local(
+        &pool,
+        repo::emoji::NewLocalEmoji {
+            shortcode: "blobcat".into(),
+            category: None,
+            aliases: vec![],
+            image_key: "emoji/local/blobcat.webp".into(),
+            media_type: "image/webp".into(),
+            license: None,
+            is_sensitive: false,
+        },
+    )
+    .await?;
+
+    let all = repo::emoji::list_remote_cached(&pool, 10).await?;
+    assert_eq!(all.len(), 1, "cached remote 1 件のみ; got {all:?}");
+    assert_eq!(all[0].id, cached.id);
+
+    // shortcode 部分一致。
+    let by_shortcode = repo::emoji::search_remote_cached(&pool, "blob", 10).await?;
+    assert_eq!(by_shortcode.len(), 1);
+    assert_eq!(by_shortcode[0].id, cached.id);
+
+    // host 部分一致。
+    let by_host = repo::emoji::search_remote_cached(&pool, "misskey", 10).await?;
+    assert_eq!(by_host.len(), 1);
+    assert_eq!(by_host[0].id, cached.id);
+
+    // 空クエリは list_remote_cached にフォールバック。
+    let empty_q = repo::emoji::search_remote_cached(&pool, "  ", 10).await?;
+    assert_eq!(empty_q.len(), 1);
+
+    // ヒットしない検索は空。
+    let no_hit = repo::emoji::search_remote_cached(&pool, "nonexistent", 10).await?;
+    assert!(no_hit.is_empty());
+
+    Ok(())
+}

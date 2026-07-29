@@ -262,6 +262,33 @@ pub enum Action {
     ListsInputSubmit,
     /// リスト機能: 入力 overlay のキャンセル (`Esc`)。
     ListsInputCancel,
+    /// 絵文字管理画面: `:emojis` ── 画面を push。
+    OpenEmojiAdmin,
+    /// 絵文字管理画面: `t` ── Local/Remote タブ切替。
+    EmojiAdminToggleTab,
+    /// 絵文字管理画面: `j`/`Down` ── 現在タブでカーソル下移動。
+    EmojiAdminSelectNext,
+    /// 絵文字管理画面: `k`/`Up` ── 現在タブでカーソル上移動。
+    EmojiAdminSelectPrev,
+    /// 絵文字管理画面: `r` ── 現在タブを再取得。
+    EmojiAdminRefresh,
+    /// 絵文字管理画面 (Local タブ): `i` ── zip インポート用ファイルピッカを開く。
+    EmojiAdminStartImport,
+    /// 絵文字管理画面 (Remote タブ): `Enter` ── 選択中のリモート絵文字を
+    /// 即座にローカルへコピー (確認プロンプト無し、リネーム無し)。
+    EmojiAdminCopySelected,
+    /// 絵文字管理画面: `Esc`/`q` ── 画面を閉じる。
+    EmojiAdminClose,
+    /// 絵文字管理画面: `/` ── 検索窓を開く。
+    EmojiAdminSearchOpen,
+    /// 絵文字管理画面: 検索窓中の文字入力。
+    EmojiAdminSearchChar(char),
+    /// 絵文字管理画面: 検索窓中の Backspace。
+    EmojiAdminSearchBackspace,
+    /// 絵文字管理画面: 検索窓の確定 (`Enter`)。
+    EmojiAdminSearchSubmit,
+    /// 絵文字管理画面: 検索窓のキャンセル (`Esc`)。
+    EmojiAdminSearchCancel,
 }
 
 /// crossterm イベント → Action。
@@ -270,7 +297,7 @@ pub enum Action {
     reason = "値で渡す `Event` を tests でも自然に書きたい"
 )]
 pub fn translate(event: Event, focus: Focus) -> Action {
-    translate_with_context(event, focus, false, false)
+    translate_with_context(event, focus, false, false, false)
 }
 
 /// [`translate`] の拡張版。`lists_input_active` は `Focus::Lists` 中に
@@ -280,6 +307,8 @@ pub fn translate(event: Event, focus: Focus) -> Action {
 /// `picker_path_input_active` は同じ理由で `Focus::Picker` 中に
 /// [`crate::picker::FilePicker::path_input`] が `Some` かどうか (=
 /// `/` で開いたパス直接入力中は文字キーを全部テキスト入力として扱う)。
+/// `emoji_admin_search_active` は `Focus::EmojiAdmin` 中に
+/// [`crate::emoji_admin::EmojiAdminScreen::query_input`] が `Some` かどうか。
 /// それぞれ対応する focus 以外では無視される。
 #[allow(
     clippy::needless_pass_by_value,
@@ -290,9 +319,16 @@ pub fn translate_with_context(
     focus: Focus,
     lists_input_active: bool,
     picker_path_input_active: bool,
+    emoji_admin_search_active: bool,
 ) -> Action {
     match event {
-        Event::Key(k) => translate_key(k, focus, lists_input_active, picker_path_input_active),
+        Event::Key(k) => translate_key(
+            k,
+            focus,
+            lists_input_active,
+            picker_path_input_active,
+            emoji_admin_search_active,
+        ),
         Event::Mouse(m) => translate_mouse(m),
         Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
             Action::Noop
@@ -305,6 +341,7 @@ fn translate_key(
     focus: Focus,
     lists_input_active: bool,
     picker_path_input_active: bool,
+    emoji_admin_search_active: bool,
 ) -> Action {
     if k.kind == KeyEventKind::Release {
         return Action::Noop;
@@ -332,6 +369,7 @@ fn translate_key(
         Focus::EmojiSearch => translate_emoji_search_key(k),
         Focus::NoteDetail => translate_note_detail_key(k),
         Focus::Lists => translate_lists_key(k, lists_input_active),
+        Focus::EmojiAdmin => translate_emoji_admin_key(k, emoji_admin_search_active),
     }
 }
 
@@ -412,6 +450,35 @@ fn translate_lists_key(k: KeyEvent, input_active: bool) -> Action {
         (KeyCode::Char('a'), m) if m.is_empty() => Action::ListsMemberAdd,
         (KeyCode::Char('x'), m) if m.is_empty() => Action::ListsMemberRemove,
         (KeyCode::Char('r'), m) if m.is_empty() => Action::ListsRefresh,
+        _ => Action::Noop,
+    }
+}
+
+/// 絵文字管理画面のキー操作。`search_active` (=
+/// [`crate::emoji_admin::EmojiAdminScreen::query_input`] が `Some`) のときは
+/// 検索窓入力中なので、`j`/`k`/`t`/`r` などの文字も全部テキスト入力として
+/// 扱う (= `translate_lists_key` と同じ設計)。
+fn translate_emoji_admin_key(k: KeyEvent, search_active: bool) -> Action {
+    if search_active {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        return match k.code {
+            KeyCode::Esc => Action::EmojiAdminSearchCancel,
+            KeyCode::Enter => Action::EmojiAdminSearchSubmit,
+            KeyCode::Backspace => Action::EmojiAdminSearchBackspace,
+            KeyCode::Char(c) if !ctrl => Action::EmojiAdminSearchChar(c),
+            _ => Action::Noop,
+        };
+    }
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => Action::EmojiAdminClose,
+        (KeyCode::Char('q'), m) if m.is_empty() => Action::EmojiAdminClose,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::EmojiAdminSelectNext,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::EmojiAdminSelectPrev,
+        (KeyCode::Char('t'), m) if m.is_empty() => Action::EmojiAdminToggleTab,
+        (KeyCode::Char('r'), m) if m.is_empty() => Action::EmojiAdminRefresh,
+        (KeyCode::Char('i'), m) if m.is_empty() => Action::EmojiAdminStartImport,
+        (KeyCode::Char('/'), m) if m.is_empty() => Action::EmojiAdminSearchOpen,
+        (KeyCode::Enter, _) => Action::EmojiAdminCopySelected,
         _ => Action::Noop,
     }
 }
@@ -1289,8 +1356,32 @@ mod tests {
                 Focus::Picker,
                 false,
                 true,
+                false,
             ),
             Action::PickerPathChar('j'),
+        ));
+    }
+
+    #[test]
+    fn translate_with_context_routes_emoji_admin_search_flag() {
+        // 検索窓非アクティブ: `j` はカーソル移動。
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)),
+                Focus::EmojiAdmin,
+            ),
+            Action::EmojiAdminSelectNext,
+        ));
+        // 検索窓アクティブ: `j` はテキスト入力。
+        assert!(matches!(
+            translate_with_context(
+                Event::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)),
+                Focus::EmojiAdmin,
+                false,
+                false,
+                true,
+            ),
+            Action::EmojiAdminSearchChar('j'),
         ));
     }
 }
