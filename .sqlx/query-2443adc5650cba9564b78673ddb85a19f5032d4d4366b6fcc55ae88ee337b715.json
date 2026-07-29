@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT n.id, n.ap_id, a.ap_id AS actor_ap_id,\n               n.tags as \"tags: Json<JsonValue>\"\n        FROM note n\n        JOIN actor a ON a.id = n.actor_id\n        WHERE n.is_local = FALSE\n          AND jsonb_array_length(n.tags) > 0\n          AND ($1::BIGINT IS NULL OR n.id > $1)\n        ORDER BY n.id ASC\n        LIMIT $2\n        ",
+  "query": "\n        SELECT n.id, n.ap_id, a.ap_id AS actor_ap_id,\n               n.tags as \"tags: Json<JsonValue>\"\n        FROM note n\n        JOIN actor a ON a.id = n.actor_id\n        WHERE n.is_local = FALSE\n          AND jsonb_typeof(n.tags) = 'array'\n          AND n.tags <> '[]'::jsonb\n          AND ($1::BIGINT IS NULL OR n.id > $1)\n        ORDER BY n.id ASC\n        LIMIT $2\n        ",
   "describe": {
     "columns": [
       {
@@ -61,5 +61,5 @@
       false
     ]
   },
-  "hash": "52a3d78b3cf47451dd94bb05699f406b3be41f637cb239bf5105632fd41035cc"
+  "hash": "2443adc5650cba9564b78673ddb85a19f5032d4d4366b6fcc55ae88ee337b715"
 }

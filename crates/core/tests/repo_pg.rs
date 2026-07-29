@@ -1721,6 +1721,20 @@ async fn list_remote_note_tags_since_id_pages_by_id(pool: PgPool) -> sqlx::Resul
         mk("lrnt-empty-tags", remote.id, false, serde_json::json!([])),
     )
     .await?;
+    // claude-review (PR #330) 指摘: AS2/JSON-LD の圧縮表現で `tag` が配列
+    // でなく単一オブジェクトになっている行が混入しうる。`jsonb_array_length`
+    // に直接渡すと非配列で例外になるため、この行がクエリ全体を落とさず
+    // 除外されることを固定する回帰テスト。
+    repo::note::insert(
+        &pool,
+        mk(
+            "lrnt-non-array-tags",
+            remote.id,
+            false,
+            serde_json::json!({"type": "Emoji", "id": "https://remote.example/emojis/y", "name": ":y:"}),
+        ),
+    )
+    .await?;
     // リモートかつ tags 有 → 対象。3 件、insert 順で id が単調増加する前提。
     let r1 = repo::note::insert(
         &pool,
