@@ -785,3 +785,46 @@ pub async fn list_mentions_window(
     .fetch_all(pool)
     .await
 }
+
+/// バックフィルCLI (`sakurasato-server emoji backfill-remote`) 向け:
+/// 蓄積済みリモート Note のうち `tag` (= AP `tag`、custom emoji を含みうる)
+/// が非空のものを id 昇順で keyset page する。
+///
+/// カーソルは `published_at` (リモート由来で信頼できない値) ではなく
+/// `n.id` (DB 採番の単調増加 PK) を使う。`tags` は `NOT NULL DEFAULT '[]'`
+/// (migration 0002) なので `jsonb_array_length` が NULL になることはない。
+/// `type == "Emoji"` かどうかの最終判定は呼び出し側 (Rust) が行う ──
+/// JSONB containment 演算子の挙動に依存しない安全策。
+#[derive(Debug, Clone)]
+pub struct RemoteNoteTagsRow {
+    pub id: i64,
+    pub ap_id: String,
+    /// 著者 actor の AP id (host 解決用)。
+    pub actor_ap_id: String,
+    pub tags: Json<JsonValue>,
+}
+
+pub async fn list_remote_note_tags_since_id(
+    pool: &PgPool,
+    after_id: Option<i64>,
+    limit: i64,
+) -> sqlx::Result<Vec<RemoteNoteTagsRow>> {
+    sqlx::query_as!(
+        RemoteNoteTagsRow,
+        r#"
+        SELECT n.id, n.ap_id, a.ap_id AS actor_ap_id,
+               n.tags as "tags: Json<JsonValue>"
+        FROM note n
+        JOIN actor a ON a.id = n.actor_id
+        WHERE n.is_local = FALSE
+          AND jsonb_array_length(n.tags) > 0
+          AND ($1::BIGINT IS NULL OR n.id > $1)
+        ORDER BY n.id ASC
+        LIMIT $2
+        "#,
+        after_id,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}

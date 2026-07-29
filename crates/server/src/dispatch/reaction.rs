@@ -27,37 +27,16 @@
 //!   drive/画像を別ドメインで配信する)。画像取得は media-proxy が SSRF 境界を担い、
 //!   client へは自鯖キャッシュ URL を返すため任意 host を許容できる。
 
-use std::time::Duration;
-
 use anyhow::Context;
-use aws_sdk_s3::primitives::ByteStream;
-use chrono::Utc;
-use sakurasato_core::model::{ActorRow, EmojiRow};
+use sakurasato_core::model::ActorRow;
 use sakurasato_core::repo;
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
-use url::Url;
 
 use super::DispatchError;
+use crate::emoji_learn::{self, LearnedEmoji, extract_shortcode};
 use crate::notification;
 use crate::state::AppState;
-
-/// Issue #135: remote emoji を media-proxy 経由で取得してキャッシュする
-/// ときの variant 文字列 (= `emoji_import.rs::EMOJI_VARIANT` と同値)。
-/// media-proxy 側の `Variant::Emoji` (512x512 / WebP 単一フレーム or animated)
-/// と揃える ── `crates/media-proxy/src/image_pipeline.rs` を参照。
-const EMOJI_VARIANT: &str = "emoji";
-
-/// Issue #135: 取得済み remote emoji を versitygw に置く prefix。
-/// `routes/media.rs` の許可リスト ([`crate::routes::media::REMOTE_EMOJI_KEY_PREFIX`])
-/// と同期させる ── 名前を grep で揃えやすいよう同 prefix を使う。
-const REMOTE_EMOJI_KEY_PREFIX: &str = "emoji/remote/";
-
-/// Issue #192: remote emoji の fetch が失敗してから再試行するまでの最短間隔。
-/// 相手サーバが恒常的に落ちている / 4xx を返している場合に毎 reaction 受信で
-/// fetch が走らないように backoff する。固定 1h で開始 ── exponential 化は
-/// future issue (= reviewer 推奨だが scope 外)。
-const FAILURE_RETRY_AFTER: Duration = Duration::from_hours(1);
 
 /// 受領 `Like` の処理。
 ///
@@ -348,29 +327,19 @@ fn extract_content(activity: &JsonValue, kind: ReactionKind) -> Result<String, D
     Ok(c)
 }
 
-/// [`learn_emoji_tag`] が学習に成功したリモート custom emoji の識別情報。
-struct LearnedEmoji {
-    /// `emoji` テーブルの id (= `reaction.emoji_id` に入れる)。
-    id: i64,
-    /// 学習した絵文字の host (= 検証済み signer host、lowercase)。reaction content の
-    /// `@host` suffix に使い、Misskey/Aria が `reactionEmojis` 経由で解決できるように
-    /// する (Issue #242)。`learn_emoji_tag` は signer の自前 emoji しか学習しない
-    /// (`Emoji.id` host == signer host を強制) ので、必ず remote host になる。
-    host: String,
-}
-
 /// Activity の `tag: [Emoji]` から remote 絵文字を学習する。
 ///
 /// `content` に該当する `Emoji.name` が見つかればその id と host を [`LearnedEmoji`]
-/// で返す。複数 tag があっても content と name (`:foo:`) が一致するものだけ採用する。
+/// で返す。複数 tag があっても content と name (`:foo:`) が一致するものだけ採用する
+/// (Note 本文の全件学習は [`crate::emoji_learn::learn_note_emoji_tags`] が別途担う)。
 /// `Emoji.id` の host が signer host と異なる場合は無視する (spoofing 防止)。
 /// `Emoji.icon.url` の host は signer と異なってよい (Issue #239、別ドメイン drive 対応)。
 ///
-/// 学習自体は best-effort。失敗しても reaction の記録は続行する。
-#[allow(
-    clippy::too_many_lines,
-    reason = "single tag-loop over Activity.tag[]; Issue #135 で cache/fetch 分岐が増えただけで構造は線形"
-)]
+/// 学習自体は best-effort。失敗しても reaction の記録は続行する。1 個の tag の
+/// 検証・fetch・DB upsert は [`emoji_learn::learn_emoji_tag_object`] に委譲する
+/// (Note 用の全件学習と共有するために切り出された共通ロジック)。shortcode が
+/// 一致した tag の学習が失敗 (host 不一致等) しても、同名 shortcode の別 tag が
+/// あれば引き続き探す (= 旧実装からの挙動を保つ)。
 async fn learn_emoji_tag(
     state: &AppState,
     signer: &ActorRow,
@@ -378,20 +347,14 @@ async fn learn_emoji_tag(
     content: &str,
 ) -> Option<LearnedEmoji> {
     let tags = activity.get("tag")?.as_array()?;
-    let signer_host = Url::parse(&signer.ap_id).ok()?.host_str()?.to_lowercase();
+    let signer_host = emoji_learn::host_from_ap_id(&signer.ap_id)?;
+    let content_shortcode = extract_shortcode(content)?;
 
     for tag in tags {
-        let Some(obj) = tag.as_object() else {
-            continue;
-        };
-        if obj
-            .get("type")
-            .and_then(JsonValue::as_str)
-            .is_none_or(|t| !t.eq_ignore_ascii_case("Emoji"))
-        {
+        if !emoji_learn::is_emoji_tag(tag) {
             continue;
         }
-        let Some(name) = obj.get("name").and_then(JsonValue::as_str) else {
+        let Some(name) = tag.get("name").and_then(JsonValue::as_str) else {
             continue;
         };
         // content と name の対応:
@@ -399,281 +362,24 @@ async fn learn_emoji_tag(
         //   content == ":blob@misskey.io:" → name 側はホスト無しの ":blob:"
         // どちらも `name` 側は ":blob:" 形式なので、両方の表記から shortcode
         // を抽出して name と比較する。
-        let shortcode = extract_shortcode(content)?;
         let Some(name_shortcode) = extract_shortcode(name) else {
             continue;
         };
-        if shortcode != name_shortcode {
+        if content_shortcode != name_shortcode {
             continue;
         }
-        // PR #191 round-1 ⚠️ #1: `extract_shortcode` は `:` を剥がして `@` で
-        // 分割するだけで charset を見ない。`/` 入りの malicious shortcode が
-        // versitygw に `emoji/remote/<host>/a/b.webp` で書かれて namespace を
-        // 汚染しないよう、fetch + PUT の前で `is_valid_shortcode` を強制する。
-        // `upsert_remote` 内の `is_valid_shortcode` 検査は upsert 前に失敗する
-        // が、その時点では既に versitygw に PUT 済 ── 早期に弾く必要がある。
-        if !repo::emoji::is_valid_shortcode(shortcode) {
-            warn!(
-                shortcode,
-                signer = %signer.ap_id,
-                "Emoji.name shortcode failed charset validation; refusing to learn"
-            );
-            continue;
+        if let Some(learned) = emoji_learn::learn_emoji_tag_object(state, &signer_host, tag).await {
+            return Some(learned);
         }
-
-        let Some(ap_id) = obj.get("id").and_then(JsonValue::as_str) else {
-            continue;
-        };
-        // Emoji.id の host が signer host と一致しなければ拒否 (spoofing)。
-        let Ok(emoji_url) = Url::parse(ap_id) else {
-            continue;
-        };
-        let Some(emoji_host) = emoji_url.host_str() else {
-            continue;
-        };
-        if !emoji_host.eq_ignore_ascii_case(&signer_host) {
-            warn!(
-                emoji_id = ap_id,
-                signer_host = %signer_host,
-                emoji_host,
-                "Emoji.id host mismatch with signer; refusing to learn"
-            );
-            continue;
-        }
-
-        let icon = obj.get("icon").and_then(JsonValue::as_object);
-        let image_url = icon
-            .and_then(|i| i.get("url"))
-            .and_then(JsonValue::as_str)
-            .unwrap_or("");
-        let media_type = icon
-            .and_then(|i| i.get("mediaType"))
-            .and_then(JsonValue::as_str)
-            .unwrap_or("application/octet-stream");
-
-        if image_url.is_empty() {
-            continue;
-        }
-        // Issue #239: icon.url の host == signer host 検査は撤廃する。Misskey は
-        // emoji メタデータ (mi.example.com) と drive/画像 (drive-mi.example.com) を
-        // 別ドメインで配信するのが一般的で、同 host 一致を強制すると正規の絵文字を
-        // 学習できなかった。同 host 強制を外しても安全な根拠:
-        //   - 画像取得は `fetch_and_cache_remote_emoji` → media-proxy
-        //     `/v1/image/fetch` 経由のみ。media-proxy が `net_guard::host_blocked`
-        //     + redirect 再検証 + max_bytes で SSRF egress 境界を担うので、icon
-        //     host を緩めても SSRF 面は広がらない。
-        //   - client へは raw icon.url ではなく自鯖キャッシュ URL
-        //     (`emoji/remote/<host>/<shortcode>.webp` → `https://<our_host>/media/...`)
-        //     を返す (conv.rs::build_reactions / local_api timeline)。任意 URL を
-        //     広告させない。
-        //   - note 本文 emoji (conv.rs::build_text_emojis) は既に icon.url を host
-        //     検査なしで透過しており、本変更で reaction emoji をそれに揃える。
-        //   - なりすまし/identity 境界は上の Emoji.id host==signer 検査が担う。
-        // ここでは media-proxy に渡す前の最低限の well-formedness のみ要求する:
-        // http/https かつ host を持つ URL であること (file:// / data: 等を弾く)。
-        let url_well_formed = Url::parse(image_url)
-            .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some());
-        if !url_well_formed {
-            warn!(
-                emoji_id = ap_id,
-                image_url, "Emoji.icon.url is not a well-formed http(s) URL; refusing to learn"
-            );
-            continue;
-        }
-
-        // Issue #135 / #192: 既存 row を見て fetch をスキップできるか判定する。
-        // - 自鯖キャッシュ済 (= `emoji/remote/...`) → DB も触らず id 返却
-        // - 直近 TTL 内に失敗 → fetch せず id 返却 (= backoff)
-        // - 上記いずれでもない → fetch を試みる (= 旧 URL row も含む)
-        let existing = repo::emoji::get_by_ap_id(state.pool(), ap_id)
-            .await
-            .inspect_err(|err| {
-                warn!(?err, emoji_id = ap_id, "get_by_ap_id failed; refetching");
-            })
-            .ok()
-            .flatten();
-
-        if let Some(ref row) = existing
-            && let Some(reason) = should_skip_fetch(row)
-        {
-            info!(
-                emoji_id = row.id,
-                shortcode = %shortcode,
-                host = %signer_host,
-                reason,
-                "remote emoji fetch skipped (cache hit / recent failure backoff)",
-            );
-            return Some(LearnedEmoji {
-                id: row.id,
-                host: signer_host.clone(),
-            });
-        }
-
-        // fetch を試みる。失敗時は `image_key = None` を SQL 側 COALESCE で温存
-        // させ、`last_failed_at = now()` で TTL backoff の起点にする。
-        let (image_key_for_upsert, stored_media_type, last_failed_at) =
-            match fetch_and_cache_remote_emoji(state, image_url, &signer_host, shortcode).await {
-                Ok((key, mt)) => (Some(key), mt, None),
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        emoji_id = ap_id,
-                        image_url,
-                        "remote emoji fetch/cache failed; recording last_failed_at backoff"
-                    );
-                    (None, media_type.to_string(), Some(Utc::now()))
-                }
-            };
-
-        let new = repo::emoji::NewRemoteEmoji {
-            shortcode: shortcode.to_string(),
-            ap_id: ap_id.to_string(),
-            host: signer_host.clone(),
-            image_key: image_key_for_upsert,
-            media_type: stored_media_type,
-            last_failed_at,
-        };
-        match repo::emoji::upsert_remote(state.pool(), new).await {
-            Ok(row) => {
-                info!(
-                    emoji_id = row.id,
-                    shortcode = %shortcode,
-                    host = %signer_host,
-                    image_cached = row.image_key.is_some(),
-                    last_failed_at = ?row.last_failed_at,
-                    "remote emoji learned",
-                );
-                return Some(LearnedEmoji {
-                    id: row.id,
-                    host: signer_host.clone(),
-                });
-            }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    emoji_id = ap_id,
-                    "remote emoji upsert failed; reaction will be stored without emoji_id"
-                );
-                return None;
-            }
-        }
+        // 学習失敗 (charset不正/host不一致/icon.url不正/upsert失敗) は
+        // 同名 shortcode の別 tag があるかもしれないので次の候補へ。
     }
     None
-}
-
-/// 既存 emoji row を見て fetch (= media-proxy → versitygw PUT) をスキップする
-/// 判定。`Some(reason)` を返したら `learn_emoji_tag` は即座に `row.id` を返す。
-///
-/// スキップ条件:
-/// 1. `image_key` が `emoji/remote/` prefix を持つ ── 自鯖に焼き済みなので
-///    内容を再取得する必要はない。
-/// 2. `last_failed_at` が直近 [`FAILURE_RETRY_AFTER`] 以内 ── 失敗 backoff。
-///    相手サーバが落ちている / 4xx を返している期間に毎 reaction で fetch を
-///    叩かない。
-///
-/// `&'static str` を返すのは tracing log 用の安定キー (= log filter 対応)。
-fn should_skip_fetch(existing: &EmojiRow) -> Option<&'static str> {
-    if existing
-        .image_key
-        .as_deref()
-        .is_some_and(|k| k.starts_with(REMOTE_EMOJI_KEY_PREFIX))
-    {
-        return Some("cache_hit");
-    }
-    if let Some(failed_at) = existing.last_failed_at {
-        let elapsed = Utc::now().signed_duration_since(failed_at).to_std().ok();
-        if elapsed.is_some_and(|e| e < FAILURE_RETRY_AFTER) {
-            return Some("recent_failure_backoff");
-        }
-    }
-    None
-}
-
-/// Issue #135: remote emoji の画像を media-proxy 経由で取得し、versitygw に
-/// 格納する。成功時は `(versitygw_key, "image/webp")` を返す。失敗時は anyhow
-/// エラーを返し、呼び出し側で `image_key = None` を選ばせる。
-///
-/// **副作用**: versitygw 上に `emoji/remote/<host>/<shortcode>.webp` を PUT する。
-/// 同名 key への複数回 PUT は idempotent (= 上書き) なので、cache hit 判定で
-/// 弾けなかった経路で重複 PUT が走っても害は無い。
-async fn fetch_and_cache_remote_emoji(
-    state: &AppState,
-    image_url: &str,
-    signer_host: &str,
-    shortcode: &str,
-) -> anyhow::Result<(String, String)> {
-    let processed = state
-        .media_proxy()
-        .fetch_image(image_url, EMOJI_VARIANT)
-        .await
-        .with_context(|| format!("media-proxy fetch {image_url}"))?;
-
-    // host / shortcode は事前に検証済み (signer_host=正規化済 hostname、
-    // shortcode=`[a-zA-Z0-9_-]{1,128}`)。path traversal にならない。
-    let storage_key = format!("{REMOTE_EMOJI_KEY_PREFIX}{signer_host}/{shortcode}.webp");
-    let media_type = processed.content_type.clone();
-    state
-        .s3_client()
-        .put_object()
-        .bucket(&state.config().storage.bucket)
-        .key(&storage_key)
-        .content_type(&media_type)
-        .body(ByteStream::from(processed.bytes))
-        .send()
-        .await
-        .with_context(|| format!("versitygw PUT {storage_key}"))?;
-    Ok((storage_key, media_type))
-}
-
-/// `:foo:` / `:foo@host:` の `foo` 部分だけを返す。`:` で挟まれていない場合は
-/// `None` (= Unicode emoji)。
-fn extract_shortcode(content: &str) -> Option<&str> {
-    let stripped = content.strip_prefix(':')?.strip_suffix(':')?;
-    // `:foo@host:` 形式から host を落とす。
-    let shortcode = stripped.split('@').next()?;
-    if shortcode.is_empty() {
-        None
-    } else {
-        Some(shortcode)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_shortcode_strips_colons_and_host() {
-        assert_eq!(extract_shortcode(":blob:"), Some("blob"));
-        assert_eq!(extract_shortcode(":blob_party:"), Some("blob_party"));
-        assert_eq!(extract_shortcode(":blob@misskey.io:"), Some("blob"));
-        assert_eq!(extract_shortcode("👍"), None);
-        assert_eq!(extract_shortcode(""), None);
-        assert_eq!(extract_shortcode(":"), None);
-        assert_eq!(extract_shortcode("::"), None);
-        assert_eq!(extract_shortcode(":@host:"), None);
-    }
-
-    /// PR #191 round-1 ⚠️ #1: `extract_shortcode` 自身は charset を見ない。
-    /// `/` 入りの shortcode を Some で返してしまうため、後段の
-    /// `is_valid_shortcode` が弾く責務を持つ ── 本テストはその境界仕様を
-    /// 固定する (= `extract_shortcode` の挙動を不用意に厳しくしないため)。
-    #[test]
-    fn extract_shortcode_does_not_filter_charset() {
-        // `learn_emoji_tag` 側で `is_valid_shortcode` を必ず呼ぶ前提で、
-        // ここでは「`/` を含む値も Some で返る」ことを記録する。
-        assert_eq!(extract_shortcode(":a/b:"), Some("a/b"));
-        // `is_valid_shortcode` 側がそれを拒否することは core 側の責務。
-        assert!(!sakurasato_core::repo::emoji::is_valid_shortcode("a/b"));
-        assert!(!sakurasato_core::repo::emoji::is_valid_shortcode(
-            "../escape"
-        ));
-        assert!(!sakurasato_core::repo::emoji::is_valid_shortcode(""));
-        assert!(sakurasato_core::repo::emoji::is_valid_shortcode("blob"));
-        assert!(sakurasato_core::repo::emoji::is_valid_shortcode(
-            "blob_party-1"
-        ));
-    }
 
     #[test]
     fn extract_content_required_for_emoji_react() {
@@ -806,76 +512,5 @@ mod tests {
             reaction_content_for_storage("👍".into(), Some(&learned)),
             "👍"
         );
-    }
-
-    // ── Issue #192: should_skip_fetch のテスト ────────────────────────────
-
-    fn emoji_row_fixture(
-        image_key: Option<&str>,
-        last_failed_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> EmojiRow {
-        EmojiRow {
-            id: 1,
-            shortcode: "blob".into(),
-            host: Some("remote.test".into()),
-            category: None,
-            aliases: sqlx::types::Json(vec![]),
-            image_key: image_key.map(str::to_string),
-            media_type: "image/webp".into(),
-            ap_id: Some("https://remote.test/emojis/blob".into()),
-            is_local: false,
-            license: None,
-            is_sensitive: false,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            last_failed_at,
-        }
-    }
-
-    #[test]
-    fn should_skip_fetch_returns_cache_hit_for_remote_prefix() {
-        let row = emoji_row_fixture(Some("emoji/remote/remote.test/blob.webp"), None);
-        assert_eq!(should_skip_fetch(&row), Some("cache_hit"));
-    }
-
-    #[test]
-    fn should_skip_fetch_returns_none_for_legacy_url() {
-        // 旧 URL row は cache hit でも recent failure でもないので fetch を試みる。
-        let row = emoji_row_fixture(Some("https://remote.test/files/blob.png"), None);
-        assert!(should_skip_fetch(&row).is_none());
-    }
-
-    #[test]
-    fn should_skip_fetch_returns_backoff_for_recent_failure() {
-        // 直近 (30 min 前) に失敗 → backoff TTL (1h) 内なので skip。
-        let recent =
-            chrono::Utc::now() - chrono::Duration::from_std(Duration::from_mins(30)).unwrap();
-        let row = emoji_row_fixture(None, Some(recent));
-        assert_eq!(should_skip_fetch(&row), Some("recent_failure_backoff"));
-    }
-
-    #[test]
-    fn should_skip_fetch_returns_none_after_backoff_window() {
-        // TTL (1h) を超えた失敗 → retry を許す。
-        let old = chrono::Utc::now() - chrono::Duration::from_std(Duration::from_hours(2)).unwrap();
-        let row = emoji_row_fixture(None, Some(old));
-        assert!(should_skip_fetch(&row).is_none());
-    }
-
-    #[test]
-    fn should_skip_fetch_returns_none_for_fresh_row() {
-        // image_key=None かつ last_failed_at=None (= 新規 row 直前) は fetch を試みる。
-        let row = emoji_row_fixture(None, None);
-        assert!(should_skip_fetch(&row).is_none());
-    }
-
-    /// Issue #192 round-2 #1 regression: 旧 URL row + 直近失敗 → backoff で skip。
-    /// COALESCE 保存とあわせて「旧 URL が残ったまま再 fetch も控える」状態を実現する。
-    #[test]
-    fn should_skip_fetch_combines_legacy_url_and_recent_failure() {
-        let recent =
-            chrono::Utc::now() - chrono::Duration::from_std(Duration::from_mins(1)).unwrap();
-        let row = emoji_row_fixture(Some("https://remote.test/files/blob.png"), Some(recent));
-        assert_eq!(should_skip_fetch(&row), Some("recent_failure_backoff"));
     }
 }

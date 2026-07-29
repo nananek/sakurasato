@@ -138,6 +138,7 @@ pub struct ImportSummary {
 pub async fn run(config: Config, args: EmojiArgs) -> anyhow::Result<()> {
     match args.command {
         EmojiCommand::Import(import) => run_import(config, import).await,
+        EmojiCommand::BackfillRemote => crate::emoji_backfill::run(config).await,
     }
 }
 

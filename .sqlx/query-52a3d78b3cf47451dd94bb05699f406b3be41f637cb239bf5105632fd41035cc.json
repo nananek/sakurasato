@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT n.id, n.ap_id, a.ap_id AS actor_ap_id,\n               n.tags as \"tags: Json<JsonValue>\"\n        FROM note n\n        JOIN actor a ON a.id = n.actor_id\n        WHERE n.is_local = FALSE\n          AND jsonb_array_length(n.tags) > 0\n          AND ($1::BIGINT IS NULL OR n.id > $1)\n        ORDER BY n.id ASC\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ap_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "actor_ap_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "tags: Json<JsonValue>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "tags"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "52a3d78b3cf47451dd94bb05699f406b3be41f637cb239bf5105632fd41035cc"
+}

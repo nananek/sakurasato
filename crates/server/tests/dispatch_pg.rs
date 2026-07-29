@@ -2477,3 +2477,252 @@ async fn follow_request_reject_enqueues_reject_and_flips_state(pool: PgPool) {
         "expected idempotency guard error, got {msg}",
     );
 }
+
+// =============================================================================
+// Note 本文リモート絵文字の学習 (Issue #328 フォローアップ)
+// =============================================================================
+
+/// followee からの Create で Note 本文に Emoji tag があれば `emoji` テーブルに
+/// 学習される (リアクション経由の学習とは独立した経路)。テスト環境は
+/// media-proxy 未接続 (`socket: "/tmp/x"`) なので `image_key` は `None` に
+/// なるが、行自体は作られる (= `emoji_learn::learn_emoji_tag_object` の
+/// fetch失敗パス、既存 `inbound_emoji_react_learns_remote_emoji` と同じ検証粒度)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_with_emoji_tag_learns_remote_emoji(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let follow_ap = format!("https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-bob-e1");
+    let f = repo::follow::insert_pending(&pool, &follow_ap, local.id, remote.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, f.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let note_id = "https://remote.test/notes/note-with-emoji";
+    let emoji_ap_id = "https://remote.test/emojis/blob_party";
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.test/users/bob/activities/create-emoji-1",
+        "type": "Create",
+        "actor": remote.ap_id,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": {
+            "id": note_id,
+            "type": "Note",
+            "attributedTo": remote.ap_id,
+            "content": "hello :blob_party:",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "published": "2026-05-31T12:00:00Z",
+            "tag": [
+                {
+                    "type": "Emoji",
+                    "id": emoji_ap_id,
+                    "name": ":blob_party:",
+                    "icon": {"type": "Image", "mediaType": "image/png", "url": "https://remote.test/files/blob_party.png"},
+                },
+            ],
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let learned = repo::emoji::get_by_ap_id(&pool, emoji_ap_id)
+        .await
+        .unwrap()
+        .expect("emoji must be learned from Note.tag");
+    assert_eq!(learned.shortcode, "blob_party");
+    assert_eq!(learned.host.as_deref(), Some("remote.test"));
+    assert!(!learned.is_local);
+}
+
+/// Note 本文に複数の Emoji tag があれば全件学習される (reaction 用の
+/// content 一致学習との違いを担保する回帰テスト)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_with_multiple_emoji_tags_learns_all(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let follow_ap = format!("https://{LOCAL_HOST}/users/{LOCAL_USER}/activities/follow-bob-e2");
+    let f = repo::follow::insert_pending(&pool, &follow_ap, local.id, remote.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, f.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let note_id = "https://remote.test/notes/note-with-two-emojis";
+    let emoji_a = "https://remote.test/emojis/blob_a";
+    let emoji_b = "https://remote.test/emojis/blob_b";
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.test/users/bob/activities/create-emoji-2",
+        "type": "Create",
+        "actor": remote.ap_id,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": {
+            "id": note_id,
+            "type": "Note",
+            "attributedTo": remote.ap_id,
+            "content": "hi :blob_a: and :blob_b:",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "published": "2026-05-31T12:00:00Z",
+            "tag": [
+                {"type": "Emoji", "id": emoji_a, "name": ":blob_a:",
+                 "icon": {"type": "Image", "mediaType": "image/png", "url": "https://remote.test/files/blob_a.png"}},
+                {"type": "Emoji", "id": emoji_b, "name": ":blob_b:",
+                 "icon": {"type": "Image", "mediaType": "image/png", "url": "https://remote.test/files/blob_b.png"}},
+            ],
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    assert!(
+        repo::emoji::get_by_ap_id(&pool, emoji_a)
+            .await
+            .unwrap()
+            .is_some(),
+        "first emoji tag must be learned"
+    );
+    assert!(
+        repo::emoji::get_by_ap_id(&pool, emoji_b)
+            .await
+            .unwrap()
+            .is_some(),
+        "second emoji tag must be learned"
+    );
+}
+
+/// Update.object.tag に Emoji があれば学習される。`update_content` による
+/// content/summary 更新とは独立した経路であることを確認する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn update_note_with_emoji_tag_learns_remote_emoji(pool: PgPool) {
+    let (_lp, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    let _ = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let note_ap_id = "https://remote.test/notes/edit-target-emoji";
+    repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id: note_ap_id.into(),
+            actor_id: remote.id,
+            content: "original".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: sakurasato_core::model::Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::Value::Array(vec![]),
+            tags: serde_json::Value::Array(vec![]),
+            is_local: false,
+            url: None,
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let emoji_ap_id = "https://remote.test/emojis/edited_emoji";
+    let body = serde_json::json!({
+        "id": "https://remote.test/users/bob/activities/update-emoji-1",
+        "type": "Update",
+        "actor": remote.ap_id,
+        "object": {
+            "id": note_ap_id,
+            "type": "Note",
+            "attributedTo": remote.ap_id,
+            "content": "edited with :edited_emoji:",
+            "updated": "2026-06-01T00:00:00Z",
+            "tag": [
+                {"type": "Emoji", "id": emoji_ap_id, "name": ":edited_emoji:",
+                 "icon": {"type": "Image", "mediaType": "image/png", "url": "https://remote.test/files/edited_emoji.png"}},
+            ],
+        },
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let after = repo::note::get_by_ap_id(&pool, note_ap_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.content, "edited with :edited_emoji:");
+
+    let learned = repo::emoji::get_by_ap_id(&pool, emoji_ap_id)
+        .await
+        .unwrap()
+        .expect("emoji must be learned from Update.object.tag");
+    assert_eq!(learned.shortcode, "edited_emoji");
+    assert_eq!(learned.host.as_deref(), Some("remote.test"));
+}

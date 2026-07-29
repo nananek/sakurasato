@@ -213,6 +213,13 @@ pub enum EmojiCommand {
     /// `/v1/image/sanitize` 経由で再エンコードしてから versitygw に書く ──
     /// CLAUDE.md §7 の隔離方針を維持するため。
     Import(EmojiImportArgs),
+    /// 蓄積済みリモート Note の本文 (`tag: [Emoji]`) を遡って学習し、
+    /// `emoji` テーブルにバックフィルする。
+    ///
+    /// リアクション受信時にのみ学習していた既存の絵文字学習ロジックを、
+    /// 過去の Note 本文にも遡って適用する。`ap_id` ベースの upsert なので
+    /// 複数回実行しても安全 (= 既学習分は cache hit で高速スキップ)。
+    BackfillRemote,
 }
 
 #[derive(Debug, Args)]

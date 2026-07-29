@@ -1667,3 +1667,95 @@ async fn emoji_remote_cached_excludes_local_and_uncached(pool: PgPool) -> sqlx::
 
     Ok(())
 }
+
+/// [`repo::note::list_remote_note_tags_since_id`] (絵文字バックフィルCLI用)
+/// が `is_local=true` の行・`tags` 空配列の行を除外し、`after_id` で正しく
+/// keyset page することを確認する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn list_remote_note_tags_since_id_pages_by_id(pool: PgPool) -> sqlx::Result<()> {
+    let local = repo::actor::insert(&pool, sample_local_actor("lrnt-local")).await?;
+    let mut remote_new = sample_local_actor("lrnt-remote");
+    remote_new.is_local = false;
+    remote_new.host = "remote.example".into();
+    remote_new.ap_id = "https://remote.example/users/lrnt".into();
+    remote_new.preferred_username = "lrnt".into();
+    remote_new.public_key_id = "https://remote.example/users/lrnt#main-key".into();
+    remote_new.inbox_url = "https://remote.example/users/lrnt/inbox".into();
+    remote_new.private_key_pem = None;
+    remote_new.ed25519_public_key_id = None;
+    remote_new.ed25519_public_key_pem = None;
+    remote_new.ed25519_private_key_pem = None;
+    remote_new.also_known_as = vec![];
+    let remote = repo::actor::insert(&pool, remote_new).await?;
+
+    let emoji_tag = serde_json::json!([{"type": "Emoji", "id": "https://remote.example/emojis/x", "name": ":x:"}]);
+    let mk =
+        |suffix: &str, author: i64, is_local: bool, tags: serde_json::Value| repo::note::NewNote {
+            ap_id: format!("https://x.test/notes/{suffix}"),
+            actor_id: author,
+            content: "n".into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags,
+            is_local,
+            url: None,
+            published_at: chrono::Utc::now(),
+        };
+
+    // ローカル (is_local=true, tags有) → 除外対象。
+    repo::note::insert(
+        &pool,
+        mk("lrnt-local-note", local.id, true, emoji_tag.clone()),
+    )
+    .await?;
+    // リモートだが tags 空 → 除外対象。
+    repo::note::insert(
+        &pool,
+        mk("lrnt-empty-tags", remote.id, false, serde_json::json!([])),
+    )
+    .await?;
+    // リモートかつ tags 有 → 対象。3 件、insert 順で id が単調増加する前提。
+    let r1 = repo::note::insert(
+        &pool,
+        mk("lrnt-remote-1", remote.id, false, emoji_tag.clone()),
+    )
+    .await?;
+    let r2 = repo::note::insert(
+        &pool,
+        mk("lrnt-remote-2", remote.id, false, emoji_tag.clone()),
+    )
+    .await?;
+    let r3 = repo::note::insert(&pool, mk("lrnt-remote-3", remote.id, false, emoji_tag)).await?;
+
+    // 初回ページ (after_id=None): 対象 3 件のみ、ローカル/空tagsは含まれない。
+    let page1 = repo::note::list_remote_note_tags_since_id(&pool, None, 10).await?;
+    let ids: Vec<i64> = page1.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![r1.id, r2.id, r3.id]);
+    assert_eq!(page1[0].actor_ap_id, remote.ap_id);
+
+    // limit で打ち切り、after_id で続きから取れる。
+    let page_first = repo::note::list_remote_note_tags_since_id(&pool, None, 2).await?;
+    assert_eq!(
+        page_first.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![r1.id, r2.id]
+    );
+    let last_id = page_first.last().unwrap().id;
+    let page_next = repo::note::list_remote_note_tags_since_id(&pool, Some(last_id), 10).await?;
+    assert_eq!(
+        page_next.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![r3.id]
+    );
+
+    // 末尾まで進めると空。
+    let page_end = repo::note::list_remote_note_tags_since_id(&pool, Some(r3.id), 10).await?;
+    assert!(page_end.is_empty());
+
+    Ok(())
+}
