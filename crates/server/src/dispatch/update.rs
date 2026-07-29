@@ -191,10 +191,23 @@ async fn update_note(
     .map_err(DispatchError::Internal)?;
 
     if let Some(row) = updated {
+        // 編集後の本文中カスタム絵文字を学習する (note.rs::handle_create と
+        // 同じ理由)。DB の `note.tags` 列自体は更新しない (本タスクのスコープ
+        // 外、update_content の対象は content/summary/edited_at のみ) ので、
+        // Update.object から都度読んで学習だけ行う。
+        let emoji_summary = crate::emoji_learn::learn_note_emoji_tags(
+            state,
+            &signer.ap_id,
+            obj.get("tag").unwrap_or(&JsonValue::Null),
+        )
+        .await;
+
         info!(
             note_id = row.id,
             signer = %signer.ap_id,
             edited_at = %edited_at,
+            emoji_tags_seen = emoji_summary.emoji_tags_seen,
+            emoji_learned = emoji_summary.emoji_learned,
             "remote note edited",
         );
     }

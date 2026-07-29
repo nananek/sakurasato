@@ -41,6 +41,10 @@ const PUBLIC_URI: &str = "https://www.w3.org/ns/activitystreams#Public";
 const CONTENT_MAX: usize = 5000;
 const SUMMARY_MAX: usize = 200;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "straight-line validation + insert + emoji学習 + notify、分岐は浅い"
+)]
 pub(crate) async fn handle_create(
     state: &AppState,
     signer: &ActorRow,
@@ -117,6 +121,18 @@ pub(crate) async fn handle_create(
         .with_context(|| format!("insert remote note {note_ap_id}"))
         .map_err(DispatchError::Internal)?;
 
+    // Note 本文中のカスタム絵文字 (`tag: [Emoji]`) を学習する。リアクション
+    // 学習 (`dispatch/reaction.rs::learn_emoji_tag`) とは別に、本文で使われた
+    // 絵文字も `emoji` テーブルに登録し、TUI 絵文字管理画面の Remote タブから
+    // 検索できるようにする (Issue #328 フォローアップ)。best-effort、失敗して
+    // も Note 保存自体には影響しない。
+    let emoji_summary = crate::emoji_learn::learn_note_emoji_tags(
+        state,
+        &signer.ap_id,
+        obj.get("tag").unwrap_or(&JsonValue::Null),
+    )
+    .await;
+
     let (quote_target, is_local_quote) = resolve_quote_target(state, obj).await;
 
     info!(
@@ -128,6 +144,8 @@ pub(crate) async fn handle_create(
         followed,
         has_quote = quote_target.is_some(),
         is_local_quote,
+        emoji_tags_seen = emoji_summary.emoji_tags_seen,
+        emoji_learned = emoji_summary.emoji_learned,
         "remote note stored",
     );
 
@@ -239,10 +257,21 @@ pub(crate) async fn fetch_and_store_remote_note(
         .await
         .with_context(|| format!("insert announced note {note_ap_id}"))
         .map_err(DispatchError::Internal)?;
+
+    // Note 本文中のカスタム絵文字を学習する (handle_create と同じ理由)。
+    let emoji_summary = crate::emoji_learn::learn_note_emoji_tags(
+        state,
+        &author.ap_id,
+        obj.get("tag").unwrap_or(&JsonValue::Null),
+    )
+    .await;
+
     info!(
         note_id = inserted.id,
         note_ap_id,
         author = %author.ap_id,
+        emoji_tags_seen = emoji_summary.emoji_tags_seen,
+        emoji_learned = emoji_summary.emoji_learned,
         "announced note fetched and stored",
     );
     Ok(inserted)

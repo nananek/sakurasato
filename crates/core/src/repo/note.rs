@@ -785,3 +785,55 @@ pub async fn list_mentions_window(
     .fetch_all(pool)
     .await
 }
+
+/// バックフィルCLI (`sakurasato-server emoji backfill-remote`) 向け:
+/// 蓄積済みリモート Note のうち `tag` (= AP `tag`、custom emoji を含みうる)
+/// が非空のものを id 昇順で keyset page する。
+///
+/// カーソルは `published_at` (リモート由来で信頼できない値) ではなく
+/// `n.id` (DB 採番の単調増加 PK) を使う。`tags` は `NOT NULL DEFAULT '[]'`
+/// (migration 0002) だが、これは列が NULL にならないことしか保証しない ──
+/// `dispatch/note.rs::build_remote_note` は `obj.get("tag")` の型を検証
+/// せずそのまま格納しているため、AS2/JSON-LD の圧縮表現 (要素 1 件のとき
+/// 配列でなく単一オブジェクトになる等) により **配列でない値**が入った行が
+/// 存在しうる。`jsonb_array_length()` は非配列に対して例外を投げるため、
+/// `jsonb_typeof(...) = 'array'` (例外を投げない) で先に型を確認してから
+/// `n.tags <> '[]'::jsonb` (空配列比較、こちらも関数呼び出しではないので
+/// 例外なし) で非空判定する ── 1 行でも `jsonb_array_length` に到達しない
+/// 書き方にすることで、backfill CLI が異常データ 1 件で全体クラッシュ
+/// しないようにする。`type == "Emoji"` かどうかの最終判定は呼び出し側
+/// (Rust, `learn_note_emoji_tags`) が `.as_array()` で行う。
+#[derive(Debug, Clone)]
+pub struct RemoteNoteTagsRow {
+    pub id: i64,
+    pub ap_id: String,
+    /// 著者 actor の AP id (host 解決用)。
+    pub actor_ap_id: String,
+    pub tags: Json<JsonValue>,
+}
+
+pub async fn list_remote_note_tags_since_id(
+    pool: &PgPool,
+    after_id: Option<i64>,
+    limit: i64,
+) -> sqlx::Result<Vec<RemoteNoteTagsRow>> {
+    sqlx::query_as!(
+        RemoteNoteTagsRow,
+        r#"
+        SELECT n.id, n.ap_id, a.ap_id AS actor_ap_id,
+               n.tags as "tags: Json<JsonValue>"
+        FROM note n
+        JOIN actor a ON a.id = n.actor_id
+        WHERE n.is_local = FALSE
+          AND jsonb_typeof(n.tags) = 'array'
+          AND n.tags <> '[]'::jsonb
+          AND ($1::BIGINT IS NULL OR n.id > $1)
+        ORDER BY n.id ASC
+        LIMIT $2
+        "#,
+        after_id,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
