@@ -176,7 +176,10 @@ pub async fn delete(State(state): State<AppState>, Path(note_id): Path<i64>) -> 
     build_and_dispatch_undo(&state, &local_actor, row).await
 }
 
-async fn build_and_dispatch_undo(
+// `pub(crate)`: miauth notes/delete (`rn:<announce_id>` 経路) も同じ Undo
+// Announce 送出ロジックを共有する (= renote は announce テーブル持ちで、
+// note とは別 id 名前空間のため notes/delete の通常経路では扱えない)。
+pub(crate) async fn build_and_dispatch_undo(
     state: &AppState,
     local_actor: &ActorRow,
     row: sakurasato_core::model::AnnounceRow,

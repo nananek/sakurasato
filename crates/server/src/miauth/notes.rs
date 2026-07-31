@@ -1073,7 +1073,7 @@ pub async fn delete(
     else {
         return auth::unauthorized("invalid or revoked token");
     };
-    let Some(note_id) = body.note_id.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
+    let Some(note_id_str) = body.note_id else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };
 
@@ -1083,6 +1083,17 @@ pub async fn delete(
             "INTERNAL_ERROR",
             "local actor initialization failed",
         );
+    };
+
+    // renote は home timeline で `rn:<announce_id>` の合成 id を持つ (`notes/show`
+    // と同じ名前空間)。素の note とは別テーブル (`announce`) なので、Undo
+    // Announce 送出は local_api 送出側 (`DELETE /api/v1/notes/{id}/renote`)
+    // と同じ経路を共有する。
+    if let Some(rest) = note_id_str.strip_prefix("rn:") {
+        return delete_renote(&state, viewer, rest).await;
+    }
+    let Ok(note_id) = note_id_str.parse::<i64>() else {
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };
     let note = match repo::note::get_by_id(state.pool(), note_id).await {
         Ok(Some(n)) => n,
@@ -1155,6 +1166,61 @@ pub async fn delete(
     }
 
     (StatusCode::NO_CONTENT, ()).into_response()
+}
+
+/// `notes/delete { noteId: "rn:<announce_id>" }` ── renote (boost) の取り消し。
+///
+/// Sakurasato は renote を `announce` テーブルで持ち独立した note 行を発行
+/// しないため、通常の note 削除 (Delete activity) ではなく `Undo Announce`
+/// を送出する。DB 削除 + Undo 送出のロジック自体は `local_api` 送出側
+/// ([`crate::local_api::renotes::build_and_dispatch_undo`], `DELETE
+/// /api/v1/notes/{id}/renote`) と共有し、レスポンス整形のみ Misskey wire
+/// (`204 No Content`) に合わせて別出しする。
+async fn delete_renote(state: &AppState, viewer: i64, announce_id_str: &str) -> Response {
+    let Ok(announce_id) = announce_id_str.parse::<i64>() else {
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+    };
+    let ann = match repo::announce::get_by_id(state.pool(), announce_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note"),
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                announce_id,
+                "miauth notes/delete: announce lookup failed"
+            );
+            return error_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "renote lookup failed",
+            );
+        }
+    };
+    if ann.actor_id != viewer {
+        return error_resp(
+            StatusCode::FORBIDDEN,
+            "PERMISSION_DENIED",
+            "renote not owned by you",
+        );
+    }
+    let Ok(Some(local_actor)) = sakurasato_core::repo::actor::get_by_id(state.pool(), viewer).await
+    else {
+        return error_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "local actor fetch failed",
+        );
+    };
+    let resp = local_api::renotes::build_and_dispatch_undo(state, &local_actor, ann).await;
+    if resp.status().is_success() {
+        (StatusCode::NO_CONTENT, ()).into_response()
+    } else {
+        error_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "renote delete failed",
+        )
+    }
 }
 
 /// `POST /api/notes/renote` (Iceshrimp 互換 alias) handler。
