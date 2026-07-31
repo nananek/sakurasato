@@ -861,6 +861,70 @@ async fn notes_renote_unknown_returns_404(pool: PgPool) {
     assert_eq!(e["error"]["code"], "NO_SUCH_NOTE");
 }
 
+/// Aria クラッシュレポート由来の回帰テスト: renote (boost) は `announce` テーブル
+/// 持ちで `rn:<announce_id>` という note とは別 id 名前空間を持つ。`notes/delete`
+/// が素の note 同様 `i64` 直接パースしか解さないと、renote を削除しようとした
+/// ときに常に `404 NO_SUCH_NOTE` になり、クライアント側で未捕捉例外化していた。
+/// `rn:` prefix を Undo Announce 経路 ([`local_api::renotes::build_and_dispatch_undo`]
+/// 共有) に振り分け、`204 No Content` + `announce` 行削除まで通ることを確認する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_delete_renote_removes_announce_row_and_returns_204(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let target_id = seed_remote_note(&pool, bob, "https://misskey.io/notes/xyz").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+
+    let v = read_json(
+        post_json(
+            app.clone(),
+            "/api/notes/renote",
+            json!({"i": token, "renoteId": target_id.to_string()}),
+        )
+        .await,
+    )
+    .await;
+    let renote_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+    assert!(
+        renote_id.starts_with("rn:"),
+        "renote id must use the rn: namespace: {renote_id}"
+    );
+
+    let resp = post_json(
+        app,
+        "/api/notes/delete",
+        json!({"i": token, "noteId": renote_id}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let row = repo::announce::get_by_pair(&pool, target_id, alice)
+        .await
+        .unwrap();
+    assert!(row.is_none(), "announce row must be deleted");
+}
+
+/// 存在しない announce id (`rn:<id>`) を `notes/delete` しようとすると
+/// `404 NO_SUCH_NOTE`。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn notes_delete_renote_unknown_returns_404(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/notes/delete",
+        json!({"i": token, "noteId": "rn:999999"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let e = read_json(resp).await;
+    assert_eq!(e["error"]["code"], "NO_SUCH_NOTE");
+}
+
 /// `replyId` 指定の `notes/create` が親 note への返信として成立する
 /// (= #166 で deferred だった reply 実装、Aria 実機検証で必要と判明)。
 /// `createdNote.replyId` が親の id を指す。
