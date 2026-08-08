@@ -79,17 +79,6 @@ pub struct Relationship {
     pub follow_id: Option<i64>,
 }
 
-impl Relationship {
-    fn neutral() -> Self {
-        Self {
-            following: false,
-            follow_state: None,
-            followed_by: false,
-            follow_id: None,
-        }
-    }
-}
-
 /// `GET /api/v1/actor?acct=...|ap_id=...`
 ///
 /// 検索順:
@@ -342,40 +331,19 @@ async fn compute_relationship(
     target: &ActorRow,
 ) -> Result<Relationship, ResolveError> {
     let local = resolve_local_actor(state).await?;
-    if target.id == local.id {
-        return Ok(Relationship::neutral());
-    }
-
-    let local_to_target = repo::follow::get_by_pair(state.pool(), local.id, target.id)
+    // follow ドメイン層の共通実装に委譲 ── 双方向の follow 行解釈 (viewer→target
+    // 厳密 / target→viewer 緩い の非対称性含む) は [`crate::follow::compute_follow_relationship`]
+    // に一元化し、MiAuth 経路 (`/api/users/show` の `isFollowed` 等) と共有する。
+    let rel = crate::follow::compute_follow_relationship(state.pool(), local.id, target.id)
         .await
-        .map_err(|err| ResolveError::Internal(format!("follow lookup (out): {err}")))?;
-    let target_to_local = repo::follow::get_by_pair(state.pool(), target.id, local.id)
-        .await
-        .map_err(|err| ResolveError::Internal(format!("follow lookup (in): {err}")))?;
-
-    let follow_state = match local_to_target.as_ref() {
-        Some(row) => Some(parse_follow_state(&row.state)?),
-        None => None,
-    };
-    let following = follow_state == Some(FollowState::Accepted);
-    let followed_by = matches!(
-        target_to_local.as_ref().map(|r| r.state.as_str()),
-        Some("accepted")
-    );
-    // `pending` / `accepted` のときだけ follow_id を露出する。`rejected` は
-    // unfollow 不要 (= 行は残っているがフォロー関係としては成立していない)、
-    // かつ `DELETE /follow/{id}` で削除すると次に follow しようとした時に
-    // `upsert_pending` 経由で `pending` に復活する設計と整合しなくなる。
-    let follow_id = match local_to_target.as_ref() {
-        Some(row) if matches!(row.state.as_str(), "pending" | "accepted") => Some(row.id),
-        _ => None,
-    };
-
+        .map_err(|err| ResolveError::Internal(format!("follow relationship: {err:#}")))?;
+    // 新規の pending 系 2 フィールドはローカル API wire shape には載せない
+    // (= `Relationship` の JSON shape は従来どおり)。
     Ok(Relationship {
-        following,
-        follow_state,
-        followed_by,
-        follow_id,
+        following: rel.following,
+        follow_state: rel.follow_state,
+        followed_by: rel.followed_by,
+        follow_id: rel.follow_id,
     })
 }
 
@@ -393,17 +361,6 @@ async fn resolve_local_actor(state: &AppState) -> Result<ActorRow, ResolveError>
         None => Err(ResolveError::Unavailable(
             "local actor not initialized; run `sakurasato-server init` first".into(),
         )),
-    }
-}
-
-fn parse_follow_state(raw: &str) -> Result<FollowState, ResolveError> {
-    match raw {
-        "pending" => Ok(FollowState::Pending),
-        "accepted" => Ok(FollowState::Accepted),
-        "rejected" => Ok(FollowState::Rejected),
-        other => Err(ResolveError::Internal(format!(
-            "follow row has unknown state {other:?}",
-        ))),
     }
 }
 

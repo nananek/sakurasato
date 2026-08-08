@@ -901,11 +901,18 @@ fn entry_to_actor_lite(entry: &TimelineEntry) -> ActorRow {
 ///
 /// `isBot` / `isCat` は Misskey 独自 field ── `Person`/`Application`/`Service`
 /// AP actor type の分岐で `isBot` を倒す。`isCat` は Sakurasato では常に `false`。
+///
+/// `relationship` は viewer (= ローカル actor) から見た target との follow 関係
+/// ([`crate::follow::compute_follow_relationship`] の結果)。`UserDetailedNotMe`
+/// の required bool `isFollowing` / `isFollowed` / `hasPendingFollowRequestFromYou`
+/// / `hasPendingFollowRequestToYou` にそのまま載せる。自分自身 (`/api/i` 経由) は
+/// [`crate::follow::FollowRelationship::neutral`] を渡せば良い。
 pub fn from_actor_detailed(
     actor: &ActorRow,
     followers_count: i64,
     following_count: i64,
     notes_count: i64,
+    relationship: crate::follow::FollowRelationship,
 ) -> JsonValue {
     let lite = from_actor_and_counts(actor, followers_count, following_count, notes_count);
     let mut v = serde_json::to_value(lite).unwrap_or_else(|_| json!({}));
@@ -1000,6 +1007,32 @@ pub fn from_actor_detailed(
         map.insert("isSuspended".to_string(), JsonValue::Bool(false));
         map.insert("publicReactions".to_string(), JsonValue::Bool(true));
 
+        // **#348 系**: misskey-dart の `UserDetailedNotMe` で **required bool**
+        // なのに `/api/users/show` で emit していなかった follow relationship
+        // 4 件。漏れていると Aria が「フォローされています」等を出せず、`_$
+        // UserDetailedNotMeFromJson` の required read で crash し得る (#174 と
+        // 同型)。`isFollowing` (= viewer → target accepted) / `isFollowed`
+        // (= target → viewer accepted) は [`crate::follow::compute_follow_relationship`]
+        // の結果をそのまま載せ、`hasPendingFollowRequest*` は pending 状態を
+        // 反映する。自分自身への `/api/i` では呼び出し側が `neutral()` を渡す
+        // ため全て false になる (= Misskey も自己参照で false / 意味論同等)。
+        map.insert(
+            "isFollowing".to_string(),
+            JsonValue::Bool(relationship.following),
+        );
+        map.insert(
+            "isFollowed".to_string(),
+            JsonValue::Bool(relationship.followed_by),
+        );
+        map.insert(
+            "hasPendingFollowRequestFromYou".to_string(),
+            JsonValue::Bool(relationship.has_pending_follow_request_from_you),
+        );
+        map.insert(
+            "hasPendingFollowRequestToYou".to_string(),
+            JsonValue::Bool(relationship.has_pending_follow_request_to_you),
+        );
+
         // **必須ではなく key の存在自体が意味を持つフィールド**: misskey_dart の
         // `User.fromJson` (= `MisskeyUsers.search` / `searchByUsernameAndHost` が
         // 使う polymorphic factory) は `json.containsKey("url")` の有無だけで
@@ -1053,7 +1086,16 @@ pub fn from_actor_me_detailed(
     notes_count: i64,
     policies: JsonValue,
 ) -> JsonValue {
-    let mut v = from_actor_detailed(actor, followers_count, following_count, notes_count);
+    // 自分自身 (Me) に対しては follow relationship は常に中立 ── `/api/i` の
+    // `UserDetailedNotMe` 部分も required bool が揃っている限り client は
+    // 描画に困らない。
+    let mut v = from_actor_detailed(
+        actor,
+        followers_count,
+        following_count,
+        notes_count,
+        crate::follow::FollowRelationship::neutral(),
+    );
     // `from_actor_detailed` は実質 `Object` を返すが、型レベルでは保証されて
     // いない。`Null` 等で来ると Me-only field 挿入が無音で消えるため、release
     // ビルドでも `error!` で気付ける形にする (= [PR #171 round-2 finding 2]
@@ -1204,6 +1246,10 @@ mod tests {
     use chrono::Utc;
     use sakurasato_core::model::ActorRow;
     use sqlx::types::Json as SqlxJson;
+
+    fn neutral_rel() -> crate::follow::FollowRelationship {
+        crate::follow::FollowRelationship::neutral()
+    }
 
     fn fake_actor(is_local: bool, host: &str, locked: bool) -> ActorRow {
         ActorRow {
@@ -1575,7 +1621,7 @@ mod tests {
         actor.summary = Some("hello world".into());
         actor.image_url = Some("https://cdn.test/banner.webp".into());
         actor.actor_type = "Service".into();
-        let v = from_actor_detailed(&actor, 1, 2, 3);
+        let v = from_actor_detailed(&actor, 1, 2, 3, neutral_rel());
         assert_eq!(v["id"], "42");
         assert_eq!(v["description"], "hello world");
         assert_eq!(v["bannerUrl"], "https://cdn.test/banner.webp");
@@ -1590,6 +1636,11 @@ mod tests {
         assert_eq!(v["isSilenced"], false);
         assert_eq!(v["isSuspended"], false);
         assert_eq!(v["publicReactions"], true);
+        // follow relationship 4 件 (neutral なので全て false)。
+        assert_eq!(v["isFollowing"], false);
+        assert_eq!(v["isFollowed"], false);
+        assert_eq!(v["hasPendingFollowRequestFromYou"], false);
+        assert_eq!(v["hasPendingFollowRequestToYou"], false);
     }
 
     #[test]
@@ -1599,7 +1650,7 @@ mod tests {
         let mut actor = fake_actor(false, "remote.test", false);
         actor.summary =
             Some(r#"<p>hello <a href="https://remote.test/@me">@me</a></p><p>line2</p>"#.into());
-        let v = from_actor_detailed(&actor, 0, 0, 0);
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel());
         assert_eq!(v["description"], "hello @me\n\nline2");
     }
 
@@ -1609,7 +1660,7 @@ mod tests {
         // そのまま (html_to_plain_text を通さない)。
         let mut actor = fake_actor(true, "sakurasato.test", false);
         actor.summary = Some("price < 100 & rising".into());
-        let v = from_actor_detailed(&actor, 0, 0, 0);
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel());
         assert_eq!(v["description"], "price < 100 & rising");
     }
 
@@ -1622,7 +1673,7 @@ mod tests {
     fn from_actor_detailed_emits_all_required_userdetailednotme_fields() {
         // remote actor (icon_url 無し) でも avatarUrl が non-null になる経路。
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0);
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel());
         // string / number で `as String` / `as num` 直読みされ、null だと throw。
         assert!(v["id"].is_string(), "id must be a string");
         assert!(v["username"].is_string(), "username must be a string");
@@ -1642,12 +1693,50 @@ mod tests {
             "isSilenced",
             "isSuspended",
             "publicReactions",
+            "isFollowing",
+            "isFollowed",
+            "hasPendingFollowRequestFromYou",
+            "hasPendingFollowRequestToYou",
         ] {
             assert!(
                 v[key].is_boolean(),
                 "required bool `{key}` must be present and boolean"
             );
         }
+    }
+
+    /// follow relationship 4 フィールドの **取り違え (swap)** 検出 ──
+    /// `isFollowing` / `isFollowed` / `hasPendingFollowRequestFromYou` /
+    /// `hasPendingFollowRequestToYou` は名前が似ていて swap しやすいので、
+    /// 全 true の `FollowRelationship` を渡してキーごとに個別 assert する。
+    #[test]
+    fn from_actor_detailed_emits_follow_relationship_without_swapping() {
+        let actor = fake_actor(false, "remote.test", false);
+        let rel = crate::follow::FollowRelationship {
+            following: true,
+            follow_state: Some(sakurasato_core::model::FollowState::Accepted),
+            followed_by: true,
+            follow_id: Some(7),
+            has_pending_follow_request_from_you: true,
+            has_pending_follow_request_to_you: true,
+        };
+        let v = from_actor_detailed(&actor, 0, 0, 0, rel);
+        assert_eq!(
+            v["isFollowing"], true,
+            "isFollowing must come from `following`"
+        );
+        assert_eq!(
+            v["isFollowed"], true,
+            "isFollowed must come from `followed_by`"
+        );
+        assert_eq!(
+            v["hasPendingFollowRequestFromYou"], true,
+            "must come from `has_pending_follow_request_from_you`"
+        );
+        assert_eq!(
+            v["hasPendingFollowRequestToYou"], true,
+            "must come from `has_pending_follow_request_to_you`"
+        );
     }
 
     /// 2026-07-22 調査: `misskey_dart` の `User.fromJson` (=
@@ -1660,7 +1749,7 @@ mod tests {
     #[test]
     fn from_actor_detailed_includes_url_key_for_userdetailed_dispatch() {
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0);
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel());
         let map = v.as_object().expect("from_actor_detailed must be object");
         assert!(
             map.contains_key("url"),

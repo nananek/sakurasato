@@ -667,6 +667,14 @@ async fn following_create_enqueues_follow(pool: PgPool) {
     // 相手 user の UserDetailed が返る。
     assert_eq!(v["username"], "bob");
     assert_eq!(v["host"], "misskey.io");
+    // follow 直後は remote 側の Accept 前なので pending ── Misskey wire の
+    // `hasPendingFollowRequestFromYou` が true で載る。
+    assert_eq!(v["hasPendingFollowRequestFromYou"], true, "{v}");
+    assert_eq!(v["hasPendingFollowRequestToYou"], false, "{v}");
+    assert_eq!(
+        v["isFollowing"], false,
+        "pending は isFollowing にならない: {v}"
+    );
 
     // delivery_queue に Follow 行が積まれている。
     let queued: i64 = sqlx::query_scalar!("SELECT count(*) FROM delivery_queue")
@@ -675,6 +683,39 @@ async fn following_create_enqueues_follow(pool: PgPool) {
         .unwrap()
         .unwrap_or(0);
     assert!(queued >= 1, "delivery_queue should have at least 1 row");
+}
+
+/// **#348 系**: 相手 (bob) が既に alice (= ローカル actor) を accepted で
+/// follow している状態で alice が follow を送ると、レスポンスの `UserDetailed`
+/// に `isFollowed=true` (「フォローされています」) が載る ──
+/// `following/create` 成功レスポンスをクライアントがそのままプロフィール描画に
+/// 使っても関係が正しく出ることを lock する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_create_response_reports_is_followed_when_mutual(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // bob → alice が accepted (既にフォローされています)。
+    accepted_follow(&pool, bob, alice).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:following"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/following/create",
+        json!({"i": token, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["username"], "bob");
+    assert_eq!(v["isFollowed"], true, "bob already follows alice: {v}");
+    // alice → bob は今回送ったばかりで pending。
+    assert_eq!(v["hasPendingFollowRequestFromYou"], true, "{v}");
+    assert_eq!(
+        v["isFollowing"], false,
+        "pending は isFollowing にならない: {v}"
+    );
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

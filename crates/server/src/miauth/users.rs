@@ -46,6 +46,7 @@ use serde_json::Value as JsonValue;
 use crate::miauth::auth;
 use crate::miauth::conv::from_actor_detailed;
 use crate::miauth::error::{bad_request, error_resp, internal_error};
+use crate::miauth::following::resolve_local_actor_id;
 use crate::state::AppState;
 
 const SCOPE_READ_ACCOUNT: &str = "read:account";
@@ -97,9 +98,11 @@ pub async fn handle(
                 return internal_error("failed to look up users");
             }
         };
+        // viewer (= ローカル actor) はループ外で 1 回だけ解決する。
+        let local_actor_id = resolve_local_actor_id(&state).await;
         let mut out = Vec::with_capacity(actors.len());
         for actor in &actors {
-            out.push(build_detailed_json(&state, actor).await);
+            out.push(build_detailed_json(&state, actor, local_actor_id).await);
         }
         return Json(out).into_response();
     }
@@ -143,7 +146,7 @@ pub async fn handle(
         return bad_request("either userId, username, or userIds is required");
     };
 
-    let detailed = build_detailed_json(&state, &actor).await;
+    let detailed = build_detailed_json(&state, &actor, resolve_local_actor_id(&state).await).await;
     Json(detailed).into_response()
 }
 
@@ -155,7 +158,17 @@ pub async fn handle(
 /// 応じて host を `None` (local) / `Some(actor.host)` (remote) に倒すため、
 /// 本関数は `ActorRow` をそのまま渡せば正しい host が得られる
 /// (= `conv::timeline_entry_to_miss_note` のような上書きは不要)。
-async fn build_detailed_json(state: &AppState, actor: &ActorRow) -> JsonValue {
+///
+/// `local_actor_id` は viewer の DB id ── `None` (= 未 init) のときは
+/// relationship を中立値にする。`isFollowing` / `isFollowed` /
+/// `hasPendingFollowRequestFromYou` / `hasPendingFollowRequestToYou` は
+/// [`crate::follow::compute_follow_relationship`] の結果を載せる (DB 障害時は
+/// `followers`/`following` count と同じフェイルオープンで中立値)。
+async fn build_detailed_json(
+    state: &AppState,
+    actor: &ActorRow,
+    local_actor_id: Option<i64>,
+) -> JsonValue {
     let followers = repo::follow::count_followers(state.pool(), actor.id)
         .await
         .unwrap_or(0);
@@ -174,7 +187,23 @@ async fn build_detailed_json(state: &AppState, actor: &ActorRow) -> JsonValue {
         // wire shape に number が必要なので 0 を返して埋める。
         0
     };
-    from_actor_detailed(actor, followers, following, notes)
+    let rel = match local_actor_id {
+        Some(local_id) => {
+            crate::follow::compute_follow_relationship(state.pool(), local_id, actor.id)
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        ?err,
+                        target_id = actor.id,
+                        "miauth users/show: relationship computation failed; \
+                         falling back to neutral",
+                    );
+                    crate::follow::FollowRelationship::neutral()
+                })
+        }
+        None => crate::follow::FollowRelationship::neutral(),
+    };
+    from_actor_detailed(actor, followers, following, notes, rel)
 }
 
 /// `limit` の既定値・上限。Misskey 公式仕様 (default 10, max 100) に揃える。
@@ -250,6 +279,8 @@ pub async fn search_by_username_and_host(
     };
 
     let mut out = Vec::with_capacity(actors.len());
+    // viewer (= ローカル actor) はループ外で 1 回だけ解決する。
+    let local_actor_id = resolve_local_actor_id(&state).await;
     for actor in actors {
         let followers = repo::follow::count_followers(state.pool(), actor.id)
             .await
@@ -262,7 +293,10 @@ pub async fn search_by_username_and_host(
         } else {
             0
         };
-        out.push(from_actor_detailed(&actor, followers, following, notes));
+        let rel = relationship_or_neutral(&state, local_actor_id, actor.id).await;
+        out.push(from_actor_detailed(
+            &actor, followers, following, notes, rel,
+        ));
     }
     Json(out).into_response()
 }
@@ -346,6 +380,8 @@ pub async fn search(
         };
 
     let mut out = Vec::with_capacity(actors.len());
+    // viewer (= ローカル actor) はループ外で 1 回だけ解決する。
+    let local_actor_id = resolve_local_actor_id(&state).await;
     for actor in actors {
         let followers = repo::follow::count_followers(state.pool(), actor.id)
             .await
@@ -358,7 +394,36 @@ pub async fn search(
         } else {
             0
         };
-        out.push(from_actor_detailed(&actor, followers, following, notes));
+        let rel = relationship_or_neutral(&state, local_actor_id, actor.id).await;
+        out.push(from_actor_detailed(
+            &actor, followers, following, notes, rel,
+        ));
     }
     Json(out).into_response()
+}
+
+/// viewer (= ローカル actor) から見た `target_actor_id` との follow relationship
+/// を計算する。`local_actor_id` が `None` (= 未 init) または DB 障害時は中立値に
+/// フェイルオープンする (= `count_followers` の `.unwrap_or(0)` と同じ方針)。
+async fn relationship_or_neutral(
+    state: &AppState,
+    local_actor_id: Option<i64>,
+    target_actor_id: i64,
+) -> crate::follow::FollowRelationship {
+    match local_actor_id {
+        Some(local_id) => {
+            crate::follow::compute_follow_relationship(state.pool(), local_id, target_actor_id)
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        ?err,
+                        target_actor_id,
+                        "miauth users search: relationship computation failed; \
+                         falling back to neutral",
+                    );
+                    crate::follow::FollowRelationship::neutral()
+                })
+        }
+        None => crate::follow::FollowRelationship::neutral(),
+    }
 }

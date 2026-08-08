@@ -26,9 +26,11 @@
 //! delete しても同じ id になり、相手側で重複排除される。inbound Undo Follow
 //! は別途実装予定 ([[m12-66-complete]] 参照、本 PR では out のみ)。
 
+use anyhow::Context;
 use sakurasato_core::model::{ActorRow, FollowRow, FollowState};
 use sakurasato_core::{Config, repo};
 use serde_json::{Value as JsonValue, json};
+use sqlx::PgPool;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -160,6 +162,125 @@ pub struct UnfollowOutcome {
     pub target_ap_id: String,
     pub queue_id: i64,
     pub inbox_url: String,
+}
+
+/// viewer (= ローカル actor) から見た target との双方向 follow 関係。
+///
+/// `local_api::actor::Relationship` (TUI 向け `GET /api/v1/actor/{id}/relationship`)
+/// と同じ意味論を follow ドメイン層に切り出し、MiAuth 経路 (`/api/users/show`
+/// 等の Misskey `UserDetailedNotMe` 必須フィールド `isFollowing` /
+/// `isFollowed` / `hasPendingFollowRequestFromYou` / `hasPendingFollowRequestToYou`)
+/// からも共有できるようにしたもの (PR #348 系、`#150` 系 follow-relationship)。
+///
+/// 意味:
+///
+/// - `following`: viewer → target が `accepted`
+/// - `follow_state`: viewer → target の最新 state (`pending`/`accepted`/`rejected`)、
+///   行が無ければ `None`
+/// - `followed_by`: target → viewer が `accepted`
+/// - `follow_id`: viewer → target の follow 行が `pending` / `accepted` のとき
+///   の `follow.id` (`rejected` / 行無しは `None`)
+/// - `has_pending_follow_request_from_you`: viewer → target が `pending`
+/// - `has_pending_follow_request_to_you`: target → viewer が `pending`
+///   (= M12 鍵アカ運用で相手の承認待ち)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Misskey UserDetailedNotMe の required bool 4 件 + 既存 Relationship の follow_id を 1 構造体で運ぶ設計"
+)]
+pub struct FollowRelationship {
+    pub following: bool,
+    pub follow_state: Option<FollowState>,
+    pub followed_by: bool,
+    pub follow_id: Option<i64>,
+    /// viewer→target が `pending`。
+    pub has_pending_follow_request_from_you: bool,
+    /// target→viewer が `pending`。
+    pub has_pending_follow_request_to_you: bool,
+}
+
+impl FollowRelationship {
+    /// 全フィールド中立 (= follow 行が無い / 自分自身)。
+    pub fn neutral() -> Self {
+        Self {
+            following: false,
+            follow_state: None,
+            followed_by: false,
+            follow_id: None,
+            has_pending_follow_request_from_you: false,
+            has_pending_follow_request_to_you: false,
+        }
+    }
+}
+
+/// `(viewer, target)` の双方向 follow 行を引いて [`FollowRelationship`] を計算する。
+///
+/// `viewer_actor_id == target_actor_id` (自分自身) は DB を引かず [`FollowRelationship::neutral`]
+/// を返す (= `local_api::actor::compute_relationship` と同じ方針)。
+///
+/// 解釈の非対称性は `local_api::actor.rs` の既存実装をそのまま引き継ぐ:
+///
+/// - viewer→target 方向は厳密 parse (`pending` / `accepted` / `rejected` 以外は
+///   Err ── 我々の書いた行なので unknown state は即座に気付きたい)。
+/// - target→viewer 方向は `matches!` の緩い文字列判定 (remote 由来の行を弾くと
+///   `followed_by` が偽陰性になり得るため、既存の意図的挙動を変えない)。
+pub async fn compute_follow_relationship(
+    pool: &PgPool,
+    viewer_actor_id: i64,
+    target_actor_id: i64,
+) -> anyhow::Result<FollowRelationship> {
+    if viewer_actor_id == target_actor_id {
+        return Ok(FollowRelationship::neutral());
+    }
+
+    let local_to_target = repo::follow::get_by_pair(pool, viewer_actor_id, target_actor_id)
+        .await
+        .context("follow lookup (out)")?;
+    let target_to_local = repo::follow::get_by_pair(pool, target_actor_id, viewer_actor_id)
+        .await
+        .context("follow lookup (in)")?;
+
+    let follow_state = match local_to_target.as_ref() {
+        Some(row) => Some(parse_state_str(&row.state)?),
+        None => None,
+    };
+    let following = follow_state == Some(FollowState::Accepted);
+    // `pending` / `accepted` のときだけ follow_id を露出する。`rejected` は
+    // unfollow 不要 (= フォロー関係としては成立していない) かつ、`DELETE
+    // /follow/{id}` で削除すると次に follow した時に `upsert_pending` 経由で
+    // `pending` に復活する設計と整合しなくなるため。
+    let follow_id = match local_to_target.as_ref() {
+        Some(row) if matches!(row.state.as_str(), "pending" | "accepted") => Some(row.id),
+        _ => None,
+    };
+    let followed_by = matches!(
+        target_to_local.as_ref().map(|r| r.state.as_str()),
+        Some("accepted")
+    );
+
+    Ok(FollowRelationship {
+        following,
+        follow_state,
+        followed_by,
+        follow_id,
+        has_pending_follow_request_from_you: follow_state == Some(FollowState::Pending),
+        has_pending_follow_request_to_you: matches!(
+            target_to_local.as_ref().map(|r| r.state.as_str()),
+            Some("pending")
+        ),
+    })
+}
+
+/// `follow.state` の文字列を [`FollowState`] に厳密 parse する。
+/// private の [`parse_follow_state`] (row 単位・`FollowError` 返却) と名前衝突
+/// しないための別名。unknown state は DB 不整合なので Err にする。
+fn parse_state_str(raw: &str) -> anyhow::Result<FollowState> {
+    match raw {
+        "pending" => Ok(FollowState::Pending),
+        "accepted" => Ok(FollowState::Accepted),
+        "rejected" => Ok(FollowState::Rejected),
+        other => anyhow::bail!("follow row has unknown state {other:?}"),
+    }
 }
 
 /// **M13 PR2 core**: 指定 target を follow する。
@@ -634,5 +755,181 @@ mod tests {
         assert_eq!(undo["object"]["actor"], "https://x/users/me");
         assert_eq!(undo["object"]["object"], "https://y/users/bob");
         assert_eq!(undo["@context"], "https://www.w3.org/ns/activitystreams");
+    }
+
+    // ── compute_follow_relationship (DB テスト) ─────────────────────────────
+
+    fn fake_new_actor(id_suffix: &str, host: &str, is_local: bool) -> repo::actor::NewActor {
+        repo::actor::NewActor {
+            ap_id: format!("https://{host}/users/user{id_suffix}"),
+            preferred_username: format!("user{id_suffix}"),
+            host: host.into(),
+            display_name: None,
+            summary: None,
+            icon_url: None,
+            image_url: None,
+            inbox_url: format!("https://{host}/inbox"),
+            shared_inbox_url: Some(format!("https://{host}/shared-inbox")),
+            outbox_url: None,
+            followers_url: None,
+            following_url: None,
+            public_key_id: format!("https://{host}/users/user{id_suffix}#main-key"),
+            public_key_pem: "fake-public-key".into(),
+            private_key_pem: None,
+            ed25519_public_key_id: None,
+            ed25519_public_key_pem: None,
+            ed25519_private_key_pem: None,
+            also_known_as: vec![],
+            moved_to_ap_id: None,
+            is_local,
+            actor_type: "Person".into(),
+            manually_approves_followers: false,
+        }
+    }
+
+    /// follow 行を `(follower, followed, state)` で直接 INSERT する。
+    #[allow(
+        clippy::similar_names,
+        reason = "AP 用語の follower/followed は命名衝突に非ず"
+    )]
+    async fn seed_follow(pool: &PgPool, follower: i64, followed: i64, state: FollowState) {
+        repo::follow::insert_pending(
+            pool,
+            &format!("https://x.test/activities/follow-{follower}-{followed}"),
+            follower,
+            followed,
+        )
+        .await
+        .unwrap();
+        // `insert_pending` は ap_id で冪等なので、同じペアで複数回呼んでも
+        // `get_by_ap_id` が同じ行を返す ── state を上書きしてから進める。
+        let row = repo::follow::get_by_pair(pool, follower, followed)
+            .await
+            .unwrap()
+            .unwrap();
+        repo::follow::set_state(pool, row.id, state).await.unwrap();
+    }
+
+    async fn seed_two_actors(pool: &PgPool) -> (i64, i64) {
+        let viewer = repo::actor::insert(pool, fake_new_actor("1", "sakurasato.test", true))
+            .await
+            .unwrap();
+        let target = repo::actor::insert(pool, fake_new_actor("2", "remote.test", false))
+            .await
+            .unwrap();
+        (viewer.id, target.id)
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn compute_follow_relationship_is_neutral_for_self(pool: PgPool) {
+        let (viewer, _) = seed_two_actors(&pool).await;
+        let rel = compute_follow_relationship(&pool, viewer, viewer)
+            .await
+            .unwrap();
+        assert_eq!(rel, FollowRelationship::neutral());
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn compute_follow_relationship_is_neutral_without_rows(pool: PgPool) {
+        let (viewer, target) = seed_two_actors(&pool).await;
+        let rel = compute_follow_relationship(&pool, viewer, target)
+            .await
+            .unwrap();
+        assert_eq!(rel, FollowRelationship::neutral());
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn compute_follow_relationship_viewer_to_target_pending(pool: PgPool) {
+        let (viewer, target) = seed_two_actors(&pool).await;
+        seed_follow(&pool, viewer, target, FollowState::Pending).await;
+        let rel = compute_follow_relationship(&pool, viewer, target)
+            .await
+            .unwrap();
+        assert!(!rel.following);
+        assert_eq!(rel.follow_state, Some(FollowState::Pending));
+        assert!(!rel.followed_by);
+        assert!(rel.follow_id.is_some());
+        assert!(rel.has_pending_follow_request_from_you);
+        assert!(!rel.has_pending_follow_request_to_you);
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn compute_follow_relationship_viewer_to_target_accepted(pool: PgPool) {
+        let (viewer, target) = seed_two_actors(&pool).await;
+        seed_follow(&pool, viewer, target, FollowState::Accepted).await;
+        let rel = compute_follow_relationship(&pool, viewer, target)
+            .await
+            .unwrap();
+        assert!(rel.following);
+        assert_eq!(rel.follow_state, Some(FollowState::Accepted));
+        assert!(!rel.followed_by);
+        assert!(rel.follow_id.is_some());
+        assert!(!rel.has_pending_follow_request_from_you);
+        assert!(!rel.has_pending_follow_request_to_you);
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn compute_follow_relationship_viewer_to_target_rejected(pool: PgPool) {
+        let (viewer, target) = seed_two_actors(&pool).await;
+        seed_follow(&pool, viewer, target, FollowState::Rejected).await;
+        let rel = compute_follow_relationship(&pool, viewer, target)
+            .await
+            .unwrap();
+        assert!(!rel.following);
+        assert_eq!(rel.follow_state, Some(FollowState::Rejected));
+        assert!(!rel.followed_by);
+        assert_eq!(
+            rel.follow_id, None,
+            "rejected row must not expose follow_id"
+        );
+        assert!(!rel.has_pending_follow_request_from_you);
+        assert!(!rel.has_pending_follow_request_to_you);
+    }
+
+    /// **鍵アカ (M12) 承認待ち**: target → viewer が pending (= 相手からの
+    /// Follow が我々側で承認待ち)。今回のユーザー報告シナリオの核心。
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn compute_follow_relationship_target_to_viewer_pending(pool: PgPool) {
+        let (viewer, target) = seed_two_actors(&pool).await;
+        seed_follow(&pool, target, viewer, FollowState::Pending).await;
+        let rel = compute_follow_relationship(&pool, viewer, target)
+            .await
+            .unwrap();
+        assert!(!rel.following);
+        assert_eq!(rel.follow_state, None);
+        assert!(!rel.followed_by);
+        assert_eq!(rel.follow_id, None);
+        assert!(!rel.has_pending_follow_request_from_you);
+        assert!(rel.has_pending_follow_request_to_you);
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn compute_follow_relationship_target_to_viewer_accepted(pool: PgPool) {
+        let (viewer, target) = seed_two_actors(&pool).await;
+        seed_follow(&pool, target, viewer, FollowState::Accepted).await;
+        let rel = compute_follow_relationship(&pool, viewer, target)
+            .await
+            .unwrap();
+        assert!(!rel.following);
+        assert_eq!(rel.follow_state, None);
+        assert!(rel.followed_by);
+        assert!(!rel.has_pending_follow_request_from_you);
+        assert!(!rel.has_pending_follow_request_to_you);
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn compute_follow_relationship_mutual_accepted(pool: PgPool) {
+        let (viewer, target) = seed_two_actors(&pool).await;
+        seed_follow(&pool, viewer, target, FollowState::Accepted).await;
+        seed_follow(&pool, target, viewer, FollowState::Accepted).await;
+        let rel = compute_follow_relationship(&pool, viewer, target)
+            .await
+            .unwrap();
+        assert!(rel.following);
+        assert_eq!(rel.follow_state, Some(FollowState::Accepted));
+        assert!(rel.followed_by);
+        assert!(rel.follow_id.is_some());
+        assert!(!rel.has_pending_follow_request_from_you);
+        assert!(!rel.has_pending_follow_request_to_you);
     }
 }

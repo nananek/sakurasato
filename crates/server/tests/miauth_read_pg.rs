@@ -785,6 +785,11 @@ async fn users_show_by_user_id_returns_detailed(pool: PgPool) {
     assert_eq!(v["isSilenced"], false);
     assert_eq!(v["isSuspended"], false);
     assert_eq!(v["publicReactions"], true);
+    // follow relationship 4 件 ── 自分自身を引いたので全て中立 (= false)。
+    assert_eq!(v["isFollowing"], false, "{v}");
+    assert_eq!(v["isFollowed"], false, "{v}");
+    assert_eq!(v["hasPendingFollowRequestFromYou"], false, "{v}");
+    assert_eq!(v["hasPendingFollowRequestToYou"], false, "{v}");
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
@@ -809,6 +814,46 @@ async fn users_show_by_username_returns_detailed(pool: PgPool) {
     let v = read_json(resp).await;
     assert_eq!(v["username"], "alice");
     assert!(v["host"].is_null());
+}
+
+/// **ユーザー報告シナリオ (#348 系)**: bob (= remote) が alice (= ローカル actor)
+/// を accepted で follow しているとき、alice の視点で `/api/users/show?userId=bob`
+/// を叩くと `isFollowed=true` (「フォローされています」) が返る。
+///
+/// `isFollowing` / `isFollowed` は **viewer (= トークン所有者 = alice) から見た**
+/// 向きであることに注意: bob が alice を follow しているので `isFollowing` では
+/// なく `isFollowed` が立つ (逆にすると Aria のプロフィール表示が逆になって
+/// 報告バグが再発する)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_show_reports_is_followed_from_viewer_perspective(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // bob → alice が accepted (= alice から見て「フォローされています」)。
+    seed_accepted_follow(&pool, bob, alice).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "userId": bob.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/users/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["username"], "bob");
+    assert_eq!(
+        v["isFollowed"], true,
+        "bob follows alice → isFollowed must be true: {v}"
+    );
+    assert_eq!(v["isFollowing"], false, "alice does not follow bob: {v}");
+    assert_eq!(v["hasPendingFollowRequestFromYou"], false, "{v}");
+    assert_eq!(v["hasPendingFollowRequestToYou"], false, "{v}");
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
