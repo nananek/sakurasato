@@ -11,9 +11,13 @@
 //!
 //! - body: `{ i: <token>, userId: "<string>" }`
 //! - 成功時: 相手 user の `MissUser` (Misskey の慣行 ── follow 状態を含む `UserDetailed`
-//!   オブジェクトを返す。ここでは [`crate::miauth::conv::from_actor_detailed`] を
-//!   流用し、`isFollowing` / `isFollowed` 等の relationship フィールドは別 endpoint
-//!   `users/relation` を別途実装する想定で本 PR では含めない)
+//!   オブジェクトを返す)。[`crate::miauth::conv::from_actor_detailed`] に
+//!   [`crate::follow::compute_follow_relationship`] の結果を渡し、`isFollowing` /
+//!   `isFollowed` / `hasPendingFollowRequestFromYou` / `hasPendingFollowRequestToYou`
+//!   を載せる。当初は「別 endpoint `users/relation` で実装予定」としていたが、
+//!   misskey-hub.net の公式 API 仕様にそのような endpoint は存在せず、
+//!   `users/show` / `following/create` 等のレスポンス自体にこれらのフィールドを
+//!   含めるのが正しい仕様だった (PR #348 系で修正)。
 //! - エラー時: `404 NO_SUCH_USER` (= 不在 actor) / `409 ALREADY_FOLLOWING` (= 既 accepted)
 //!   など Misskey 慣行の `error.code` を返す
 //!
@@ -132,6 +136,11 @@ pub async fn delete(
 /// Misskey `following/create` の成功 body ── 相手 user の `UserDetailed` を返す。
 /// `target` actor は [`FollowOutcome::target`] 由来。`MissUser` の follower
 /// count は target actor 視点なので、`count_followers` を別途引く。
+///
+/// relationship (= `isFollowing` / `isFollowed` / `hasPendingFollowRequest*`)
+/// は follow 直後の実状態を [`crate::follow::compute_follow_relationship`] で
+/// 引いて載せる。local actor id が解決できない (init 未実行) 場合は
+/// `followers`/`following` count と同じく中立値でフェイルオープンする。
 async fn build_create_response(state: &AppState, outcome: &FollowOutcome) -> serde_json::Value {
     let followers = repo::follow::count_followers(state.pool(), outcome.target.id)
         .await
@@ -144,7 +153,8 @@ async fn build_create_response(state: &AppState, outcome: &FollowOutcome) -> ser
     } else {
         0
     };
-    from_actor_detailed(&outcome.target, followers, following, notes)
+    let rel = compute_relationship_or_neutral(state, outcome.target.id).await;
+    from_actor_detailed(&outcome.target, followers, following, notes, rel)
 }
 
 /// `following/delete` の成功 body ── unfollow した相手 user の `UserDetailed`。
@@ -164,7 +174,8 @@ async fn build_delete_response(state: &AppState, outcome: &UnfollowOutcome) -> s
             } else {
                 0
             };
-            from_actor_detailed(&actor, followers, following, notes)
+            let rel = compute_relationship_or_neutral(state, actor.id).await;
+            from_actor_detailed(&actor, followers, following, notes, rel)
         }
         _ => {
             // actor 行が消えていても unfollow 自体は成功している。空 object で返す。
@@ -173,7 +184,34 @@ async fn build_delete_response(state: &AppState, outcome: &UnfollowOutcome) -> s
     }
 }
 
-async fn resolve_local_actor_id(state: &AppState) -> Option<i64> {
+/// viewer (= ローカル actor) から見た `target_actor_id` との follow relationship
+/// を計算する。local actor 未 init / DB 障害時は中立値にフェイルオープンする
+/// (= `followers`/`following` count の `.unwrap_or(0)` と同じ方針)。
+async fn compute_relationship_or_neutral(
+    state: &AppState,
+    target_actor_id: i64,
+) -> crate::follow::FollowRelationship {
+    match resolve_local_actor_id(state).await {
+        Some(local_id) => crate::follow::compute_follow_relationship(
+            state.pool(),
+            local_id,
+            target_actor_id,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                ?err,
+                target_actor_id,
+                "miauth following: relationship computation failed; falling back to neutral",
+            );
+            crate::follow::FollowRelationship::neutral()
+        }),
+        None => crate::follow::FollowRelationship::neutral(),
+    }
+}
+
+/// ローカル actor の DB id を引く。未 init / 非 local のときは `None`。
+pub(super) async fn resolve_local_actor_id(state: &AppState) -> Option<i64> {
     let host = &state.config().server.host;
     let user = &state.config().server.user;
     match repo::actor::get_by_username_host(state.pool(), user, host).await {

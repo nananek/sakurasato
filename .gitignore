@@ -4,6 +4,9 @@
 **/*.rs.bk
 /.dev-cache
 
+# claude planファイル置き場 (opencode引き継ぎ用の一時ディレクトリ)
+/tmp/
+
 # Claude Code (local session state)
 .claude/
 
