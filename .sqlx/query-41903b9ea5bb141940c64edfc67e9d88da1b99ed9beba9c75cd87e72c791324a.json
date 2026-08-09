@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            birthday, location, lang, followed_message,\n            fields as \"fields: Json<Vec<crate::model::ActorField>>\",\n            fetched_at, created_at, updated_at\n        FROM actor\n        WHERE\n            (preferred_username ILIKE $1 OR display_name ILIKE $1)\n            AND ($2::BOOLEAN IS NULL OR is_local = $2)\n        ORDER BY is_local DESC, preferred_username ASC\n        LIMIT $3 OFFSET $4\n        ",
+  "query": "\n        SELECT\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            birthday, location, lang, followed_message,\n            fields as \"fields: Json<Vec<crate::model::ActorField>>\",\n            followers_count, following_count, notes_count,\n            fetched_at, created_at, updated_at\n        FROM actor WHERE ap_id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -324,6 +324,39 @@
       },
       {
         "ordinal": 29,
+        "name": "followers_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "followers_count"
+          }
+        }
+      },
+      {
+        "ordinal": 30,
+        "name": "following_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "following_count"
+          }
+        }
+      },
+      {
+        "ordinal": 31,
+        "name": "notes_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "notes_count"
+          }
+        }
+      },
+      {
+        "ordinal": 32,
         "name": "fetched_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -334,7 +367,7 @@
         }
       },
       {
-        "ordinal": 30,
+        "ordinal": 33,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -345,7 +378,7 @@
         }
       },
       {
-        "ordinal": 31,
+        "ordinal": 34,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -358,10 +391,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Bool",
-        "Int8",
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
@@ -394,10 +424,13 @@
       true,
       true,
       false,
+      false,
+      false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "0a471f4608a221b89195dd3670841fd2c1e1b9ad966db0b1ab18b900466c4218"
+  "hash": "41903b9ea5bb141940c64edfc67e9d88da1b99ed9beba9c75cd87e72c791324a"
 }

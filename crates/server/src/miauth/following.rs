@@ -135,24 +135,17 @@ pub async fn delete(
 
 /// Misskey `following/create` の成功 body ── 相手 user の `UserDetailed` を返す。
 /// `target` actor は [`FollowOutcome::target`] 由来。`MissUser` の follower
-/// count は target actor 視点なので、`count_followers` を別途引く。
+/// count は target actor 視点なので、[`crate::miauth::counts::counts_for_actor`]
+/// で actor 種別に読み分けて引く (remote は Collection `totalItems` キャッシュ。
+/// follow 直後は `fetch_and_upsert` で取得済みなので新鮮)。
 ///
 /// relationship (= `isFollowing` / `isFollowed` / `hasPendingFollowRequest*`)
 /// は follow 直後の実状態を [`crate::follow::compute_follow_relationship`] で
 /// 引いて載せる。local actor id が解決できない (init 未実行) 場合は
 /// `followers`/`following` count と同じく中立値でフェイルオープンする。
 async fn build_create_response(state: &AppState, outcome: &FollowOutcome) -> serde_json::Value {
-    let followers = repo::follow::count_followers(state.pool(), outcome.target.id)
-        .await
-        .unwrap_or(0);
-    let following = repo::follow::count_following(state.pool(), outcome.target.id)
-        .await
-        .unwrap_or(0);
-    let notes = if outcome.target.is_local {
-        repo::note::count_local(state.pool()).await.unwrap_or(0)
-    } else {
-        0
-    };
+    let (followers, following, notes) =
+        crate::miauth::counts::counts_for_actor(state, &outcome.target).await;
     let rel = compute_relationship_or_neutral(state, outcome.target.id).await;
     from_actor_detailed(&outcome.target, followers, following, notes, rel)
 }
@@ -163,17 +156,8 @@ async fn build_delete_response(state: &AppState, outcome: &UnfollowOutcome) -> s
     // (= 我々が知っている actor の master データなので follow 関係とは独立)。
     match repo::actor::get_by_ap_id(state.pool(), &outcome.target_ap_id).await {
         Ok(Some(actor)) => {
-            let followers = repo::follow::count_followers(state.pool(), actor.id)
-                .await
-                .unwrap_or(0);
-            let following = repo::follow::count_following(state.pool(), actor.id)
-                .await
-                .unwrap_or(0);
-            let notes = if actor.is_local {
-                repo::note::count_local(state.pool()).await.unwrap_or(0)
-            } else {
-                0
-            };
+            let (followers, following, notes) =
+                crate::miauth::counts::counts_for_actor(state, &actor).await;
             let rel = compute_relationship_or_neutral(state, actor.id).await;
             from_actor_detailed(&actor, followers, following, notes, rel)
         }

@@ -63,7 +63,6 @@ async fn actor_round_trip(pool: PgPool) -> sqlx::Result<()> {
     assert!(inserted.id > 0);
     assert_eq!(inserted.preferred_username, "alice1");
     assert_eq!(inserted.also_known_as.0.len(), 1);
-
     let by_id = repo::actor::get_by_id(&pool, inserted.id).await?.unwrap();
     assert_eq!(by_id.ap_id, inserted.ap_id);
 
@@ -124,6 +123,38 @@ async fn actor_round_trip(pool: PgPool) -> sqlx::Result<()> {
         !json.contains("MOCK-ED-PRIV"),
         "Ed25519 private key body leaked into JSON: {json}"
     );
+
+    Ok(())
+}
+
+/// `set_remote_counts` ── remote actor の count キャッシュを書き込む。`None` の
+/// 引数は「取得失敗」を意味し既存値を維持する (COALESCE) ことを固定する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn set_remote_counts_writes_only_some_and_keeps_none(pool: PgPool) -> sqlx::Result<()> {
+    let inserted = repo::actor::insert(&pool, sample_local_actor("cnt")).await?;
+    assert_eq!(inserted.followers_count, 0, "new row defaults to 0");
+
+    // 部分更新: Some だけ書き込み、None は 0 のまま。
+    repo::actor::set_remote_counts(&pool, inserted.id, Some(5), None, Some(9)).await?;
+    let mid = repo::actor::get_by_id(&pool, inserted.id).await?.unwrap();
+    assert_eq!(mid.followers_count, 5);
+    assert_eq!(mid.following_count, 0, "None は既存値 (0) を維持");
+    assert_eq!(mid.notes_count, 9);
+
+    // 既存値がある状態で None を渡すと上書きされない (ネットワーク障害で
+    // キャッシュ済み count を 0 にしないためのフェイルオープン)。
+    repo::actor::set_remote_counts(&pool, inserted.id, Some(1), Some(2), None).await?;
+    let done = repo::actor::get_by_id(&pool, inserted.id).await?.unwrap();
+    assert_eq!(done.followers_count, 1);
+    assert_eq!(done.following_count, 2);
+    assert_eq!(done.notes_count, 9, "None は既存値 (9) を維持");
+
+    // 全部 None (= 全 Collection 失敗) は何も変えない。
+    repo::actor::set_remote_counts(&pool, inserted.id, None, None, None).await?;
+    let final_ = repo::actor::get_by_id(&pool, inserted.id).await?.unwrap();
+    assert_eq!(final_.followers_count, 1);
+    assert_eq!(final_.following_count, 2);
+    assert_eq!(final_.notes_count, 9);
 
     Ok(())
 }

@@ -90,6 +90,17 @@ pub struct ActorRow {
     /// JSONB 配列で `NOT NULL DEFAULT '[]'` ── nullable にせず「項目無し」を
     /// 空配列で表現する (Misskey wire も `fields` を常に配列で返す)。
     pub fields: Json<Vec<ActorField>>,
+    /// remote actor 専用の count キャッシュ (Aria プロフィールの
+    /// `followersCount` / `followingCount` / `notesCount` 用)。
+    ///
+    /// `fetch_and_upsert` が相手インスタンスの `followers` / `following` /
+    /// `outbox` Collection の `totalItems` をキャッシュする (Mastodon /
+    /// Misskey 共通パターン)。local actor は更新しない ── 呼び出し側が
+    /// `is_local` で分岐して `follow` / `note` テーブルの実クエリを使うため、
+    /// このカラムは local 行では常に 0 のままで実害は無い。
+    pub followers_count: i64,
+    pub following_count: i64,
+    pub notes_count: i64,
     pub fetched_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -136,6 +147,9 @@ impl std::fmt::Debug for ActorRow {
             .field("lang", &self.lang)
             .field("followed_message", &self.followed_message)
             .field("fields", &self.fields)
+            .field("followers_count", &self.followers_count)
+            .field("following_count", &self.following_count)
+            .field("notes_count", &self.notes_count)
             .field("fetched_at", &self.fetched_at)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)

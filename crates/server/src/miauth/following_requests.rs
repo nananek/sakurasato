@@ -109,13 +109,10 @@ pub async fn list(
         }
     };
 
-    let me_followers = repo::follow::count_followers(state.pool(), me.id)
-        .await
-        .unwrap_or(0);
-    let me_following = repo::follow::count_following(state.pool(), me.id)
-        .await
-        .unwrap_or(0);
-    let me_notes = repo::note::count_local(state.pool()).await.unwrap_or(0);
+    // count は actor 種別で読み分ける (local = 実クエリ / remote = Collection
+    // `totalItems` キャッシュ) ── [`crate::miauth::counts::counts_for_actor`]。
+    let (me_followers, me_following, me_notes) =
+        crate::miauth::counts::counts_for_actor(&state, &me).await;
     let followee = from_actor_and_counts(&me, me_followers, me_following, me_notes);
 
     let mut out = Vec::with_capacity(rows.len());
@@ -145,17 +142,8 @@ pub async fn list(
                 );
             }
         };
-        let f_followers = repo::follow::count_followers(state.pool(), follower_actor.id)
-            .await
-            .unwrap_or(0);
-        let f_following = repo::follow::count_following(state.pool(), follower_actor.id)
-            .await
-            .unwrap_or(0);
-        let f_notes = if follower_actor.is_local {
-            repo::note::count_local(state.pool()).await.unwrap_or(0)
-        } else {
-            0
-        };
+        let (f_followers, f_following, f_notes) =
+            crate::miauth::counts::counts_for_actor(&state, &follower_actor).await;
         let follower = from_actor_and_counts(&follower_actor, f_followers, f_following, f_notes);
         out.push(json!({
             "id": follow_id.to_string(),

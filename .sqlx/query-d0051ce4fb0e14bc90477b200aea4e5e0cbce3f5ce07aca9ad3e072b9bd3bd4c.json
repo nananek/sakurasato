@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE actor SET\n            followers_count = COALESCE($2, followers_count),\n            following_count = COALESCE($3, following_count),\n            notes_count = COALESCE($4, notes_count)\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d0051ce4fb0e14bc90477b200aea4e5e0cbce3f5ce07aca9ad3e072b9bd3bd4c"
+}
