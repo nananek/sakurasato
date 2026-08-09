@@ -120,6 +120,7 @@ where
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         "#,
         new.ap_id,
@@ -165,6 +166,7 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<ActorRow>>
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         FROM actor WHERE id = $1
         "#,
@@ -194,6 +196,7 @@ pub async fn list_by_ids(pool: &PgPool, ids: &[i64]) -> sqlx::Result<Vec<ActorRo
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         FROM actor WHERE id = ANY($1)
         "#,
@@ -222,6 +225,7 @@ pub async fn list_local(pool: &PgPool) -> sqlx::Result<Vec<ActorRow>> {
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         FROM actor WHERE is_local = TRUE
         ORDER BY id ASC
@@ -246,6 +250,7 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Act
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         FROM actor WHERE ap_id = $1
         "#,
@@ -275,6 +280,7 @@ pub async fn get_by_username_host(
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         FROM actor WHERE preferred_username = $1 AND host = $2
         "#,
@@ -314,6 +320,7 @@ pub async fn search_by_username_host(
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         FROM actor
         WHERE
@@ -360,6 +367,7 @@ pub async fn search(
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         FROM actor
         WHERE
@@ -383,6 +391,38 @@ pub async fn mark_fetched(pool: &PgPool, id: i64) -> sqlx::Result<()> {
     sqlx::query!(
         "UPDATE actor SET fetched_at = now(), updated_at = now() WHERE id = $1",
         id,
+    )
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// remote actor の count キャッシュ (followers / following / outbox Collection の
+/// `totalItems`) を書き込む。
+///
+/// `None` の引数は「その Collection の取得に失敗した」を意味し、**既存値を
+/// 維持する** (COALESCE) ── 一時的なネットワーク障害でキャッシュ済みの count を
+/// 0 に上書きしないためのフェイルオープン。`mark_fetched` と違い `fetched_at` は
+/// 触らない (= 呼び出し側が成功時にまとめて `mark_fetched` する)。
+pub async fn set_remote_counts(
+    pool: &PgPool,
+    id: i64,
+    followers_count: Option<i64>,
+    following_count: Option<i64>,
+    notes_count: Option<i64>,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE actor SET
+            followers_count = COALESCE($2, followers_count),
+            following_count = COALESCE($3, following_count),
+            notes_count = COALESCE($4, notes_count)
+        WHERE id = $1
+        "#,
+        id,
+        followers_count,
+        following_count,
+        notes_count,
     )
     .execute(pool)
     .await
@@ -467,6 +507,7 @@ pub async fn update_profile(
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         "#,
         id,
@@ -521,6 +562,7 @@ pub async fn set_also_known_as(
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         "#,
         id,
@@ -558,6 +600,7 @@ pub async fn set_moved_to(
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         "#,
         id,
@@ -594,6 +637,7 @@ pub async fn set_manually_approves_followers(
             moved_to_ap_id, is_local, actor_type, manually_approves_followers,
             birthday, location, lang, followed_message,
             fields as "fields: Json<Vec<crate::model::ActorField>>",
+            followers_count, following_count, notes_count,
             fetched_at, created_at, updated_at
         "#,
         id,

@@ -35,6 +35,7 @@ use crate::state::AppState;
 pub mod auth;
 pub mod check;
 pub mod conv;
+pub mod counts;
 pub mod drive;
 pub mod emojis;
 pub mod endpoints;

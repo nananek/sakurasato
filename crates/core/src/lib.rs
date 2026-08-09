@@ -59,6 +59,10 @@ mod tests {
         //   actor.birthday TEXT を追加。"YYYY-MM-DD" ISO 日付文字列)
         // 0028 actor_profile_fields (= MiAuth `i/update` の location/lang/
         //   followedMessage/fields 用に actor へ 4 列追加。fields は JSONB 配列)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 28);
+        // 0029 actor_remote_counts (= remote actor の followers/following/outbox
+        //   Collection `totalItems` キャッシュ 3 列を actor に追加。MiAuth の
+        //   `/api/users/show` が Aria プロフィールの followersCount/
+        //   followingCount/notesCount に出す値の出所)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 29);
     }
 }

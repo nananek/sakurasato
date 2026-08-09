@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE actor SET\n            preferred_username = $1,\n            host = $2,\n            display_name = $3,\n            summary = $4,\n            icon_url = $5,\n            image_url = $6,\n            inbox_url = $7,\n            shared_inbox_url = $8,\n            outbox_url = $9,\n            followers_url = $10,\n            following_url = $11,\n            public_key_id = $12,\n            public_key_pem = $13,\n            ed25519_public_key_id = $14,\n            ed25519_public_key_pem = $15,\n            also_known_as = $16,\n            moved_to_ap_id = $17,\n            actor_type = $18,\n            manually_approves_followers = $19,\n            updated_at = now()\n        WHERE id = $20\n        RETURNING\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: sqlx::types::Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            birthday, location, lang, followed_message,\n            fields as \"fields: sqlx::types::Json<Vec<ActorField>>\",\n            fetched_at, created_at, updated_at\n        ",
+  "query": "\n        UPDATE actor SET\n            preferred_username = $1,\n            host = $2,\n            display_name = $3,\n            summary = $4,\n            icon_url = $5,\n            image_url = $6,\n            inbox_url = $7,\n            shared_inbox_url = $8,\n            outbox_url = $9,\n            followers_url = $10,\n            following_url = $11,\n            public_key_id = $12,\n            public_key_pem = $13,\n            ed25519_public_key_id = $14,\n            ed25519_public_key_pem = $15,\n            also_known_as = $16,\n            moved_to_ap_id = $17,\n            actor_type = $18,\n            manually_approves_followers = $19,\n            updated_at = now()\n        WHERE id = $20\n        RETURNING\n            id, ap_id, preferred_username, host, display_name, summary,\n            icon_url, image_url, inbox_url, shared_inbox_url, outbox_url,\n            followers_url, following_url, public_key_id, public_key_pem,\n            private_key_pem,\n            ed25519_public_key_id, ed25519_public_key_pem, ed25519_private_key_pem,\n            also_known_as as \"also_known_as: sqlx::types::Json<Vec<String>>\",\n            moved_to_ap_id, is_local, actor_type, manually_approves_followers,\n            birthday, location, lang, followed_message,\n            fields as \"fields: sqlx::types::Json<Vec<ActorField>>\",\n            followers_count, following_count, notes_count,\n            fetched_at, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -324,6 +324,39 @@
       },
       {
         "ordinal": 29,
+        "name": "followers_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "followers_count"
+          }
+        }
+      },
+      {
+        "ordinal": 30,
+        "name": "following_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "following_count"
+          }
+        }
+      },
+      {
+        "ordinal": 31,
+        "name": "notes_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "notes_count"
+          }
+        }
+      },
+      {
+        "ordinal": 32,
         "name": "fetched_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -334,7 +367,7 @@
         }
       },
       {
-        "ordinal": 30,
+        "ordinal": 33,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -345,7 +378,7 @@
         }
       },
       {
-        "ordinal": 31,
+        "ordinal": 34,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -410,10 +443,13 @@
       true,
       true,
       false,
+      false,
+      false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "3e393f87e728e25ed33347d261fb73f13676c3fe9ab785cc1e81dc9c23555065"
+  "hash": "986ed03c8f6eff5117c40b61b4ad448e18c3f8873dc34abd2daf01170a9112dd"
 }

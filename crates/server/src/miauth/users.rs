@@ -154,6 +154,16 @@ pub async fn handle(
 /// 都度引く (`users/show` の単発呼び出しでは無視できるコスト、`userIds` 一括
 /// 経路でも Aria のリスト表示は数十件規模までなので N+1 の実害は薄い)。
 ///
+/// **remote actor は先に TTL ベースの on-demand 再 fetch をする**
+/// ([`crate::remote_actor::refresh_remote_actor_if_stale`]) ── `fetched_at` が
+/// 1 時間を超えて古い場合は actor + count を相手インスタンスから再取得する
+/// (Aria がプロフィール画面を開くたびに毎回 GET が飛ぶのは避け、TTL 内は DB
+/// キャッシュのみで応答する)。再 fetch 失敗時は既存 DB 値をそのまま使う
+/// フェイルオープン (= `/api/users/show` 自体は失敗しない)。
+///
+/// count は [`crate::miauth::counts::counts_for_actor`] で actor 種別に読み分け
+/// る: local は実クエリ、remote は `actor` テーブルの count キャッシュ。
+///
 /// `from_actor_detailed` 内の `from_actor_and_counts` が `actor.is_local` に
 /// 応じて host を `None` (local) / `Some(actor.host)` (remote) に倒すため、
 /// 本関数は `ActorRow` をそのまま渡せば正しい host が得られる
@@ -169,24 +179,9 @@ async fn build_detailed_json(
     actor: &ActorRow,
     local_actor_id: Option<i64>,
 ) -> JsonValue {
-    let followers = repo::follow::count_followers(state.pool(), actor.id)
-        .await
-        .unwrap_or(0);
-    let following = repo::follow::count_following(state.pool(), actor.id)
-        .await
-        .unwrap_or(0);
-    // notes_count はお一人様 server なので local actor のみ集計可能。
-    // remote actor の場合、Sakurasato 内に「相手が見せた note」しか持っていない
-    // ので、その shard だけの count になる ── Misskey も同じ実装方針 (= cache
-    // 経由なのでローカル view を返す)。
-    let notes = if actor.is_local {
-        repo::note::count_local(state.pool()).await.unwrap_or(0)
-    } else {
-        // 簡易: remote actor の note を count する関数は無いので 0 を返す。
-        // wire 互換性的に「数 0」より「count を返さない」方が嬉しいケースもあるが、
-        // wire shape に number が必要なので 0 を返して埋める。
-        0
-    };
+    let actor = crate::remote_actor::refresh_remote_actor_if_stale(state, actor).await;
+    let (followers, following, notes) =
+        crate::miauth::counts::counts_for_actor(state, &actor).await;
     let rel = match local_actor_id {
         Some(local_id) => {
             crate::follow::compute_follow_relationship(state.pool(), local_id, actor.id)
@@ -203,7 +198,7 @@ async fn build_detailed_json(
         }
         None => crate::follow::FollowRelationship::neutral(),
     };
-    from_actor_detailed(actor, followers, following, notes, rel)
+    from_actor_detailed(&actor, followers, following, notes, rel)
 }
 
 /// `limit` の既定値・上限。Misskey 公式仕様 (default 10, max 100) に揃える。
@@ -282,17 +277,8 @@ pub async fn search_by_username_and_host(
     // viewer (= ローカル actor) はループ外で 1 回だけ解決する。
     let local_actor_id = resolve_local_actor_id(&state).await;
     for actor in actors {
-        let followers = repo::follow::count_followers(state.pool(), actor.id)
-            .await
-            .unwrap_or(0);
-        let following = repo::follow::count_following(state.pool(), actor.id)
-            .await
-            .unwrap_or(0);
-        let notes = if actor.is_local {
-            repo::note::count_local(state.pool()).await.unwrap_or(0)
-        } else {
-            0
-        };
+        let (followers, following, notes) =
+            crate::miauth::counts::counts_for_actor(&state, &actor).await;
         let rel = relationship_or_neutral(&state, local_actor_id, actor.id).await;
         out.push(from_actor_detailed(
             &actor, followers, following, notes, rel,
@@ -383,17 +369,8 @@ pub async fn search(
     // viewer (= ローカル actor) はループ外で 1 回だけ解決する。
     let local_actor_id = resolve_local_actor_id(&state).await;
     for actor in actors {
-        let followers = repo::follow::count_followers(state.pool(), actor.id)
-            .await
-            .unwrap_or(0);
-        let following = repo::follow::count_following(state.pool(), actor.id)
-            .await
-            .unwrap_or(0);
-        let notes = if actor.is_local {
-            repo::note::count_local(state.pool()).await.unwrap_or(0)
-        } else {
-            0
-        };
+        let (followers, following, notes) =
+            crate::miauth::counts::counts_for_actor(&state, &actor).await;
         let rel = relationship_or_neutral(&state, local_actor_id, actor.id).await;
         out.push(from_actor_detailed(
             &actor, followers, following, notes, rel,

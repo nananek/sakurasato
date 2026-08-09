@@ -909,6 +909,159 @@ async fn users_show_neither_id_nor_username_is_400(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+// ─── remote count キャッシュ (followers/following/notesCount) ─────────────
+
+/// remote actor の `users/show` は、`actor` テーブルの count キャッシュ
+/// (Collection `totalItems`) をそのまま `followersCount` / `followingCount` /
+/// `notesCount` に載せる ── ローカルの `follow` テーブル集計 (0 or 1) や 0 固定
+/// ではなく、相手インスタンスの自己申告値が出ること。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_show_remote_actor_returns_cached_counts(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // fetch_and_upsert 相当のキャッシュを seed (= Collection totalItems)。
+    repo::actor::set_remote_counts(&pool, bob, Some(12_345), Some(678), Some(9_876))
+        .await
+        .expect("set cached counts");
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "userId": bob.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/users/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["username"], "bob");
+    assert_eq!(v["followersCount"], 12_345, "{v}");
+    assert_eq!(v["followingCount"], 678, "{v}");
+    assert_eq!(v["notesCount"], 9_876, "{v}");
+}
+
+/// remote actor のキャッシュが stale (`fetched_at` が TTL 超過) でも
+/// `users/show` は 200 を返し、既存の DB キャッシュ値で応答する
+/// (= フェイルオープン。テスト経路は `enable_remote_fetch = false` なので
+/// 実ネットワークへは出ない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_show_remote_actor_stale_cache_is_fail_open(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    repo::actor::set_remote_counts(&pool, bob, Some(42), Some(7), Some(3))
+        .await
+        .expect("set cached counts");
+    // fetched_at を 2 時間前に backdate (= TTL 1 時間を超過)。
+    sqlx::query!(
+        "UPDATE actor SET fetched_at = now() - make_interval(hours => 2) WHERE id = $1",
+        bob
+    )
+    .execute(&pool)
+    .await
+    .expect("backdate fetched_at");
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "userId": bob.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/users/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["followersCount"], 42, "{v}");
+    assert_eq!(v["followingCount"], 7, "{v}");
+    assert_eq!(v["notesCount"], 3, "{v}");
+}
+
+/// local actor の count は従来どおり実クエリ集計のまま (= 回帰ガード) ──
+/// remote からの accepted follow 1 件 + local note 2 件がそのまま出る。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_show_local_actor_counts_stay_from_real_queries(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // bob → alice が accepted (alice の followers が 1 になる)。
+    seed_accepted_follow(&pool, bob, alice).await;
+    // alice の投稿 2 件。
+    seed_note(&pool, alice, "sakurasato.test", "n1", Visibility::Public).await;
+    seed_note(&pool, alice, "sakurasato.test", "n2", Visibility::Public).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "userId": alice.to_string()});
+    let resp = app
+        .oneshot(
+            Request::post("/api/users/show")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["followersCount"], 1, "real follow table count: {v}");
+    assert_eq!(v["followingCount"], 0, "{v}");
+    assert_eq!(v["notesCount"], 2, "real local note count: {v}");
+}
+
+/// ユーザー検索 (`search-by-username-and-host` / `search`) も remote actor には
+/// count キャッシュを載せる (プロフィール表示の検索画面で 0 が出ないように)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_search_endpoints_return_cached_counts_for_remote(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    repo::actor::set_remote_counts(&pool, bob, Some(100), Some(200), Some(300))
+        .await
+        .expect("set cached counts");
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    for path in [
+        "/api/users/search-by-username-and-host",
+        "/api/users/search",
+    ] {
+        let body = if path.contains("by-username-and-host") {
+            json!({"i": token, "username": "bo"})
+        } else {
+            json!({"i": token, "query": "bob"})
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let arr = read_json(resp).await;
+        let arr = arr.as_array().expect("search returns array");
+        let hit = arr
+            .iter()
+            .find(|u| u["username"] == "bob")
+            .unwrap_or_else(|| panic!("bob must be in {path} results: {arr:?}"));
+        assert_eq!(hit["followersCount"], 100, "{path}: {hit}");
+        assert_eq!(hit["followingCount"], 200, "{path}: {hit}");
+        assert_eq!(hit["notesCount"], 300, "{path}: {hit}");
+    }
+}
+
 // ─── session-related: notes/show check token + scope ──────────────────
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
