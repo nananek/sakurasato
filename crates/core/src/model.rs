@@ -93,11 +93,13 @@ pub struct ActorRow {
     /// remote actor 専用の count キャッシュ (Aria プロフィールの
     /// `followersCount` / `followingCount` / `notesCount` 用)。
     ///
-    /// `fetch_and_upsert` が相手インスタンスの `followers` / `following` /
-    /// `outbox` Collection の `totalItems` をキャッシュする (Mastodon /
-    /// Misskey 共通パターン)。local actor は更新しない ── 呼び出し側が
-    /// `is_local` で分岐して `follow` / `note` テーブルの実クエリを使うため、
-    /// このカラムは local 行では常に 0 のままで実害は無い。
+    /// `remote_actor::fetch_and_upsert_with_counts` (= `MiAuth` プロフィール表示
+    /// 専用経路) が相手インスタンスの `followers` / `following` / `outbox`
+    /// Collection の `totalItems` をキャッシュする (Mastodon / Misskey 共通
+    /// パターン。共有ホットパスの `fetch_and_upsert` は counts を取得しない)。
+    /// local actor は更新しない ── 呼び出し側が `is_local` で分岐して
+    /// `follow` / `note` テーブルの実クエリを使うため、このカラムは local 行
+    /// では常に 0 のままで実害は無い。
     pub followers_count: i64,
     pub following_count: i64,
     pub notes_count: i64,

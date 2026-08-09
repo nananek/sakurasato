@@ -59,9 +59,10 @@ const FETCH_DEADLINE: Duration = Duration::from_secs(10);
 /// remote actor のプロフィール (+ counts) キャッシュの再 fetch TTL。
 ///
 /// `fetched_at` がこの閾値を超えて古い remote actor は、`/api/users/show` 等で
-/// 表示する直前に `fetch_and_upsert` で同期的に再取得する (= Misskey の
-/// on-demand 更新相当)。設定可能な項目にする必然性が薄いので named constant
-/// に留める (CLAUDE.md §8 の「既存の `MAX_AP_OBJECT_BYTES` 等と同様」)。
+/// 表示する直前に [`fetch_and_upsert_with_counts`] で同期的に再取得する
+/// (= Misskey の on-demand 更新相当)。設定可能な項目にする必然性が薄いので
+/// named constant に留める (CLAUDE.md §8 の「既存の `MAX_AP_OBJECT_BYTES` 等と
+/// 同様」)。
 const REMOTE_ACTOR_REFRESH_TTL: chrono::Duration = chrono::Duration::hours(1);
 
 #[derive(Debug, Error)]
@@ -118,20 +119,92 @@ pub(crate) async fn fetch_and_upsert_for_signature(
 /// ように `pub` で公開する ── M9 で Move 受領 / outbound の前段として、
 /// target/aka actor が DB に居ないときに引いてくる用途で必要になった。
 ///
-/// actor 本体に続けて、`followers` / `following` / `outbox` Collection の
-/// `totalItems` も並行取得し、count キャッシュとして DB に格納する (= Aria 等
-/// のプロフィール画面に出す `followersCount` / `followingCount` /
-/// `notesCount`。Mastodon / Misskey 共通パターン)。Collection 取得の失敗は
-/// 個別に fail-open する ── 1 つ落ちても actor 本体の upsert と他の count は
-/// 成功させる。
+/// **この関数は actor 本体のみを取得し、Collection (`followers` / `following` /
+/// `outbox`) の `totalItems` は取得しない** ── inbox 署名検証 (extractor) /
+/// Update 受信 / Move 受領・送出 / Follow 解決 / 未知 Note の author 解決など
+/// **複数の共有ホットパス**から呼ばれるため、ここで counts まで引くと
+/// per-domain レート制限 (Issue #269) のトークン消費が 1 fetch あたり 1 → 4 に
+/// 増える。counts が必要なのは `MiAuth` プロフィール表示のみなので、
+/// [`fetch_and_upsert_with_counts`] がこの関数を呼んでから後追いで取得する
+/// (プロフィール表示用途の呼び出し側はそちらを選ぶ)。
 pub async fn fetch_and_upsert(state: &AppState, ap_id: &str) -> Result<ActorRow, FetchError> {
     let json = fetch_actor_json(state, ap_id).await?;
-    let mut parsed = parse_actor_json(ap_id, &json)?;
-    let (followers_count, following_count, notes_count) = fetch_remote_counts(state, &parsed).await;
-    parsed.followers_count = followers_count;
-    parsed.following_count = following_count;
-    parsed.notes_count = notes_count;
+    let parsed = parse_actor_json(ap_id, &json)?;
     upsert(state, parsed).await
+}
+
+/// [`fetch_and_upsert`] + Collection `totalItems` の count キャッシュ取得
+/// (**`MiAuth` プロフィール表示専用経路** = `refresh_remote_actor_if_stale` が
+/// 呼ぶ)。actor 本体の upsert に続けて、`followers` / `following` / `outbox`
+/// Collection の `totalItems` を並行取得し、DB と戻り値の行の両方に反映する
+/// (= Aria 等のプロフィール画面に出す `followersCount` / `followingCount` /
+/// `notesCount`。Mastodon / Misskey 共通パターン)。
+///
+/// Collection 取得の失敗は個別に fail-open する ── 1 つ落ちても actor 本体の
+/// upsert と他の count は成功し、失敗した count は既存 DB 値を維持する
+/// ([`apply_counts`] の `None` 扱い。新規 insert では 0 のまま)。
+pub async fn fetch_and_upsert_with_counts(
+    state: &AppState,
+    ap_id: &str,
+) -> Result<ActorRow, FetchError> {
+    let row = fetch_and_upsert(state, ap_id).await?;
+    let counts = fetch_row_counts(state, &row).await;
+    Ok(apply_counts(state, row, counts).await)
+}
+
+/// actor の 3 つの Collection (`followers` / `following` / `outbox`) を **並行**
+/// GET して `totalItems` を読む。各取得は個別に fail-open する ── 失敗は
+/// `None` になり、呼び出し側は「取得に失敗した = DB の既存 count を維持する」と
+/// 解釈する (新規 insert では 0 のまま)。
+///
+/// URL は upsert 済みの `ActorRow` から読む (= [`fetch_and_upsert`] がパース・
+/// 保存したものと同一)。
+async fn fetch_row_counts(
+    state: &AppState,
+    row: &ActorRow,
+) -> (Option<i64>, Option<i64>, Option<i64>) {
+    let followers = fetch_collection_total_items(state, row.followers_url.as_deref());
+    let following = fetch_collection_total_items(state, row.following_url.as_deref());
+    let outbox = fetch_collection_total_items(state, row.outbox_url.as_deref());
+    tokio::join!(followers, following, outbox)
+}
+
+/// 取得できた Collection count を **DB と戻り値の行の両方**に反映する。
+///
+/// `None` の引数は「その Collection の取得に失敗した / `totalItems` が無い」
+/// を意味し、既存値を維持する ── 一時的なネットワーク障害でキャッシュ済みの
+/// count を 0 に上書きしないためのフェイルオープン。3 つとも `None` のときは
+/// DB 書き込み自体を行わない (全 fetch 失敗で 0 埋めの UPDATE を投げない)。
+///
+/// DB 書き込みの失敗は warn だけに留める (actor 本体の upsert は成功している
+/// ので、count の記録失敗で呼び出し元を失敗させない)。ただし行のフィールドは
+/// メモリ上で更新して返す ── 呼び出し元 ([`fetch_and_upsert_with_counts`] /
+/// [`refresh_remote_actor_if_stale`]) が「更新後の行」としてこの戻り値を使う
+/// ため、書き込み前の値のまま返すと follow 直後 / TTL 再 fetch 直後の
+/// レスポンスに古い count (新規なら 0) が出てしまう。
+async fn apply_counts(
+    state: &AppState,
+    row: ActorRow,
+    counts: (Option<i64>, Option<i64>, Option<i64>),
+) -> ActorRow {
+    if counts.0.is_none() && counts.1.is_none() && counts.2.is_none() {
+        return row;
+    }
+    if let Err(err) =
+        repo::actor::set_remote_counts(state.pool(), row.id, counts.0, counts.1, counts.2).await
+    {
+        warn!(
+            ?err,
+            actor_id = row.id,
+            "remote actor count cache write failed; serving in-memory counts",
+        );
+    }
+    ActorRow {
+        followers_count: counts.0.unwrap_or(row.followers_count),
+        following_count: counts.1.unwrap_or(row.following_count),
+        notes_count: counts.2.unwrap_or(row.notes_count),
+        ..row
+    }
 }
 
 /// actor JSON 取得。HTTP GET だけ。DB 非依存。
@@ -139,21 +212,11 @@ async fn fetch_actor_json(state: &AppState, ap_id: &str) -> Result<JsonValue, Fe
     fetch_object_json(state, ap_id).await
 }
 
-/// actor の 3 つの Collection (`followers` / `following` / `outbox`) を **並行**
-/// GET して `totalItems` を読む。各取得は個別に fail-open する ── 失敗は
-/// `None` になり、呼び出し側は「取得に失敗した = DB の既存 count を維持する」と
-/// 解釈する (新規 insert では 0 のまま)。
-async fn fetch_remote_counts(
-    state: &AppState,
-    parsed: &ParsedRemoteActor,
-) -> (Option<i64>, Option<i64>, Option<i64>) {
-    let followers = fetch_collection_total_items(state, parsed.followers_url.as_deref());
-    let following = fetch_collection_total_items(state, parsed.following_url.as_deref());
-    let outbox = fetch_collection_total_items(state, parsed.outbox_url.as_deref());
-    tokio::join!(followers, following, outbox)
-}
-
 /// Collection URL を `GET` して `totalItems` (数値) を読む。
+///
+/// **`MiAuth` プロフィール表示専用経路** ([`fetch_and_upsert_with_counts`]) から
+/// 呼ばれる ── 共有ホットパスの [`fetch_and_upsert`] はこの関数を通らない
+/// (per-domain レート制限のトークン消費を増やさないため)。
 ///
 /// 汎用 [`fetch_object_json`] をそのまま使う ── SSRF 検査 / redirect 拒否 /
 /// per-domain レート制限 / サイズ上限 / `id` 一致検査を actor / Note fetch と
@@ -165,8 +228,8 @@ async fn fetch_remote_counts(
 /// 持つ。以下のケースは **エラーにせず `None` で fail-open** する:
 /// - URL が無い (actor JSON に `followers` 等が無い / 一部の実装は出さない)
 /// - HTTP 取得が失敗した (相手インスタンス down 等)
-/// - `totalItems` フィールドが無い / 数値でない (Mastodon はフォロー一覧を
-///   非公開にすると `totalItems` を返さない実装がある)
+/// - `totalItems` フィールドが無い / 数値でない / **負値** (Mastodon は
+///   フォロー一覧を非公開にすると `totalItems` を返さない実装がある)
 async fn fetch_collection_total_items(state: &AppState, url: Option<&str>) -> Option<i64> {
     let url = url?;
     let json = match fetch_object_json(state, url).await {
@@ -183,12 +246,15 @@ async fn fetch_collection_total_items(state: &AppState, url: Option<&str>) -> Op
     parse_collection_total_items(&json)
 }
 
-/// Collection JSON から `totalItems` を抜き出す。フィールド欠如 / 非数値は
-/// `None` (= fail-open)。`items` / `orderedItems` の配列長は読まない ──
+/// Collection JSON から `totalItems` を抜き出す。フィールド欠如 / 非数値 /
+/// 負値は `None` (= fail-open。負値はあり得ないので壊れた値として扱い、DB に
+/// 負の count を保存しない)。`items` / `orderedItems` の配列長は読まない ──
 /// Collection のページング実装差 (`totalItems` を出すか `orderedItems` だけ
 /// 出すか) に依存しない「`totalItems` があればそれを信じる」最小実装に留める。
 fn parse_collection_total_items(json: &JsonValue) -> Option<i64> {
-    json.get("totalItems").and_then(JsonValue::as_i64)
+    json.get("totalItems")
+        .and_then(JsonValue::as_i64)
+        .filter(|n| *n >= 0)
 }
 
 /// 任意の AP object (`Note` / `Actor` 等) を `uri` から `GET` する汎用 fetcher。
@@ -349,13 +415,6 @@ struct ParsedRemoteActor {
     /// 相手側でどう Follow を扱っているかのキャッシュとして保持する。
     /// 値が無ければ `false` (= 通常アカ扱い)。
     manually_approves_followers: bool,
-    /// `followers` / `following` / `outbox` Collection の `totalItems` キャッシュ
-    /// (Aria プロフィールの `followersCount` / `followingCount` / `notesCount`
-    /// 用)。`Some(n)` = 相手の申告値、`None` = Collection 取得に失敗 / 非公開で
-    /// `totalItems` が無い (= DB の既存値を維持、新規は 0)。
-    followers_count: Option<i64>,
-    following_count: Option<i64>,
-    notes_count: Option<i64>,
 }
 
 /// 取得した actor JSON をパースして必要フィールドを取り出す。
@@ -452,13 +511,6 @@ fn parse_actor_json(ap_id: &str, json: &JsonValue) -> Result<ParsedRemoteActor, 
         moved_to_ap_id: s("movedTo"),
         actor_type,
         manually_approves_followers,
-        // count 3 点は parse_actor_json では読まない ── actor JSON 本体に
-        // `followersCount` 等の拡張は無く、`followers` / `following` / `outbox`
-        // URL 先の Collection を GET して `totalItems` を読む (fetch_and_upsert
-        // の fetch_remote_counts が埋める)。ここでは「未取得」= None。
-        followers_count: None,
-        following_count: None,
-        notes_count: None,
     })
 }
 
@@ -542,57 +594,44 @@ async fn upsert(state: &AppState, parsed: ParsedRemoteActor) -> Result<ActorRow,
     // 既存行があれば update、無ければ insert ── 同一 ap_id は一意。
     // 既存 actor で publicKey が変わっている = 相手が再 keying したとき
     // (例えば Mastodon の管理操作)。更新で追従する。
-    let counts = (
-        parsed.followers_count,
-        parsed.following_count,
-        parsed.notes_count,
-    );
-    let row = if let Some(existing) = repo::actor::get_by_ap_id(state.pool(), &parsed.ap_id).await?
-    {
-        update_existing(state, existing.id, parsed).await?
-    } else {
-        let new = repo::actor::NewActor {
-            ap_id: parsed.ap_id.clone(),
-            preferred_username: parsed.preferred_username,
-            host: parsed.host,
-            display_name: parsed.display_name,
-            summary: parsed.summary,
-            icon_url: parsed.icon_url,
-            image_url: parsed.image_url,
-            inbox_url: parsed.inbox_url,
-            shared_inbox_url: parsed.shared_inbox_url,
-            outbox_url: parsed.outbox_url,
-            followers_url: parsed.followers_url,
-            following_url: parsed.following_url,
-            public_key_id: parsed.public_key_id,
-            public_key_pem: parsed.public_key_pem,
-            private_key_pem: None,
-            ed25519_public_key_id: parsed.ed25519_public_key_id,
-            ed25519_public_key_pem: parsed.ed25519_public_key_pem,
-            ed25519_private_key_pem: None,
-            also_known_as: parsed.also_known_as,
-            moved_to_ap_id: parsed.moved_to_ap_id,
-            is_local: false,
-            actor_type: parsed.actor_type,
-            manually_approves_followers: parsed.manually_approves_followers,
-        };
-        repo::actor::insert(state.pool(), new).await?
-    };
-
-    // 取得できた Collection count だけ DB に反映する (None = 失敗なので既存値を
-    // 維持 ── 一時的なネットワーク障害でキャッシュ済み count を 0 に上書きしない)。
-    // 書き込み失敗は actor 本体の upsert を失敗させないよう warn だけに留める。
-    if (counts.0.is_some() || counts.1.is_some() || counts.2.is_some())
-        && let Err(err) =
-            repo::actor::set_remote_counts(state.pool(), row.id, counts.0, counts.1, counts.2).await
-    {
-        warn!(
-            ?err,
-            actor_id = row.id,
-            "remote actor count cache write failed; continuing with actor upsert",
-        );
+    if let Some(existing) = repo::actor::get_by_ap_id(state.pool(), &parsed.ap_id).await? {
+        let updated = update_existing(state, existing.id, parsed).await?;
+        repo::actor::mark_fetched(state.pool(), updated.id).await?;
+        return Ok(updated);
     }
 
+    let new = repo::actor::NewActor {
+        ap_id: parsed.ap_id.clone(),
+        preferred_username: parsed.preferred_username,
+        host: parsed.host,
+        display_name: parsed.display_name,
+        summary: parsed.summary,
+        icon_url: parsed.icon_url,
+        image_url: parsed.image_url,
+        inbox_url: parsed.inbox_url,
+        shared_inbox_url: parsed.shared_inbox_url,
+        outbox_url: parsed.outbox_url,
+        followers_url: parsed.followers_url,
+        following_url: parsed.following_url,
+        public_key_id: parsed.public_key_id,
+        public_key_pem: parsed.public_key_pem,
+        private_key_pem: None,
+        ed25519_public_key_id: parsed.ed25519_public_key_id,
+        ed25519_public_key_pem: parsed.ed25519_public_key_pem,
+        ed25519_private_key_pem: None,
+        also_known_as: parsed.also_known_as,
+        moved_to_ap_id: parsed.moved_to_ap_id,
+        is_local: false,
+        actor_type: parsed.actor_type,
+        manually_approves_followers: parsed.manually_approves_followers,
+    };
+    let row = repo::actor::insert(state.pool(), new).await?;
+
+    // count キャッシュ (followers/following/outbox Collection `totalItems`) は
+    // **ここでは書き込まない** ── [`fetch_and_upsert_with_counts`] (= MiAuth
+    // プロフィール表示経路) が actor 本体の upsert に続けて `apply_counts` で
+    // 反映する。共有ホットパスの fetch でレート制限トークンを余計に消費しない
+    // ため (fetch_and_upsert の doc 参照)。
     repo::actor::mark_fetched(state.pool(), row.id).await?;
     Ok(row)
 }
@@ -678,9 +717,9 @@ async fn update_existing(
 ///
 /// `MiAuth` の `/api/users/show` 等で remote actor を返す直前に呼ぶ ──
 /// `fetched_at` が [`REMOTE_ACTOR_REFRESH_TTL`] を超えていたら
-/// [`fetch_and_upsert`] で同期的に再取得し、更新後の行を返す。これにより
-/// Aria のプロフィール画面を開くたびに毎回 GET が飛ぶことはなく (TTL 内は
-/// DB キャッシュのみで応答)、古い count が表示され続けることもない
+/// [`fetch_and_upsert_with_counts`] で同期的に再取得し、更新後の行を返す。
+/// これにより Aria のプロフィール画面を開くたびに毎回 GET が飛ぶことはなく
+/// (TTL 内は DB キャッシュのみで応答)、古い count が表示され続けることもない
 /// (= Misskey の on-demand 更新相当)。
 ///
 /// フェイルオープン方針:
@@ -701,7 +740,7 @@ pub async fn refresh_remote_actor_if_stale(state: &AppState, actor: &ActorRow) -
     if !is_remote_actor_stale(actor.fetched_at) {
         return actor.clone();
     }
-    match fetch_and_upsert(state, &actor.ap_id).await {
+    match fetch_and_upsert_with_counts(state, &actor.ap_id).await {
         Ok(row) => row,
         Err(err) => {
             warn!(
@@ -920,6 +959,16 @@ mod tests {
         assert_eq!(
             parse_collection_total_items(&json!({"totalItems": 42.5})),
             None
+        );
+        // 負値はあり得ないので fail-open (= DB に負の count を保存しない)
+        assert_eq!(
+            parse_collection_total_items(&json!({"totalItems": -1})),
+            None
+        );
+        // 0 は正当な値として受理する (フォロー/投稿が 0 件のアカウント)
+        assert_eq!(
+            parse_collection_total_items(&json!({"totalItems": 0})),
+            Some(0)
         );
     }
 

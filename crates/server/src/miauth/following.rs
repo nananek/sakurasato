@@ -137,7 +137,10 @@ pub async fn delete(
 /// `target` actor は [`FollowOutcome::target`] 由来。`MissUser` の follower
 /// count は target actor 視点なので、[`crate::miauth::counts::counts_for_actor`]
 /// で actor 種別に読み分けて引く (remote は Collection `totalItems` キャッシュ。
-/// follow 直後は `fetch_and_upsert` で取得済みなので新鮮)。
+/// 表示前に `users/show` のプロフィール経路
+/// [`crate::remote_actor::refresh_remote_actor_if_stale`] が取得・更新する ──
+/// Aria はプロフィール画面 → フォローの順で叩くため、実用上は直前に新鮮化
+/// されている)。
 ///
 /// relationship (= `isFollowing` / `isFollowed` / `hasPendingFollowRequest*`)
 /// は follow 直後の実状態を [`crate::follow::compute_follow_relationship`] で

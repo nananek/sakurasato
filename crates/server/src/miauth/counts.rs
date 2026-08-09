@@ -11,7 +11,8 @@
 //!   お一人様サーバはローカルの `follow` テーブルに remote actor の「真の
 //!   フォロー関係」を持っていない (あるのは「自分がその remote をフォローして
 //!   いるか」の 0 or 1 だけ) ので、`count_followers` 等で集計すると意味が違う
-//!   値になってしまう。キャッシュは `crate::remote_actor::fetch_and_upsert` が
+//!   値になってしまう。キャッシュは `crate::remote_actor::fetch_and_upsert_with_counts`
+//!   (= `refresh_remote_actor_if_stale` 経由、MiAuth プロフィール表示専用) が
 //!   相手インスタンスの `followers` / `following` / `outbox` Collection の
 //!   `totalItems` から埋める (Mastodon / Misskey 共通パターン、自己申告値を
 //!   信じる設計)。
