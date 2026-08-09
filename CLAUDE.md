@@ -70,6 +70,7 @@
 - **WebFinger 解決も media-proxy 経由**（M10、PR #51 で追加）。`follow <acct>` CLI は media-proxy の `/v1/webfinger/resolve` を通る ── SSRF / redirect / `max_bytes` を画像取得と同じ防御で共有し、`acct:` → actor URI 解決の外向き HTTP が server から消える。
 - **外部 POST（ActivityPub 配送 / remote actor fetch）は当面 server から直接行う**（暫定）。Mastodon / Misskey / Pleroma も server 直配送が業界標準で、配送経路を media-proxy に通す利点は限定的なため。これは M6 で media-proxy を実装した時点で再評価する選択（[Issue #23](https://github.com/nananek/sakurasato/issues/23)）。**M6 / M10 完了時点でも本方針を維持**（配送 POST と remote actor fetch のレスポンスは JSON のみで画像デコードを伴わず、媒介化の利得が薄い。一方 WebFinger は鍵を要さない単純 GET なので媒介化済み）。配送経路自体の隔離は将来の独立 issue で再評価。
 - **remote Note fetch（受信 `Announce` 経由、followee のみ）も server 直 GET**（[Issue #266](https://github.com/nananek/sakurasato/issues/266)、PR #267）。followee がブーストした未知 Note を表示するため origin から `GET` する。remote actor fetch と同じ `fetch_object_json`（SSRF / redirect 拒否 / サイズ上限 / `id` 一致）を共有し、レスポンスは JSON のみで画像デコードを伴わないため actor fetch と同種の例外として server 直に置く。fetch を引き起こせるのは followee の boost のみ（= follow グラフで bound）。
+- **remote actor の `followers`/`following`/`outbox` Collection `totalItems` 取得も server 直 GET**（Aria 等 MiAuth クライアントのプロフィール表示用に `followersCount`/`followingCount`/`notesCount` をキャッシュする目的）。`fetch_and_upsert` が actor 本体取得に続けて同じ `fetch_object_json` で 3 Collection を並行 GET する ── レスポンスは JSON のみで画像デコードを伴わないため actor fetch と同種の例外として server 直に置く。取得失敗は個別に fail-open（DB の既存キャッシュ値を維持）。
 - **外部 GET（リモートメディア / OGP / WebFinger）は media-proxy のみ**。M6 で TUI のアバター取得経路も `/api/v1/media/proxy` 経由 → media-proxy に切り替え済み（[Issue #36](https://github.com/nananek/sakurasato/issues/36) 解消）── TUI ホストプロセスから直接外向き接続が出なくなり、ホスト LAN / クラウド IMDS への SSRF 表面が縮小。M10 では WebFinger も同 egress 経路に寄せた。
 - postgres / versitygw は内部ネットのみ。TUI はコンテナ外でホスト端末から Unix ソケット接続。
 
@@ -178,7 +179,7 @@ TUI クライアントはコンテナ外（ホスト端末）で実行し、マ�
 - **rootless**: 非 root UID で実行（`USER nonroot` / 数値 UID）。
 - `read_only: true`（root fs）＋ 必要箇所のみ `tmpfs`(/tmp)。
 - `cap_drop: [ALL]`、`security_opt: ["no-new-privileges:true"]`。
-- **ネットワーク分離**: versitygw・postgres は内部ネットのみ。**media-proxy は外部 GET（画像 / OGP / WebFinger）の egress を持つ**。**server は AP 配送 POST と remote actor fetch / remote Note fetch のみ外部に egress を持つ**（暫定、§3 / [Issue #23](https://github.com/nananek/sakurasato/issues/23)、Note fetch は [#266](https://github.com/nananek/sakurasato/issues/266)）── M10 で再評価し配送経路は当面 server 直のまま維持、WebFinger は M10 PR #51 で media-proxy 経由に移行。
+- **ネットワーク分離**: versitygw・postgres は内部ネットのみ。**media-proxy は外部 GET（画像 / OGP / WebFinger）の egress を持つ**。**server は AP 配送 POST と remote actor fetch（`followers`/`following`/`outbox` Collection `totalItems` 取得含む）/ remote Note fetch のみ外部に egress を持つ**（暫定、§3 / [Issue #23](https://github.com/nananek/sakurasato/issues/23)、Note fetch は [#266](https://github.com/nananek/sakurasato/issues/266)）── M10 で再評価し配送経路は当面 server 直のまま維持、WebFinger は M10 PR #51 で media-proxy 経由に移行。
 - **危険な入力の隔離**: 画像デコード・外部 GET は必ず media-proxy 側。server は信頼できないバイト列を直接デコードしない（AP 配送・actor fetch・Note fetch のレスポンスは JSON のみで扱う）。
 
 ### 7.1 シークレット管理
