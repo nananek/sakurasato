@@ -1033,6 +1033,24 @@ pub fn from_actor_detailed(
             JsonValue::Bool(relationship.has_pending_follow_request_to_you),
         );
 
+        // **misskey_dart (shiosyakeyakini-info, MIT) `UserDetailedNotMeWithRelations`**
+        // は `UserDetailed.fromJson` が `isFollowing` key の有無だけで分岐するため、
+        // 上の `isFollowing` を emit した時点で必ずこの型で parse される。その
+        // generated `_$UserDetailedNotMeWithRelationsFromJson` は `isBlocking` /
+        // `isBlocked` / `isMuted` / `isRenoteMuted` も **required bool** として
+        // 読み、欠けると `type 'Null' is not a subtype of type 'bool'` で crash
+        // する (= #174 と同型の required bool 漏れの WithRelations 版。Aria の
+        // `UserNotifier` で実際に発生した)。Sakurasato はブロック / ミュート
+        // 機能を持たないため全て固定 `false`。`notify` / `withReplies` は
+        // nullable だが、wire parity のため Misskey の既定値 (normal / true) を
+        // 載せておく。
+        map.insert("isBlocking".to_string(), JsonValue::Bool(false));
+        map.insert("isBlocked".to_string(), JsonValue::Bool(false));
+        map.insert("isMuted".to_string(), JsonValue::Bool(false));
+        map.insert("isRenoteMuted".to_string(), JsonValue::Bool(false));
+        map.insert("notify".to_string(), JsonValue::String("normal".into()));
+        map.insert("withReplies".to_string(), JsonValue::Bool(true));
+
         // **必須ではなく key の存在自体が意味を持つフィールド**: misskey_dart の
         // `User.fromJson` (= `MisskeyUsers.search` / `searchByUsernameAndHost` が
         // 使う polymorphic factory) は `json.containsKey("url")` の有無だけで
@@ -1641,6 +1659,14 @@ mod tests {
         assert_eq!(v["isFollowed"], false);
         assert_eq!(v["hasPendingFollowRequestFromYou"], false);
         assert_eq!(v["hasPendingFollowRequestToYou"], false);
+        // WithRelations 版の required bool + 既定値 (`isFollowing` を emit すると
+        // misskey_dart は必ず `UserDetailedNotMeWithRelations` で parse する)。
+        assert_eq!(v["isBlocking"], false);
+        assert_eq!(v["isBlocked"], false);
+        assert_eq!(v["isMuted"], false);
+        assert_eq!(v["isRenoteMuted"], false);
+        assert_eq!(v["notify"], "normal");
+        assert_eq!(v["withReplies"], true);
     }
 
     #[test]
@@ -1697,12 +1723,27 @@ mod tests {
             "isFollowed",
             "hasPendingFollowRequestFromYou",
             "hasPendingFollowRequestToYou",
+            "isBlocking",
+            "isBlocked",
+            "isMuted",
+            "isRenoteMuted",
         ] {
             assert!(
                 v[key].is_boolean(),
                 "required bool `{key}` must be present and boolean"
             );
         }
+    }
+
+    /// `UserDetailedNotMeWithRelations` は `notify` / `withReplies` も
+    /// wire 上よく読まれる。nullable なので欠けても crash しないが、
+    /// Misskey 既定値が載っていることを lock する。
+    #[test]
+    fn from_actor_detailed_emits_withrelations_defaults() {
+        let actor = fake_actor(false, "remote.test", false);
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel());
+        assert_eq!(v["notify"], "normal");
+        assert_eq!(v["withReplies"], true);
     }
 
     /// follow relationship 4 フィールドの **取り違え (swap)** 検出 ──
