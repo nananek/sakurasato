@@ -790,6 +790,15 @@ async fn users_show_by_user_id_returns_detailed(pool: PgPool) {
     assert_eq!(v["isFollowed"], false, "{v}");
     assert_eq!(v["hasPendingFollowRequestFromYou"], false, "{v}");
     assert_eq!(v["hasPendingFollowRequestToYou"], false, "{v}");
+    // `isFollowing` を emit したことで misskey_dart は必ず
+    // `UserDetailedNotMeWithRelations` で parse する ── その required bool 群
+    // と既定値も欠けずに載っていること (= Aria の crash 回帰ガード)。
+    assert_eq!(v["isBlocking"], false, "{v}");
+    assert_eq!(v["isBlocked"], false, "{v}");
+    assert_eq!(v["isMuted"], false, "{v}");
+    assert_eq!(v["isRenoteMuted"], false, "{v}");
+    assert_eq!(v["notify"], "normal", "{v}");
+    assert_eq!(v["withReplies"], true, "{v}");
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
