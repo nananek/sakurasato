@@ -1,8 +1,8 @@
 name: Release Validation (main PR)
 
 # develop → main の release PR でのみ発火する重量級ゲート。
-# 通常の develop 内 PR では発火しない (= 開発体験は ci.yml + claude-review に
-# 任せる)。release 前に「distroless build が全部通る」「compose stack が
+# 通常の develop 内 PR では発火しない (= 開発体験は ci.yml に任せる)。
+# release 前に「distroless build が全部通る」「compose stack が
 # 起動して well-known が応答する」という 2 つの実機チェックを通す。
 #
 # 関連 workflow:
