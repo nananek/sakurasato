@@ -315,7 +315,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 - **CI** (`ci.yml`): `cargo fmt --check` / `clippy -D warnings` / `test`。`main`・`develop` の push と PR。required status check = `ci`。`Cargo.toml` が無い間はスキップして緑（M1 で本稼働）。
 - **Publish** (`publish.yml`): タグ push (`YYYY.MM.patch`) と `develop` push で発火。ghcr に `sakurasato-{server,media-proxy,versitygw}` を public で push する。BuildKit + GitHub Actions cache (`type=gha,scope=<name>`) を使うことで 3 イメージ並列ビルドが現実時間内に収まる。**新しい deploy host は `docker compose -f docker-compose.yml -f docker-compose.ghcr.yml pull` で取得**（§9 参照）。
 - **Build cache warm** (`build-cache-warm.yml`): `develop` 向け PR で発火。server / media-proxy / versitygw / tui の 4 Dockerfile を push せず build するだけの補助ジョブ（load only、公開イメージ自体は push しない）。`publish.yml` と**同じ** registry キャッシュ (`ghcr.io/.../sakurasato-cache-<name>`、`type=registry`。`release-validation.yml` の `release-validation-<name>` scope とは別) に書き込むことが唯一の目的 ── develop へのマージ直後に走る `publish.yml` の実 build がこのキャッシュにヒットし、「マージしてから GHCR に上がるまで」の待ち時間を縮める。**当初 `type=gha` で実装したが、GHA cache はブランチ (ref) 単位でスコープが分離されており、defaultブランチ (develop) 以外の ref (PR の feature branch) で書いたキャッシュが develop push の実行に引き継がれない制約があり実測で無改善だった (PR #330 実測: 9m37s〜10m50s → 10m22s)ため、ブランチに依存しない `type=registry` に切り替えた**。ghcr へのキャッシュ書き込みのため `packages: write` が必要 → fork PR には `if:` ガードで権限を渡さない。required status check には登録しない（失敗しても PR マージを妨げない、あくまでキャッシュ最適化）。
-- **Release Validation** (`release-validation.yml`): **`main` 向け PR でのみ発火** する重量級ゲート。`develop` 内 PR では発火しない（= 開発体験は ci.yml + claude-review + build-cache-warm.yml に任せる）。2 ジョブ:
+- **Release Validation** (`release-validation.yml`): **`main` 向け PR でのみ発火** する重量級ゲート。`develop` 内 PR では発火しない（= 開発体験は ci.yml + build-cache-warm.yml に任せる）。2 ジョブ:
   - `build-images` — server / media-proxy / versitygw / tui の 4 Dockerfile を `linux/amd64` で並列 build (load only、ghcr push なし)。どの 1 つが壊れたかが matrix UI で即わかる。
   - `stack-smoke` — secrets を ephemeral 生成 → `docker compose up -d --build` (dev overlay で 8080/5432/7070 を 127.0.0.1 露出) → `/.well-known/nodeinfo` と `/nodeinfo/2.1` を curl --retry で probe → `down -v`。「binary が起動しない / config パース不能 / DB migration 失敗」を release 前に検出する。
 - **CodeQL** (`codeql.yml`): Rust SAST（`build-mode: none`）。`.rs`/`Cargo.*` 変更時と週次。
@@ -324,18 +324,16 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 - **Federation Test (Nekonoverse / tmux TUI)** (`federation-test-nekonoverse.yml`): tmux pty + 実 sakurasato-tui binary で Sakurasato ↔ Nekonoverse を駆動。nightly cron (UTC 19:30) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
 - **Federation Test (Nekonoverse / 2-sks Move A)** (`federation-test-nekonoverse-2sks.yml`): 2-sks 構成で Issue #140 PR2 (Scenario A = sks-old → sks-new Move) を駆動。alias-add x 2 + bob follow + move-out CLI 1-shot + Move propagation 観測。nightly cron (UTC 19:45) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
 - **Federation Test (Misskey / MiAuth)** (`federation-test-misskey.yml`): pytest + httpx + misskey.py (= YuzuRyo61, MIT) で Sakurasato ↔ Misskey を駆動。`test_misskey_smoke.py` (連合) + `test_miauth_{flow,read,write}_parity.py` (MiAuth wire-compat parity) を流す。nightly cron (UTC 20:00) / `workflow_dispatch` / **`main` 向け PR** で発火。Misskey 本体は AGPL-3.0 だが未改変 image の CI 起動は §13 (network copyleft) を起動しない (= [`agpl-discipline-miauth`](DEPLOYMENT.md#6-miauth-経路-mobile-misskey-互換))。
-- **Claude PR レビュー** (`claude-review.yml`): `anthropics/claude-code-action@v1`、認証 **`secrets.CLAUDE_CODE_OAUTH_TOKEN`**。PR 自動 + `@claude` メンション、verdict 付き top-level コメントを必ず投稿。
 - **Dependabot** (`dependabot.yml`): `cargo`/`github-actions`/`docker` を週次更新。
 - **アラート**: Dependabot alerts / 自動セキュリティ修正 / secret scanning + push protection 有効化済み。
 
 ### `main` 向け PR の required status checks
 
-`develop` → `main` の release PR は GitHub branch protection で以下を **必須** に設定する (= GitHub UI > Settings > Branches で `main` を編集 → Require status checks to pass before merging に列挙)。`develop` 向け PR では `ci` と `claude-review` のみが required。
+`develop` → `main` の release PR は GitHub branch protection で以下を **必須** に設定する (= GitHub UI > Settings > Branches で `main` を編集 → Require status checks to pass before merging に列挙)。`develop` 向け PR では `ci` のみが required。
 
 | Check | Workflow | 目的 |
 |---|---|---|
 | `ci` | `ci.yml` | fmt / clippy / test (= 全 PR で必須) |
-| `claude-review` | `claude-review.yml` | verdict コメント (= 全 PR で必須) |
 | `Mastodon (programmatic)` | `federation-test.yml` | 実 Mastodon との連合疎通 |
 | `Nekonoverse (tmux TUI)` | `federation-test-nekonoverse.yml` | 実 Nekonoverse との TUI 連合 |
 | `Nekonoverse (2-sks Move A)` | `federation-test-nekonoverse-2sks.yml` | sks-old → sks-new Move を 2-sks 構成で観測 (#140 PR2) |
@@ -346,7 +344,6 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 新 workflow 追加時は本表と `release-validation.yml` 双方の更新を忘れない。
 
 ### 要設定の secret
-- **`CLAUDE_CODE_OAUTH_TOKEN`** — Claude PR レビュー用。`gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo nananek/sakurasato`（iikanji と同じ値でOK）。
 
 ---
 
