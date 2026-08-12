@@ -59,7 +59,7 @@ use crate::event_bus::{ReactionKind, StreamEvent};
 use crate::miauth::auth;
 use crate::miauth::conv::{
     NoteSummary, build_renote_miss_note, bulk_load_note_summaries, from_actor_and_counts,
-    timeline_entry_to_miss_note,
+    resolve_user_emojis, resolve_user_emojis_by_ids, timeline_entry_to_miss_note,
 };
 use crate::miauth::notes::{resolve_self_actor_id, viewer_can_view_entry};
 use crate::miauth::notifications::build_notification;
@@ -269,7 +269,11 @@ impl ConnState {
         let summaries = bulk_load_note_summaries(state.pool(), &[note_id], viewer).await;
         let empty = empty_summary();
         let summary = summaries.get(&note_id).unwrap_or(&empty);
-        let miss = timeline_entry_to_miss_note(&entry, summary, host);
+        let user_emojis = resolve_user_emojis_by_ids(state.pool(), host, &[entry.actor_id])
+            .await
+            .remove(&entry.actor_id)
+            .unwrap_or_default();
+        let miss = timeline_entry_to_miss_note(&entry, summary, host, &user_emojis);
         let body = serde_json::to_value(&miss).unwrap_or(JsonValue::Null);
 
         self.notes.insert(note_id); // reaction 増減の noteUpdated を届けるため。
@@ -311,8 +315,13 @@ impl ConnState {
         let summaries = bulk_load_note_summaries(state.pool(), &[announce.note_id], viewer).await;
         let empty = empty_summary();
         let summary = summaries.get(&announce.note_id).unwrap_or(&empty);
-        let renoted = timeline_entry_to_miss_note(&entry, summary, host);
-        let renoter_user = from_actor_and_counts(&renoter, 0, 0, 0);
+        let user_emojis = resolve_user_emojis_by_ids(state.pool(), host, &[entry.actor_id])
+            .await
+            .remove(&entry.actor_id)
+            .unwrap_or_default();
+        let renoted = timeline_entry_to_miss_note(&entry, summary, host, &user_emojis);
+        let renoter_emojis = resolve_user_emojis(state.pool(), host, &renoter).await;
+        let renoter_user = from_actor_and_counts(&renoter, 0, 0, 0, renoter_emojis);
         let created_at = announce
             .published_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);

@@ -49,7 +49,7 @@ use tracing::warn;
 
 use crate::follow_request::{MutateError, approve_or_reject};
 use crate::miauth::auth;
-use crate::miauth::conv::from_actor_and_counts;
+use crate::miauth::conv::{from_actor_and_counts, resolve_user_emojis};
 use crate::miauth::error::error_resp;
 use crate::miauth::notes::resolve_self_actor;
 use crate::state::AppState;
@@ -113,7 +113,9 @@ pub async fn list(
     // `totalItems` キャッシュ) ── [`crate::miauth::counts::counts_for_actor`]。
     let (me_followers, me_following, me_notes) =
         crate::miauth::counts::counts_for_actor(&state, &me).await;
-    let followee = from_actor_and_counts(&me, me_followers, me_following, me_notes);
+    let host = state.config().server.host.clone();
+    let me_emojis = resolve_user_emojis(state.pool(), &host, &me).await;
+    let followee = from_actor_and_counts(&me, me_followers, me_following, me_notes, me_emojis);
 
     let mut out = Vec::with_capacity(rows.len());
     for (follow_id, _ap_id, follower_ap_id, _state_str, _created_at) in rows {
@@ -144,7 +146,14 @@ pub async fn list(
         };
         let (f_followers, f_following, f_notes) =
             crate::miauth::counts::counts_for_actor(&state, &follower_actor).await;
-        let follower = from_actor_and_counts(&follower_actor, f_followers, f_following, f_notes);
+        let follower_emojis = resolve_user_emojis(state.pool(), &host, &follower_actor).await;
+        let follower = from_actor_and_counts(
+            &follower_actor,
+            f_followers,
+            f_following,
+            f_notes,
+            follower_emojis,
+        );
         out.push(json!({
             "id": follow_id.to_string(),
             "follower": follower,

@@ -43,7 +43,8 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::miauth::auth;
 use crate::miauth::conv::{
-    NoteSummary, bulk_load_note_summaries, from_actor_and_counts, timeline_entry_to_miss_note,
+    NoteSummary, bulk_load_note_summaries, from_actor_and_counts, resolve_user_emojis,
+    resolve_user_emojis_by_ids, timeline_entry_to_miss_note,
 };
 use crate::miauth::error::error_resp;
 use crate::state::AppState;
@@ -201,8 +202,11 @@ pub(crate) async fn build_notification(
             cached.clone()
         } else {
             let built = match repo::actor::get_by_id(state.pool(), notifier_id).await {
-                Ok(Some(actor)) => serde_json::to_value(from_actor_and_counts(&actor, 0, 0, 0))
-                    .unwrap_or(JsonValue::Null),
+                Ok(Some(actor)) => {
+                    let emojis = resolve_user_emojis(state.pool(), host, &actor).await;
+                    serde_json::to_value(from_actor_and_counts(&actor, 0, 0, 0, emojis))
+                        .unwrap_or(JsonValue::Null)
+                }
                 _ => JsonValue::Null,
             };
             actor_cache.insert(notifier_id, built.clone());
@@ -224,7 +228,11 @@ pub(crate) async fn build_notification(
             my_reaction: None,
         };
         let summary = summaries.get(&note_id).unwrap_or(&empty);
-        let note = timeline_entry_to_miss_note(&entry, summary, host);
+        let user_emojis = resolve_user_emojis_by_ids(state.pool(), host, &[entry.actor_id])
+            .await
+            .remove(&entry.actor_id)
+            .unwrap_or_default();
+        let note = timeline_entry_to_miss_note(&entry, summary, host, &user_emojis);
         obj["note"] = serde_json::to_value(&note).unwrap_or(JsonValue::Null);
     }
 

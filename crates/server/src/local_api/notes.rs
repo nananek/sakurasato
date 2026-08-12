@@ -555,7 +555,12 @@ struct ResolvedMention {
 ///
 /// 重複 shortcode は ASCII-lowercase で dedupe。上限 [`EMOJI_MAX`] を超えた
 /// ぶんは drop (= attack 防御 + 投稿サイズ抑制)。
-fn parse_emoji_shortcodes(content: &str) -> Vec<String> {
+///
+/// `pub(crate)` ── `MiAuth` ユーザー `emojis` map / actor `tag` 解決
+/// (`crate::miauth::conv::resolve_user_emojis`) が `display_name` / summary /
+/// fields から同じ抽出ロジックを再利用する (= 本文とユーザーで shortcode
+/// 抽出の文字種・大小正規化を drift させない)。
+pub(crate) fn parse_emoji_shortcodes(content: &str) -> Vec<String> {
     let bytes = content.as_bytes();
     let mut out: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

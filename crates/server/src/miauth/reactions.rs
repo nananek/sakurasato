@@ -43,7 +43,7 @@ use crate::local_api::reactions::{
     ReactionCoreError, create_reaction_core, delete_my_reaction_on_note_core,
 };
 use crate::miauth::auth;
-use crate::miauth::conv::from_actor_and_counts;
+use crate::miauth::conv::{from_actor_and_counts, resolve_user_emojis};
 use crate::miauth::error::error_resp;
 use crate::miauth::notes::{resolve_self_actor_id, viewer_can_view_entry};
 use crate::state::AppState;
@@ -227,14 +227,18 @@ pub async fn list(
 
     // reactor の MissUser を組み立てる。同一 actor の連投を引き直さないよう cache。
     let mut user_cache: HashMap<i64, JsonValue> = HashMap::new();
+    let host = state.config().server.host.clone();
     let mut out: Vec<JsonValue> = Vec::with_capacity(rows.len());
     for row in &rows {
         let user = if let Some(cached) = user_cache.get(&row.actor_id) {
             cached.clone()
         } else {
             let built = match repo::actor::get_by_id(state.pool(), row.actor_id).await {
-                Ok(Some(actor)) => serde_json::to_value(from_actor_and_counts(&actor, 0, 0, 0))
-                    .unwrap_or(JsonValue::Null),
+                Ok(Some(actor)) => {
+                    let emojis = resolve_user_emojis(state.pool(), &host, &actor).await;
+                    serde_json::to_value(from_actor_and_counts(&actor, 0, 0, 0, emojis))
+                        .unwrap_or(JsonValue::Null)
+                }
                 _ => JsonValue::Null,
             };
             user_cache.insert(row.actor_id, built.clone());

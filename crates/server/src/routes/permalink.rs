@@ -197,7 +197,30 @@ async fn render_ap_note(state: &AppState, note: &NoteRow, actor: &ActorRow) -> J
             );
         }
     }
+    // `tag` (Mention / Emoji / Hashtag) は DB 保存済みの `note.tags` をそのまま
+    // 出す ── オリジナルの Create (`crate::local_api::notes::build_create_activity`)
+    // が載せた配列と byte 一致する (= バグ 2: canonical URL refetch で絵文字が
+    // 解決されない問題の修正。fetch 経路の受信側は `tag: [Emoji]` から
+    // `:foo:` を画像化する)。
+    if let Some(tags) = note_tags_to_ap_value(&note.tags.0) {
+        body["tag"] = tags;
+    }
     body
+}
+
+/// `note.tags` (Mention / Emoji / Hashtag 配列) を AP `tag` フィールド値に変換
+/// する純関数。
+///
+/// 空配列 (または非配列) なら `None` (= `tag` key を omit) ── オリジナル
+/// Create の `if !tag.is_empty()` ガードと同じ形。非空なら保存済み配列を
+/// clone してそのまま返す (byte 一致の保証)。
+fn note_tags_to_ap_value(tags: &serde_json::Value) -> Option<serde_json::Value> {
+    match tags {
+        serde_json::Value::Array(arr) if !arr.is_empty() => {
+            Some(serde_json::Value::Array(arr.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn render_html(note: &NoteRow, username: &str, display_name: Option<&str>) -> Body {
@@ -362,5 +385,28 @@ mod tests {
     fn escape_text_passes_through_plain() {
         assert_eq!(escape_text("hello world"), "hello world");
         assert_eq!(escape_text("日本語"), "日本語");
+    }
+
+    /// `note.tags` 非空 → `Some(保存済み配列そのまま)` (Create と byte 一致)。
+    #[test]
+    fn note_tags_to_ap_value_emits_non_empty_array_verbatim() {
+        let tags = serde_json::json!([
+            { "type": "Emoji", "name": ":sakura:", "icon": { "type": "Image", "url": "https://sakurasato.test/media/emoji/local/sakura.webp" } },
+            { "type": "Mention", "href": "https://nekonoverse.test/users/bob", "name": "@bob@nekonoverse.test" },
+        ]);
+        let v = note_tags_to_ap_value(&tags).expect("non-empty array must yield Some");
+        assert_eq!(
+            v, tags,
+            "tag must be emitted verbatim (= byte-identical to Create)"
+        );
+    }
+
+    /// `note.tags` 空配列 → `None` (= `tag` key を omit、従来 wire 互換)。
+    #[test]
+    fn note_tags_to_ap_value_omits_empty_array() {
+        assert!(note_tags_to_ap_value(&serde_json::json!([])).is_none());
+        // 非配列 (= NULL / object) も安全側で omit。
+        assert!(note_tags_to_ap_value(&serde_json::json!(null)).is_none());
+        assert!(note_tags_to_ap_value(&serde_json::json!({})).is_none());
     }
 }

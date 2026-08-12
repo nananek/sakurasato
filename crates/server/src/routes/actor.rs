@@ -54,6 +54,13 @@ pub struct ActorJson {
     /// 後方互換のため `false` でも明示的に出す ── Mastodon 自身も常時 emit。
     #[serde(rename = "manuallyApprovesFollowers")]
     pub manually_approves_followers: bool,
+    /// displayName / summary に埋め込まれた `:shortcode:` の `Emoji` tag
+    /// (= note 本文側と同じ [`crate::local_api::emoji_tag::build_emoji_tag`]
+    /// 形状、byte 一致)。受信側サーバはこれで displayName の絵文字を学習・
+    /// 画像化できる。**空のときは omit** (= 絵文字を持たない actor は従来の
+    /// wire と完全互換)。
+    #[serde(rename = "tag", skip_serializing_if = "Vec::is_empty")]
+    pub tag: Vec<serde_json::Value>,
     #[serde(rename = "endpoints", skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<Endpoints>,
 }
@@ -102,7 +109,7 @@ pub async fn actor_json(State(state): State<AppState>, Path(name): Path<String>)
         }
     };
 
-    let json = build_actor_json(&row);
+    let json = build_actor_json(&row, resolve_actor_emoji_tags(&state, &row).await);
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -120,7 +127,13 @@ pub async fn actor_json(State(state): State<AppState>, Path(name): Path<String>)
 /// `row.private_key_pem` は **常に** レスポンスに含めない (公開鍵側だけ載せる)。
 /// 呼び出し側は `ActorJson` → `serde_json::to_value(..)` で `object` に
 /// 埋め込める。
-pub fn build_actor_json(row: &sakurasato_core::model::ActorRow) -> ActorJson {
+///
+/// `tags` は解決済みの AP `Emoji` tag 配列 (= [`resolve_actor_emoji_tags`]
+/// の結果)。本関数は純関数のまま、I/O を呼び出し側に残す。
+pub fn build_actor_json(
+    row: &sakurasato_core::model::ActorRow,
+    tags: Vec<serde_json::Value>,
+) -> ActorJson {
     // Ed25519 鍵が登録されていれば assertionMethod に Multikey として並べる。
     // PEM パース失敗は 500 にせず、警告ログを残して omit する: RSA だけでも
     // 連合は機能するし、500 で actor 取得が永続的に壊れるよりはマシ。
@@ -194,9 +207,135 @@ pub fn build_actor_json(row: &sakurasato_core::model::ActorRow) -> ActorJson {
         also_known_as: row.also_known_as.0.clone(),
         moved_to: row.moved_to_ap_id.clone(),
         manually_approves_followers: row.manually_approves_followers,
+        tag: tags,
         endpoints: row
             .shared_inbox_url
             .clone()
             .map(|url| Endpoints { shared_inbox: url }),
+    }
+}
+
+/// ローカル actor の `display_name` / `summary` に含まれる `:shortcode:` を
+/// DB の emoji 行に解決して AP `Emoji` tag 配列を組み立てる。
+///
+/// note 本文側 [`crate::local_api::notes::resolve_emoji_tags`] と同じ
+/// [`crate::local_api::notes::parse_emoji_shortcodes`] +
+/// [`crate::local_api::emoji_tag::build_emoji_tag`] を共有するため、連合 wire
+/// 上の `Emoji` tag は note と byte 一致する (= 受信側は `tag` さえあれば
+/// displayName の絵文字を学習できる、バグ 1 の actor 側修正)。shortcode 抽出
+/// は [`crate::miauth::conv::collect_actor_emoji_shortcodes`] を使う
+/// (= `MiAuth` ユーザー `emojis` map と同一規約)。
+///
+/// - 解決できない shortcode は黙って drop (note 側と同じ fail-open)。
+/// - 同一 shortcode に local / learned-remote 両行がある場合は **local 優先**
+///   (remote 行は local 行で解決済みなら捨てる)。
+pub(crate) async fn resolve_actor_emoji_tags(
+    state: &AppState,
+    actor: &sakurasato_core::model::ActorRow,
+) -> Vec<serde_json::Value> {
+    let shortcodes = crate::miauth::conv::collect_actor_emoji_shortcodes(actor);
+    if shortcodes.is_empty() {
+        return Vec::new();
+    }
+    let Ok(rows) = repo::emoji::list_by_shortcodes(state.pool(), &shortcodes).await else {
+        return Vec::new();
+    };
+    // local 優先で shortcode → row に畳む (learned-remote 行は local 行に
+    // 上書きされる ── `BTreeMap` なので shortcode 昇順 = 決定的な tag 順)。
+    let mut by_shortcode: std::collections::BTreeMap<String, sakurasato_core::model::EmojiRow> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        if row.host.is_some() && by_shortcode.contains_key(&row.shortcode) {
+            continue;
+        }
+        by_shortcode.insert(row.shortcode.clone(), row);
+    }
+    let host = &state.config().server.host;
+    let mut out = Vec::with_capacity(by_shortcode.len());
+    for (_, row) in by_shortcode {
+        if let Some(tag) = crate::local_api::emoji_tag::build_emoji_tag(host, &row) {
+            out.push(tag);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use sakurasato_core::model::ActorRow;
+    use serde_json::json;
+    use sqlx::types::Json as SqlxJson;
+
+    fn fake_actor() -> ActorRow {
+        ActorRow {
+            id: 42,
+            ap_id: "https://sakurasato.test/users/me".into(),
+            preferred_username: "me".into(),
+            host: "sakurasato.test".into(),
+            display_name: Some("Alice".into()),
+            summary: None,
+            icon_url: None,
+            image_url: None,
+            inbox_url: "https://sakurasato.test/users/me/inbox".into(),
+            shared_inbox_url: None,
+            outbox_url: None,
+            followers_url: None,
+            following_url: None,
+            public_key_id: "k".into(),
+            public_key_pem: "p".into(),
+            private_key_pem: None,
+            ed25519_public_key_id: None,
+            ed25519_public_key_pem: None,
+            ed25519_private_key_pem: None,
+            also_known_as: SqlxJson(vec![]),
+            moved_to_ap_id: None,
+            is_local: true,
+            actor_type: "Person".into(),
+            manually_approves_followers: false,
+            birthday: None,
+            location: None,
+            lang: None,
+            followed_message: None,
+            fields: SqlxJson(vec![]),
+            followers_count: 0,
+            following_count: 0,
+            notes_count: 0,
+            fetched_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// 絵文字を解決できなかった (= tags 空) ときは `tag` key 自体を omit ──
+    /// 絵文字を持たない actor は従来の wire と完全互換。
+    #[test]
+    fn build_actor_json_omits_tag_when_empty() {
+        let json = serde_json::to_value(build_actor_json(&fake_actor(), Vec::new())).unwrap();
+        assert!(
+            json.get("tag").is_none(),
+            "empty tags must omit the `tag` key entirely"
+        );
+    }
+
+    /// 解決済み `Emoji` tag は `tag: [...]` としてそのまま載る (note 側の
+    /// [`crate::local_api::emoji_tag::build_emoji_tag`] と同じ形状)。
+    #[test]
+    fn build_actor_json_emits_resolved_emoji_tags() {
+        let tag = json!({
+            "type": "Emoji",
+            "id": "https://sakurasato.test/emojis/sakura",
+            "name": ":sakura:",
+            "updated": "2026-08-12T00:00:00Z",
+            "icon": {
+                "type": "Image",
+                "mediaType": "image/webp",
+                "url": "https://sakurasato.test/media/emoji/local/sakura.webp",
+            },
+        });
+        let json =
+            serde_json::to_value(build_actor_json(&fake_actor(), vec![tag.clone()])).unwrap();
+        assert_eq!(json["tag"], serde_json::json!([tag]));
     }
 }

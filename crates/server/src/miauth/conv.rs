@@ -55,7 +55,12 @@ use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 use std::collections::BTreeMap;
 
-use sakurasato_core::model::ActorRow;
+/// 解決できない actor の fallback として使う空 `emojis` map。
+/// (`HashMap::get` の `unwrap_or` 先 ── bulk 経路で毎回 `BTreeMap::new()` を
+/// 作り直さないための shared reference。)
+pub(crate) static EMPTY_EMOJIS: BTreeMap<String, String> = BTreeMap::new();
+
+use sakurasato_core::model::{ActorRow, EmojiRow};
 use sakurasato_core::repo::announce::AnnounceSummaryRow;
 use sakurasato_core::repo::note::TimelineEntry;
 use sakurasato_core::repo::reaction::ReactionSummaryRow;
@@ -104,6 +109,14 @@ pub struct MissUser {
     /// `note` テーブルの `is_local = TRUE` の件数 (お一人様サーバ前提で
     /// 「自分の投稿数」と同義)。
     pub notes_count: i64,
+    /// ユーザーの `name` / `description` / `fields` に埋め込まれた `:shortcode:`
+    /// の解決 map (= Misskey の `UserLite` / `UserDetailed` 共有フィールド)。
+    ///
+    /// Misskey wire では **常に存在する object** (空でも `{}`) で、key は
+    /// コロン無し shortcode。クライアント (Aria 等) はこの map を使って
+    /// displayName 内の `:foo:` を画像化する ── 空のまま名前に `:foo:` が
+    /// 入ると生テキストで表示される (バグ 1 の根本原因)。
+    pub emojis: BTreeMap<String, String>,
 }
 
 /// Sakurasato の [`ActorRow`] + 集計 count から `MissUser` を組み立てる。
@@ -112,11 +125,16 @@ pub struct MissUser {
 /// `repo::follow::count_*` + `repo::note::count_local` を直接叩いて値を集めて
 /// から本関数に渡す。本関数はアロケーションだけで I/O を持たない (= unit test
 /// で DB を立てずに変換ロジックだけ検証可能)。
+///
+/// `emojis` は呼び出し側が [`resolve_user_emojis`] で解決済みの shortcode →
+/// URL map を渡す (= 本関数は純変換のまま、I/O を呼び出し側に残す)。
+#[allow(clippy::too_many_arguments)]
 pub fn from_actor_and_counts(
     actor: &ActorRow,
     followers_count: i64,
     following_count: i64,
     notes_count: i64,
+    emojis: BTreeMap<String, String>,
 ) -> MissUser {
     MissUser {
         id: actor.id.to_string(),
@@ -138,7 +156,114 @@ pub fn from_actor_and_counts(
         followers_count,
         following_count,
         notes_count,
+        emojis,
     }
+}
+
+/// `ActorRow` の `display_name` / `summary` / `fields` (name + value) から
+/// `:shortcode:` を抽出する (ASCII-lowercase + dedupe + 上限付き)。
+///
+/// [`crate::local_api::notes::parse_emoji_shortcodes`] を再利用する純関数で、
+/// ユーザー `emojis` map (`resolve_user_emojis`) と actor `tag: [Emoji]`
+/// (`crate::routes::actor::resolve_actor_emoji_tags`) が共有する ── 本文と
+/// ユーザーで shortcode 抽出の文字種・大小正規化を drift させない。
+pub(crate) fn collect_actor_emoji_shortcodes(actor: &ActorRow) -> Vec<String> {
+    let mut shortcodes: Vec<String> = Vec::new();
+    for text in [actor.display_name.as_deref(), actor.summary.as_deref()]
+        .into_iter()
+        .flatten()
+        .chain(
+            actor
+                .fields
+                .0
+                .iter()
+                .flat_map(|f| [f.name.as_str(), f.value.as_str()]),
+        )
+    {
+        shortcodes.extend(crate::local_api::notes::parse_emoji_shortcodes(text));
+    }
+    shortcodes.sort_unstable();
+    shortcodes.dedup();
+    shortcodes
+}
+
+/// emoji 行の集合を `{shortcode: url}` map に畳む純関数。
+///
+/// - 同一 shortcode に local (`host IS NULL`) / learned-remote 両行がある場合
+///   は **local 行優先** (remote 行は local 行で解決済みなら捨てる)。
+/// - `image_key` が欠落している行は URL を組み立てられないのでスキップ
+///   (= `list_by_shortcodes` の SQL 側でも `image_key IS NOT NULL` で弾いて
+///   いるが、呼び出し経路によらず安全側の二重ガード)。
+pub(crate) fn emoji_rows_to_url_map(rows: &[EmojiRow], host: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for row in rows {
+        if row.host.is_some() && out.contains_key(&row.shortcode) {
+            continue;
+        }
+        let Some(image_key) = row.image_key.as_deref() else {
+            continue;
+        };
+        out.insert(
+            row.shortcode.clone(),
+            crate::local_api::media::build_media_url(host, image_key),
+        );
+    }
+    out
+}
+
+/// ユーザーの `display_name` / `summary` / `fields` (name + value) に埋め込ま
+/// れた `:shortcode:` を DB の emoji 行に解決し、Misskey ユーザー `emojis`
+/// フィールド用の `{shortcode: url}` map を返す。
+///
+/// - shortcode 抽出は [`collect_actor_emoji_shortcodes`] (= note 本文側と同じ
+///   文字種・ASCII-lowercase 規約)。解決できない shortcode は黙って drop
+///   (本文側と同じ fail-open)。
+/// - URL は local / learned-remote とも自インスタンスの `build_media_url`
+///   (= `/media/<image_key>`)。クライアントは `MiAuth` サーバ (= 自分) から
+///   fetch するため remote オリジンを直に渡さない。
+/// - 同一 shortcode に local / remote 両行がある場合は **local 行優先**
+///   (= [`emoji_rows_to_url_map`])。
+pub(crate) async fn resolve_user_emojis(
+    pool: &sqlx::PgPool,
+    host: &str,
+    actor: &ActorRow,
+) -> BTreeMap<String, String> {
+    let shortcodes = collect_actor_emoji_shortcodes(actor);
+    if shortcodes.is_empty() {
+        return BTreeMap::new();
+    }
+    let rows = match sakurasato_core::repo::emoji::list_by_shortcodes(pool, &shortcodes).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(?err, "resolve_user_emojis: list_by_shortcodes failed");
+            return BTreeMap::new();
+        }
+    };
+    emoji_rows_to_url_map(&rows, host)
+}
+
+/// 複数 actor の `emojis` map を一括解決して `actor_id → map` を返す。
+///
+/// bulk 経路 (timeline / streaming / lists / notifications の entry 列挙) で
+/// entry ごとに [`resolve_user_emojis`] を呼ばない (N+1 抑止) ための共通
+/// ヘルパー。actor の batch fetch + 各 actor の `emojis` 解決を 1 回に畳む。
+/// DB エラー時は fail-open (該当 actor は空 map)。
+pub(crate) async fn resolve_user_emojis_by_ids(
+    pool: &sqlx::PgPool,
+    host: &str,
+    actor_ids: &[i64],
+) -> std::collections::HashMap<i64, BTreeMap<String, String>> {
+    let mut ids: Vec<i64> = actor_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut out = std::collections::HashMap::with_capacity(ids.len());
+    let Ok(actors) = sakurasato_core::repo::actor::list_by_ids(pool, &ids).await else {
+        return out;
+    };
+    for a in &actors {
+        out.insert(a.id, resolve_user_emojis(pool, host, a).await);
+    }
+    out
 }
 
 /// `actor.icon_url == None` のケースで合成する identicon URL (= M14 #174)。
@@ -677,10 +802,15 @@ fn miss_file_id_from_url(url: &str) -> String {
 
 /// `TimelineEntry` (= note row + actor 表示情報) と集計 summary を `MissNote`
 /// に組み立てる。`MissNote.reply` / `renote` は本 PR では常に `None`。
+///
+/// `user_emojis` は **entry の actor の** `emojis` map。本関数は sync で
+/// I/O を持たないため、呼び出し側 (bulk 経路は [`resolve_user_emojis_by_ids`]
+/// で actor ごとに 1 回解決) が渡す。
 pub(crate) fn timeline_entry_to_miss_note(
     entry: &TimelineEntry,
     summary: &NoteSummary,
     host: &str,
+    user_emojis: &BTreeMap<String, String>,
 ) -> MissNote {
     // **PR #165 round-2 fix**: `actor.is_local` を `entry.actor_ap_id` の host が
     // 自インスタンス (`host`) と一致するかで判定する。`entry_to_actor_lite` は
@@ -697,7 +827,7 @@ pub(crate) fn timeline_entry_to_miss_note(
     // の `normalize_host_for_compare` と同じ流儀。
     let mut actor = entry_to_actor_lite(entry);
     actor.is_local = is_same_host(&entry.actor_ap_id, host);
-    let user = from_actor_and_counts(&actor, 0, 0, 0);
+    let user = from_actor_and_counts(&actor, 0, 0, 0, user_emojis.clone());
 
     let created_at = entry
         .published_at
@@ -910,14 +1040,16 @@ fn entry_to_actor_lite(entry: &TimelineEntry) -> ActorRow {
 /// の required bool `isFollowing` / `isFollowed` / `hasPendingFollowRequestFromYou`
 /// / `hasPendingFollowRequestToYou` にそのまま載せる。自分自身 (`/api/i` 経由) は
 /// [`crate::follow::FollowRelationship::neutral`] を渡せば良い。
+#[allow(clippy::too_many_arguments)]
 pub fn from_actor_detailed(
     actor: &ActorRow,
     followers_count: i64,
     following_count: i64,
     notes_count: i64,
     relationship: crate::follow::FollowRelationship,
+    emojis: BTreeMap<String, String>,
 ) -> JsonValue {
-    let lite = from_actor_and_counts(actor, followers_count, following_count, notes_count);
+    let lite = from_actor_and_counts(actor, followers_count, following_count, notes_count, emojis);
     let mut v = serde_json::to_value(lite).unwrap_or_else(|_| json!({}));
     if let JsonValue::Object(ref mut map) = v {
         map.insert(
@@ -1086,8 +1218,10 @@ pub fn from_actor_detailed(
 /// - `roles: []` ── role 機能を持たないため空配列。
 /// - `policies: {...}` ── `/api/meta.policies` と同じ shape。client は self の
 ///   permission チェックに使う。
-/// - `emojis: {}` ── 自分の display name や description に絵文字を埋め込んだ
-///   場合の shortcode → URL map。お一人様で empty map で十分。
+/// - `emojis` ── 自分の display name や description に絵文字を埋め込んだ場合の
+///   shortcode → URL map。`from_actor_detailed` 経由で呼び出し側が解決済みの
+///   map を渡す (= `resolve_user_emojis`)。従来は `{}` 固定で、名前に `:foo:`
+///   を入れると Aria 等で生テキスト表示になっていた (バグ 1)。
 /// - `onlineStatus: "unknown"` ── オンライン状態の追跡を実装しないため固定。
 /// - `mfmEnabled: true` ── MFM 記法を `text` 上でレンダリングしてほしい。
 /// - `isExplorable: true` ── public profile に出るかどうかの hint。お一人様で
@@ -1100,12 +1234,14 @@ pub fn from_actor_detailed(
 /// が [`crate::miauth::meta::build_policies_value`] を介して `/api/meta` と
 /// 完全に同じ JSON を渡す形にすることで、`/api/meta` と `/api/i` の policies
 /// が乖離しない設計。
+#[allow(clippy::too_many_arguments)]
 pub fn from_actor_me_detailed(
     actor: &ActorRow,
     followers_count: i64,
     following_count: i64,
     notes_count: i64,
     policies: JsonValue,
+    emojis: BTreeMap<String, String>,
 ) -> JsonValue {
     // 自分自身 (Me) に対しては follow relationship は常に中立 ── `/api/i` の
     // `UserDetailedNotMe` 部分も required bool が揃っている限り client は
@@ -1116,6 +1252,7 @@ pub fn from_actor_me_detailed(
         following_count,
         notes_count,
         crate::follow::FollowRelationship::neutral(),
+        emojis,
     );
     // `from_actor_detailed` は実質 `Object` を返すが、型レベルでは保証されて
     // いない。`Null` 等で来ると Me-only field 挿入が無音で消えるため、release
@@ -1160,9 +1297,10 @@ pub fn from_actor_me_detailed(
         map.insert("pinnedNotes".to_string(), JsonValue::Array(vec![]));
         // `fields` は `UserDetailed` 共有フィールドなので [`from_actor_detailed`]
         // (基底) で実データを挿入済み ── ここで空配列に上書きしない。
+        // `emojis` も UserDetailed 共有フィールドで、基底が呼び出し側から
+        // 渡された実 map を emit 済み ── ここで `{}` に上書きしない (バグ 1)。
 
         // object 系。
-        map.insert("emojis".to_string(), serde_json::json!({}));
         map.insert("policies".to_string(), policies);
 
         // 画像系 (= blurhash 未生成、null で client 側 default に倒す)。
@@ -1265,7 +1403,7 @@ pub fn user_list_to_miss(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use sakurasato_core::model::ActorRow;
+    use sakurasato_core::model::{ActorField, ActorRow, EmojiRow};
     use sqlx::types::Json as SqlxJson;
 
     fn neutral_rel() -> crate::follow::FollowRelationship {
@@ -1316,7 +1454,7 @@ mod tests {
     #[test]
     fn local_actor_host_is_null() {
         let actor = fake_actor(true, "sakurasato", false);
-        let miss = from_actor_and_counts(&actor, 3, 5, 7);
+        let miss = from_actor_and_counts(&actor, 3, 5, 7, BTreeMap::new());
         assert_eq!(miss.id, "42");
         assert_eq!(miss.username, "me");
         assert_eq!(miss.name.as_deref(), Some("Alice"));
@@ -1331,7 +1469,7 @@ mod tests {
     #[test]
     fn remote_actor_host_is_some() {
         let actor = fake_actor(false, "remote.test", false);
-        let miss = from_actor_and_counts(&actor, 0, 0, 0);
+        let miss = from_actor_and_counts(&actor, 0, 0, 0, BTreeMap::new());
         assert_eq!(miss.host.as_deref(), Some("remote.test"));
     }
 
@@ -1339,7 +1477,7 @@ mod tests {
     #[test]
     fn locked_actor_serializes_as_locked() {
         let actor = fake_actor(true, "sakurasato", true);
-        let miss = from_actor_and_counts(&actor, 0, 0, 0);
+        let miss = from_actor_and_counts(&actor, 0, 0, 0, BTreeMap::new());
         assert!(miss.is_locked);
     }
 
@@ -1347,7 +1485,7 @@ mod tests {
     #[test]
     fn json_shape_matches_misskey_userlite_minimum() {
         let actor = fake_actor(true, "sakurasato", false);
-        let miss = from_actor_and_counts(&actor, 11, 12, 13);
+        let miss = from_actor_and_counts(&actor, 11, 12, 13, BTreeMap::new());
         let json = serde_json::to_value(&miss).unwrap();
         assert_eq!(json["id"], "42");
         assert_eq!(json["username"], "me");
@@ -1374,7 +1512,7 @@ mod tests {
         let mut actor = fake_actor(true, "sakurasato", false);
         actor.display_name = None;
         actor.icon_url = None;
-        let miss = from_actor_and_counts(&actor, 0, 0, 0);
+        let miss = from_actor_and_counts(&actor, 0, 0, 0, BTreeMap::new());
         let json = serde_json::to_value(&miss).unwrap();
         assert!(json["name"].is_null());
         // **non-null**: icon_url が None でも identicon URL で fallback。
@@ -1382,6 +1520,119 @@ mod tests {
         let url = json["avatarUrl"].as_str().unwrap();
         assert!(url.starts_with("https://"));
         assert!(url.contains("/identicon/"));
+    }
+
+    /// バグ 1 の回帰ガード: 渡した `emojis` map が `UserLite` JSON の
+    /// `emojis` object にそのまま emit される (空でも `{}` = Misskey wire は
+    /// 常に object)。key はコロン無し shortcode。
+    #[test]
+    fn from_actor_and_counts_emits_emojis_map() {
+        let actor = fake_actor(true, "sakurasato", false);
+        let emojis = BTreeMap::from([
+            (
+                "sakura".to_string(),
+                "https://sakurasato.test/media/emoji/local/sakura.webp".to_string(),
+            ),
+            (
+                "blobcat".to_string(),
+                "https://sakurasato.test/media/emoji/local/blobcat.webp".to_string(),
+            ),
+        ]);
+        let miss = from_actor_and_counts(&actor, 0, 0, 0, emojis.clone());
+        assert_eq!(miss.emojis, emojis);
+        let json = serde_json::to_value(&miss).unwrap();
+        assert_eq!(
+            json["emojis"],
+            serde_json::json!({
+                "sakura": "https://sakurasato.test/media/emoji/local/sakura.webp",
+                "blobcat": "https://sakurasato.test/media/emoji/local/blobcat.webp",
+            })
+        );
+    }
+
+    /// バグ 1 の回帰ガード: `UserDetailed` (= `users/show` 等) も渡した
+    /// `emojis` map を emit する (基底 `from_actor_and_counts` 経由)。
+    #[test]
+    fn from_actor_detailed_emits_emojis_map() {
+        let actor = fake_actor(false, "sakurasato.test", false);
+        let emojis = BTreeMap::from([(
+            "sakura".to_string(),
+            "https://sakurasato.test/media/emoji/local/sakura.webp".to_string(),
+        )]);
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), emojis.clone());
+        assert_eq!(
+            v["emojis"],
+            serde_json::json!({ "sakura": "https://sakurasato.test/media/emoji/local/sakura.webp" })
+        );
+    }
+
+    /// shortcode を何も含まない actor は `collect_actor_emoji_shortcodes` が
+    /// 空を返す (= `resolve_user_emojis` の DB 引きを short-circuit する)。
+    #[test]
+    fn collect_actor_emoji_shortcodes_empty_when_no_shortcode() {
+        let actor = fake_actor(true, "sakurasato", false);
+        assert!(collect_actor_emoji_shortcodes(&actor).is_empty());
+    }
+
+    /// `display_name` / `summary` / `fields` (name + value) から `:foo:` を
+    /// 横断的に集め、ASCII-lowercase + dedupe する (= 本文側と同じ規約)。
+    #[test]
+    fn collect_actor_emoji_shortcodes_spans_all_text_fields() {
+        let mut actor = fake_actor(true, "sakurasato", false);
+        actor.display_name = Some("Alice :Sakura: :blobcat:".into());
+        actor.summary = Some("suki :sakura:".into());
+        actor.fields = SqlxJson(vec![ActorField {
+            name: "URL".into(),
+            value: "example.com :blobcat:".into(),
+        }]);
+        // ASCII-lowercase + 全フィールド横断 + dedupe。
+        assert_eq!(
+            collect_actor_emoji_shortcodes(&actor),
+            vec!["blobcat".to_string(), "sakura".to_string()]
+        );
+    }
+
+    /// `emoji_rows_to_url_map`: local 行優先 + `image_key` 欠落行スキップ。
+    #[test]
+    fn emoji_rows_to_url_map_prefers_local_and_skips_missing_image() {
+        let local = EmojiRow {
+            id: 1,
+            shortcode: "sakura".into(),
+            host: None,
+            category: None,
+            aliases: SqlxJson(vec![]),
+            image_key: Some("emoji/local/sakura.webp".into()),
+            media_type: "image/webp".into(),
+            ap_id: None,
+            is_local: true,
+            license: None,
+            is_sensitive: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_failed_at: None,
+        };
+        // 同じ shortcode の learned-remote 行 (後ろに置いて「local 優先」を確認)。
+        let mut remote = local.clone();
+        remote.id = 2;
+        remote.host = Some("misskey.io".into());
+        remote.image_key = Some("emoji/remote/misskey.io/sakura.webp".into());
+        remote.is_local = false;
+        // image_key 欠落行 (= fetch 失敗キャッシュ行) はスキップ。
+        let mut broken = local.clone();
+        broken.id = 3;
+        broken.shortcode = "broken".into();
+        broken.image_key = None;
+
+        let map = emoji_rows_to_url_map(&[broken, remote, local], "sakurasato.test");
+        assert_eq!(
+            map.len(),
+            1,
+            "broken 行はスキップ、remote は local に敗れる"
+        );
+        assert_eq!(
+            map["sakura"],
+            "https://sakurasato.test/media/emoji/local/sakura.webp"
+        );
     }
 
     // ── #159: visibility / file id / reactions / detailed user ────────────
@@ -1645,7 +1896,7 @@ mod tests {
         actor.summary = Some("hello world".into());
         actor.image_url = Some("https://cdn.test/banner.webp".into());
         actor.actor_type = "Service".into();
-        let v = from_actor_detailed(&actor, 1, 2, 3, neutral_rel());
+        let v = from_actor_detailed(&actor, 1, 2, 3, neutral_rel(), BTreeMap::new());
         assert_eq!(v["id"], "42");
         assert_eq!(v["description"], "hello world");
         assert_eq!(v["bannerUrl"], "https://cdn.test/banner.webp");
@@ -1682,7 +1933,7 @@ mod tests {
         let mut actor = fake_actor(false, "remote.test", false);
         actor.summary =
             Some(r#"<p>hello <a href="https://remote.test/@me">@me</a></p><p>line2</p>"#.into());
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel());
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), BTreeMap::new());
         assert_eq!(v["description"], "hello @me\n\nline2");
     }
 
@@ -1692,7 +1943,7 @@ mod tests {
         // そのまま (html_to_plain_text を通さない)。
         let mut actor = fake_actor(true, "sakurasato.test", false);
         actor.summary = Some("price < 100 & rising".into());
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel());
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), BTreeMap::new());
         assert_eq!(v["description"], "price < 100 & rising");
     }
 
@@ -1705,7 +1956,7 @@ mod tests {
     fn from_actor_detailed_emits_all_required_userdetailednotme_fields() {
         // remote actor (icon_url 無し) でも avatarUrl が non-null になる経路。
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel());
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), BTreeMap::new());
         // string / number で `as String` / `as num` 直読みされ、null だと throw。
         assert!(v["id"].is_string(), "id must be a string");
         assert!(v["username"].is_string(), "username must be a string");
@@ -1747,7 +1998,7 @@ mod tests {
     #[test]
     fn from_actor_detailed_emits_withrelations_defaults() {
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel());
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), BTreeMap::new());
         assert_eq!(v["notify"], "normal");
         assert_eq!(v["withReplies"], true);
     }
@@ -1767,7 +2018,7 @@ mod tests {
             has_pending_follow_request_from_you: true,
             has_pending_follow_request_to_you: true,
         };
-        let v = from_actor_detailed(&actor, 0, 0, 0, rel);
+        let v = from_actor_detailed(&actor, 0, 0, 0, rel, BTreeMap::new());
         assert_eq!(
             v["isFollowing"], true,
             "isFollowing must come from `following`"
@@ -1796,7 +2047,7 @@ mod tests {
     #[test]
     fn from_actor_detailed_includes_url_key_for_userdetailed_dispatch() {
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel());
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), BTreeMap::new());
         let map = v.as_object().expect("from_actor_detailed must be object");
         assert!(
             map.contains_key("url"),
@@ -1891,7 +2142,7 @@ mod tests {
     fn timeline_entry_for_local_actor_emits_user_host_null() {
         let entry = fake_timeline_entry("https://sakurasato.test/users/alice");
         let summary = empty_summary();
-        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test");
+        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test", &EMPTY_EMOJIS);
         let json = serde_json::to_value(&note).unwrap();
         assert!(
             json["user"]["host"].is_null(),
@@ -1906,7 +2157,7 @@ mod tests {
     fn timeline_entry_for_remote_actor_emits_user_host_some() {
         let entry = fake_timeline_entry("https://misskey.io/users/bob");
         let summary = empty_summary();
-        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test");
+        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test", &EMPTY_EMOJIS);
         let json = serde_json::to_value(&note).unwrap();
         assert_eq!(
             json["user"]["host"], "misskey.io",
@@ -1920,7 +2171,7 @@ mod tests {
     fn timeline_entry_local_host_with_port_still_emits_null() {
         let entry = fake_timeline_entry("https://example.com/users/alice");
         let summary = empty_summary();
-        let note = timeline_entry_to_miss_note(&entry, &summary, "example.com:8443");
+        let note = timeline_entry_to_miss_note(&entry, &summary, "example.com:8443", &EMPTY_EMOJIS);
         let json = serde_json::to_value(&note).unwrap();
         assert!(
             json["user"]["host"].is_null(),

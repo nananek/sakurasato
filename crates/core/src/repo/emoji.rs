@@ -350,6 +350,36 @@ pub async fn search_remote_cached(
     .await
 }
 
+/// shortcode の一括取得。local (`host IS NULL`) と learned remote の両行を
+/// 返す ── 呼び出し側 (`MiAuth` ユーザー `emojis` map / actor `tag` 解決) が
+/// 同一 shortcode の衝突時に local 行優先で dedupe する。
+///
+/// `image_key IS NULL` (= fetch 失敗キャッシュ行、`should_skip_fetch` 参照) は
+/// 画像 URL を組み立てられないため除外する。`shortcodes` は呼び出し側で
+/// lowercase + dedupe 済みを想定 (= `parse_emoji_shortcodes` の出力規約)。
+pub async fn list_by_shortcodes(
+    pool: &PgPool,
+    shortcodes: &[String],
+) -> sqlx::Result<Vec<EmojiRow>> {
+    if shortcodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        EmojiRow,
+        r#"
+        SELECT
+            id, shortcode, host, category,
+            aliases as "aliases: Json<Vec<String>>",
+            image_key, media_type, ap_id, is_local, license, is_sensitive, created_at, updated_at, last_failed_at
+        FROM emoji
+        WHERE shortcode = ANY($1) AND image_key IS NOT NULL
+        "#,
+        shortcodes,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// `id` で 1 行引く。`reaction.emoji_id` を Activity 再構築する経路で使う
 /// (例: Undo の `object` を inline 化するときに元の `Emoji` tag を組み立てる)。
 pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<EmojiRow>> {

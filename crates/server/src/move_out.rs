@@ -200,7 +200,7 @@ where
     // Update activity でフォロワーに配信。M7 のプロフィール変更と同じ Update
     // を使い回す ── object に actor JSON 全体を載せるので `alsoKnownAs` も
     // そのまま伝わる。
-    let activity = build_update_activity(&updated);
+    let activity = build_update_activity(state, &updated).await;
     let queued = enqueue_to_followers(state, &updated, &activity).await;
     eprintln!("(Update queued for {queued} follower inbox(es))");
     Ok(())
