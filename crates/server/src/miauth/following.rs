@@ -40,7 +40,7 @@ use crate::follow::{
     delete_follow_core,
 };
 use crate::miauth::auth;
-use crate::miauth::conv::from_actor_detailed;
+use crate::miauth::conv::{from_actor_detailed, resolve_user_emojis};
 use crate::miauth::error::error_resp;
 use crate::state::AppState;
 
@@ -150,7 +150,9 @@ async fn build_create_response(state: &AppState, outcome: &FollowOutcome) -> ser
     let (followers, following, notes) =
         crate::miauth::counts::counts_for_actor(state, &outcome.target).await;
     let rel = compute_relationship_or_neutral(state, outcome.target.id).await;
-    from_actor_detailed(&outcome.target, followers, following, notes, rel)
+    let emojis =
+        resolve_user_emojis(state.pool(), &state.config().server.host, &outcome.target).await;
+    from_actor_detailed(&outcome.target, followers, following, notes, rel, emojis)
 }
 
 /// `following/delete` の成功 body ── unfollow した相手 user の `UserDetailed`。
@@ -162,7 +164,9 @@ async fn build_delete_response(state: &AppState, outcome: &UnfollowOutcome) -> s
             let (followers, following, notes) =
                 crate::miauth::counts::counts_for_actor(state, &actor).await;
             let rel = compute_relationship_or_neutral(state, actor.id).await;
-            from_actor_detailed(&actor, followers, following, notes, rel)
+            let emojis =
+                resolve_user_emojis(state.pool(), &state.config().server.host, &actor).await;
+            from_actor_detailed(&actor, followers, following, notes, rel, emojis)
         }
         _ => {
             // actor 行が消えていても unfollow 自体は成功している。空 object で返す。

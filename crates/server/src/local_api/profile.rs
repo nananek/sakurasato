@@ -26,7 +26,7 @@ use tracing::{error, warn};
 
 use crate::delivery;
 use crate::local_api::media::build_media_url;
-use crate::routes::actor::build_actor_json;
+use crate::routes::actor::{build_actor_json, resolve_actor_emoji_tags};
 use crate::state::AppState;
 
 /// `crate::miauth::i::update` (Misskey 互換 `i/update`) も同じ上限を共有する
@@ -172,7 +172,7 @@ pub async fn patch(State(state): State<AppState>, Json(req): Json<ProfileUpdate>
         }
     };
 
-    let activity = build_update_activity(&updated);
+    let activity = build_update_activity(&state, &updated).await;
     let queued = enqueue_to_followers(&state, &updated, &activity).await;
 
     let body = ProfileResponse {
@@ -279,8 +279,13 @@ async fn resolve_media_url(
 ///
 /// 配送方針: フォロワー全員に「自分の actor が変わった」と伝えるので、
 /// `to = [Public]` / `cc = [followers]` (Mastodon の actor Update と同じ)。
-pub(crate) fn build_update_activity(actor: &ActorRow) -> JsonValue {
-    let actor_object = serde_json::to_value(build_actor_json(actor))
+///
+/// displayName / summary の `:shortcode:` を `tag: [Emoji]` として解決して
+/// 載せる (= `routes::actor::resolve_actor_emoji_tags`)。`build_actor_json` は
+/// 純関数なので、I/O は本関数が行って tags を渡す。
+pub(crate) async fn build_update_activity(state: &AppState, actor: &ActorRow) -> JsonValue {
+    let tags = resolve_actor_emoji_tags(state, actor).await;
+    let actor_object = serde_json::to_value(build_actor_json(actor, tags))
         .expect("ActorJson serializes to JSON without error");
     let now = chrono::Utc::now();
     let activity_id = format!(

@@ -106,7 +106,7 @@ pub async fn set_lock_state(state: &AppState, next: bool) -> anyhow::Result<Lock
             )
         })?;
 
-    let activity = build_update_activity(&updated);
+    let activity = build_update_activity(state, &updated).await;
     let (queued, enqueue_failures) = enqueue_to_followers(state, &updated, &activity).await?;
     Ok(LockOutcome {
         updated,

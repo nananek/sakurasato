@@ -40,7 +40,8 @@ use serde_json::{Value as JsonValue, json};
 use crate::local_api;
 use crate::miauth::auth;
 use crate::miauth::conv::{
-    MissNote, NoteSummary, build_renote_miss_note, bulk_load_note_summaries, from_actor_and_counts,
+    EMPTY_EMOJIS, MissNote, NoteSummary, build_renote_miss_note, bulk_load_note_summaries,
+    from_actor_and_counts, resolve_user_emojis, resolve_user_emojis_by_ids,
     timeline_entry_to_miss_note,
 };
 use crate::miauth::error::{bad_request, error_resp};
@@ -145,7 +146,11 @@ pub async fn show(
     let summaries = bulk_load_note_summaries(state.pool(), &[entry.id], viewer).await;
     let summary = summaries.remove_summary(entry.id);
     let host = &state.config().server.host;
-    let note = timeline_entry_to_miss_note(&entry, &summary, host);
+    let user_emojis = resolve_user_emojis_by_ids(state.pool(), host, &[entry.actor_id])
+        .await
+        .remove(&entry.actor_id)
+        .unwrap_or_default();
+    let note = timeline_entry_to_miss_note(&entry, &summary, host, &user_emojis);
     Json(note).into_response()
 }
 
@@ -224,8 +229,11 @@ async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
     let summaries = bulk_load_note_summaries(state.pool(), &[entry.id], viewer).await;
     let summary = summaries.remove_summary(entry.id);
     let host = &state.config().server.host;
-    let renoted = timeline_entry_to_miss_note(&entry, &summary, host);
-    let renoter_user = from_actor_and_counts(&renoter, 0, 0, 0);
+    let actor_emojis = resolve_user_emojis_by_ids(state.pool(), host, &[entry.actor_id]).await;
+    let entry_emojis = actor_emojis.get(&entry.actor_id).unwrap_or(&EMPTY_EMOJIS);
+    let renoted = timeline_entry_to_miss_note(&entry, &summary, host, entry_emojis);
+    let renoter_emojis = resolve_user_emojis(state.pool(), host, &renoter).await;
+    let renoter_user = from_actor_and_counts(&renoter, 0, 0, 0, renoter_emojis);
     let created_at = ann
         .published_at
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -371,14 +379,23 @@ pub async fn timeline(
 
     let host = &state.config().server.host;
 
+    // actor ごとに emojis map を 1 回解決して共有する (entry ごとの N+1 抑止、
+    // `conv::resolve_user_emojis_by_ids` 参照)。note 作者 + renoter をまとめて
+    // 引き、`renoter_actors` は既に fetch 済み (= `actor_by_id`) なので
+    // emojis 解決のみ。
+    let mut actor_ids: Vec<i64> = note_entries.iter().map(|e| e.actor_id).collect();
+    actor_ids.extend(renoter_ids.iter().copied());
+    let user_emojis = resolve_user_emojis_by_ids(state.pool(), host, &actor_ids).await;
+
     // note と renote を (sort_ts, MissNote) で 1 本に統合する。
     let mut items: Vec<(chrono::DateTime<chrono::Utc>, MissNote)> =
         Vec::with_capacity(note_entries.len() + renote_rows.len());
     for e in &note_entries {
         let summary = summaries.get(&e.id).unwrap_or(&empty);
+        let emojis = user_emojis.get(&e.actor_id).unwrap_or(&EMPTY_EMOJIS);
         items.push((
             e.published_at,
-            timeline_entry_to_miss_note(e, summary, host),
+            timeline_entry_to_miss_note(e, summary, host, emojis),
         ));
     }
     for r in &renote_rows {
@@ -390,8 +407,10 @@ pub async fn timeline(
             continue;
         };
         let summary = summaries.get(&entry.id).unwrap_or(&empty);
-        let renoted = timeline_entry_to_miss_note(entry, summary, host);
-        let renoter = from_actor_and_counts(actor, 0, 0, 0);
+        let entry_emojis = user_emojis.get(&entry.actor_id).unwrap_or(&EMPTY_EMOJIS);
+        let renoted = timeline_entry_to_miss_note(entry, summary, host, entry_emojis);
+        let renoter_emojis = user_emojis.get(&actor.id).unwrap_or(&EMPTY_EMOJIS);
+        let renoter = from_actor_and_counts(actor, 0, 0, 0, renoter_emojis.clone());
         let created_at = r
             .announce_published_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -537,11 +556,14 @@ pub async fn mentions(
         my_reaction: None,
     };
     let host = &state.config().server.host;
+    let actor_ids: Vec<i64> = entries.iter().map(|e| e.actor_id).collect();
+    let user_emojis = resolve_user_emojis_by_ids(state.pool(), host, &actor_ids).await;
     let notes: Vec<MissNote> = entries
         .iter()
         .map(|e| {
             let summary = summaries.get(&e.id).unwrap_or(&empty);
-            timeline_entry_to_miss_note(e, summary, host)
+            let emojis = user_emojis.get(&e.actor_id).unwrap_or(&EMPTY_EMOJIS);
+            timeline_entry_to_miss_note(e, summary, host, emojis)
         })
         .collect();
     Json(notes).into_response()
@@ -849,14 +871,21 @@ pub async fn users_notes(
 
     let host = &state.config().server.host;
 
+    // actor ごとに emojis map を 1 回解決して共有する (= entry ごとの N+1 抑止)。
+    // renoter は常に対象ユーザ本人 (= `target`) なので actor_id に含める。
+    let mut actor_ids: Vec<i64> = note_entries.iter().map(|e| e.actor_id).collect();
+    actor_ids.push(target.id);
+    let user_emojis = resolve_user_emojis_by_ids(state.pool(), host, &actor_ids).await;
+
     // note と renote を (sort_ts, MissNote) で 1 本に統合する。
     let mut items: Vec<(chrono::DateTime<chrono::Utc>, MissNote)> =
         Vec::with_capacity(note_entries.len() + renote_rows.len());
     for e in &note_entries {
         let summary = summaries.get(&e.id).unwrap_or(&empty);
+        let entry_emojis = user_emojis.get(&e.actor_id).unwrap_or(&EMPTY_EMOJIS);
         items.push((
             e.published_at,
-            timeline_entry_to_miss_note(e, summary, host),
+            timeline_entry_to_miss_note(e, summary, host, entry_emojis),
         ));
     }
     for r in &renote_rows {
@@ -870,9 +899,11 @@ pub async fn users_notes(
         // `viewer_can_view_entry` を呼ぶ必要は無い (= renote 件数ぶんの follow
         // 引き N+1 を解消)。
         let summary = summaries.get(&entry.id).unwrap_or(&empty);
-        let renoted = timeline_entry_to_miss_note(entry, summary, host);
+        let entry_emojis = user_emojis.get(&entry.actor_id).unwrap_or(&EMPTY_EMOJIS);
+        let renoted = timeline_entry_to_miss_note(entry, summary, host, entry_emojis);
         // renoter は常に対象ユーザ本人。
-        let renoter = from_actor_and_counts(&target, 0, 0, 0);
+        let renoter_emojis = user_emojis.get(&target.id).unwrap_or(&EMPTY_EMOJIS);
+        let renoter = from_actor_and_counts(&target, 0, 0, 0, renoter_emojis.clone());
         let created_at = r
             .announce_published_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -927,6 +958,10 @@ pub struct CreateNoteBody {
 }
 
 /// `POST /api/notes/create` handler。
+#[allow(
+    clippy::too_many_lines,
+    reason = "pure renote / quote renote / replyId 解決 / 既存 local_api 委譲 / MissNote 合成を 1 ハンドラに収める"
+)]
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1045,7 +1080,11 @@ pub async fn create(
     let summaries = bulk_load_note_summaries(state.pool(), &[entry.id], viewer).await;
     let summary = summaries.remove_summary(entry.id);
     let host = &state.config().server.host;
-    let note = timeline_entry_to_miss_note(&entry, &summary, host);
+    let user_emojis = resolve_user_emojis_by_ids(state.pool(), host, &[entry.actor_id])
+        .await
+        .remove(&entry.actor_id)
+        .unwrap_or_default();
+    let note = timeline_entry_to_miss_note(&entry, &summary, host, &user_emojis);
 
     // Misskey wire は `{ createdNote: MissNote }` を返す。
     (StatusCode::OK, Json(json!({ "createdNote": note }))).into_response()
@@ -1322,8 +1361,14 @@ async fn handle_renote(state: &AppState, renote_id: Option<&str>) -> Response {
     let host = &state.config().server.host;
     let summaries = bulk_load_note_summaries(state.pool(), &[target_entry.id], viewer).await;
     let summary = summaries.remove_summary(target_entry.id);
-    let renoted = timeline_entry_to_miss_note(&target_entry, &summary, host);
-    let renoter = from_actor_and_counts(&local_actor, 0, 0, 0);
+    let actor_emojis =
+        resolve_user_emojis_by_ids(state.pool(), host, &[target_entry.actor_id]).await;
+    let entry_emojis = actor_emojis
+        .get(&target_entry.actor_id)
+        .unwrap_or(&EMPTY_EMOJIS);
+    let renoted = timeline_entry_to_miss_note(&target_entry, &summary, host, entry_emojis);
+    let renoter_emojis = resolve_user_emojis(state.pool(), host, &local_actor).await;
+    let renoter = from_actor_and_counts(&local_actor, 0, 0, 0, renoter_emojis);
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let created_note = build_renote_miss_note(

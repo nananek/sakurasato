@@ -44,8 +44,9 @@ use serde::Deserialize;
 
 use crate::miauth::auth;
 use crate::miauth::conv::{
-    MissNote, NoteSummary, build_renote_miss_note, bulk_load_note_summaries, from_actor_and_counts,
-    timeline_entry_to_miss_note, user_list_to_miss,
+    EMPTY_EMOJIS, MissNote, NoteSummary, build_renote_miss_note, bulk_load_note_summaries,
+    from_actor_and_counts, resolve_user_emojis_by_ids, timeline_entry_to_miss_note,
+    user_list_to_miss,
 };
 use crate::miauth::error::{bad_request, error_resp};
 use crate::miauth::notes::{ms_epoch_to_datetime, resolve_cursor_ts, resolve_self_actor_id};
@@ -483,13 +484,19 @@ pub async fn timeline(
 
     let host = &state.config().server.host;
 
+    // actor ごとに emojis map を 1 回解決して共有する (entry ごとの N+1 抑止)。
+    let mut actor_ids: Vec<i64> = note_entries.iter().map(|e| e.actor_id).collect();
+    actor_ids.extend(renoter_ids.iter().copied());
+    let user_emojis = resolve_user_emojis_by_ids(state.pool(), host, &actor_ids).await;
+
     let mut items: Vec<(DateTime<Utc>, MissNote)> =
         Vec::with_capacity(note_entries.len() + renote_rows.len());
     for e in &note_entries {
         let summary = summaries.get(&e.id).unwrap_or(&empty);
+        let emojis = user_emojis.get(&e.actor_id).unwrap_or(&EMPTY_EMOJIS);
         items.push((
             e.published_at,
-            timeline_entry_to_miss_note(e, summary, host),
+            timeline_entry_to_miss_note(e, summary, host, emojis),
         ));
     }
     for r in &renote_rows {
@@ -500,8 +507,12 @@ pub async fn timeline(
             continue;
         };
         let summary = summaries.get(&entry.id).unwrap_or(&empty);
-        let renoted = timeline_entry_to_miss_note(entry, summary, host);
-        let renoter = from_actor_and_counts(actor, 0, 0, 0);
+        let entry_emojis = user_emojis.get(&entry.actor_id).unwrap_or(&EMPTY_EMOJIS);
+        let renoted = timeline_entry_to_miss_note(entry, summary, host, entry_emojis);
+        // renoter も `user_emojis` (= renoter_ids を含む) から引く ── actor
+        // ごと 1 回の解決に畳む (N+1 抑止)。
+        let renoter_emojis = user_emojis.get(&actor.id).unwrap_or(&EMPTY_EMOJIS);
+        let renoter = from_actor_and_counts(actor, 0, 0, 0, renoter_emojis.clone());
         let created_at = r
             .announce_published_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);

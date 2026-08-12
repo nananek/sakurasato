@@ -51,7 +51,7 @@ use crate::local_api::profile::{
     DISPLAY_NAME_MAX, SUMMARY_MAX, build_update_activity, enqueue_to_followers,
 };
 use crate::miauth::auth;
-use crate::miauth::conv::from_actor_me_detailed;
+use crate::miauth::conv::{from_actor_me_detailed, resolve_user_emojis};
 use crate::miauth::error::{bad_request, error_resp, internal_error};
 use crate::miauth::meta::{build_policies, max_file_size_mb_from_bytes};
 use crate::miauth::notes::resolve_self_actor;
@@ -191,7 +191,12 @@ pub(crate) async fn build_self_me_detailed(state: &AppState) -> Result<JsonValue
         .await
         .unwrap_or(0);
 
-    let mut me = from_actor_me_detailed(&actor, followers, following, notes, policies);
+    // 自分の display name / description / fields に埋め込んだ `:shortcode:` を
+    // 解決して `emojis` map に載せる (= バグ 1: Aria 等が名前の絵文字を画像化
+    // できるようにする)。解決できない shortcode は fail-open で空 map になる。
+    let emojis = resolve_user_emojis(state.pool(), host, &actor).await;
+
+    let mut me = from_actor_me_detailed(&actor, followers, following, notes, policies, emojis);
     if let Some(map) = me.as_object_mut() {
         map.insert(
             "unreadNotificationsCount".to_string(),
@@ -299,7 +304,7 @@ pub async fn update(
     // Update を 1 回だけ配送する (両方変わっても 2 回送らない ── フォロワーの
     // inbox を 2 倍叩く必要は無い)。
     if profile_changed || lock_changed {
-        let activity = build_update_activity(&actor);
+        let activity = build_update_activity(&state, &actor).await;
         enqueue_to_followers(&state, &actor, &activity).await;
     }
 

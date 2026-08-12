@@ -44,7 +44,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
 use crate::miauth::auth;
-use crate::miauth::conv::from_actor_detailed;
+use crate::miauth::conv::{from_actor_detailed, resolve_user_emojis};
 use crate::miauth::error::{bad_request, error_resp, internal_error};
 use crate::miauth::following::resolve_local_actor_id;
 use crate::state::AppState;
@@ -198,7 +198,8 @@ async fn build_detailed_json(
         }
         None => crate::follow::FollowRelationship::neutral(),
     };
-    from_actor_detailed(&actor, followers, following, notes, rel)
+    let emojis = resolve_user_emojis(state.pool(), &state.config().server.host, &actor).await;
+    from_actor_detailed(&actor, followers, following, notes, rel, emojis)
 }
 
 /// `limit` の既定値・上限。Misskey 公式仕様 (default 10, max 100) に揃える。
@@ -276,12 +277,16 @@ pub async fn search_by_username_and_host(
     let mut out = Vec::with_capacity(actors.len());
     // viewer (= ローカル actor) はループ外で 1 回だけ解決する。
     let local_actor_id = resolve_local_actor_id(&state).await;
+    // actor ごとに emojis map を 1 回解決して共有する (= entry ごとの N+1 抑止、
+    // `conv::resolve_user_emojis` 参照)。
+    let host = state.config().server.host.clone();
     for actor in actors {
         let (followers, following, notes) =
             crate::miauth::counts::counts_for_actor(&state, &actor).await;
         let rel = relationship_or_neutral(&state, local_actor_id, actor.id).await;
+        let emojis = resolve_user_emojis(state.pool(), &host, &actor).await;
         out.push(from_actor_detailed(
-            &actor, followers, following, notes, rel,
+            &actor, followers, following, notes, rel, emojis,
         ));
     }
     Json(out).into_response()
@@ -368,12 +373,16 @@ pub async fn search(
     let mut out = Vec::with_capacity(actors.len());
     // viewer (= ローカル actor) はループ外で 1 回だけ解決する。
     let local_actor_id = resolve_local_actor_id(&state).await;
+    // actor ごとに emojis map を 1 回解決して共有する (= entry ごとの N+1 抑止、
+    // `conv::resolve_user_emojis` 参照)。
+    let host = state.config().server.host.clone();
     for actor in actors {
         let (followers, following, notes) =
             crate::miauth::counts::counts_for_actor(&state, &actor).await;
         let rel = relationship_or_neutral(&state, local_actor_id, actor.id).await;
+        let emojis = resolve_user_emojis(state.pool(), &host, &actor).await;
         out.push(from_actor_detailed(
-            &actor, followers, following, notes, rel,
+            &actor, followers, following, notes, rel, emojis,
         ));
     }
     Json(out).into_response()
