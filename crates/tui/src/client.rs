@@ -1257,9 +1257,16 @@ pub struct PendingFollow {
     pub ap_id: String,
     pub follower_ap_id: String,
     /// 表示用 acct: local なら `user`、remote なら `user@host`。
+    /// フィールド追加 (フォローリクエスト情報表示) より前の server 版と組み
+    /// 合わせても一覧が deserialize 失敗しないよう `#[serde(default)]`。
+    /// (TUI は ghcr 発行対象外でローカルビルドのため、server とバージョンが
+    /// ズレることがある — TimelineNote.actor_icon_url と同じ流儀)
+    #[serde(default)]
     pub follower_acct: String,
+    #[serde(default)]
     pub follower_display_name: Option<String>,
     /// HTML のまま。プレーン化は描画側 (`crate::content::to_plain_text`)。
+    #[serde(default)]
     pub follower_summary: Option<String>,
     pub received_at: String,
     pub state: String,
