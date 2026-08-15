@@ -29,7 +29,7 @@
 //! - `following/requests/accept` : body `{ i, userId }` → `{}` (204 相当)
 //! - `following/requests/reject` : body `{ i, userId }` → `{}`
 //! - `following/requests/cancel` : body `{ i, userId }` → `{}` (Misskey は
-//!   UserLite だが、aria は cancel の戻り値を使わない void 実装)
+//!   `UserLite` だが、aria は cancel の戻り値を使わない void 実装)
 //!
 //! `userId` は **follow request 自体の id ではなく相手 actor の userId**
 //! (Misskey 仕様)。`(follower, followed)` に UNIQUE 制約があるため
