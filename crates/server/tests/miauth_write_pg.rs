@@ -14,6 +14,8 @@
 //! - `reactions/delete { i, noteId }` で自分の reaction を消す
 //! - `following/create { i, userId }` で Follow 配送、`delivery_queue` に行が積まれる
 //! - `following/delete { i, userId }` で Undo Follow 配送
+//! - `following/requests/{list,accept,reject,cancel}` で鍵アカ承認待ちの確認・
+//!   承認・拒否・取り下げ (cancel は送信側 pending の Undo Follow 配送)
 //! - `i/update { i, description, avatarId, bannerId, isLocked, birthday, ... }`
 //!   でプロフィール編集 (Aria `INotifier` の crash fix)、`MeDetailed` を返し
 //!   `Update` activity をフォロワーに配送する
@@ -1211,7 +1213,7 @@ async fn users_lists_create_without_scope_is_401(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-// ─── following/requests/{list,accept,reject} (Aria FollowRequestsNotifier fix) ──
+// ─── following/requests/{list,accept,reject,cancel} (Aria FollowRequestsNotifier fix) ──
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn following_requests_list_returns_pending(pool: PgPool) {
@@ -1348,6 +1350,118 @@ async fn following_requests_accept_already_accepted_returns_400(pool: PgPool) {
         read_json(resp).await["error"]["code"],
         "FOLLOW_REQUEST_NOT_FOUND"
     );
+}
+
+/// `following/requests/cancel` 成功 ── me (= alice) が remote に送った pending
+/// Follow を取り下げると、follow 行が消え、Undo Follow が delivery_queue に
+/// 積まれる。対象行の向きは `pending_follow(alice, bob)` (= follower=alice)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requests_cancel_deletes_row_and_enqueues_undo(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let follow_id = pending_follow(&pool, alice_id, bob_id).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:following"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/following/requests/cancel",
+        json!({"i": token, "userId": bob_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let row = repo::follow::get_by_id(&pool, follow_id)
+        .await
+        .unwrap();
+    assert!(row.is_none(), "follow row must be deleted by cancel");
+
+    // delivery_queue に Undo Follow が積まれ、object が取り下げ対象の
+    // (me → bob) ペアになっている。runtime クエリなので .sqlx offline cache
+    // は不要 (notes/delete テストと同じ流儀)。
+    let activity: JsonValue = sqlx::query_scalar(
+        "SELECT activity FROM delivery_queue WHERE activity->>'type' = 'Undo' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("an Undo activity must be enqueued");
+    assert_eq!(activity["type"], "Undo");
+    assert_eq!(activity["object"]["type"], "Follow");
+    assert_eq!(activity["object"]["actor"], "https://sakurasato.test/users/alice");
+    assert_eq!(activity["object"]["object"], "https://misskey.io/users/bob");
+}
+
+/// `following/requests/cancel` は pending 限定 ── accepted 済みのフォローを
+/// cancel で消してしまう事故を防ぐ (state を問わず削除する
+/// `delete_follow_core` を pending でガードするため)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requests_cancel_already_accepted_returns_400(pool: PgPool) {
+    let alice_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // accepted な行 (= cancel 対象外)。
+    accepted_follow(&pool, alice_id, bob_id).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:following"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/following/requests/cancel",
+        json!({"i": token, "userId": bob_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        read_json(resp).await["error"]["code"],
+        "FOLLOW_REQUEST_NOT_FOUND"
+    );
+
+    let row = repo::follow::get_by_pair(&pool, alice_id, bob_id)
+        .await
+        .unwrap();
+    assert!(row.is_some(), "accepted follow row must survive a failed cancel");
+}
+
+/// `following/requests/cancel` で行が無い (誰も follow していない) → 400。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requests_cancel_no_row_returns_400(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // alice → bob の follow 行を作らない。
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:following"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/following/requests/cancel",
+        json!({"i": token, "userId": bob_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        read_json(resp).await["error"]["code"],
+        "FOLLOW_REQUEST_NOT_FOUND"
+    );
+}
+
+/// `following/requests/cancel` の scope 不足 (read:account のみ) → 401。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn following_requests_cancel_without_scope_is_401(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob_id = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/following/requests/cancel",
+        json!({"i": token, "userId": bob_id.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ─── i/update (プロフィール編集 / Aria `INotifier` crash fix) ──────────────
