@@ -1375,10 +1375,13 @@ fn render_follow_requests_screen(
         // marker(2) と区切り (2x3) は固定なので、display → acct の順に
         // 残り幅へ切り詰める。
         let fixed = 2 + 6 + id.chars().count() + received.chars().count();
-        let rest = body_width.saturating_sub(fixed as u16);
-        let acct_w = acct.chars().count() as u16;
+        let rest = body_width.saturating_sub(u16::try_from(fixed).unwrap_or(0));
+        let acct_w = u16::try_from(acct.chars().count()).unwrap_or(u16::MAX);
         let display = truncate_for_width(&display, rest.saturating_sub(acct_w));
-        let acct = truncate_for_width(&acct, rest.saturating_sub(display.chars().count() as u16));
+        let acct = truncate_for_width(
+            &acct,
+            rest.saturating_sub(u16::try_from(display.chars().count()).unwrap_or(u16::MAX)),
+        );
         // summary は HTML のまま届くので profile / timeline と同じく
         // `to_plain_text` でプレーン化し、改行を空白化して 1 行に収める。
         let summary_plain = item

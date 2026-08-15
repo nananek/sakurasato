@@ -1260,7 +1260,7 @@ pub struct PendingFollow {
     /// フィールド追加 (フォローリクエスト情報表示) より前の server 版と組み
     /// 合わせても一覧が deserialize 失敗しないよう `#[serde(default)]`。
     /// (TUI は ghcr 発行対象外でローカルビルドのため、server とバージョンが
-    /// ズレることがある — TimelineNote.actor_icon_url と同じ流儀)
+    /// ズレることがある — `TimelineNote.actor_icon_url` と同じ流儀)
     #[serde(default)]
     pub follower_acct: String,
     #[serde(default)]

@@ -2,7 +2,7 @@
 //! 専用画面。`:requests` で開く ([`crate::command::Command::OpenRequests`])。
 //!
 //! 画面は単純な縦リスト ── 1 エントリ 2 行固定 (= 1 行目: display name +
-//! acct + `[id]` + received_at、2 行目: summary を 1 行化、無ければ空行)。
+//! acct + `[id]` + `received_at`、2 行目: summary を 1 行化、無ければ空行)。
 //! キー操作は [`crate::event::translate_requests_key`] 参照:
 //!
 //! - `j` / `k` ── カーソル移動
