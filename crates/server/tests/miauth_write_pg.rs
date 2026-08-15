@@ -1353,7 +1353,7 @@ async fn following_requests_accept_already_accepted_returns_400(pool: PgPool) {
 }
 
 /// `following/requests/cancel` 成功 ── me (= alice) が remote に送った pending
-/// Follow を取り下げると、follow 行が消え、Undo Follow が delivery_queue に
+/// Follow を取り下げると、follow 行が消え、Undo Follow が `delivery_queue` に
 /// 積まれる。対象行の向きは `pending_follow(alice, bob)` (= follower=alice)。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn following_requests_cancel_deletes_row_and_enqueues_undo(pool: PgPool) {
