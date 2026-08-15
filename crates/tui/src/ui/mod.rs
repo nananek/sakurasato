@@ -1368,6 +1368,17 @@ fn render_follow_requests_screen(
                 .to_string()
         });
         let acct = format!("@{}", item.follower_acct);
+        let id = format!("[{}]", item.id);
+        let received = truncate_for_width(&item.received_at, 24);
+        // 1 行目が panel 幅を超えると wrap で 2 行固定 (= `row_step=2`) が
+        // 崩れ、`ensure_visible` / `resolve_fixed_row` の行計算とズレる。
+        // marker(2) と区切り (2x3) は固定なので、display → acct の順に
+        // 残り幅へ切り詰める。
+        let fixed = 2 + 6 + id.chars().count() + received.chars().count();
+        let rest = body_width.saturating_sub(fixed as u16);
+        let acct_w = acct.chars().count() as u16;
+        let display = truncate_for_width(&display, rest.saturating_sub(acct_w));
+        let acct = truncate_for_width(&acct, rest.saturating_sub(display.chars().count() as u16));
         // summary は HTML のまま届くので profile / timeline と同じく
         // `to_plain_text` でプレーン化し、改行を空白化して 1 行に収める。
         let summary_plain = item
@@ -1399,12 +1410,9 @@ fn render_follow_requests_screen(
             Span::raw("  "),
             Span::styled(acct, Style::default().fg(palette.muted)),
             Span::raw("  "),
-            Span::styled(format!("[{}]", item.id), Style::default().fg(palette.muted)),
+            Span::styled(id, Style::default().fg(palette.muted)),
             Span::raw("  "),
-            Span::styled(
-                truncate_for_width(&item.received_at, 24),
-                Style::default().fg(palette.muted),
-            ),
+            Span::styled(received, Style::default().fg(palette.muted)),
         ]));
         if summary_line.is_empty() {
             lines.push(Line::from(""));
