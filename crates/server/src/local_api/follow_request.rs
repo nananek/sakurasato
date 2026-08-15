@@ -24,6 +24,13 @@ pub struct PendingFollow {
     pub id: i64,
     pub ap_id: String,
     pub follower_ap_id: String,
+    /// 表示用 acct: follower が local なら `user`、remote なら `user@host`
+    /// (notifications API と同じ流儀)。
+    pub follower_acct: String,
+    /// 無ければ `None`。fallback (`preferred_username`) は表示側 (TUI) の責務。
+    pub follower_display_name: Option<String>,
+    /// **HTML のまま**。プレーン化は TUI 側 (`content::to_plain_text`)。
+    pub follower_summary: Option<String>,
     pub received_at: String,
     /// 行の現状の `follow.state`。`?state=pending` (default) 経路では常に
     /// `"pending"`、`?state=all` 経路では `"accepted"` / `"rejected"` も入る。
@@ -56,15 +63,25 @@ pub async fn list(
         Ok(rows) => {
             let items = rows
                 .into_iter()
-                .map(
-                    |(id, ap_id, follower_ap_id, st, created_at)| PendingFollow {
-                        id,
-                        ap_id,
-                        follower_ap_id,
-                        received_at: created_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        state: st,
-                    },
-                )
+                .map(|row| {
+                    let follower_acct = if row.follower_is_local {
+                        row.follower_preferred_username.clone()
+                    } else {
+                        format!("{}@{}", row.follower_preferred_username, row.follower_host)
+                    };
+                    PendingFollow {
+                        id: row.id,
+                        ap_id: row.ap_id,
+                        follower_ap_id: row.follower_ap_id,
+                        follower_acct,
+                        follower_display_name: row.follower_display_name,
+                        follower_summary: row.follower_summary,
+                        received_at: row
+                            .created_at
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        state: row.state,
+                    }
+                })
                 .collect();
             (StatusCode::OK, Json(ListResponse { items })).into_response()
         }

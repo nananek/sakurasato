@@ -1265,12 +1265,21 @@ fn render_follow_list_screen(
 
 /// M12 (#66): 鍵アカ承認待ち follow 一覧画面。
 ///
-/// シンプルなテキスト一覧 ── 各行に `[N]` `follower_ap_id` `received_at`。
-/// avatar overlay は不要 (= 承認可否判断に icon は要らない、`ap_id` で十分)。
+/// 各エントリは固定 2 行 (= `row_step=2`):
+/// 1 行目: `▶ <display_name | preferred_username>  @acct  [id]  <received_at>`
+/// 2 行目: `<summary を to_plain_text → 1 行化 → truncate_for_width>` (無ければ空行)
+///
+/// avatar overlay は不要 (= 承認可否判断に icon は要らない、display name + bio
+/// で十分)。2 行固定のためスクロール (`ensure_visible`) / マウスクリック
+/// (`resolve_fixed_row`) は `follow_list` の avatar 有と同じ計算で揃える。
 ///
 /// 戻り値は `list_rect` ── main loop が次フレームの
 /// [`crate::follow_requests::FollowRequestsScreen::ensure_visible`] にこの
 /// 高さを渡すために使う。非表示時は zero rect。
+#[allow(
+    clippy::too_many_lines,
+    reason = "一覧画面 1 枚分の宣言的描画 (follow_list と同じ流儀)"
+)]
 fn render_follow_requests_screen(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1327,39 +1336,89 @@ fn render_follow_requests_screen(
     // [`crate::runtime::main_loop`] が
     // [`crate::follow_requests::FollowRequestsScreen::ensure_visible`] を
     // 毎フレーム呼ぶことで保証される (= timeline / follow_list と同パターン)。
-    let visible = list_rect.height as usize;
+    // 1 エントリ 2 行固定 (= `row_step=2`) ── `ensure_visible` とマウスクリック
+    // の row_step と揃えること。
+    let row_step: u16 = 2;
+    let visible = (list_rect.height / row_step) as usize;
     let top = fr.top.min(fr.items.len().saturating_sub(1));
-    let lines: Vec<Line<'static>> = fr
-        .items
-        .iter()
-        .enumerate()
-        .skip(top)
-        .take(visible)
-        .map(|(idx, item)| {
-            let selected = idx == fr.cursor;
-            let marker = if selected { "▶ " } else { "  " };
-            let marker_style = if selected {
+    let body_width = list_rect.width.saturating_sub(2);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible * usize::from(row_step));
+    let mut row_cursor: u16 = 0;
+    for (idx, item) in fr.items.iter().enumerate().skip(top).take(visible) {
+        if row_cursor + row_step > list_rect.height {
+            break;
+        }
+        let selected = idx == fr.cursor;
+        let marker = if selected { "▶ " } else { "  " };
+        let marker_style = if selected {
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        // display_name は無ければ preferred_username を代用。acct の user 部分
+        // (= `user@host` の `@` 以前) は API が follower_preferred_username を
+        // 元に組み立てているので、これで local / remote 両対応の fallback になる。
+        let display = item.follower_display_name.clone().unwrap_or_else(|| {
+            item.follower_acct
+                .split('@')
+                .next()
+                .unwrap_or(&item.follower_acct)
+                .to_string()
+        });
+        let acct = format!("@{}", item.follower_acct);
+        // summary は HTML のまま届くので profile / timeline と同じく
+        // `to_plain_text` でプレーン化し、改行を空白化して 1 行に収める。
+        let summary_plain = item
+            .follower_summary
+            .as_deref()
+            .map(crate::content::to_plain_text);
+        let summary_line: String = summary_plain
+            .as_deref()
+            .map(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), marker_style),
+            Span::styled(
+                display,
                 Style::default()
-                    .fg(palette.accent_strong)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(palette.muted)
-            };
-            Line::from(vec![
-                Span::styled(marker.to_string(), marker_style),
+                    .fg(palette.foreground)
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::raw("  "),
+            Span::styled(acct, Style::default().fg(palette.muted)),
+            Span::raw("  "),
+            Span::styled(format!("[{}]", item.id), Style::default().fg(palette.muted)),
+            Span::raw("  "),
+            Span::styled(
+                truncate_for_width(&item.received_at, 24),
+                Style::default().fg(palette.muted),
+            ),
+        ]));
+        if summary_line.is_empty() {
+            lines.push(Line::from(""));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
                 Span::styled(
-                    format!("[{}] ", item.id),
+                    truncate_for_width(&summary_line, body_width),
                     Style::default().fg(palette.muted),
                 ),
-                Span::styled(
-                    item.follower_ap_id.clone(),
-                    Style::default().fg(palette.foreground),
-                ),
-                Span::raw("  "),
-                Span::styled(item.received_at.clone(), Style::default().fg(palette.muted)),
-            ])
-        })
-        .collect();
+            ]));
+        }
+        row_cursor += row_step;
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), list_rect);
     list_rect
 }

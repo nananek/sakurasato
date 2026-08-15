@@ -236,7 +236,14 @@ Compose で `Ctrl-E` を押すと「本文に `:shortcode:` / Unicode 1 字を�
 | `r` | 一覧を再取得 |
 | `Esc` / `q` | 画面を閉じる (Timeline に戻る) |
 
-各行は `[<follow_id>] <follower_ap_id>  <received_at>` の形で 1 行表示。approve / reject 成功時はその行が即座にリストから消えます。
+各エントリは **2 行固定** で表示します:
+
+```
+▶ <display_name | preferred_username>  @user@host  [<follow_id>]  <received_at>
+   <summary (bio) を 1 行にプレーン化して表示。無ければ空行>
+```
+
+1 行目が follower の表示名 (無ければ `preferred_username`)、acct、follow 行の id、受信日時。2 行目がプロフィール本文 (bio) で、HTML はプレーン化の上 1 行に収めて切り詰めます。approve / reject 成功時はその行が即座にリストから消えます。
 
 **注意 1**: `:unlock` しても既に pending の Follow が auto-accept されることはありません ([CLAUDE.md §5.1](../CLAUDE.md))。明示的に `a` で approve する必要があります (= Mastodon と同じ作法、lock 解除事故で全 pending を取り込む暴発を防ぐ)。
 

@@ -99,6 +99,9 @@ mod tests {
             id,
             ap_id: format!("https://x.test/users/{id}/Follow"),
             follower_ap_id: format!("https://x.test/users/u{id}"),
+            follower_acct: format!("u{id}@x.test"),
+            follower_display_name: None,
+            follower_summary: None,
             received_at: "2026-06-01T00:00:00Z".into(),
             state: "pending".into(),
         }

@@ -1256,6 +1256,11 @@ pub struct PendingFollow {
     pub id: i64,
     pub ap_id: String,
     pub follower_ap_id: String,
+    /// 表示用 acct: local なら `user`、remote なら `user@host`。
+    pub follower_acct: String,
+    pub follower_display_name: Option<String>,
+    /// HTML のまま。プレーン化は描画側 (`crate::content::to_plain_text`)。
+    pub follower_summary: Option<String>,
     pub received_at: String,
     pub state: String,
 }
