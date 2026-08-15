@@ -1420,7 +1420,10 @@ async fn following_requests_cancel_already_accepted_returns_400(pool: PgPool) {
     let row = repo::follow::get_by_pair(&pool, alice_id, bob_id)
         .await
         .unwrap();
-    assert!(row.is_some(), "accepted follow row must survive a failed cancel");
+    assert!(
+        row.is_some(),
+        "accepted follow row must survive a failed cancel"
+    );
 }
 
 /// `following/requests/cancel` で行が無い (誰も follow していない) → 400。
