@@ -211,11 +211,11 @@ async fn main_loop(
         // (ensure_visible は二段スクロール禁止のための保険)。
         let approx_items = timeline_capacity.max(1) / 4;
         app.ensure_visible(approx_items.max(1));
-        // M12 (#66): Follow Requests 一覧画面のスクロール追従。1 行 = 1 件
-        // (アバター無し)。`last_rects.follow_requests` は直前フレームで
-        // 確定した一覧領域の Rect。
+        // M12 (#66): Follow Requests 一覧画面のスクロール追従。1 エントリ 2 行
+        // 固定 (= display name + bio)。`last_rects.follow_requests` は直前
+        // フレームで確定した一覧領域の Rect。
         if let Some(fr) = app.follow_requests.as_mut() {
-            let viewport = last_rects.follow_requests.height as usize;
+            let viewport = (last_rects.follow_requests.height / 2) as usize;
             fr.ensure_visible(viewport);
         }
         // #206 PR3: 通知一覧画面のスクロール追従 (1 件 1 行)。
@@ -2163,10 +2163,11 @@ fn click_requests(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
     if !rect_contains(rects.follow_requests, col, row) {
         return;
     }
+    // 1 エントリ 2 行固定 (= render_follow_requests_screen の row_step と揃える)。
     if let Some(fr) = app.follow_requests.as_mut() {
         let top = fr.top;
         let len = fr.items.len();
-        if let Some(idx) = ui::hit::resolve_fixed_row(rects.follow_requests, row, 1, top, len) {
+        if let Some(idx) = ui::hit::resolve_fixed_row(rects.follow_requests, row, 2, top, len) {
             fr.cursor = idx;
         }
     }

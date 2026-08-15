@@ -118,7 +118,9 @@ pub async fn list(
     let followee = from_actor_and_counts(&me, me_followers, me_following, me_notes, me_emojis);
 
     let mut out = Vec::with_capacity(rows.len());
-    for (follow_id, _ap_id, follower_ap_id, _state_str, _created_at) in rows {
+    for row in rows {
+        let follow_id = row.id;
+        let follower_ap_id = row.follower_ap_id;
         let follower_actor = match repo::actor::get_by_ap_id(state.pool(), &follower_ap_id).await {
             Ok(Some(actor)) => actor,
             Ok(None) => {

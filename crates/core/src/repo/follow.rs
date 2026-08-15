@@ -93,12 +93,13 @@ pub async fn get_by_pair(
 /// - `Some("all")` ── 全 state (= テスト再実行時の cleanup や、現状把握用)
 /// - 他の値は `pending` と同じ扱い (= 念のための後方互換)
 ///
-/// 返り値は `(follow.id, follow.ap_id, follower.ap_id, state, created_at)`。
-/// 順序は `follow.created_at` の昇順で固定。
+/// 返り値は [`PendingFollowRow`] — follow 行に follower actor の表示情報
+/// (`preferred_username` / `host` / `display_name` / `summary` / `is_local`) を
+/// JOIN したもの。順序は `follow.created_at` の昇順で固定。
 pub async fn list_for_local(
     pool: &PgPool,
     state_filter: Option<&str>,
-) -> sqlx::Result<Vec<(i64, String, String, String, chrono::DateTime<chrono::Utc>)>> {
+) -> sqlx::Result<Vec<PendingFollowRow>> {
     let want_all = state_filter == Some("all");
     let rows = sqlx::query!(
         r#"
@@ -107,7 +108,12 @@ pub async fn list_for_local(
             f.ap_id        AS "ap_id!",
             follower.ap_id AS "follower_ap_id!",
             f.state        AS "state!",
-            f.created_at   AS "created_at!"
+            f.created_at   AS "created_at!",
+            follower.preferred_username AS "follower_preferred_username!",
+            follower.host               AS "follower_host!",
+            follower.display_name       AS "follower_display_name?",
+            follower.summary            AS "follower_summary?",
+            follower.is_local           AS "follower_is_local!"
         FROM follow f
         JOIN actor follower ON follower.id = f.follower_actor_id
         JOIN actor followed ON followed.id = f.followed_actor_id
@@ -121,8 +127,39 @@ pub async fn list_for_local(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| (r.id, r.ap_id, r.follower_ap_id, r.state, r.created_at))
+        .map(|r| PendingFollowRow {
+            id: r.id,
+            ap_id: r.ap_id,
+            follower_ap_id: r.follower_ap_id,
+            state: r.state,
+            created_at: r.created_at,
+            follower_preferred_username: r.follower_preferred_username,
+            follower_host: r.follower_host,
+            follower_display_name: r.follower_display_name,
+            follower_summary: r.follower_summary,
+            follower_is_local: r.follower_is_local,
+        })
         .collect())
+}
+
+/// `list_for_local` の 1 行分。follower は follow の宛先 (= local) とは別に
+/// JOIN 済みなので、追加クエリなしで follower の表示情報が取れる。
+///
+/// `summary` は **HTML のまま** (`<p>…</p>` 等)。プレーン化は表示側
+/// (TUI は `content::to_plain_text`、CLI は現状 summary 非表示) の責務。
+/// `follower_is_local` は acct 構築 (`user` vs `user@host`) に使う。
+#[derive(Debug)]
+pub struct PendingFollowRow {
+    pub id: i64,
+    pub ap_id: String,
+    pub follower_ap_id: String,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub follower_preferred_username: String,
+    pub follower_host: String,
+    pub follower_display_name: Option<String>,
+    pub follower_summary: Option<String>,
+    pub follower_is_local: bool,
 }
 
 /// `list_pending_for_local` の旧シグネチャ ── 既存呼び出し側との互換のため
@@ -133,9 +170,7 @@ pub async fn list_pending_for_local(
     let all = list_for_local(pool, None).await?;
     Ok(all
         .into_iter()
-        .map(|(id, ap_id, follower_ap_id, _state, created_at)| {
-            (id, ap_id, follower_ap_id, created_at)
-        })
+        .map(|row| (row.id, row.ap_id, row.follower_ap_id, row.created_at))
         .collect())
 }
 

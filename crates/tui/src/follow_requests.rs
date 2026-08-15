@@ -1,8 +1,9 @@
 //! M12 (Issue #66): 鍵アカ運用の承認待ち follow を見て / 承認 / 拒否する
 //! 専用画面。`:requests` で開く ([`crate::command::Command::OpenRequests`])。
 //!
-//! 画面は単純な縦リスト ── 各行に `id` / `follower_ap_id` / `received_at` を
-//! 並べる。キー操作は [`crate::event::translate_requests_key`] 参照:
+//! 画面は単純な縦リスト ── 1 エントリ 2 行固定 (= 1 行目: display name +
+//! acct + `[id]` + `received_at`、2 行目: summary を 1 行化、無ければ空行)。
+//! キー操作は [`crate::event::translate_requests_key`] 参照:
 //!
 //! - `j` / `k` ── カーソル移動
 //! - `a`      ── 選択行を approve
@@ -99,6 +100,9 @@ mod tests {
             id,
             ap_id: format!("https://x.test/users/{id}/Follow"),
             follower_ap_id: format!("https://x.test/users/u{id}"),
+            follower_acct: format!("u{id}@x.test"),
+            follower_display_name: None,
+            follower_summary: None,
             received_at: "2026-06-01T00:00:00Z".into(),
             state: "pending".into(),
         }
