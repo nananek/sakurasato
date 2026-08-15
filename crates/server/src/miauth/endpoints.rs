@@ -89,6 +89,7 @@ const SUPPORTED_ENDPOINTS: &[&str] = &[
     "following/requests/list",
     "following/requests/accept",
     "following/requests/reject",
+    "following/requests/cancel",
     "drive/files/create",
     "drive/files",
     "drive/files/show",

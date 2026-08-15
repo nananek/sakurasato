@@ -157,6 +157,14 @@ pub fn router(state: AppState) -> Router {
             "/api/following/requests/reject",
             post(following_requests::reject),
         )
+        // Aria の `MisskeyFollowingRequests.cancel` (= フォローボタンの requested
+        // 表示 → cancel) が 404 で crash していたギャップ。`{i, userId}` で
+        // 自分が送った pending Follow を取り下げる (accept/reject とは引数の
+        // 向きが逆)。
+        .route(
+            "/api/following/requests/cancel",
+            post(following_requests::cancel),
+        )
         // リスト機能 (Mastodon/Misskey 互換)。`crate::miauth::lists` 参照。
         .route("/api/users/lists/create", post(lists::create))
         .route("/api/users/lists/list", post(lists::list))
