@@ -1372,9 +1372,7 @@ async fn following_requests_cancel_deletes_row_and_enqueues_undo(pool: PgPool) {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let row = repo::follow::get_by_id(&pool, follow_id)
-        .await
-        .unwrap();
+    let row = repo::follow::get_by_id(&pool, follow_id).await.unwrap();
     assert!(row.is_none(), "follow row must be deleted by cancel");
 
     // delivery_queue に Undo Follow が積まれ、object が取り下げ対象の
@@ -1388,7 +1386,10 @@ async fn following_requests_cancel_deletes_row_and_enqueues_undo(pool: PgPool) {
     .expect("an Undo activity must be enqueued");
     assert_eq!(activity["type"], "Undo");
     assert_eq!(activity["object"]["type"], "Follow");
-    assert_eq!(activity["object"]["actor"], "https://sakurasato.test/users/alice");
+    assert_eq!(
+        activity["object"]["actor"],
+        "https://sakurasato.test/users/alice"
+    );
     assert_eq!(activity["object"]["object"], "https://misskey.io/users/bob");
 }
 
