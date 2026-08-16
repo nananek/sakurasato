@@ -16,6 +16,7 @@ pub mod media;
 pub mod nodeinfo;
 pub mod outbox;
 pub mod permalink;
+pub mod tags;
 pub mod webfinger;
 
 pub fn router(state: AppState) -> Router {
@@ -38,6 +39,8 @@ pub fn router(state: AppState) -> Router {
         )
         // inline tag で発行している Emoji.id を dereferenceable に (FEP-9098)。
         .route("/emojis/{shortcode}", get(emoji::handle))
+        // ハッシュタグの最小 HTML 一覧ページ (= `tag.Hashtag` の href が指す先)。
+        .route("/tags/{name}", get(tags::handle))
         // `{*key}` で `/media/path/to/object.png` のスラッシュ入りキーを 1 つの
         // `String` にキャプチャする (axum 0.8 ワイルドカード)。
         .route("/media/{*key}", get(media::handle))

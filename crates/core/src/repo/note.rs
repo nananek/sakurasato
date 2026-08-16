@@ -510,6 +510,47 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> 
     .await
 }
 
+/// `/tags/{name}` ページ用 ── 指定ハッシュタグを持つ公開ノートを新しい順で
+/// 列挙する。
+///
+/// `tag` は **`#` 抜き・lowercase** のタグ名 (= `note.tags` の
+/// `{"type": "Hashtag", "name": "#{name}"}` の `name` と一致する形)。
+/// お一人様サーバなので seq scan で十分 (GIN index は張らない)。
+///
+/// 対象は `public` / `unlisted` のみ (= permalink と同じ可視性境界。URL を
+/// 知っていれば見られる公開ページなので、followers / direct は載せない)。
+pub async fn list_by_hashtag(pool: &PgPool, tag: &str, limit: i64) -> sqlx::Result<Vec<NoteRow>> {
+    // tag 名は `#` 抜き・lowercase 前提 (parse_hashtags が正規化済み)。JSON へは
+    // serde で組み立てる (= タグ名に JSON 特殊文字が混入しても壊れない)。タグ名
+    // は body 文字種制約済みだが defense-in-depth。
+    let needle = serde_json::json!([{
+        "type": "Hashtag",
+        "name": format!("#{tag}"),
+    }]);
+    sqlx::query_as!(
+        NoteRow,
+        r#"
+        SELECT
+            id, ap_id, actor_id, content, language, in_reply_to_ap_id,
+            in_reply_to_note_id, summary, visibility, sensitive,
+            to_recipients as "to_recipients: Json<Vec<String>>",
+            cc_recipients as "cc_recipients: Json<Vec<String>>",
+            attachments as "attachments: Json<JsonValue>",
+            tags as "tags: Json<JsonValue>",
+            is_local, url, source, published_at, edited_at, created_at, updated_at
+        FROM note
+        WHERE tags @> $1::jsonb
+          AND visibility IN ('public', 'unlisted')
+        ORDER BY published_at DESC, id DESC
+        LIMIT $2
+        "#,
+        needle,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// `NodeInfo.usage.localPosts` 用 ── `is_local = true` の Note の総数を返す。
 ///
 /// お一人様サーバなので件数は単純なスカラで十分。直近の `active_users` 推定にも
