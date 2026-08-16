@@ -125,11 +125,11 @@ pub async fn create(
     body: Option<Json<CreateBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(name) = body
         .name
         .as_deref()
@@ -158,11 +158,11 @@ pub async fn list(
     body: Option<Json<ListOnlyBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let rows = match repo::user_list::list_all(state.pool()).await {
         Ok(rows) => rows,
         Err(err) => {
@@ -191,11 +191,11 @@ pub async fn show(
     body: Option<Json<ShowBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(list_id) = parse_list_id(body.list_id.as_deref()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_LIST", "no such list");
     };
@@ -209,11 +209,11 @@ pub async fn update(
     body: Option<Json<UpdateBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(list_id) = parse_list_id(body.list_id.as_deref()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_LIST", "no such list");
     };
@@ -246,11 +246,11 @@ pub async fn delete(
     body: Option<Json<ShowBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(list_id) = parse_list_id(body.list_id.as_deref()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_LIST", "no such list");
     };
@@ -275,11 +275,11 @@ pub async fn push(
     body: Option<Json<MemberBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let (Some(list_id), Some(user_id)) = (
         parse_list_id(body.list_id.as_deref()),
         parse_list_id(body.user_id.as_deref()),
@@ -321,11 +321,11 @@ pub async fn pull(
     body: Option<Json<MemberBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let (Some(list_id), Some(user_id)) = (
         parse_list_id(body.list_id.as_deref()),
         parse_list_id(body.user_id.as_deref()),
@@ -360,11 +360,11 @@ pub async fn timeline(
     body: Option<Json<TimelineBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(list_id) = parse_list_id(body.list_id.as_deref()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_LIST", "no such list");
     };

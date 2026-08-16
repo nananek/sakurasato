@@ -79,8 +79,17 @@ mod common {
             miauth: Some(MiAuthConfig {
                 listen: "unix:/tmp/miauth.sock".into(),
                 session_ttl_secs: 600,
+                // 厳密 scope 検証のテストは `ignore_scope = false` で走らせる。
+                ignore_scope: false,
             }),
         }
+    }
+
+    /// `make_config` のアナーキー版 (`ignore_scope = true`)。
+    pub(super) fn make_config_anarchy(host: &str, user: &str) -> sakurasato_core::Config {
+        let mut cfg = make_config(host, user);
+        cfg.miauth.as_mut().unwrap().ignore_scope = true;
+        cfg
     }
 }
 
@@ -556,11 +565,11 @@ async fn timeline_limit_clamps_to_max_100(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn timeline_without_scope_returns_401(pool: PgPool) {
+async fn timeline_without_scope_returns_403(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
     let state = make_state(pool.clone(), "sakurasato.test", "alice");
     let app = router_for(&state);
-    // scope ゼロの token ── handler 内 `unauthorized` 経路に倒れる。
+    // scope ゼロの token ── handler 内 `forbidden` (403 PERMISSION_DENIED) 経路。
     let token = issue_token_with_scopes(&pool, &[]).await;
 
     let body = json!({"i": token});
@@ -573,11 +582,9 @@ async fn timeline_without_scope_returns_401(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    // #197: 401 も nested body `{"error":{"code":"AUTHENTICATION_FAILED",...}}` で
-    // 返す (= forbidden / 404 / 500 と shape を揃え、client が code を拾える)。
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let err = read_json(resp).await;
-    assert_eq!(err["error"]["code"], "AUTHENTICATION_FAILED");
+    assert_eq!(err["error"]["code"], "PERMISSION_DENIED");
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
@@ -1065,7 +1072,7 @@ async fn users_search_endpoints_return_cached_counts_for_remote(pool: PgPool) {
 // ─── session-related: notes/show check token + scope ──────────────────
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn notes_show_without_scope_returns_401(pool: PgPool) {
+async fn notes_show_without_scope_returns_403(pool: PgPool) {
     let actor_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
     let note_id = seed_note(&pool, actor_id, "sakurasato.test", "x", Visibility::Public).await;
     let state = make_state(pool.clone(), "sakurasato.test", "alice");
@@ -1082,7 +1089,7 @@ async fn notes_show_without_scope_returns_401(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // ─── #165 round-2 review #3: followers / direct visibility access control ─
@@ -1474,7 +1481,7 @@ async fn mentions_visibility_filter_specified(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn mentions_without_scope_returns_401(pool: PgPool) {
+async fn mentions_without_scope_returns_403(pool: PgPool) {
     let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
     let state = make_state(pool.clone(), "sakurasato.test", "alice");
     let app = router_for(&state);
@@ -1490,7 +1497,7 @@ async fn mentions_without_scope_returns_401(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // ─── M14 #170: HTML タグが MissNote.text に流れない ───────────────────────
@@ -2086,7 +2093,7 @@ async fn drive_files_requires_read_scope(pool: PgPool) {
     let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
     let state = make_state(pool.clone(), "sakurasato.test", "alice");
     let app = router_for(&state);
-    // write:notes だけのトークンでは read:drive が無く 401。
+    // write:notes だけのトークンでは read:drive が無く 403 PERMISSION_DENIED。
     let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
     let body = json!({"i": token});
     let resp = app
@@ -2098,7 +2105,9 @@ async fn drive_files_requires_read_scope(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "PERMISSION_DENIED");
 }
 
 /// `drive/files/update` で `comment` (= alt text) を設定 → クリアできること。
@@ -2196,7 +2205,9 @@ async fn drive_files_update_requires_write_scope(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "PERMISSION_DENIED");
 }
 
 /// `drive/files/delete` ── 未添付 file は 204 で消え、再 show は 404。
@@ -2334,7 +2345,7 @@ async fn drive_folders_returns_empty_array(pool: PgPool) {
     assert_eq!(v.as_array().expect("folders is array").len(), 0);
 }
 
-/// `POST /api/drive` は `read:drive` を要求する (scope 無しトークンは 401)。
+/// `POST /api/drive` は `read:drive` を要求する (scope 無しトークンは 403)。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn drive_usage_requires_read_scope(pool: PgPool) {
     let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
@@ -2351,7 +2362,9 @@ async fn drive_usage_requires_read_scope(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "PERMISSION_DENIED");
 }
 
 // ─── notes/reactions (#244 follow-up: reactor 一覧) ──────────────────────
@@ -2993,18 +3006,20 @@ async fn users_notes_missing_user_id_returns_400(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
-async fn users_notes_without_scope_returns_401(pool: PgPool) {
+async fn users_notes_without_scope_returns_403(pool: PgPool) {
     let host = "sakurasato.test";
     let alice = seed_local_actor(&pool, host, "alice").await;
     let state = make_state(pool.clone(), host, "alice");
-    // scope ゼロの token ── require_scope が弾く。
+    // scope ゼロの token ── require_scope が 403 PERMISSION_DENIED で弾く。
     let token = issue_token_with_scopes(&pool, &[]).await;
     let resp = users_notes_request(
         router_for(&state),
         json!({"i": token, "userId": alice.to_string()}),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "PERMISSION_DENIED");
 }
 
 /// `withReplies=false` は他者宛返信を除外するが、自己スレッド (= 自分の note への
@@ -3848,4 +3863,25 @@ async fn users_search_by_username_and_host_escapes_wildcards(pool: PgPool) {
         vec!["a_b".to_string()],
         "`_` in the query must not act as a single-char wildcard: {usernames:?}"
     );
+}
+
+// ─── アナーキー (ignore_scope) ─────────────────────────────────────────
+
+/// `/api/i` は手動 `validate_token_raw` + `has_scope` 経路 (= `require_scope`
+/// でない)。アナーキー (`ignore_scope = true`) では **空 permissions token** でも
+/// 200 になること (= `/api/i` が read:account 不足で弾かれない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn anarchy_api_i_works_without_read_scope(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config_anarchy("sakurasato.test", "alice"),
+    );
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &[]).await;
+
+    let resp = post(app, "/api/i", json!({"i": token})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["username"], "alice");
 }

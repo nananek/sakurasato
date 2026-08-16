@@ -82,11 +82,12 @@ pub async fn create(
     body: Option<Json<CreateReactionBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_REACTIONS).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_REACTIONS).await
+        {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(note_id) = body.note_id.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };
@@ -115,11 +116,12 @@ pub async fn delete(
     body: Option<Json<DeleteReactionBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_REACTIONS).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_REACTIONS).await
+        {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(note_id) = body.note_id.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };
@@ -161,11 +163,11 @@ pub async fn list(
     body: Option<Json<ListReactionsBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(note_id) = body.note_id.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };

@@ -95,11 +95,11 @@ pub async fn show(
     body: Option<Json<ShowBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token_row =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(note_id_str) = body.note_id else {
         return bad_request("noteId is required");
     };
@@ -260,11 +260,11 @@ pub async fn timeline(
     body: Option<Json<TimelineBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token_row =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
 
     let Some(viewer) = resolve_self_actor_id(&state).await else {
         return error_resp(
@@ -476,11 +476,11 @@ pub async fn mentions(
     body: Option<Json<MentionsBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token_row =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
 
     let Some(viewer) = resolve_self_actor(&state).await else {
         return error_resp(
@@ -746,11 +746,11 @@ pub async fn users_notes(
     let Some(Json(body)) = body else {
         return bad_request("userId is required");
     };
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
 
     // 対象ユーザ解決 (userId のみ ── username+host は users/notes では非対応)。
     let Some(user_id_str) = body.user_id.as_deref() else {
@@ -968,11 +968,11 @@ pub async fn create(
     body: Option<Json<CreateNoteBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_NOTES).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_NOTES).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
 
     // **pure renote** (= 本文なし + renoteId あり) → Announce (boost)。既存
     // `local_api::renotes::create` (= announce 行 + 連合 Announce 配送) に通し、
@@ -1107,11 +1107,11 @@ pub async fn delete(
     body: Option<Json<DeleteNoteBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_NOTES).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_NOTES).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(note_id_str) = body.note_id else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };

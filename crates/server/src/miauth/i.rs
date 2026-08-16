@@ -89,8 +89,9 @@ pub struct IBody {
 /// `POST /api/i` handler。
 ///
 /// 認証フロー: body `i` → Authorization Bearer の順で raw token を探し、
-/// [`auth::validate_token_raw`] で DB lookup する。見つからない / scope 不足
-/// なら 401 / 403。成功すれば local actor の `MissUser` を返す。
+/// [`auth::validate_token_for_scope`] で DB lookup + scope 検査する。見つから
+/// ない / scope 不足 なら 401 / 403 (アナーキー `ignore_scope` ON なら scope
+/// 検査はスキップ)。成功すれば local actor の `MissUser` を返す。
 pub async fn handle(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -115,20 +116,17 @@ pub async fn handle(
         },
     };
 
-    // 2. token を DB lookup。失敗 (= unknown / revoked) は 401。
-    let Some(token_row) = auth::validate_token_raw(&state, &raw).await else {
-        return auth::unauthorized("invalid or revoked token");
+    // 2. token を DB lookup → scope 検査 (アナーキー `ignore_scope` は
+    //    `validate_token_for_scope` が吸収。OFF なら read:account 不足は 403)。
+    let token_row = match auth::validate_token_for_scope(&state, &raw, SCOPE_READ_ACCOUNT).await {
+        Ok(row) => row,
+        Err(e) => return e.into_response(),
     };
 
-    // 3. scope 検査。`read:account` 必須。
-    if !auth::has_scope(&token_row, SCOPE_READ_ACCOUNT) {
-        return auth::forbidden(&format!("missing scope: {SCOPE_READ_ACCOUNT}"));
-    }
-
-    // 4. `last_used_at` を best-effort 更新 (= block しない)。
+    // 3. `last_used_at` を best-effort 更新 (= block しない)。
     auth::mark_used_async(&state, token_row.id);
 
-    // 5. local actor + 集計 count → MeDetailed (M14 #170 で MissUser → MeDetailed
+    // 4. local actor + 集計 count → MeDetailed (M14 #170 で MissUser → MeDetailed
     //    に拡張、Aria / Milktea の self profile 描画用)。
     let me = match build_self_me_detailed(&state).await {
         Ok(v) => v,
@@ -254,9 +252,9 @@ pub async fn update(
 ) -> Response {
     let body = body.map_or(JsonValue::Null, |j| j.0);
     let token = body.get("i").and_then(JsonValue::as_str);
-    let Some(_token_row) = auth::require_scope(&state, &headers, token, SCOPE_WRITE_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
+    let _token_row = match auth::require_scope(&state, &headers, token, SCOPE_WRITE_ACCOUNT).await {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
     };
 
     let Some(local_actor) = resolve_self_actor(&state).await else {

@@ -62,11 +62,12 @@ pub async fn create(
     body: Option<Json<FollowingBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_FOLLOWING).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token_row =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_FOLLOWING).await
+        {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(actor_id) = parse_user_id(body.user_id.as_deref()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_USER", "no such user");
     };
@@ -84,11 +85,12 @@ pub async fn delete(
     body: Option<Json<FollowingBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_FOLLOWING).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token_row =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_FOLLOWING).await
+        {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(target_id) = parse_user_id(body.user_id.as_deref()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_USER", "no such user");
     };

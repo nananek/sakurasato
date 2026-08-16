@@ -28,8 +28,8 @@
 //! ## 認証
 //!
 //! `?i=<token>` の Bearer 相当を validate し、`read:account` scope を要求する
-//! (stub から不変)。upgrade 前に viewer (= お一人様 local actor) を解決して
-//! packing に使う。
+//! (アナーキー `ignore_scope` ON なら scope 検査はスキップ、token 有効性のみ)。
+//! upgrade 前に viewer (= お一人様 local actor) を解決して packing に使う。
 //!
 //! ## keep alive
 //!
@@ -109,12 +109,10 @@ pub async fn handle(
     let Some(raw) = query.i.filter(|s| !s.is_empty()) else {
         return auth::unauthorized("missing token (use ?i=<token>)");
     };
-    let Some(token_row) = auth::validate_token_raw(&state, &raw).await else {
-        return auth::unauthorized("invalid or revoked token");
+    let token_row = match auth::validate_token_for_scope(&state, &raw, SCOPE_READ_ACCOUNT).await {
+        Ok(row) => row,
+        Err(e) => return e.into_response(),
     };
-    if !auth::has_scope(&token_row, SCOPE_READ_ACCOUNT) {
-        return auth::forbidden(&format!("missing scope: {SCOPE_READ_ACCOUNT}"));
-    }
     auth::mark_used_async(&state, token_row.id);
 
     // viewer (= お一人様 local actor) を upgrade 前に解決して packing に使う。

@@ -94,11 +94,11 @@ pub async fn list(
     body: Option<Json<ListBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token_row =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(me) = resolve_self_actor(&state).await else {
         return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -211,11 +211,12 @@ pub async fn cancel(
     body: Option<Json<MutateBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_FOLLOWING).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token_row =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_FOLLOWING).await
+        {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(target_id) = body.user_id.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_USER", "no such user");
     };
@@ -287,11 +288,12 @@ async fn mutate(
     new_state: FollowState,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token_row) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_FOLLOWING).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token_row =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_FOLLOWING).await
+        {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(follower_id) = body.user_id.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_USER", "no such user");
     };

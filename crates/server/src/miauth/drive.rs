@@ -93,11 +93,9 @@ pub async fn create(
     }
 
     // token は form field `i` か Authorization ヘッダのどちらでも可。
-    if auth::require_scope(&state, &headers, token.as_deref(), SCOPE_WRITE_DRIVE)
-        .await
-        .is_none()
+    if let Err(e) = auth::require_scope(&state, &headers, token.as_deref(), SCOPE_WRITE_DRIVE).await
     {
-        return auth::unauthorized("invalid or revoked token");
+        return e.into_response();
     }
 
     let Some(bytes) = file else {
@@ -182,11 +180,9 @@ pub async fn list(
     body: Option<Json<ListBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    if auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_DRIVE)
-        .await
-        .is_none()
+    if let Err(e) = auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_DRIVE).await
     {
-        return auth::unauthorized("invalid or revoked token");
+        return e.into_response();
     }
     let Some(owner) = local_actor_id(&state).await else {
         return internal_error("local actor not initialized");
@@ -228,11 +224,9 @@ pub async fn show(
     body: Option<Json<ShowBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    if auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_DRIVE)
-        .await
-        .is_none()
+    if let Err(e) = auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_DRIVE).await
     {
-        return auth::unauthorized("invalid or revoked token");
+        return e.into_response();
     }
     let Some(owner) = local_actor_id(&state).await else {
         return internal_error("local actor not initialized");
@@ -272,11 +266,8 @@ pub async fn update(
 ) -> Response {
     let body = body.map_or(serde_json::Value::Null, |j| j.0);
     let token = body.get("i").and_then(serde_json::Value::as_str);
-    if auth::require_scope(&state, &headers, token, SCOPE_WRITE_DRIVE)
-        .await
-        .is_none()
-    {
-        return auth::unauthorized("invalid or revoked token");
+    if let Err(e) = auth::require_scope(&state, &headers, token, SCOPE_WRITE_DRIVE).await {
+        return e.into_response();
     }
     let Some(owner) = local_actor_id(&state).await else {
         return internal_error("local actor not initialized");
@@ -358,11 +349,10 @@ pub async fn delete(
     body: Option<Json<DeleteBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    if auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_DRIVE)
-        .await
-        .is_none()
+    if let Err(e) =
+        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_WRITE_DRIVE).await
     {
-        return auth::unauthorized("invalid or revoked token");
+        return e.into_response();
     }
     let Some(owner) = local_actor_id(&state).await else {
         return internal_error("local actor not initialized");
@@ -452,11 +442,9 @@ pub async fn usage(
     body: Option<Json<TokenOnlyBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    if auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_DRIVE)
-        .await
-        .is_none()
+    if let Err(e) = auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_DRIVE).await
     {
-        return auth::unauthorized("invalid or revoked token");
+        return e.into_response();
     }
     let Some(owner) = local_actor_id(&state).await else {
         return internal_error("local actor not initialized");
@@ -481,11 +469,9 @@ pub async fn folders(
     body: Option<Json<TokenOnlyBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    if auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_DRIVE)
-        .await
-        .is_none()
+    if let Err(e) = auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_DRIVE).await
     {
-        return auth::unauthorized("invalid or revoked token");
+        return e.into_response();
     }
     Json(Vec::<serde_json::Value>::new()).into_response()
 }
