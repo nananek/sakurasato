@@ -175,6 +175,7 @@ async fn seed_note_with_audience(
         tags: json!([]),
         is_local: true,
         url: None,
+        source: None,
         published_at: chrono::Utc::now(),
     };
     let row = repo::note::insert(pool, new).await.expect("seed note");
@@ -332,6 +333,71 @@ async fn timeline_returns_miss_notes_in_id_desc(pool: PgPool) {
     assert!(notes[0]["files"].is_array());
     assert!(notes[0]["reactions"].is_object());
     assert!(notes[0]["emojis"].is_object());
+}
+
+/// ハッシュタグ入り投稿 (`tag.Hashtag` + content に `<a class="hashtag">`) が
+/// `notes/timeline` の `tags` 配列に載り、`text` は `<a>` 抜きの plain のまま
+/// 返ること (= `build_hashtags` / `html_to_plain_text` 経由の round-trip)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn timeline_exposes_hashtags_and_strips_links(pool: PgPool) {
+    let actor_id = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let ap_id = format!("https://sakurasato.test/notes/tag1-{}", Uuid::new_v4());
+    let row = repo::note::insert(
+        &pool,
+        NewNote {
+            ap_id: ap_id.clone(),
+            actor_id,
+            content: r#"<p>spring <a href="https://sakurasato.test/tags/sakura" class="hashtag" rel="nofollow">#sakura</a> <a href="https://sakurasato.test/tags/桜" class="hashtag" rel="nofollow">#桜</a></p>"#.into(),
+            language: Some("ja".into()),
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+            cc_recipients: vec![],
+            attachments: json!([]),
+            tags: json!([
+                {"type": "Hashtag", "href": "https://sakurasato.test/tags/sakura", "name": "#sakura"},
+                {"type": "Hashtag", "href": "https://sakurasato.test/tags/桜", "name": "#桜"},
+            ]),
+            is_local: true,
+            url: None,
+            source: Some("spring #sakura #桜".into()),
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let canonical = format!("https://sakurasato.test/notes/{}", row.id);
+    repo::note::set_ap_id_and_url(&pool, row.id, &canonical, &canonical)
+        .await
+        .unwrap();
+
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["read:account"]).await;
+
+    let body = json!({"i": token, "limit": 10});
+    let resp = app
+        .oneshot(
+            Request::post("/api/notes/timeline")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let notes = read_json(resp).await;
+    let notes = notes.as_array().expect("timeline returns array");
+    assert_eq!(notes.len(), 1);
+    // `tags` は `#` 抜きの lowercase 名 (= build_hashtags 経由)。
+    assert_eq!(notes[0]["tags"], json!(["sakura", "桜"]));
+    // `text` は `<a>` を剥がした元文 (= html_to_plain_text)。
+    assert_eq!(notes[0]["text"], "spring #sakura #桜");
+    // `renoteId` / `renote` は無し。
+    assert!(notes[0]["renoteId"].is_null());
 }
 
 /// followee の renote (= `Announce`) が home timeline に **renote `MissNote`** と
@@ -1625,6 +1691,7 @@ async fn timeline_attachment_wire_shape_matches_misskey_dart(pool: PgPool) {
         tags: json!([]),
         is_local: true,
         url: None,
+        source: None,
         published_at: chrono::Utc::now(),
     };
     let row = repo::note::insert(&pool, new).await.expect("seed note");
@@ -2752,6 +2819,7 @@ async fn seed_note_full(
         tags: json!([]),
         is_local: true,
         url: None,
+        source: None,
         published_at,
     };
     let row = repo::note::insert(pool, new).await.expect("seed note");

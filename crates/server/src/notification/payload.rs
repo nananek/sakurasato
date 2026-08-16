@@ -316,6 +316,7 @@ mod tests {
             tags: Json(JsonValue::Array(Vec::new())),
             is_local: false,
             url: Some("https://example.com/@alice/1".into()),
+            source: None,
             published_at: Utc::now(),
             edited_at: None,
             created_at: Utc::now(),

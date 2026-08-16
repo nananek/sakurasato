@@ -135,6 +135,7 @@ async fn seed_note(pool: &PgPool, actor_id: i64, host: &str) -> i64 {
             tags: serde_json::json!([]),
             is_local: true,
             url: Some(ap_id),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -311,6 +312,7 @@ async fn create_reaction_with_host_suffix_normalizes_to_local_shortcode(pool: Pg
             tags: serde_json::json!([]),
             is_local: true,
             url: Some("https://example.test/notes/2".into()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -611,6 +613,7 @@ async fn seed_remote_note(pool: &PgPool, actor_id: i64, ap_id: &str) -> i64 {
             tags: serde_json::json!([]),
             is_local: false,
             url: Some(ap_id.into()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )

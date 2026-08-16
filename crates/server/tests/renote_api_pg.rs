@@ -177,6 +177,7 @@ async fn seed_note_with_visibility(
             tags: serde_json::json!([]),
             is_local,
             url: Some(ap_id),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )

@@ -155,7 +155,13 @@ async fn render_ap_note(state: &AppState, note: &NoteRow, actor: &ActorRow) -> J
         .published_at
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut body = json!({
-        "@context": "https://www.w3.org/ns/activitystreams",
+        "@context": [
+            "https://www.w3.org/ns/activitystreams",
+            {
+                "misskey": "https://misskey-hub.net/ns#",
+                "_misskey_content": "misskey:_misskey_content",
+            },
+        ],
         "type": "Note",
         "id": note.ap_id,
         "attributedTo": actor.ap_id,
@@ -166,6 +172,18 @@ async fn render_ap_note(state: &AppState, note: &NoteRow, actor: &ActorRow) -> J
         "sensitive": note.sensitive,
         "url": note.url.clone().unwrap_or_else(|| note.ap_id.clone()),
     });
+    // **MFM ソース**: ローカル投稿 (= `note.source` が Some) だけを
+    // `source` / `_misskey_content` に載せる。オリジナル Create
+    // (`crate::local_api::notes::build_create_activity`) が `source` を
+    // `Some` のときだけ出すのと byte 一致させる (= canonical URL refetch と
+    // 配信が同じ内容を返す原則)。
+    if let Some(src) = note.source.as_deref() {
+        body["source"] = json!({
+            "content": src,
+            "mediaType": "text/plain",
+        });
+        body["_misskey_content"] = JsonValue::String(src.into());
+    }
     if let Some(s) = note.summary.as_deref()
         && !s.is_empty()
     {

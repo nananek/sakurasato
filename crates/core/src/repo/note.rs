@@ -25,6 +25,10 @@ pub struct NewNote {
     pub tags: JsonValue,
     pub is_local: bool,
     pub url: Option<String>,
+    /// MFM ソース (migration 0030)。ローカル投稿は生の投稿本文 (= plain text)、
+    /// remote note は現状 `None`。AP `Note.source` / `_misskey_content` として
+    /// 配送するために DB に保存する。
+    pub source: Option<String>,
     pub published_at: DateTime<Utc>,
 }
 
@@ -59,11 +63,11 @@ where
             ap_id, actor_id, content, language, in_reply_to_ap_id,
             in_reply_to_note_id, summary, visibility, sensitive,
             to_recipients, cc_recipients, attachments, tags, is_local,
-            url, published_at
+            url, source, published_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16
+            $11, $12, $13, $14, $15, $16, $17
         )
         ON CONFLICT (ap_id) DO UPDATE SET ap_id = EXCLUDED.ap_id
         RETURNING
@@ -73,7 +77,7 @@ where
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, edited_at, created_at, updated_at
+            is_local, url, source, published_at, edited_at, created_at, updated_at
         "#,
         new.ap_id,
         new.actor_id,
@@ -90,6 +94,7 @@ where
         new.tags,
         new.is_local,
         new.url,
+        new.source,
         new.published_at,
     )
     .fetch_one(executor)
@@ -129,7 +134,7 @@ where
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, edited_at, created_at, updated_at
+            is_local, url, source, published_at, edited_at, created_at, updated_at
         "#,
         content,
         summary,
@@ -249,7 +254,7 @@ where
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, edited_at, created_at, updated_at
+            is_local, url, source, published_at, edited_at, created_at, updated_at
         FROM note WHERE ap_id = $1
         "#,
         ap_id,
@@ -496,12 +501,53 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> 
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, edited_at, created_at, updated_at
+            is_local, url, source, published_at, edited_at, created_at, updated_at
         FROM note WHERE id = $1
         "#,
         id,
     )
     .fetch_optional(pool)
+    .await
+}
+
+/// `/tags/{name}` ページ用 ── 指定ハッシュタグを持つ公開ノートを新しい順で
+/// 列挙する。
+///
+/// `tag` は **`#` 抜き・lowercase** のタグ名 (= `note.tags` の
+/// `{"type": "Hashtag", "name": "#{name}"}` の `name` と一致する形)。
+/// お一人様サーバなので seq scan で十分 (GIN index は張らない)。
+///
+/// 対象は `public` / `unlisted` のみ (= permalink と同じ可視性境界。URL を
+/// 知っていれば見られる公開ページなので、followers / direct は載せない)。
+pub async fn list_by_hashtag(pool: &PgPool, tag: &str, limit: i64) -> sqlx::Result<Vec<NoteRow>> {
+    // tag 名は `#` 抜き・lowercase 前提 (parse_hashtags が正規化済み)。JSON へは
+    // serde で組み立てる (= タグ名に JSON 特殊文字が混入しても壊れない)。タグ名
+    // は body 文字種制約済みだが defense-in-depth。
+    let needle = serde_json::json!([{
+        "type": "Hashtag",
+        "name": format!("#{tag}"),
+    }]);
+    sqlx::query_as!(
+        NoteRow,
+        r#"
+        SELECT
+            id, ap_id, actor_id, content, language, in_reply_to_ap_id,
+            in_reply_to_note_id, summary, visibility, sensitive,
+            to_recipients as "to_recipients: Json<Vec<String>>",
+            cc_recipients as "cc_recipients: Json<Vec<String>>",
+            attachments as "attachments: Json<JsonValue>",
+            tags as "tags: Json<JsonValue>",
+            is_local, url, source, published_at, edited_at, created_at, updated_at
+        FROM note
+        WHERE tags @> $1::jsonb
+          AND visibility IN ('public', 'unlisted')
+        ORDER BY published_at DESC, id DESC
+        LIMIT $2
+        "#,
+        needle,
+        limit,
+    )
+    .fetch_all(pool)
     .await
 }
 

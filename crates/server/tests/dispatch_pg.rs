@@ -1310,6 +1310,7 @@ async fn delete_by_author_removes_note(pool: PgPool) {
             tags: serde_json::Value::Array(vec![]),
             is_local: false,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1389,6 +1390,7 @@ async fn delete_by_non_author_is_rejected(pool: PgPool) {
             tags: serde_json::Value::Array(vec![]),
             is_local: false,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1498,6 +1500,7 @@ async fn update_note_by_author_changes_content(pool: PgPool) {
             tags: serde_json::Value::Array(vec![]),
             is_local: false,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1587,6 +1590,7 @@ async fn update_note_by_non_author_is_rejected(pool: PgPool) {
             tags: serde_json::Value::Array(vec![]),
             is_local: false,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1735,6 +1739,7 @@ async fn announce_from_followee_inserts_row(pool: PgPool) {
             tags: serde_json::Value::Array(vec![]),
             is_local: false,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1826,6 +1831,7 @@ async fn announce_of_own_note_creates_notification(pool: PgPool) {
             tags: serde_json::Value::Array(vec![]),
             is_local: true,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1981,6 +1987,7 @@ async fn undo_announce_removes_row(pool: PgPool) {
             tags: serde_json::Value::Array(vec![]),
             is_local: false,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -2773,6 +2780,7 @@ async fn update_note_with_emoji_tag_learns_remote_emoji(pool: PgPool) {
             tags: serde_json::Value::Array(vec![]),
             is_local: false,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )

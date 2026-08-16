@@ -63,6 +63,8 @@ mod tests {
         //   Collection `totalItems` キャッシュ 3 列を actor に追加。MiAuth の
         //   `/api/users/show` が Aria プロフィールの followersCount/
         //   followingCount/notesCount に出す値の出所)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 29);
+        // 0030 note_source (= MFM ソース列。ローカル投稿の生本文を AP
+        //   `Note.source` / `_misskey_content` として配送するために保存する)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 30);
     }
 }

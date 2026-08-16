@@ -202,6 +202,7 @@ fn new_note(actor_id: i64, ap_suffix: &str, visibility: Visibility) -> NewNote {
         tags: serde_json::json!([]),
         is_local: true,
         url: None,
+        source: None,
         published_at: chrono::Utc::now(),
     }
 }

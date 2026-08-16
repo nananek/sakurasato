@@ -251,6 +251,7 @@ async fn insert_local_note(
             tags: serde_json::json!([]),
             is_local: true,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -565,6 +566,116 @@ async fn create_note_persists_and_enqueues(pool: PgPool) {
     assert_eq!(inbox_count, 1);
 }
 
+/// mention + hashtag を含むローカル投稿が `<a>` でマークアップされ、MFM ソース
+/// (`source` / `_misskey_content`) と `tag.Hashtag` が配送されることを検証する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn create_note_marks_up_mentions_and_hashtags(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let mut bob = common::sample_local_actor("bob", "remote.test");
+    bob.is_local = false;
+    bob.private_key_pem = None;
+    bob.ed25519_private_key_pem = None;
+    bob.shared_inbox_url = Some("https://remote.test/inbox".into());
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+    let f_ap_id = "https://remote.test/follows/alice-by-bob".to_string();
+    let row = repo::follow::upsert_pending(&pool, &f_ap_id, bob.id, me.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(&pool, row.id, sakurasato_core::model::FollowState::Accepted)
+        .await
+        .unwrap();
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let body = serde_json::json!({
+        "content": "hi @bob@remote.test #sakura #桜",
+        "visibility": "public",
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/notes")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = read_json(resp).await;
+    // content (HTML) に mention / hashtag の `<a>` が入る。
+    assert_eq!(
+        json["content"],
+        serde_json::json!(
+            r#"<p>hi <a href="https://remote.test/users/bob" class="mention" rel="nofollow">@bob@remote.test</a> <a href="https://example.test/tags/sakura" class="hashtag" rel="nofollow">#sakura</a> <a href="https://example.test/tags/桜" class="hashtag" rel="nofollow">#桜</a></p>"#
+        ),
+    );
+    let id = json["id"].as_i64().unwrap();
+
+    // delivery_queue の activity を検査。
+    let row = sqlx::query!(r#"SELECT activity FROM delivery_queue LIMIT 1"#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let activity = &row.activity;
+    // `@context` が配列で misskey alias (`_misskey_content`) を含む。
+    let ctx = activity["@context"].as_array().expect("@context array");
+    assert_eq!(ctx[0], "https://www.w3.org/ns/activitystreams");
+    assert_eq!(ctx[1]["_misskey_content"], "misskey:_misskey_content");
+    assert_eq!(ctx[1]["misskey"], "https://misskey-hub.net/ns#");
+
+    let object = &activity["object"];
+    assert_eq!(object["type"], "Note");
+    assert_eq!(object["id"], format!("https://example.test/notes/{id}"));
+    // content に mention / hashtag の `<a>`。
+    let content = object["content"].as_str().unwrap();
+    assert!(
+        content.contains(r#"class="mention" rel="nofollow">@bob@remote.test</a>"#),
+        "content should link the mention: {content}"
+    );
+    assert!(
+        content.contains(r#"class="hashtag" rel="nofollow">#sakura</a>"#),
+        "content should link the hashtag: {content}"
+    );
+    // `tag` に Mention + Hashtag が載る。
+    let tags = object["tag"].as_array().expect("object.tag array");
+    assert_eq!(tags.len(), 3, "Mention 1 + Hashtag 2, got {tags:?}");
+    assert!(tags.iter().any(|t| t["type"] == "Mention"
+        && t["href"] == bob.ap_id
+        && t["name"] == "@bob@remote.test"));
+    assert!(tags.iter().any(|t| t["type"] == "Hashtag"
+        && t["href"] == "https://example.test/tags/sakura"
+        && t["name"] == "#sakura"));
+    assert!(tags.iter().any(|t| t["type"] == "Hashtag"
+        && t["href"] == "https://example.test/tags/桜"
+        && t["name"] == "#桜"));
+    // MFM ソース: `_misskey_content` と `source.content` が生本文。
+    assert_eq!(
+        object["_misskey_content"],
+        "hi @bob@remote.test #sakura #桜"
+    );
+    assert_eq!(
+        object["source"]["content"],
+        "hi @bob@remote.test #sakura #桜"
+    );
+    assert_eq!(object["source"]["mediaType"], "text/plain");
+    // DB の note.source にも生本文が保存されている。
+    let db_source: Option<String> =
+        sqlx::query_scalar!("SELECT source FROM note WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        db_source.as_deref(),
+        Some("hi @bob@remote.test #sakura #桜")
+    );
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn create_note_rejects_empty_content(pool: PgPool) {
     repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
@@ -780,6 +891,7 @@ async fn create_note_direct_reply_to_remote_actor_has_only_parent_in_to(pool: Pg
             tags: serde_json::json!([]),
             is_local: false,
             url: Some(bob_seed_ap_id.into()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1068,6 +1180,7 @@ async fn create_note_reply_enqueues_to_non_follower_parent_author(pool: PgPool) 
             tags: serde_json::json!([]),
             is_local: false,
             url: Some(charlie_note_ap_id.into()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1176,6 +1289,7 @@ async fn create_note_reply_dedupes_when_parent_author_is_follower(pool: PgPool) 
             tags: serde_json::json!([]),
             is_local: false,
             url: Some(bob_note_ap_id.into()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -2012,6 +2126,7 @@ async fn insert_note_with_visibility(
             tags: serde_json::json!([]),
             is_local: false,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
