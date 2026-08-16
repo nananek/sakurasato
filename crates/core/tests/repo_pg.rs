@@ -179,6 +179,7 @@ async fn note_round_trip(pool: PgPool) -> sqlx::Result<()> {
         tags: serde_json::json!([]),
         is_local: true,
         url: Some("https://example.test/@alice2/n1".into()),
+        source: None,
         published_at: now,
     };
     let inserted = repo::note::insert(&pool, new).await?;
@@ -216,6 +217,7 @@ async fn note_insert_is_idempotent_on_ap_id(pool: PgPool) -> sqlx::Result<()> {
         tags: serde_json::json!([]),
         is_local: false,
         url: None,
+        source: None,
         published_at: now,
     };
 
@@ -763,6 +765,7 @@ async fn reaction_insert_and_delete(pool: PgPool) -> sqlx::Result<()> {
             tags: serde_json::json!([]),
             is_local: true,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -805,6 +808,7 @@ async fn reaction_insert_or_get_is_idempotent(pool: PgPool) -> sqlx::Result<()> 
             tags: serde_json::json!([]),
             is_local: true,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -857,6 +861,7 @@ async fn reaction_count_by_note_groups_by_content(pool: PgPool) -> sqlx::Result<
             tags: serde_json::json!([]),
             is_local: true,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -911,6 +916,7 @@ async fn reaction_content_consolidation_collapses_host_suffix_dups(
             tags: serde_json::json!([]),
             is_local: true,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1050,6 +1056,7 @@ async fn migration_0023_restores_host_for_remote_reaction_content(
             tags: serde_json::json!([]),
             is_local: true,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1184,6 +1191,7 @@ async fn note_summary_empty_or_blank_normalized_to_null(pool: PgPool) -> sqlx::R
         tags: serde_json::json!([]),
         is_local: false,
         url: None,
+        source: None,
         published_at: chrono::Utc::now(),
     };
     let empty = repo::note::insert(&pool, mk("nsum-empty", Some(""))).await?;
@@ -1255,6 +1263,7 @@ async fn prune_remote_notes_keeps_local_and_interacted(pool: PgPool) -> sqlx::Re
             tags: serde_json::json!([]),
             is_local,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         };
 
@@ -1737,6 +1746,7 @@ async fn list_remote_note_tags_since_id_pages_by_id(pool: PgPool) -> sqlx::Resul
             tags,
             is_local,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         };
 

@@ -476,6 +476,10 @@ async fn build_remote_note(
         tags,
         is_local: false,
         url,
+        // remote note の MFM ソース (`source.content` / `_misskey_content`) の
+        // 取り込みはスコープ外。現状は None のまま (将来 inbound で保存する
+        // 場合はここで抽出して入れる)。
+        source: None,
         published_at,
     })
 }

@@ -178,6 +178,11 @@ pub struct NoteRow {
     pub tags: Json<serde_json::Value>,
     pub is_local: bool,
     pub url: Option<String>,
+    /// MFM ソース (Misskey 互換)。ローカル投稿は生の投稿本文 (= plain text)、
+    /// remote note は現状 `None`。AP `Note.source` / `_misskey_content` として
+    /// 連合相手へ配送し、Misskey 系が MFM としてレンダリングできるようにする
+    /// (migration 0030)。公開情報のみで機微でない。
+    pub source: Option<String>,
     pub published_at: DateTime<Utc>,
     /// M11: リモート `Update`/`Note` を受領した時刻 (= 編集時刻)。
     /// 初回受信時は `None`。ローカル投稿の編集機能は未実装なので、現状は

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, ap_id, actor_id, content, language, in_reply_to_ap_id,\n            in_reply_to_note_id, summary, visibility, sensitive,\n            to_recipients as \"to_recipients: Json<Vec<String>>\",\n            cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            attachments as \"attachments: Json<JsonValue>\",\n            tags as \"tags: Json<JsonValue>\",\n            is_local, url, published_at, edited_at, created_at, updated_at\n        FROM note WHERE id = $1\n        ",
+  "query": "\n        INSERT INTO note (\n            ap_id, actor_id, content, language, in_reply_to_ap_id,\n            in_reply_to_note_id, summary, visibility, sensitive,\n            to_recipients, cc_recipients, attachments, tags, is_local,\n            url, source, published_at\n        )\n        VALUES (\n            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,\n            $11, $12, $13, $14, $15, $16, $17\n        )\n        ON CONFLICT (ap_id) DO UPDATE SET ap_id = EXCLUDED.ap_id\n        RETURNING\n            id, ap_id, actor_id, content, language, in_reply_to_ap_id,\n            in_reply_to_note_id, summary, visibility, sensitive,\n            to_recipients as \"to_recipients: Json<Vec<String>>\",\n            cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            attachments as \"attachments: Json<JsonValue>\",\n            tags as \"tags: Json<JsonValue>\",\n            is_local, url, source, published_at, edited_at, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -181,6 +181,17 @@
       },
       {
         "ordinal": 16,
+        "name": "source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
         "name": "published_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -191,7 +202,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 18,
         "name": "edited_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -202,7 +213,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 19,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -213,7 +224,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 20,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -226,7 +237,23 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Bool",
+        "Jsonb",
+        "Jsonb",
+        "Jsonb",
+        "Jsonb",
+        "Bool",
+        "Text",
+        "Text",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -246,11 +273,12 @@
       false,
       false,
       true,
+      true,
       false,
       true,
       false,
       false
     ]
   },
-  "hash": "209825e669d6d56f6207cdb5730bf2a21ca0fbbfb7f757bb5067d986c6a82f1c"
+  "hash": "c252e2e135fa2cac2333e6ef3264a8f82ede9b4ac83936487a9783072b61afab"
 }

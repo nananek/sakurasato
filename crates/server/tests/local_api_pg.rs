@@ -251,6 +251,7 @@ async fn insert_local_note(
             tags: serde_json::json!([]),
             is_local: true,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -780,6 +781,7 @@ async fn create_note_direct_reply_to_remote_actor_has_only_parent_in_to(pool: Pg
             tags: serde_json::json!([]),
             is_local: false,
             url: Some(bob_seed_ap_id.into()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1068,6 +1070,7 @@ async fn create_note_reply_enqueues_to_non_follower_parent_author(pool: PgPool) 
             tags: serde_json::json!([]),
             is_local: false,
             url: Some(charlie_note_ap_id.into()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -1176,6 +1179,7 @@ async fn create_note_reply_dedupes_when_parent_author_is_follower(pool: PgPool) 
             tags: serde_json::json!([]),
             is_local: false,
             url: Some(bob_note_ap_id.into()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -2012,6 +2016,7 @@ async fn insert_note_with_visibility(
             tags: serde_json::json!([]),
             is_local: false,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )

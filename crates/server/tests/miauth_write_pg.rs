@@ -187,6 +187,7 @@ async fn seed_remote_note(pool: &PgPool, actor_id: i64, ap_id: &str) -> i64 {
             tags: json!([]),
             is_local: false,
             url: Some(ap_id.into()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )

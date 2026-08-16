@@ -130,6 +130,7 @@ async fn seed_note(pool: &PgPool, actor_id: i64) -> i64 {
             tags: serde_json::json!([]),
             is_local: true,
             url: Some(ap_id),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )

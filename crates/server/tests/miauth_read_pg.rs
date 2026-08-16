@@ -175,6 +175,7 @@ async fn seed_note_with_audience(
         tags: json!([]),
         is_local: true,
         url: None,
+        source: None,
         published_at: chrono::Utc::now(),
     };
     let row = repo::note::insert(pool, new).await.expect("seed note");
@@ -1625,6 +1626,7 @@ async fn timeline_attachment_wire_shape_matches_misskey_dart(pool: PgPool) {
         tags: json!([]),
         is_local: true,
         url: None,
+        source: None,
         published_at: chrono::Utc::now(),
     };
     let row = repo::note::insert(&pool, new).await.expect("seed note");
@@ -2752,6 +2754,7 @@ async fn seed_note_full(
         tags: json!([]),
         is_local: true,
         url: None,
+        source: None,
         published_at,
     };
     let row = repo::note::insert(pool, new).await.expect("seed note");

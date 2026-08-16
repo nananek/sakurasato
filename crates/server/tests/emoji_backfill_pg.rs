@@ -126,6 +126,7 @@ fn new_note(suffix: &str, actor_id: i64, is_local: bool, tags: serde_json::Value
         tags,
         is_local,
         url: None,
+        source: None,
         published_at: chrono::Utc::now(),
     }
 }

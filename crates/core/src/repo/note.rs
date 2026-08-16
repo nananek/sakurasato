@@ -25,6 +25,10 @@ pub struct NewNote {
     pub tags: JsonValue,
     pub is_local: bool,
     pub url: Option<String>,
+    /// MFM ソース (migration 0030)。ローカル投稿は生の投稿本文 (= plain text)、
+    /// remote note は現状 `None`。AP `Note.source` / `_misskey_content` として
+    /// 配送するために DB に保存する。
+    pub source: Option<String>,
     pub published_at: DateTime<Utc>,
 }
 
@@ -59,11 +63,11 @@ where
             ap_id, actor_id, content, language, in_reply_to_ap_id,
             in_reply_to_note_id, summary, visibility, sensitive,
             to_recipients, cc_recipients, attachments, tags, is_local,
-            url, published_at
+            url, source, published_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16
+            $11, $12, $13, $14, $15, $16, $17
         )
         ON CONFLICT (ap_id) DO UPDATE SET ap_id = EXCLUDED.ap_id
         RETURNING
@@ -73,7 +77,7 @@ where
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, edited_at, created_at, updated_at
+            is_local, url, source, published_at, edited_at, created_at, updated_at
         "#,
         new.ap_id,
         new.actor_id,
@@ -90,6 +94,7 @@ where
         new.tags,
         new.is_local,
         new.url,
+        new.source,
         new.published_at,
     )
     .fetch_one(executor)
@@ -129,7 +134,7 @@ where
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, edited_at, created_at, updated_at
+            is_local, url, source, published_at, edited_at, created_at, updated_at
         "#,
         content,
         summary,
@@ -249,7 +254,7 @@ where
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, edited_at, created_at, updated_at
+            is_local, url, source, published_at, edited_at, created_at, updated_at
         FROM note WHERE ap_id = $1
         "#,
         ap_id,
@@ -496,7 +501,7 @@ pub async fn get_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<NoteRow>> 
             cc_recipients as "cc_recipients: Json<Vec<String>>",
             attachments as "attachments: Json<JsonValue>",
             tags as "tags: Json<JsonValue>",
-            is_local, url, published_at, edited_at, created_at, updated_at
+            is_local, url, source, published_at, edited_at, created_at, updated_at
         FROM note WHERE id = $1
         "#,
         id,

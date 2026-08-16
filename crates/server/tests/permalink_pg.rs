@@ -162,6 +162,7 @@ async fn insert_note_with_visibility(
             tags: serde_json::json!([]),
             is_local,
             url: None,
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )

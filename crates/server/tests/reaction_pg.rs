@@ -203,6 +203,7 @@ async fn seed_local_note(pool: &PgPool, local_actor_id: i64) -> (i64, String) {
             tags: serde_json::json!([]),
             is_local: true,
             url: Some(ap_id.clone()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
@@ -239,6 +240,7 @@ async fn seed_remote_note(
             tags: serde_json::json!([]),
             is_local: false,
             url: Some(ap_id.clone()),
+            source: None,
             published_at: chrono::Utc::now(),
         },
     )
