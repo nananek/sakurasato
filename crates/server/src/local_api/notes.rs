@@ -78,6 +78,9 @@ const MENTION_MAX: usize = 50;
 /// 後の dedupe 済み件数で評価。Misskey の慣習 (= 1 投稿 30 個前後) に余裕を
 /// もたせて 64 個まで許可、超えたぶんは static drop。
 const EMOJI_MAX: usize = 64;
+/// 1 投稿あたりのハッシュタグ上限。`EMOJI_MAX` と同水準。超えたぶんは
+/// static drop (= attack 防御 + 投稿サイズ抑制)。
+const HASHTAG_MAX: usize = 64;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateNoteRequest {
@@ -204,10 +207,16 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
     // 載せる前に HTML へ変換する。これをしないと `<` が連合先 / MiAuth
     // クライアントで未閉じタグとして解釈され本文が壊れる。mention / emoji の
     // 抽出は上で plain な `req.content` から済ませてあるので、ここで HTML 化
-    // しても tag 配列とは整合する。以降は DB / 配送 / SSE / レスポンスすべて
-    // この HTML 形を canonical な `content` として扱う (= remote note と同じ
-    // 不変条件)。
-    let content_html = crate::text::plain_text_to_html(&req.content);
+    // しても tag 配列とは整合する。**解決済み mention と抽出済み hashtag は
+    // `<a>` でマークアップ**する (= 連合先で素のテキストのまま表示される問題
+    // の解消。`scan_mentions` / `scan_hashtags` と同一 span なので tag 配列と
+    // 描画がずれない)。以降は DB / 配送 / SSE / レスポンスすべてこの HTML 形を
+    // canonical な `content` として扱う (= remote note と同じ不変条件)。
+    let content_html = crate::text::plain_text_to_html_with_links(
+        &req.content,
+        &build_mention_map(&mentions),
+        &build_hashtag_map(&prepared.hashtag_tags),
+    );
 
     // direct で `to` が空 (= 自己 mention のみで剥がれて何も残らない等) なら拒否。
     if matches!(visibility, Visibility::Direct) && prepared.to.is_empty() {
@@ -249,6 +258,7 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateNoteReq
         &prepared.attachment_documents,
         &prepared.all_tags(),
         published_at,
+        Some(&req.content),
     );
     // **#65**: extra_inboxes は (a) 返信先 author の inbox と (b) mention で
     // 解決した remote actor の inbox の和集合。重複は `enqueue_deliveries` 側で
@@ -341,6 +351,9 @@ struct PreparedNote {
     /// **#102**: `Note.tag` に乗せる Emoji エントリ。content から抽出した
     /// `:foo:` shortcode を local emoji 行に解決して 1 件ごとに組み立てる。
     emoji_tags: Vec<JsonValue>,
+    /// `Note.tag` に乗せる Hashtag エントリ。`{type: Hashtag, href: "{host}/tags/{name}",
+    /// name: "#{name}"}` を content から抽出したハッシュタグ 1 件ごとに組み立てる。
+    hashtag_tags: Vec<JsonValue>,
 }
 
 impl PreparedNote {
@@ -403,6 +416,19 @@ impl PreparedNote {
                 "name": p.mention_name,
             }));
         }
+        // ハッシュタグ: content から `#name` を抽出し、`tag.Hashtag` を
+        // 組み立てる。href は `{host}/tags/{name}` (Mastodon / Misskey /
+        // Nekonoverse が使う慣習形。`routes/tags.rs` がリンク先を提供する)。
+        let hashtag_tags: Vec<JsonValue> = parse_hashtags(&req.content)
+            .into_iter()
+            .map(|name| {
+                json!({
+                    "type": "Hashtag",
+                    "href": format!("https://{host}/tags/{name}"),
+                    "name": format!("#{name}"),
+                })
+            })
+            .collect();
         Self {
             summary: req
                 .summary
@@ -415,15 +441,19 @@ impl PreparedNote {
             attachment_documents,
             mention_tags,
             emoji_tags,
+            hashtag_tags,
         }
     }
 
-    /// `Note.tag` 用に mention + emoji を結合した配列。`build_create_activity`
-    /// にも `note.tags` JSONB にも同値を流し込む。
+    /// `Note.tag` 用に mention + emoji + hashtag を結合した配列。
+    /// `build_create_activity` にも `note.tags` JSONB にも同値を流し込む。
     fn all_tags(&self) -> Vec<JsonValue> {
-        let mut v = Vec::with_capacity(self.mention_tags.len() + self.emoji_tags.len());
+        let mut v = Vec::with_capacity(
+            self.mention_tags.len() + self.emoji_tags.len() + self.hashtag_tags.len(),
+        );
         v.extend(self.mention_tags.iter().cloned());
         v.extend(self.emoji_tags.iter().cloned());
+        v.extend(self.hashtag_tags.iter().cloned());
         v
     }
 }
@@ -652,9 +682,46 @@ async fn resolve_emoji_tags(state: &AppState, content: &str) -> Vec<JsonValue> {
 ///
 /// 同じ acct を複数回書いても結果は **1 件のみ** (= ASCII-lower で dedupe)。
 fn parse_mentions(content: &str) -> Vec<MentionAcct> {
-    let bytes = content.as_bytes();
-    let mut out: Vec<MentionAcct> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut out: Vec<MentionAcct> = Vec::new();
+    for span in scan_mentions(content) {
+        let key = (
+            span.user.to_ascii_lowercase(),
+            span.host.to_ascii_lowercase(),
+        );
+        if seen.insert(key) {
+            out.push(MentionAcct {
+                user: span.user,
+                host: span.host,
+                name: span.name,
+            });
+        }
+    }
+    out
+}
+
+/// [`scan_mentions`] の抽出結果 1 件分。`start` / `end` は content 内の byte
+/// index (`start` = `@` の位置、`end` = host 末尾の 1 つ後ろ。文末ピリオド等の
+/// trim 済み)。`text.rs` の markup (`plain_text_to_html_with_links`) と
+/// `parse_mentions` が**同じ抽出ロジック**を共有するための公開型。
+#[derive(Debug, Clone)]
+pub(crate) struct MentionSpan {
+    pub start: usize,
+    pub end: usize,
+    pub user: String,
+    pub host: String,
+    /// `@user@host` の display 形 (元のケース保持)。AS2 `Mention.name` 用。
+    pub name: String,
+}
+
+/// content から `@user@host` を **byte span 付き**で抽出する。重複は除かない
+/// (= 全出現位置を返す。dedupe は呼び出し側で行う)。
+///
+/// 抽出規則は [`parse_mentions`] と完全に同一 ── `text.rs` の markup はこの
+/// span を使うことで「解決済み mention とずれない」ことを保証する。
+pub(crate) fn scan_mentions(content: &str) -> Vec<MentionSpan> {
+    let bytes = content.as_bytes();
+    let mut out: Vec<MentionSpan> = Vec::new();
     let mut i = 0;
     // **PR #78 review F-2**: 直前の反復で mention を抽出しきった場合、その
     // mention の末尾は host TLD 文字 (= 英数) なので単純な前一文字判定では
@@ -725,17 +792,90 @@ fn parse_mentions(content: &str) -> Vec<MentionAcct> {
         // ここに来た時点で user/host は ASCII バイトのみ → str スライスは安全。
         let user_str = content[user_start..user_end].to_string();
         let host_str = content[host_start..host_end].to_string();
-        let key = (user_str.to_ascii_lowercase(), host_str.to_ascii_lowercase());
-        if seen.insert(key) {
-            let name = format!("@{user_str}@{host_str}");
-            out.push(MentionAcct {
-                user: user_str,
-                host: host_str,
-                name,
-            });
-        }
+        out.push(MentionSpan {
+            start: i,
+            end: host_end,
+            name: format!("@{user_str}@{host_str}"),
+            user: user_str,
+            host: host_str,
+        });
         i = k;
         prev_mention_end = Some(k);
+    }
+    out
+}
+
+/// ハッシュタグ body に含まれる文字種 (= Nekonoverse `_HASHTAG_RE` と同じ)。
+/// ASCII alphanumeric / `_` / ひらがな・カタカナ・CJK (`\u3041-\u9fff`、これが
+/// カタカナ `\u30a0-\u30ff` を包含) / 半角カタカナ (`\uff66-\uff9f`)。
+fn is_hashtag_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || c == '_'
+        || matches!(c, '\u{3041}'..='\u{9fff}' | '\u{ff66}'..='\u{ff9f}')
+}
+
+/// [`scan_hashtags`] の抽出結果 1 件分。`start` = `#` の位置、`end` = body 末尾の
+/// 1 つ後ろ (byte index)。`name` は **`#` 抜き・元ケース**。`text.rs` の markup と
+/// `parse_hashtags` が同じ抽出ロジックを共有するための公開型。
+#[derive(Debug, Clone)]
+pub(crate) struct HashtagSpan {
+    pub start: usize,
+    pub end: usize,
+    pub name: String,
+}
+
+/// content から `#tag` を **byte span 付き**で抽出する。重複は除かない
+/// (= 全出現位置を返す。dedupe / lowercase / 上限は呼び出し側で行う)。
+///
+/// 単語境界: `#` の**直前の文字**がハッシュタグ body 文字種でないときだけ
+/// 候補とみなす ── `C#tag` / `abc#def` のような「英単語の続きの `#`」を
+/// ハッシュタグと誤認しない (Mastodon と同じ word-boundary 規則)。
+pub(crate) fn scan_hashtags(content: &str) -> Vec<HashtagSpan> {
+    let chars: Vec<(usize, char)> = content.char_indices().collect();
+    let mut out: Vec<HashtagSpan> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].1 != '#' {
+            i += 1;
+            continue;
+        }
+        if i > 0 && is_hashtag_char(chars[i - 1].1) {
+            // `C#` / `あ#` 等 ── 前が body 文字種なのでハッシュタグ開始でない。
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut body = String::new();
+        while j < chars.len() && is_hashtag_char(chars[j].1) {
+            body.push(chars[j].1);
+            j += 1;
+        }
+        if !body.is_empty() {
+            out.push(HashtagSpan {
+                start: chars[i].0,
+                end: chars[j - 1].0 + chars[j - 1].1.len_utf8(),
+                name: body,
+            });
+        }
+        i = j;
+    }
+    out
+}
+
+/// content からハッシュタグ名を抽出する。lowercase + dedupe、上限
+/// [`HASHTAG_MAX`]。超えたぶんは static drop。抽出規則は [`scan_hashtags`] と
+/// 完全に同一。
+pub(crate) fn parse_hashtags(content: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for span in scan_hashtags(content) {
+        if out.len() >= HASHTAG_MAX {
+            break;
+        }
+        let lc = span.name.to_lowercase();
+        if seen.insert(lc.clone()) {
+            out.push(lc);
+        }
     }
     out
 }
@@ -994,6 +1134,9 @@ async fn persist_note(
         tags: JsonValue::Array(prepared.all_tags()),
         is_local: true,
         url: None,
+        // MFM ソース = 生の投稿本文 (= plain text)。AP `Note.source` /
+        // `_misskey_content` として配送するため DB に保存する。
+        source: Some(req.content.clone()),
         published_at,
     };
 
@@ -1253,6 +1396,7 @@ fn build_create_activity(
     attachments: &[JsonValue],
     tag: &[JsonValue],
     published_at: chrono::DateTime<chrono::Utc>,
+    source: Option<&str>,
 ) -> JsonValue {
     let published = published_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let activity_id = format!("{note_url}/activity");
@@ -1283,9 +1427,26 @@ fn build_create_activity(
     if !tag.is_empty() {
         note["tag"] = JsonValue::Array(tag.to_vec());
     }
+    // **MFM ソース**: ローカル投稿は plain text なので `text/plain` を MFM 互換
+    // として載せる (= Misskey / Nekonoverse 双方が `source.content` /
+    // `_misskey_content` を MFM レンダリングする)。`None` (= remote 等) なら
+    // key 自体を omit する。
+    if let Some(src) = source {
+        note["source"] = json!({
+            "content": src,
+            "mediaType": "text/plain",
+        });
+        note["_misskey_content"] = JsonValue::String(src.into());
+    }
 
     json!({
-        "@context": "https://www.w3.org/ns/activitystreams",
+        "@context": [
+            "https://www.w3.org/ns/activitystreams",
+            {
+                "misskey": "https://misskey-hub.net/ns#",
+                "_misskey_content": "misskey:_misskey_content",
+            },
+        ],
         "type": "Create",
         "id": activity_id,
         "actor": actor.ap_id,
@@ -1294,6 +1455,36 @@ fn build_create_activity(
         "published": published,
         "object": note,
     })
+}
+
+/// 解決済み mention のリストから markup 用の「lowercase `user@host` → actor URI」
+/// マップを組み立てる。`text.rs::plain_text_to_html_with_links` が解決マップに
+/// 載っている mention だけを `<a>` 化する (= 自己 mention / 未解決は素のまま)。
+fn build_mention_map(mentions: &[ResolvedMention]) -> std::collections::HashMap<String, String> {
+    mentions
+        .iter()
+        .map(|m| {
+            let key = m.name.trim_start_matches('@').to_ascii_lowercase();
+            (key, m.actor_uri.clone())
+        })
+        .collect()
+}
+
+/// `PreparedNote.hashtag_tags` から markup 用の「lowercase tag name → href」
+/// マップを組み立てる。`name` は `#{name}` 形式なので `#` を剥いて lowercase。
+fn build_hashtag_map(hashtag_tags: &[JsonValue]) -> std::collections::HashMap<String, String> {
+    hashtag_tags
+        .iter()
+        .filter_map(|t| {
+            let name = t
+                .get("name")
+                .and_then(JsonValue::as_str)?
+                .trim_start_matches('#')
+                .to_lowercase();
+            let href = t.get("href").and_then(JsonValue::as_str)?.to_string();
+            Some((name, href))
+        })
+        .collect()
 }
 
 fn bad_request(reason: &'static str) -> Response {
@@ -1622,6 +1813,64 @@ mod tests {
         assert_eq!(m.len(), 2, "expected 2 mentions, got {m:?}");
         assert_eq!(m[0].name, "@alice@a.test");
         assert_eq!(m[1].name, "@bob@b.test");
+    }
+
+    // ── parse_hashtags (MFM mention/hashtag markup) ──────────────────
+
+    #[test]
+    fn parse_hashtags_basic() {
+        let v = parse_hashtags("hello #world and #sakura");
+        assert_eq!(v, vec!["world", "sakura"]);
+    }
+
+    #[test]
+    fn parse_hashtags_lowercase_and_dedupe() {
+        let v = parse_hashtags("#Sakura #SAKURA #sakura #flower");
+        assert_eq!(v, vec!["sakura", "flower"]);
+    }
+
+    #[test]
+    fn parse_hashtags_japanese() {
+        // ひらがな・漢字・カタカナ・半角カタカナが拾える。
+        let v = parse_hashtags("#さくら #桜 #カタカナ #ｶﾀｶﾅ");
+        assert_eq!(v, vec!["さくら", "桜", "カタカナ", "ｶﾀｶﾅ"]);
+    }
+
+    #[test]
+    fn parse_hashtags_requires_word_boundary() {
+        // 英単語の続きの `#` はハッシュタグと誤認しない (Mastodon と同規則)。
+        assert!(
+            parse_hashtags("C# is a language").is_empty(),
+            "C# を拾わない"
+        );
+        assert!(parse_hashtags("abc#def").is_empty(), "単語内 # を拾わない");
+        // 直前が `#` 自身 (= `##tag`) は 2 つ目からはじめて拾う。
+        let v = parse_hashtags("##tag");
+        assert_eq!(v, vec!["tag"]);
+    }
+
+    #[test]
+    fn parse_hashtags_underscore_digits_ok() {
+        let v = parse_hashtags("#hello_world #foo1 #123");
+        assert_eq!(v, vec!["hello_world", "foo1", "123"]);
+    }
+
+    #[test]
+    fn parse_hashtags_empty_or_missing_is_empty() {
+        assert!(parse_hashtags("").is_empty());
+        assert!(parse_hashtags("no hashtags here").is_empty());
+        assert!(parse_hashtags("#").is_empty(), "body 空は拾わない");
+    }
+
+    #[test]
+    fn parse_hashtags_respects_max_limit() {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        for n in 0..200 {
+            let _ = write!(s, "#t{n} ");
+        }
+        let v = parse_hashtags(&s);
+        assert_eq!(v.len(), HASHTAG_MAX);
     }
 
     /// **PR #78 review F-2**: 直後に通常文字が来た場合は flag が解除されて
