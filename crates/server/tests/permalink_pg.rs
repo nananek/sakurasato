@@ -266,6 +266,70 @@ async fn permalink_returns_ap_json_when_accept_activitystreams(pool: PgPool) {
     );
 }
 
+/// local note の permalink AP JSON refetch が、オリジナル Create と同じ
+/// MFM ソース (`source` / `_misskey_content`) と `@context` 配列を返すこと。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn permalink_ap_json_includes_mfm_source_for_local_note(pool: PgPool) {
+    let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let ap_id = "https://example.test/notes/mfm".to_string();
+    let row = repo::note::insert(
+        &pool,
+        sakurasato_core::repo::note::NewNote {
+            ap_id,
+            actor_id: actor.id,
+            content: r#"<p>hi <a href="https://example.test/tags/sakura" class="hashtag" rel="nofollow">#sakura</a></p>"#.into(),
+            language: Some("ja".into()),
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([
+                { "type": "Hashtag", "href": "https://example.test/tags/sakura", "name": "#sakura" }
+            ]),
+            is_local: true,
+            url: None,
+            source: Some("hi #sakura".into()),
+            published_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/notes/{}", row.id))
+                .header(header::ACCEPT, "application/activity+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // `@context` 配列 + misskey alias (Create と byte 一致)。
+    let ctx = json["@context"].as_array().expect("@context array");
+    assert_eq!(ctx[0], "https://www.w3.org/ns/activitystreams");
+    assert_eq!(ctx[1]["_misskey_content"], "misskey:_misskey_content");
+    // MFM ソース。
+    assert_eq!(json["_misskey_content"], "hi #sakura");
+    assert_eq!(json["source"]["content"], "hi #sakura");
+    assert_eq!(json["source"]["mediaType"], "text/plain");
+    // tag.Hashtag も DB 保存値がそのまま出る。
+    assert_eq!(json["tag"][0]["type"], "Hashtag");
+    assert_eq!(json["tag"][0]["name"], "#sakura");
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn permalink_renders_local_note_with_escaped_content(pool: PgPool) {
     let actor = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))

@@ -239,6 +239,91 @@ async fn note_insert_is_idempotent_on_ap_id(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// `repo::note::list_by_hashtag` が `tag.Hashtag` を持ち public / unlisted の
+/// note だけを新しい順で返すこと。`followers` / `direct` とタグ不一致は除外。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn list_by_hashtag_filters_visibility_and_tag(pool: PgPool) -> sqlx::Result<()> {
+    let author = repo::actor::insert(&pool, sample_local_actor("alice")).await?;
+    let mk = |suffix: &str,
+              content: &str,
+              visibility: Visibility,
+              tags: serde_json::Value,
+              published_at: chrono::DateTime<chrono::Utc>| {
+        repo::note::NewNote {
+            ap_id: format!("https://example.test/notes/{suffix}"),
+            actor_id: author.id,
+            content: content.into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility,
+            sensitive: false,
+            to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags,
+            is_local: true,
+            url: None,
+            source: None,
+            published_at,
+        }
+    };
+    let hashtag = |name: &str| {
+        serde_json::json!([{
+            "type": "Hashtag",
+            "name": format!("#{name}"),
+        }])
+    };
+    let now = chrono::Utc::now();
+    // 同じタグを持つ public / unlisted note 2 件。`published_at` が同一なので
+    // `id DESC` (= 後から挿入した順) で並ぶ。
+    let _ = repo::note::insert(
+        &pool,
+        mk("a", "a", Visibility::Public, hashtag("sakura"), now),
+    )
+    .await?;
+    let _ = repo::note::insert(
+        &pool,
+        mk("b", "b", Visibility::Unlisted, hashtag("sakura"), now),
+    )
+    .await?;
+    // followers / direct / 別タグ / タグ無しは除外されるべき。
+    let _ = repo::note::insert(
+        &pool,
+        mk("c", "c", Visibility::Followers, hashtag("sakura"), now),
+    )
+    .await?;
+    let _ = repo::note::insert(
+        &pool,
+        mk("d", "d", Visibility::Direct, hashtag("sakura"), now),
+    )
+    .await?;
+    let _ = repo::note::insert(
+        &pool,
+        mk("e", "e", Visibility::Public, hashtag("yuki"), now),
+    )
+    .await?;
+    let _ = repo::note::insert(
+        &pool,
+        mk("f", "f", Visibility::Public, serde_json::json!([]), now),
+    )
+    .await?;
+
+    let rows = repo::note::list_by_hashtag(&pool, "sakura", 50).await?;
+    let contents: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
+    // `published_at` 同一 → `id DESC` (= 後から挿入した unlisted の "b" が先)。
+    assert_eq!(contents, vec!["b", "a"], "got {contents:?}");
+
+    // 未知タグは空。
+    assert!(
+        repo::note::list_by_hashtag(&pool, "nope", 50)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn follow_state_transitions(pool: PgPool) -> sqlx::Result<()> {
     let me = repo::actor::insert(&pool, sample_local_actor("a")).await?;
