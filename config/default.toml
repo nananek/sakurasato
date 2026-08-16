@@ -105,3 +105,9 @@ max_zip_bytes = 104857600  # 100 MiB
 # # pending session の有効期限 (秒)。Misskey 公式クライアントが UUID 生成 →
 # # 認可 URL 表示 → CLI で approve → polling 開始までの現実的所要時間で 10 分。
 # session_ttl_secs = 600
+# # MiAuth token の permission scope を無視する「アナーキー」フラグ (default ON)。
+# # ON なら token が有効であることだけを検査し、read:*/write:* の細かい scope
+# # 検証をスキップする ── お一人様サーバの実態に合わせ、Aria 等の follow が
+# # `write:following` scope の grant 忘れで 401 になる問題を防ぐ。OFF にすると
+# # 従来どおり scope を厳密検証し、不足時は 403 PERMISSION_DENIED を返す。
+# ignore_scope = true

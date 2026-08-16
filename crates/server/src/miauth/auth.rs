@@ -23,19 +23,17 @@
 //!   コアロジック (失敗時は best-effort logging)。
 //! - [`mark_used_async`] — `last_used_at` を best-effort 更新する detached task。
 //! - [`has_scope`] — Token row が指定 scope を持つか判定。
-//! - [`unauthorized`] / [`forbidden`] — error response の組立 helper。
+//! - [`require_scope`] / [`validate_token_for_scope`] — token 解決 + scope 検査を
+//!   1 関数で行う共通ヘルパ。`ignore_scope` (アナーキー) ON なら scope 検査を
+//!   スキップし、OFF なら token 有効 = `Ok` / scope 不足 = [`MiAuthScopeError`]
+//!   (401 vs 403 を区別)。
+//! - [`unauthorized`] / [`forbidden`] — error response の組立 helper (Misskey
+//!   wire の `id` / `kind` 込み)。
 //! - [`parse_bearer_header`] — `Authorization: Bearer ...` の薄いラッパ
 //!   (= 既存 [`crate::token::parse_bearer`] を再 export している実装)。
 //!
-//! #158 では `POST /api/i` 等で本ヘルパを使い、handler 内で:
-//! ```ignore
-//! let raw = body.i.or_else(|| parse_bearer_header(&headers));
-//! let row = validate_token_raw(&state, &raw).await?;
-//! if !has_scope(&row, "read:account") { return forbidden("missing scope"); }
-//! mark_used_async(&state, row.id);
-//! // ... handler 本体
-//! ```
-//! のような flow に組む。
+//! アナーキーフラグ (`config.miauth.ignore_scope`, default ON) の詳細は
+//! [`require_scope`] のドキュメントを参照。
 
 use axum::Json;
 use axum::http::{StatusCode, header};
@@ -43,7 +41,9 @@ use axum::response::{IntoResponse, Response};
 use sakurasato_core::model::MiAuthTokenRow;
 use sakurasato_core::repo;
 use serde_json::json;
+use uuid::Uuid;
 
+use crate::miauth::error::error_kind;
 use crate::state::AppState;
 
 /// 生トークン文字列 → DB lookup。成功なら [`MiAuthTokenRow`] を返す。
@@ -98,22 +98,33 @@ pub fn has_scope(token: &MiAuthTokenRow, required: &str) -> bool {
 /// `MiAuth` scheme を案内する (= Misskey クライアントは Bearer と body `i` の
 /// 両方を試すので、scheme 名は将来の拡張用 informational に近い)。
 ///
-/// body は Misskey wire の **nested** 形 `{"error":{"code","message"}}` で返す
-/// (#197) ── `forbidden` (`PERMISSION_DENIED`) や各 endpoint の 404/500 と shape を
-/// 揃え、クライアントが 401 から `code`/`message` を取り出せるようにする。code は
+/// body は Misskey wire の **nested** 形 `{"error":{"code","message","id","kind"}}`
+/// で返す (#197 / fix/miauth-follow-failure) ── `forbidden` (`PERMISSION_DENIED`)
+/// や各 endpoint の 404/500 と shape を揃え、クライアントが 401 から
+/// `code`/`message` を取り出せるようにする。`id` は misskey-dart の
+/// `MisskeyException.fromJson` が required で読む UUID (= 欠落すると client が
+/// raw `DioException` に倒れてエラー表示が壊れる)。code は
 /// `AUTHENTICATION_FAILED` (= Misskey が無効トークンに返す wire code)。
 pub fn unauthorized(reason: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, r#"Bearer realm="sakurasato""#)],
-        Json(json!({"error": {"code": "AUTHENTICATION_FAILED", "message": reason}})),
+        Json(json!({
+            "error": {
+                "code": "AUTHENTICATION_FAILED",
+                "message": reason,
+                "id": Uuid::new_v4().to_string(),
+                "kind": error_kind(StatusCode::UNAUTHORIZED, "AUTHENTICATION_FAILED"),
+            }
+        })),
     )
         .into_response()
 }
 
 /// 403 レスポンス (= 認証は通ったが scope が足りない)。Misskey 系の慣習で
 /// `error.code = "PERMISSION_DENIED"` 相当を返すと client 側でわかりやすい
-/// (= scope 不足の hint UI が出る) ので body にも入れておく。
+/// (= scope 不足の hint UI が出る) ので body にも入れておく。`kind = "permission"`
+/// は fork の `MisskeyExceptionKind` enum に一致させる。
 pub fn forbidden(reason: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -121,7 +132,9 @@ pub fn forbidden(reason: &str) -> Response {
             "error": {
                 "code": "PERMISSION_DENIED",
                 "message": reason,
-            },
+                "id": Uuid::new_v4().to_string(),
+                "kind": error_kind(StatusCode::FORBIDDEN, "PERMISSION_DENIED"),
+            }
         })),
     )
         .into_response()
@@ -138,37 +151,92 @@ pub fn parse_bearer_header(header_value: &str) -> Option<&str> {
 /// scope 検査までを 1 関数で済ませる共通ヘルパ (= PR #165 round-2 review #1
 /// の duplication 解消)。
 ///
-/// 成功時 (= token 解決 + scope OK) は `Some(MiAuthTokenRow)` を返し、
+/// 成功時 (= token 解決 + scope OK) は `Ok(MiAuthTokenRow)` を返し、
 /// 同時に `last_used_at` の best-effort 更新タスクを spawn する。
 ///
-/// 失敗時は `None` を返す。呼び出し側は `None` を見たら
-/// [`unauthorized`] を返す ── token 未提示 / 不正 / scope 不足 のいずれも
-/// 「401 unauthorized」に倒す。Misskey wire 仕様は 401/403 を厳密には区別
-/// しない (= client は再認可フローに倒すだけ) ので、外側からは 1 種類で扱う。
+/// 失敗時は [`MiAuthScopeError`] で区別する:
 ///
-/// **scope 不足** を明示したいときは戻り値の `MiAuthTokenRow.permissions` を
-/// 別途引いて [`forbidden`] を返す経路が必要だが、本ヘルパは「scope OK」を
-/// boolean に潰す。
+/// - [`MiAuthScopeError::Unauthorized`]: token が無い / 不正 / revoke 済み
+///   (= 401 `AUTHENTICATION_FAILED` に倒す)。
+/// - [`MiAuthScopeError::Forbidden`]: token は有効だが要求 scope が無い
+///   (= 403 `PERMISSION_DENIED` に倒す。**`ignore_scope` (= アナーキー) OFF
+///   のときのみ発生**。ON なら scope 検査自体をスキップする)。
+///
+/// ## アナーキーフラグ (`ignore_scope`)
+///
+/// `config.miauth.ignore_scope` (default ON) が `true` のとき、scope 検査を
+/// **丸ごとスキップ**する ── token が有効 (= hash が DB に存在) なら
+/// `permissions` 列を参照せず全 read/write を許可する。お一人様サーバの実態に
+/// 合わせ、Aria 等の follow が `write:following` scope の grant 忘れで 401 に
+/// なる問題 (= 本 task) を構造的に解消する。**token 有効性の検査は常に残す**
+/// (= 無効 / revoke 済み token の 401 は維持)。
 pub async fn require_scope(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     body_i: Option<&str>,
     required_scope: &str,
-) -> Option<MiAuthTokenRow> {
+) -> Result<MiAuthTokenRow, MiAuthScopeError> {
     let raw = match body_i.filter(|s| !s.is_empty()) {
         Some(s) => s.to_string(),
         None => headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_bearer_header)
-            .map(str::to_string)?,
+            .map(str::to_string)
+            .ok_or(MiAuthScopeError::Unauthorized)?,
     };
-    let token_row = validate_token_raw(state, &raw).await?;
+    validate_token_for_scope(state, &raw, required_scope).await
+}
+
+/// `require_scope` のうち「raw token 確定後」の部分。
+///
+/// token 有効性 (= hash lookup) は常に検査し、`ignore_scope` (アナーキー) ON
+/// なら scope 検査をスキップする。i.rs の `handle` / streaming.rs のように
+/// body `i` / query `i` の取り出し方が `require_scope` と異なる経路からも
+/// 同じ検証ロジックを共有できるよう切り出した。
+pub async fn validate_token_for_scope(
+    state: &AppState,
+    raw: &str,
+    required_scope: &str,
+) -> Result<MiAuthTokenRow, MiAuthScopeError> {
+    // token 有効性はアナーキーでも常に検査 (= 無効 / revoke 済みは 401)。
+    let Some(token_row) = validate_token_raw(state, raw).await else {
+        return Err(MiAuthScopeError::Unauthorized);
+    };
+    if state
+        .config()
+        .miauth
+        .as_ref()
+        .is_some_and(|m| m.ignore_scope)
+    {
+        mark_used_async(state, token_row.id);
+        return Ok(token_row);
+    }
     if !has_scope(&token_row, required_scope) {
-        return None;
+        return Err(MiAuthScopeError::Forbidden);
     }
     mark_used_async(state, token_row.id);
-    Some(token_row)
+    Ok(token_row)
+}
+
+/// [`require_scope`] / [`validate_token_for_scope`] の失敗種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiAuthScopeError {
+    /// token が無い / 不正 / revoke 済み → 401 `AUTHENTICATION_FAILED`。
+    Unauthorized,
+    /// token は有効だが要求 scope が無い → 403 `PERMISSION_DENIED`
+    /// (= `ignore_scope` OFF / 厳密モード時のみ到達)。
+    Forbidden,
+}
+
+impl MiAuthScopeError {
+    /// Misskey wire のエラーレスポンスへ変換する。
+    pub fn into_response(self) -> Response {
+        match self {
+            Self::Unauthorized => unauthorized("invalid or revoked token"),
+            Self::Forbidden => forbidden("missing required scope"),
+        }
+    }
 }
 
 #[cfg(test)]

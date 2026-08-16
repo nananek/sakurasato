@@ -86,11 +86,11 @@ pub async fn list(
     body: Option<Json<NotificationsBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(recipient) = resolve_self_actor_id(&state).await else {
         return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -154,11 +154,11 @@ pub async fn mark_all_read(
     body: Option<Json<MarkAllBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let Some(_token) =
-        auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await
-    else {
-        return auth::unauthorized("invalid or revoked token");
-    };
+    let _token =
+        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let Some(recipient) = resolve_self_actor_id(&state).await else {
         return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,

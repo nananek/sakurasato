@@ -85,6 +85,7 @@ mod common {
             miauth: Some(MiAuthConfig {
                 listen: "unix:/tmp/miauth.sock".into(),
                 session_ttl_secs: 600,
+                ignore_scope: false,
             }),
         }
     }

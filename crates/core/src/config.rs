@@ -569,10 +569,28 @@ pub struct MiAuthConfig {
     /// の現実的所要時間)。
     #[serde(default = "default_miauth_session_ttl_secs")]
     pub session_ttl_secs: u64,
+    /// `MiAuth` token の `permission` scope を **無視** する「アナーキー」フラグ
+    /// (default `true` = ON)。
+    ///
+    /// お一人様専用サーバの実態に合わせ、token が有効 (= hash が DB に存在)
+    /// なら `permissions` 列を参照せず全 read/write endpoint を許可する。
+    /// Misskey クライアント (= Aria / Milktea) の follow が `write:following`
+    /// scope の grant 忘れで 401 になる問題を構造的に解消する ── 管理者が
+    /// 40+ scope の CSV を approve 時に正確にコピペする運用が不要になる。
+    ///
+    /// OFF にすると従来どおり scope を厳密検証し、不足時は `403
+    /// PERMISSION_DENIED` (= [`crate::miauth::auth::forbidden`] 相当) を返す。
+    /// トークンの `permissions` は ON/OFF に関わらず引き続き保管・表示される。
+    #[serde(default = "default_miauth_ignore_scope")]
+    pub ignore_scope: bool,
 }
 
 fn default_miauth_session_ttl_secs() -> u64 {
     600
+}
+
+fn default_miauth_ignore_scope() -> bool {
+    true
 }
 
 fn default_max_note_text_length() -> u32 {
@@ -1089,6 +1107,42 @@ max_pixels = 33554432
                 miauth.listener().unwrap(),
                 Listen::Tcp("127.0.0.1:19000".into())
             );
+            Ok(())
+        });
+    }
+
+    /// `ignore_scope` は書かなくても **default ON** に倒れる (お一人様実態に
+    /// 合わせたアナーキーフラグ。Aria の follow が scope 不足で 401 になる
+    /// 問題を既定で防ぐ)。
+    #[test]
+    fn miauth_ignore_scope_defaults_to_true() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env(
+                "SAKURASATO_MIAUTH__LISTEN",
+                "unix:/run/sakurasato/miauth.sock",
+            );
+            let cfg = Config::load(&path, None).unwrap();
+            let miauth = cfg.miauth.expect("miauth should be present");
+            assert!(
+                miauth.ignore_scope,
+                "ignore_scope must default to true (anarchy)"
+            );
+            Ok(())
+        });
+    }
+
+    /// env `SAKURASATO_MIAUTH__IGNORE_SCOPE=false` で OFF に倒せる (= 厳密
+    /// scope 検証へ戻す)。
+    #[test]
+    fn miauth_ignore_scope_overridable_via_env() {
+        Jail::expect_with(|jail| {
+            let path = write_default(jail);
+            jail.set_env("SAKURASATO_MIAUTH__LISTEN", "tcp://127.0.0.1:19000");
+            jail.set_env("SAKURASATO_MIAUTH__IGNORE_SCOPE", "false");
+            let cfg = Config::load(&path, None).unwrap();
+            let miauth = cfg.miauth.expect("miauth should be present");
+            assert!(!miauth.ignore_scope, "ignore_scope must be off via env");
             Ok(())
         });
     }
