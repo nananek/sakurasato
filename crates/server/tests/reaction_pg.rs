@@ -708,3 +708,136 @@ async fn inbound_reaction_on_remote_note_is_recorded(pool: PgPool) {
         notifs.len(),
     );
 }
+
+/// 同一 Like (= 同じ `ap_id`) が `/inbox` に 2 回投函される再配送で、reaction 行は
+/// 1 つ・count は 1・**in-app 通知も 1 件のみ** (= 通知フィードの二重エントリを
+/// 防ぐ硬化後の挙動)。dispatch は `insert_or_get` の `is_new` flag で再配送を
+/// 検出し、通知 / streaming をスキップする。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn inbound_reaction_redelivery_does_not_duplicate_notification(pool: PgPool) {
+    let (_, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(&pool, remote_actor("remote.test", "bob", &remote_pub))
+        .await
+        .unwrap();
+    let (note_id, note_ap_id) = seed_local_note(&pool, local.id).await;
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let activity_id = "https://remote.test/users/bob/activities/like-redeliver".to_string();
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": activity_id,
+        "type": "Like",
+        "actor": remote.ap_id,
+        "object": note_ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+
+    for _ in 0..2 {
+        let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    // reaction 行は 1 つ (= ap_id UNIQUE の冪等)。
+    let row = repo::reaction::get_by_ap_id(&pool, &activity_id)
+        .await
+        .unwrap()
+        .expect("reaction row should exist");
+    assert_eq!(row.note_id, note_id);
+
+    // count も 1 (= 二重カウントしない)。
+    let counts = repo::reaction::count_by_note(&pool, note_id).await.unwrap();
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].content, "");
+    assert_eq!(counts[0].count, 1);
+
+    // in-app 通知は 1 件のみ (= 再配送で通知フィードが二重にならない)。
+    let notifs = repo::notification::list(&pool, local.id, 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        notifs.len(),
+        1,
+        "同一 Like の再配送でも in-app 通知は 1 件のまま (got {})",
+        notifs.len(),
+    );
+    assert_eq!(notifs[0].event_type, "reaction");
+    assert_eq!(notifs[0].notifier_actor_id, Some(remote.id));
+    assert_eq!(notifs[0].note_id, Some(note_id));
+}
+
+/// 別 Like ID だが同じ natural key (actor / note / content) の Like が 2 回届く
+/// ケース (= 同じ人・同じ note・同じ絵文字を別 Activity ID で押し付けてきた) も
+/// dispatch レベルで 1 行に潰れる。2 つ目は既存行を返すので通知も発火しない。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn inbound_reaction_different_id_same_natural_key_dedupes(pool: PgPool) {
+    let (_, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(&pool, remote_actor("remote.test", "bob", &remote_pub))
+        .await
+        .unwrap();
+    let (note_id, note_ap_id) = seed_local_note(&pool, local.id).await;
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+    let keyid = format!("{}#main-key", remote.ap_id);
+
+    for activity_id in [
+        "https://remote.test/users/bob/activities/like-nk-a",
+        "https://remote.test/users/bob/activities/like-nk-b",
+    ] {
+        let body = serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": activity_id,
+            "type": "Like",
+            "actor": remote.ap_id,
+            "object": note_ap_id,
+        })
+        .to_string();
+        let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    // 1 つ目の ap_id の行だけ存在し、2 つ目は natural key 衝突で作られない。
+    let first =
+        repo::reaction::get_by_ap_id(&pool, "https://remote.test/users/bob/activities/like-nk-a")
+            .await
+            .unwrap()
+            .expect("first reaction row should exist");
+    let second =
+        repo::reaction::get_by_ap_id(&pool, "https://remote.test/users/bob/activities/like-nk-b")
+            .await
+            .unwrap();
+    assert!(
+        second.is_none(),
+        "natural key dedup で 2 つ目の ap_id 行は存在しない"
+    );
+
+    // count も 1。
+    let counts = repo::reaction::count_by_note(&pool, note_id).await.unwrap();
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].count, 1);
+
+    // in-app 通知も 1 件 (2 つ目は既存行 → 通知を発火しない)。
+    let notifs = repo::notification::list(&pool, local.id, 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        notifs.len(),
+        1,
+        "別 ID でも natural key 衝突の再配送は通知を増やさない (got {})",
+        notifs.len(),
+    );
+    assert_eq!(first.note_id, note_id);
+}
