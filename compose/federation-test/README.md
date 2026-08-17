@@ -34,23 +34,36 @@ Mastodon / Misskey / Fedibird の公式 actor JSON は `assertionMethod` を
 `mastodon` を `misskey / pleroma / mitra / fedibird / nekonoverse` の
 いずれかに差し替えて使う。
 
-### Programmatic (pytest) — Mastodon のみ (M12 / Issue #56)
+### Programmatic (pytest)
 
-手動 `setup-*.sh` の代わりに pytest で Pass/Fail を出すモード:
+手動 `setup-*.sh` の代わりに pytest で Pass/Fail を出すモード。
+`mastodon` / `nekonoverse` / `nekonoverse-2sks` / `misskey` / `pleroma` /
+`mitra` / `fedibird` の全 impl で対応済み (M12 Issue #56 で mastodon 導入、
+後続 PR で残りを同パターンで追加):
 
 ```bash
-./scripts/federation-test/pytest.sh mastodon
-# ↑ compose --profile pytest で全サービスを立ち上げ、
-#   `tests/federation/test_mastodon.py` を回す
+./scripts/federation-test/pytest.sh mastodon   # test_mastodon.py
+./scripts/federation-test/pytest.sh pleroma    # test_pleroma.py
+./scripts/federation-test/pytest.sh mitra      # test_mitra.py
+./scripts/federation-test/pytest.sh fedibird   # test_fedibird.py
+# ↑ compose --profile pytest で全サービスを立ち上げ、対応する
+#   tests/federation/test_<impl>.py を回す
 # DEBUG_KEEP=1 を付けると終了後もコンテナを残す (= ログ漁り用)
 ```
 
-CI では `.github/workflows/federation-test.yml` が nightly cron +
-`workflow_dispatch` で同じ stack を回す (required check ではない、
-外部 image の更新で揺らぐため)。
+CI では `.github/workflows/federation-test*.yml` (impl ごとに 1 ファイル) が
+nightly cron + `workflow_dispatch` + main 向け PR で同じ stack を回す
+(develop 向け PR では発火しない、required check は main PR のみ)。
 
-後続 PR で Misskey / Pleroma / Mitra / Fedibird / Nekonoverse 用の
-`test_misskey.py` 等を同じパターンで追加する予定。
+- `pleroma` は entrypoint 側で bob アカウントを自動作成し、pytest 側が
+  OAuth password grant (`/api/v1/apps` → `/oauth/token`) で token を取得する
+  (Mitra と同じ経路)。
+- `mitra` の中核テストは `TestLockedFollow` (鍵アカ round-trip)。実機調査
+  (`tmp/plan-follow-request-accept-mitra.md`) で確認済みの cavage RSA-SHA256
+  経路を固定しており、RFC 9421 + Ed25519 の受信側検証は Mitra 非依存の
+  `crates/server/src/inbox_signature_tests.rs` で別途カバーしている。
+- `fedibird` は Mastodon フォークなので `MastodonClient` を base_url/domain
+  だけ差し替えて再利用している。
 
 ## 検証はコンテナの中から
 
@@ -123,11 +136,15 @@ OK。
 - 各 impl から sakurasato `/inbox` に Follow POST → cavage RSA 署名検証 →
   Follow handler 起動 → Accept キュー投入 → delivery worker が impl inbox に
   POST → 受理 → impl 側に Follow 関係成立
-- 対応状況 (2026-05-30 時点):
+- 対応状況 (2026-05-30 時点、M3b フォロー分は以降のマイルストーンで解消済み):
   - **mastodon / mitra / fedibird / misskey**: 完全相互フォロー成立
   - **pleroma**: cavage RSA 署名検証で 401 (M3b フォロー対象)
   - **nekonoverse**: cavage に Ed25519 keyId を載せる流派で sakurasato が
     拒否 (M3b フォロー対象)
+- **pytest 自動化状況**: `mastodon` / `nekonoverse` / `nekonoverse-2sks` /
+  `misskey` / `pleroma` / `mitra` / `fedibird` の全 impl が
+  `scripts/federation-test/pytest.sh <impl>` + 対応 CI workflow でカバー
+  済み (上記「Programmatic (pytest)」節参照)。
 
 ### M9: Move (引っ越し) の手動検証
 

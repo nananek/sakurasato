@@ -5,6 +5,9 @@
 #
 # 起動: scripts/federation-test/up.sh pleroma
 # 停止: scripts/federation-test/down.sh pleroma
+#
+# pytest 自動テスト (federation-test-pleroma.yml / pytest.sh 経由):
+#   ./scripts/federation-test/pytest.sh pleroma
 
 services:
   certs:
@@ -61,16 +64,48 @@ services:
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
-      # 既定の /run/sakurasato は rootless container では書けない
-      # (M4 PR1 で local API が入った後の compose 漏れ)。federation-test で
-      # TUI は使わないので /tmp 配下に逃がす。
-      SAKURASATO_SERVER__LOCAL_API_SOCKET: /tmp/sakurasato-local.sock
+      # distroless の `/home/nonroot` は uid 65532 が 0o700 で所有しており、
+      # 名前付き volume の初回マウントでもこの ownership/perms がコピー
+      # される (= pytest が同 uid で覗ける)。mastodon compose と同じ経路に
+      # 揃える。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       sakurasato-init:
         condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
     volumes:
       - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+      - media_sock:/run/sakurasato
+    networks:
+      - pleroma-fed
+
+  # `follow` CLI / `POST /api/v1/follow` の WebFinger 解決が media-proxy 経由
+  # (M10 PR #51) のため、prefollow-bob / TestFollow (SK→Pleroma 方向) の
+  # 成立に必要 (mastodon compose と同じ構成)。
+  sakurasato-media-proxy:
+    build:
+      context: ..
+      dockerfile: docker/media-proxy.Dockerfile
+    image: sakurasato/media-proxy:dev
+    environment:
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    healthcheck:
+      test: ["CMD", "/app/sakurasato-media-proxy", "--healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
     networks:
       - pleroma-fed
 
@@ -116,6 +151,12 @@ services:
       DB_USER: pleroma
       DB_PASS: testpass
       DB_NAME: pleroma
+      # pleroma-entrypoint.sh がこの資格情報で bob アカウントを作成する。
+      # pytest 側は OAuth password grant (`/api/v1/apps` → `/oauth/token`)
+      # でこの資格情報から token を取得する (§2.A、Mitra と同じ経路)。
+      BOB_USERNAME: bob
+      BOB_EMAIL: bob@pleroma
+      BOB_PASSWORD: Password1234!
     volumes:
       # NOTE: :ro 不可。explodingcamera/pleroma image の起動スクリプトが
       # `chown` を試みるため、read-only マウントだと exit 1 で死ぬ。
@@ -143,8 +184,100 @@ services:
         aliases:
           - pleroma
 
+  # ── pytest プロファイル ────────────────────────────────────
+  # `up.sh pleroma` (= 手動 e2e) では起動しない。pytest 自動化時のみ:
+  #   ./scripts/federation-test/pytest.sh pleroma
+
+  sakurasato-token-issuer:
+    image: sakurasato/server:dev
+    command: ["token", "issue", "--name", "pytest", "--out", "/home/nonroot/pytest.token"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+    networks:
+      - pleroma-fed
+    profiles: [pytest]
+    restart: "no"
+
+  # sakurasato 側から bob@pleroma を follow しておく (mastodon compose と
+  # 同じパターン)。WebFinger は media-proxy 経由。
+  sakurasato-prefollow-bob:
+    image: sakurasato/server:dev
+    command: ["follow", "bob@pleroma"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
+      pleroma-app:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    networks:
+      - pleroma-fed
+    profiles: [pytest]
+    restart: "no"
+
+  pytest:
+    build:
+      context: ../tests/federation
+      dockerfile: Dockerfile
+    image: sakurasato/federation-pytest:dev
+    command: ["pytest", "-xvs", "--tb=short", "test_pleroma.py"]
+    environment:
+      SAKURASATO_BASE_URL: https://sakurasato
+      SAKURASATO_DOMAIN: sakurasato
+      SAKURASATO_LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_TOKEN_FILE: /home/nonroot/pytest.token
+      MASTODON_ENABLED: "0"
+      PLEROMA_ENABLED: "1"
+      PLEROMA_BASE_URL: https://pleroma
+      PLEROMA_DOMAIN: pleroma
+      PLEROMA_USERNAME: bob
+      PLEROMA_PASSWORD: Password1234!
+      SSL_CERT_FILE: /certs/ca.crt
+      REQUESTS_CA_BUNDLE: /certs/ca.crt
+    user: "65532:65532"
+    depends_on:
+      sakurasato-server:
+        condition: service_started
+      sakurasato-token-issuer:
+        condition: service_completed_successfully
+      sakurasato-prefollow-bob:
+        condition: service_completed_successfully
+      pleroma-app:
+        condition: service_started
+      nginx-pl:
+        condition: service_started
+      nginx-sks:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot:ro
+    networks:
+      - pleroma-fed
+    profiles: [pytest]
+    restart: "no"
+
 volumes:
   certs:
+  sakurasato_local_api:
+  media_sock:
 
 networks:
   pleroma-fed:

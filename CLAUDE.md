@@ -325,6 +325,9 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 - **Federation Test (Nekonoverse / tmux TUI)** (`federation-test-nekonoverse.yml`): tmux pty + 実 sakurasato-tui binary で Sakurasato ↔ Nekonoverse を駆動。nightly cron (UTC 19:30) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
 - **Federation Test (Nekonoverse / 2-sks Move A)** (`federation-test-nekonoverse-2sks.yml`): 2-sks 構成で Issue #140 PR2 (Scenario A = sks-old → sks-new Move) を駆動。alias-add x 2 + bob follow + move-out CLI 1-shot + Move propagation 観測。nightly cron (UTC 19:45) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
 - **Federation Test (Misskey / MiAuth)** (`federation-test-misskey.yml`): pytest + httpx + misskey.py (= YuzuRyo61, MIT) で Sakurasato ↔ Misskey を駆動。`test_misskey_smoke.py` (連合) + `test_miauth_{flow,read,write}_parity.py` (MiAuth wire-compat parity) を流す。nightly cron (UTC 20:00) / `workflow_dispatch` / **`main` 向け PR** で発火。Misskey 本体は AGPL-3.0 だが未改変 image の CI 起動は §13 (network copyleft) を起動しない (= [`agpl-discipline-miauth`](DEPLOYMENT.md#6-miauth-経路-mobile-misskey-互換))。
+- **Federation Test (Pleroma)** (`federation-test-pleroma.yml`): pytest + httpx で Sakurasato ↔ Pleroma (`ghcr.io/explodingcamera/pleroma:stable`) を駆動。`test_pleroma.py`。bob アカウントは entrypoint 側で自動作成、token は pytest 側の OAuth password grant で取得。nightly cron (UTC 20:15) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
+- **Federation Test (Mitra)** (`federation-test-mitra.yml`): pytest + httpx で Sakurasato ↔ Mitra (`bleakfuture0/mitra:latest`, FEP-521a Multikey 対応) を駆動。`test_mitra.py`、中核は鍵アカ Follow round-trip (`tmp/plan-follow-request-accept-mitra.md` の実機調査の再現)。実機で確認済みの cavage RSA-SHA256 経路を固定し、RFC 9421 + Ed25519 の受信側検証は Mitra 非依存に `inbox_signature_tests.rs` 側でカバーする。nightly cron (UTC 20:30) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
+- **Federation Test (Fedibird)** (`federation-test-fedibird.yml`): pytest + httpx で Sakurasato ↔ Fedibird (Mastodon フォーク、inline build) を駆動。`test_fedibird.py`、`MastodonClient` を base_url/domain 差し替えで再利用。初回ビルド 30 分強のため timeout 75 分。nightly cron (UTC 20:45) / `workflow_dispatch` / **`main` 向け PR** で発火。develop PR では発火しない。
 - **Dependabot** (`dependabot.yml`): `cargo`/`github-actions`/`docker` を週次更新。
 - **アラート**: Dependabot alerts / 自動セキュリティ修正 / secret scanning + push protection 有効化済み。
 
@@ -339,6 +342,9 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 | `Nekonoverse (tmux TUI)` | `federation-test-nekonoverse.yml` | 実 Nekonoverse との TUI 連合 |
 | `Nekonoverse (2-sks Move A)` | `federation-test-nekonoverse-2sks.yml` | sks-old → sks-new Move を 2-sks 構成で観測 (#140 PR2) |
 | `Misskey + MiAuth (programmatic)` | `federation-test-misskey.yml` | 実 Misskey との連合 + MiAuth wire-compat parity |
+| `Pleroma (programmatic)` | `federation-test-pleroma.yml` | 実 Pleroma との連合疎通 |
+| `Mitra (programmatic)` | `federation-test-mitra.yml` | 実 Mitra との連合疎通 (鍵アカ Follow round-trip 中心) |
+| `Fedibird (programmatic)` | `federation-test-fedibird.yml` | 実 Fedibird との連合疎通 |
 | `Build server` / `Build media-proxy` / `Build versitygw` / `Build tui` | `release-validation.yml` (matrix) | 4 Dockerfile が個別に build できる |
 | `Stack smoke (compose up + nodeinfo probe)` | `release-validation.yml` | compose stack が起動して well-known が応答 |
 

@@ -10,6 +10,9 @@
 #   # 起動 / 停止
 #   scripts/federation-test/up.sh fedibird
 #   scripts/federation-test/down.sh fedibird
+#
+#   # pytest 自動テスト (federation-test-fedibird.yml / pytest.sh 経由):
+#   ./scripts/federation-test/pytest.sh fedibird
 
 services:
   certs:
@@ -66,16 +69,49 @@ services:
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
-      # 既定の /run/sakurasato は rootless container では書けない
-      # (M4 PR1 で local API が入った後の compose 漏れ)。federation-test で
-      # TUI は使わないので /tmp 配下に逃がす。
-      SAKURASATO_SERVER__LOCAL_API_SOCKET: /tmp/sakurasato-local.sock
+      # distroless の `/home/nonroot` は uid 65532 が 0o700 で所有しており、
+      # 名前付き volume の初回マウントでもこの ownership/perms がコピー
+      # される (= pytest が同 uid で覗ける)。mastodon compose と同じ経路に
+      # 揃える (旧 `/tmp/sakurasato-local.sock` は pytest の UDS 共有と噛み
+      # 合わないため置き換え)。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       sakurasato-init:
         condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
     volumes:
       - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+      - media_sock:/run/sakurasato
+    networks:
+      - fedibird-fed
+
+  # `follow` CLI / `POST /api/v1/follow` の WebFinger 解決が media-proxy 経由
+  # (M10 PR #51) のため、prefollow-bob / TestFollow (SK→Fedibird 方向) の
+  # 成立に必要 (mastodon compose と同じ構成)。
+  sakurasato-media-proxy:
+    build:
+      context: ..
+      dockerfile: docker/media-proxy.Dockerfile
+    image: sakurasato/media-proxy:dev
+    environment:
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    healthcheck:
+      test: ["CMD", "/app/sakurasato-media-proxy", "--healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
     networks:
       - fedibird-fed
 
@@ -279,10 +315,107 @@ services:
         aliases:
           - fedibird
 
+  # ── pytest プロファイル ────────────────────────────────────
+  # `up.sh fedibird` (= 手動 e2e) では起動しない。pytest 自動化時のみ:
+  #   ./scripts/federation-test/pytest.sh fedibird
+
+  sakurasato-token-issuer:
+    image: sakurasato/server:dev
+    command: ["token", "issue", "--name", "pytest", "--out", "/home/nonroot/pytest.token"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+    networks:
+      - fedibird-fed
+    profiles: [pytest]
+    restart: "no"
+
+  # sakurasato 側から bob@fedibird を follow しておく (mastodon compose と
+  # 同じパターン)。WebFinger は media-proxy 経由。
+  sakurasato-prefollow-bob:
+    image: sakurasato/server:dev
+    command: ["follow", "bob@fedibird"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
+      fedibird-web:
+        condition: service_healthy
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    networks:
+      - fedibird-fed
+    profiles: [pytest]
+    restart: "no"
+
+  pytest:
+    build:
+      context: ../tests/federation
+      dockerfile: Dockerfile
+    image: sakurasato/federation-pytest:dev
+    command: ["pytest", "-xvs", "--tb=short", "test_fedibird.py"]
+    environment:
+      SAKURASATO_BASE_URL: https://sakurasato
+      SAKURASATO_DOMAIN: sakurasato
+      SAKURASATO_LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_TOKEN_FILE: /home/nonroot/pytest.token
+      # このスタックには Mastodon が居ないので wait_for_instances をスキップ
+      # させる (conftest.py の MASTODON_ENABLED ゲート)。
+      MASTODON_ENABLED: "0"
+      FEDIBIRD_ENABLED: "1"
+      FEDIBIRD_BASE_URL: https://fedibird
+      FEDIBIRD_DOMAIN: fedibird
+      FEDIBIRD_USERNAME: bob
+      FEDIBIRD_TOKEN_FILE: /fedibird-tokens/bob_token.txt
+      SSL_CERT_FILE: /certs/ca.crt
+      REQUESTS_CA_BUNDLE: /certs/ca.crt
+    user: "65532:65532"
+    depends_on:
+      sakurasato-server:
+        condition: service_started
+      sakurasato-token-issuer:
+        condition: service_completed_successfully
+      sakurasato-prefollow-bob:
+        condition: service_completed_successfully
+      fedibird-web:
+        condition: service_healthy
+      fedibird-sidekiq:
+        condition: service_started
+      nginx-fb:
+        condition: service_started
+      nginx-sks:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot:ro
+      - fedibird_tokens:/fedibird-tokens:ro
+    networks:
+      - fedibird-fed
+    profiles: [pytest]
+    restart: "no"
+
 volumes:
   certs:
   fedibird_system:
   fedibird_tokens:
+  sakurasato_local_api:
+  media_sock:
 
 networks:
   fedibird-fed:

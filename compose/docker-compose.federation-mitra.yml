@@ -5,6 +5,17 @@
 #
 # 起動: scripts/federation-test/up.sh mitra
 # 停止: scripts/federation-test/down.sh mitra
+#
+# pytest 自動テスト (federation-test-mitra.yml / pytest.sh 経由):
+#   ./scripts/federation-test/pytest.sh mitra
+#
+# 実機調査 (tmp/plan-follow-request-accept-mitra.md) により、Sakurasato →
+# Mitra 方向の受信 Follow は cavage RSA-SHA256 署名で成立することを確認済み
+# (Mitra の署名検証は cavage/RFC9421 両対応、Sakurasato → Mitra は cavage の
+# みを使う)。README の「RFC 9421 + Ed25519」は Mitra の対応能力の話であり、
+# 本 pytest スイートの前提ではない (RFC9421+Ed25519 の受信側検証は
+# `crates/server/tests/dispatch_pg.rs` / `inbox_signature_tests.rs` で
+# Mitra 非依存にカバーする)。
 
 services:
   certs:
@@ -61,16 +72,48 @@ services:
       SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
       SAKURASATO_SERVER__HOST: sakurasato
       SAKURASATO_SERVER__USER: me
-      # 既定の /run/sakurasato は rootless container では書けない
-      # (M4 PR1 で local API が入った後の compose 漏れ)。federation-test で
-      # TUI は使わないので /tmp 配下に逃がす。
-      SAKURASATO_SERVER__LOCAL_API_SOCKET: /tmp/sakurasato-local.sock
+      # distroless の `/home/nonroot` は uid 65532 が 0o700 で所有しており、
+      # 名前付き volume の初回マウントでもこの ownership/perms がコピー
+      # される (= pytest が同 uid で覗ける)。mastodon compose と同じ経路に
+      # 揃える。
+      SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
       SSL_CERT_FILE: /certs/ca.crt
     depends_on:
       sakurasato-init:
         condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
     volumes:
       - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+      - media_sock:/run/sakurasato
+    networks:
+      - mitra-fed
+
+  # `POST /api/v1/follow` (local API) の WebFinger 解決が media-proxy 経由
+  # (M10 PR #51) のため、TestFollow の SK→Mitra 方向に必要 (mastodon compose
+  # と同じ構成)。
+  sakurasato-media-proxy:
+    build:
+      context: ..
+      dockerfile: docker/media-proxy.Dockerfile
+    image: sakurasato/media-proxy:dev
+    environment:
+      SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - media_sock:/run/sakurasato
+    healthcheck:
+      test: ["CMD", "/app/sakurasato-media-proxy", "--healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
     networks:
       - mitra-fed
 
@@ -135,9 +178,80 @@ services:
         aliases:
           - mitra
 
+  # ── pytest プロファイル ────────────────────────────────────
+  # `up.sh mitra` (= 手動 e2e) では起動しない。pytest 自動化時のみ:
+  #   ./scripts/federation-test/pytest.sh mitra
+  #
+  # `sakurasato-prefollow-bob` 相当の one-shot コンテナは置かない ──
+  # §1.3 実機調査のフローは Mitra 側の bob から Sakurasato への follow が
+  # 起点であり、逆方向 (SK→Mitra) は `TestFollow` テスト本体が
+  # `sakurasato.follow("bob@mitra")` (local API) を直接叩いて検証する。
+
+  sakurasato-token-issuer:
+    image: sakurasato/server:dev
+    command: ["token", "issue", "--name", "pytest", "--out", "/home/nonroot/pytest.token"]
+    environment:
+      SAKURASATO_DATABASE__URL: postgres://sakurasato:testpass@postgres-sks:5432/sakurasato
+      SAKURASATO_SERVER__HOST: sakurasato
+      SAKURASATO_SERVER__USER: me
+      SSL_CERT_FILE: /certs/ca.crt
+    depends_on:
+      sakurasato-init:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot
+    networks:
+      - mitra-fed
+    profiles: [pytest]
+    restart: "no"
+
+  pytest:
+    build:
+      context: ../tests/federation
+      dockerfile: Dockerfile
+    image: sakurasato/federation-pytest:dev
+    command: ["pytest", "-xvs", "--tb=short", "test_mitra.py"]
+    environment:
+      SAKURASATO_BASE_URL: https://sakurasato
+      SAKURASATO_DOMAIN: sakurasato
+      SAKURASATO_LOCAL_API_SOCKET: /home/nonroot/local.sock
+      SAKURASATO_TOKEN_FILE: /home/nonroot/pytest.token
+      MASTODON_ENABLED: "0"
+      MITRA_ENABLED: "1"
+      MITRA_BASE_URL: https://mitra
+      MITRA_DOMAIN: mitra
+      MITRA_USERNAME: bob
+      MITRA_PASSWORD: password123
+      SSL_CERT_FILE: /certs/ca.crt
+      REQUESTS_CA_BUNDLE: /certs/ca.crt
+    user: "65532:65532"
+    depends_on:
+      sakurasato-server:
+        condition: service_started
+      sakurasato-token-issuer:
+        condition: service_completed_successfully
+      sakurasato-media-proxy:
+        condition: service_healthy
+      mitra-app:
+        condition: service_started
+      nginx-mitra:
+        condition: service_started
+      nginx-sks:
+        condition: service_started
+    volumes:
+      - certs:/certs:ro
+      - sakurasato_local_api:/home/nonroot:ro
+    networks:
+      - mitra-fed
+    profiles: [pytest]
+    restart: "no"
+
 volumes:
   certs:
   mitra-storage:
+  sakurasato_local_api:
+  media_sock:
 
 networks:
   mitra-fed:
