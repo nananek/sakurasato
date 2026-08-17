@@ -168,6 +168,16 @@ services:
         condition: service_healthy
       certs:
         condition: service_completed_successfully
+    # pleroma-entrypoint.sh は start.sh (HTTP server) をバックグラウンド起動
+    # した「後」に bob アカウントを作成するため、HTTP 疎通確認だけでは bob
+    # 未作成のまま healthy 扱いになってしまう。entrypoint がアカウント作成
+    # 完了後に書くマーカーファイルの存在を見る。
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/sakurasato-bob-ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
     networks:
       - pleroma-fed
 
@@ -224,7 +234,7 @@ services:
       sakurasato-media-proxy:
         condition: service_healthy
       pleroma-app:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - certs:/certs:ro
       - media_sock:/run/sakurasato
@@ -261,7 +271,7 @@ services:
       sakurasato-prefollow-bob:
         condition: service_completed_successfully
       pleroma-app:
-        condition: service_started
+        condition: service_healthy
       nginx-pl:
         condition: service_started
       nginx-sks:

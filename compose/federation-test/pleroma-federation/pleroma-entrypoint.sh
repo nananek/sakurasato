@@ -78,4 +78,13 @@ else
   exit 1
 fi
 
+# compose の healthcheck (pleroma-app) が見るマーカー。HTTP は bob 作成より
+# 先に応答してしまう (start.sh を先にバックグラウンド起動しているため) ので、
+# `/api/v1/instance` 疎通だけでは pytest 側の `sakurasato-prefollow-bob` /
+# `pytest` サービスが bob 未作成のまま先行してしまうレースがある。bob 作成が
+# 完了した (= このスクリプトのここまでの処理が終わった) 時点でマーカーを書き、
+# healthcheck 側はこのファイルの存在だけを見る。
+touch /tmp/sakurasato-bob-ready
+echo "bob account setup complete; wrote readiness marker"
+
 wait "$PLEROMA_PID"
