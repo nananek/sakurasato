@@ -133,7 +133,7 @@ fn build_remote_actor(rsa_pub_pem: &str, ed25519_pub_pem: Option<&str>) -> NewAc
 /// `crates/server/tests/dispatch_pg.rs::local_actor` と同じ形 ── 送信側の
 /// outbound 署名は M3b-2 時点で cavage RSA-SHA256 のみのため、local actor は
 /// RSA 鍵のみ持つ (`priv_pem` はテストでは実際に署名計算に使わないプレース
-/// ホルダで良い、dispatch_pg.rs と同じ慣習)。
+/// ホルダで良い、`dispatch_pg.rs` と同じ慣習)。
 fn local_actor(pub_pem: &str, priv_pem: &str) -> NewActor {
     let ap_id = format!("https://{HOST}/users/{LOCAL_USER}");
     NewActor {
@@ -985,7 +985,7 @@ async fn rfc9421_multi_label_all_invalid_returns_401(pool: PgPool) {
 // (plan §4 item 3 の「重複セットアップコストが低い方に寄せてよい」判断)。
 // ===========================================================================
 
-/// cavage 版 `follow_request_enqueues_accept` (dispatch_pg.rs) の
+/// cavage 版 `follow_request_enqueues_accept` (`dispatch_pg.rs`) の
 /// RFC9421+Ed25519 移植。新規 Follow → 即 accepted (お一人様 + 自動承認) →
 /// Accept が `delivery_queue` に積まれることを、DB 直 assert で検証する
 /// (plan §4 の「Follow 実体検証」要件も兼ねる)。
@@ -1057,7 +1057,7 @@ async fn rfc9421_ed25519_follow_is_accepted_and_state_transitions(pool: PgPool) 
     assert_eq!(object["object"], local.ap_id);
 }
 
-/// cavage 版 `duplicate_follow_is_idempotent` (dispatch_pg.rs) の
+/// cavage 版 `duplicate_follow_is_idempotent` (`dispatch_pg.rs`) の
 /// RFC9421+Ed25519 移植。同じ Follow が二度届いても follow 行は 1 つのまま
 /// (accepted に固定、pending へ巻き戻らない) ことを確認する。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
@@ -1108,7 +1108,7 @@ async fn rfc9421_ed25519_duplicate_follow_is_idempotent(pool: PgPool) {
     );
 }
 
-/// cavage 版 `locked_actor_keeps_inbound_follow_pending` (dispatch_pg.rs) の
+/// cavage 版 `locked_actor_keeps_inbound_follow_pending` (`dispatch_pg.rs`) の
 /// RFC9421+Ed25519 移植。鍵アカ (Issue #66) 宛の Follow は auto-Accept されず
 /// `follow.state = pending` で据え置かれ、`delivery_queue` に Accept は
 /// 積まれないことを確認する。
@@ -1181,7 +1181,7 @@ async fn rfc9421_ed25519_locked_actor_keeps_inbound_follow_pending(pool: PgPool)
     );
 }
 
-/// cavage 版 `follow_id_host_mismatch_is_rejected` (dispatch_pg.rs) の
+/// cavage 版 `follow_id_host_mismatch_is_rejected` (`dispatch_pg.rs`) の
 /// RFC9421+Ed25519 移植。信頼境界テスト (round-2 F2 回帰) ── 署名検証層を
 /// 抜けた後の handler の host 一致チェックが署名方式に依存しないことを確認
 /// する (plan §3 item 4)。
