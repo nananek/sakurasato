@@ -1,0 +1,85 @@
+name: Federation Test (Mitra)
+
+# 連合テスト (pytest + httpx) の自動駆動。Mitra は FEP-521a Multikey 対応の
+# Rust 製 ActivityPub サーバで、`test_mitra.py` は
+# `tmp/plan-follow-request-accept-mitra.md` の実機調査 (2026-08-15) で確認
+# 済みの鍵アカ round-trip を中核に据える
+# (tmp/plan-federation-test-pleroma-mitra-fedibird.md §2.C)。
+#
+# 起動契機:
+#   - nightly cron (UTC 20:30 = JST 05:30 ── mastodon (19:00) / nekonoverse
+#     (19:30) / nekonoverse-2sks (19:45) / misskey (20:00) / pleroma (20:15)
+#     と 15 分刻みでずらして runner 競合を緩める)
+#   - workflow_dispatch (= UI から手動キック)
+#   - **main 向け PR** (= develop → main の release PR)。required check 化を
+#     想定し、release 前に必ず通す。develop 向け PR では発火させない。
+#
+# 失敗時の調査:
+#   1. Actions タブの個別 run ログ
+#   2. "Collect logs on failure" step の出力 (各 service の tail-300)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 20 * * *"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: federation-test-mitra
+  cancel-in-progress: false
+
+jobs:
+  mitra:
+    name: Mitra (programmatic)
+    runs-on: ubuntu-latest
+    # Mitra image pull + sakurasato ビルド + pytest で全体 30 分上限
+    # (Mitra は事前ビルド image を pull するのみで inline build が無い)。
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: docker compose version
+        run: docker compose version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Run pytest stack
+        # DEBUG_KEEP=1: pytest.sh の `trap cleanup EXIT` (= down -v) を抑止し、
+        # 失敗時にコンテナを残して下の "Collect logs on failure" を実働させる。
+        # 後始末は末尾の "Tear down on failure" (if: always()) が必ず行う。
+        run: DEBUG_KEEP=1 ./scripts/federation-test/pytest.sh mitra
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          set +e
+          project="sakurasato-fed-mitra-pytest"
+          compose_file="compose/docker-compose.federation-mitra.yml"
+          for svc in sakurasato-init sakurasato-server sakurasato-media-proxy \
+                     postgres-sks nginx-sks \
+                     postgres-mitra mitra-app nginx-mitra \
+                     sakurasato-token-issuer; do
+            echo "==> ${svc} logs"
+            docker compose -p "$project" -f "$compose_file" \
+              --profile pytest logs --no-color --tail=300 "$svc" || true
+          done
+          echo "==> pytest logs"
+          docker compose -p "$project" -f "$compose_file" \
+            --profile pytest logs --no-color --tail=500 pytest || true
+
+      - name: Tear down on failure
+        if: always()
+        run: |
+          project="sakurasato-fed-mitra-pytest"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-mitra.yml \
+            --profile pytest down -v --remove-orphans || true

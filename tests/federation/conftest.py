@@ -87,6 +87,40 @@ NEKONOVERSE_BOB_NEW_USERNAME = os.environ.get(
 MASTODON_ENABLED = os.environ.get("MASTODON_ENABLED", "1") != "0"
 NEKONOVERSE_ENABLED = os.environ.get("NEKONOVERSE_ENABLED", "0") == "1"
 
+# ── Fedibird env (federation-test-pleroma-mitra-fedibird plan §2.B) ──────
+# Fedibird は Mastodon フォークで REST API 互換性が高いため、専用クライアント
+# クラスは作らず `MastodonClient` を base_url/domain/username だけ差し替えて
+# 再利用する。token は entrypoint 側で Doorkeeper 直発行済み (Fedibird 3.4.1
+# は OAuth password grant 未対応、fedibird-entrypoint.sh 参照)。
+FEDIBIRD_BASE_URL = os.environ.get("FEDIBIRD_BASE_URL", "https://fedibird")
+FEDIBIRD_DOMAIN = os.environ.get("FEDIBIRD_DOMAIN", "fedibird")
+FEDIBIRD_USERNAME = os.environ.get("FEDIBIRD_USERNAME", "bob")
+FEDIBIRD_TOKEN_FILE = os.environ.get(
+    "FEDIBIRD_TOKEN_FILE", "/fedibird-tokens/bob_token.txt"
+)
+FEDIBIRD_ENABLED = os.environ.get("FEDIBIRD_ENABLED", "0") == "1"
+
+# ── Mitra env (同 plan §2.C) ──────────────────────────────────────
+# Mitra は Mastodon 互換 API のサブセットを持つが、OAuth token は entrypoint
+# 側で発行されない (bob アカウント作成のみ自動化済み、mitra-entrypoint.sh)。
+# pytest 側で `/api/v1/apps` → `/oauth/token` (password grant) を叩いて取得
+# する (`tmp/plan-follow-request-accept-mitra.md` の実機調査で確認済みの経路)。
+MITRA_BASE_URL = os.environ.get("MITRA_BASE_URL", "https://mitra")
+MITRA_DOMAIN = os.environ.get("MITRA_DOMAIN", "mitra")
+MITRA_USERNAME = os.environ.get("MITRA_USERNAME", "bob")
+MITRA_PASSWORD = os.environ.get("MITRA_PASSWORD", "password123")
+MITRA_ENABLED = os.environ.get("MITRA_ENABLED", "0") == "1"
+
+# ── Pleroma env (同 plan §2.A) ────────────────────────────────────
+# Pleroma は (Mastodon と異なり) OAuth password grant を引き続き提供する
+# ため、Mitra と同じ password grant 経路で token を取る。bob アカウントは
+# entrypoint 側で作成済み (pleroma-entrypoint.sh)。
+PLEROMA_BASE_URL = os.environ.get("PLEROMA_BASE_URL", "https://pleroma")
+PLEROMA_DOMAIN = os.environ.get("PLEROMA_DOMAIN", "pleroma")
+PLEROMA_USERNAME = os.environ.get("PLEROMA_USERNAME", "bob")
+PLEROMA_PASSWORD = os.environ.get("PLEROMA_PASSWORD", "Password1234!")
+PLEROMA_ENABLED = os.environ.get("PLEROMA_ENABLED", "0") == "1"
+
 # ── Misskey env (#162 / M14 MiAuth parity test 基盤) ─────────────
 # 本物 Misskey instance を `compose/docker-compose.federation-misskey.yml`
 # pytest profile で起動し、`misskey-seed` が admin user + `i` token を発行する。
@@ -582,6 +616,17 @@ def wait_for_instances() -> None:
     # Nekonoverse 側: 同じく `/api/v1/instance` が 200 で ready。
     if NEKONOVERSE_ENABLED:
         wait_for_http(f"{NEKONOVERSE_BASE_URL}/api/v1/instance", timeout=240)
+    # Fedibird 側: Mastodon フォークなので同じく `/api/v1/instance` で ready 判定。
+    if FEDIBIRD_ENABLED:
+        wait_for_http(f"{FEDIBIRD_BASE_URL}/api/v1/instance", timeout=240)
+    # Mitra / Pleroma 側: Mastodon API のフルセットを実装しているとは限らない
+    # ため (Mitra は部分実装)、全 AP 実装が持つ `/.well-known/nodeinfo` で
+    # ready 判定する ── ready の意味は「HTTP server が起動し AP discovery に
+    # 応答できる」で、他の gate と同じ強さ。
+    if MITRA_ENABLED:
+        wait_for_http(f"{MITRA_BASE_URL}/.well-known/nodeinfo", timeout=240)
+    if PLEROMA_ENABLED:
+        wait_for_http(f"{PLEROMA_BASE_URL}/.well-known/nodeinfo", timeout=240)
     # Misskey 側 (= #162): `/api/meta` を空 body POST で叩いて 200 が返れば ready。
     # Misskey API は GET ではなく POST + JSON body が前提 (= 唯一の例外は
     # `/api/ping` だがそれも POST)。`wait_for_http` は GET 専用なので Misskey は
@@ -642,6 +687,134 @@ def mastodon(mastodon_token: str):
         domain=MASTODON_DOMAIN,
         username=MASTODON_USERNAME,
         token=mastodon_token,
+    )
+    client.login()
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+# ── Fedibird: MastodonClient を base_url/domain/username 差し替えで再利用 ──
+
+
+@pytest.fixture(scope="session")
+def fedibird_token() -> str:
+    return _read_token_file(FEDIBIRD_TOKEN_FILE, label="fedibird")
+
+
+@pytest.fixture(scope="session")
+def fedibird(fedibird_token: str):
+    client = MastodonClient(
+        base_url=FEDIBIRD_BASE_URL,
+        domain=FEDIBIRD_DOMAIN,
+        username=FEDIBIRD_USERNAME,
+        token=fedibird_token,
+    )
+    client.login()
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+# ── Mitra / Pleroma: OAuth password grant で token を取る薄いヘルパー ────
+#
+# 両実装とも Mastodon 互換の `POST /api/v1/apps` (client 登録) →
+# `POST /oauth/token` (grant_type=password) 経路を持つ (Mastodon 4.x は
+# password grant を削除済みだが、Mitra/Pleroma は維持している。Mitra は
+# `tmp/plan-follow-request-accept-mitra.md` の実機調査で確認済み)。
+# entrypoint 側でアカウント作成のみ済ませておき、token 発行は pytest 起動時に
+# ここで行う。app 登録直後は DB 反映のタイムラグがありうるので `poll_until`
+# で数回リトライする。
+def _oauth_password_grant_token(
+    *,
+    base_url: str,
+    username: str,
+    password: str,
+    scopes: str = "read write follow",
+    client_name: str = "sakurasato-federation-pytest",
+) -> str:
+    client = httpx.Client(base_url=base_url, timeout=20, verify=_SSL_VERIFY)
+    try:
+
+        def _fetch() -> str | None:
+            app_resp = client.post(
+                "/api/v1/apps",
+                json={
+                    "client_name": client_name,
+                    "redirect_uris": "urn:ietf:wg:oauth:2.0:oob",
+                    "scopes": scopes,
+                },
+            )
+            if app_resp.status_code != 200:
+                return None
+            app = app_resp.json()
+            token_resp = client.post(
+                "/oauth/token",
+                json={
+                    "grant_type": "password",
+                    "username": username,
+                    "password": password,
+                    "client_id": app["client_id"],
+                    "client_secret": app["client_secret"],
+                    "scope": scopes,
+                },
+            )
+            if token_resp.status_code != 200:
+                return None
+            return token_resp.json()["access_token"]
+
+        return poll_until(
+            _fetch,
+            timeout=120,
+            interval=3,
+            desc=f"OAuth password grant token for {username}@{base_url}",
+        )
+    finally:
+        client.close()
+
+
+@pytest.fixture(scope="session")
+def mitra_token() -> str:
+    return _oauth_password_grant_token(
+        base_url=MITRA_BASE_URL,
+        username=MITRA_USERNAME,
+        password=MITRA_PASSWORD,
+    )
+
+
+@pytest.fixture(scope="session")
+def mitra(mitra_token: str):
+    client = MastodonClient(
+        base_url=MITRA_BASE_URL,
+        domain=MITRA_DOMAIN,
+        username=MITRA_USERNAME,
+        token=mitra_token,
+    )
+    client.login()
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+@pytest.fixture(scope="session")
+def pleroma_token() -> str:
+    return _oauth_password_grant_token(
+        base_url=PLEROMA_BASE_URL,
+        username=PLEROMA_USERNAME,
+        password=PLEROMA_PASSWORD,
+    )
+
+
+@pytest.fixture(scope="session")
+def pleroma(pleroma_token: str):
+    client = MastodonClient(
+        base_url=PLEROMA_BASE_URL,
+        domain=PLEROMA_DOMAIN,
+        username=PLEROMA_USERNAME,
+        token=pleroma_token,
     )
     client.login()
     try:

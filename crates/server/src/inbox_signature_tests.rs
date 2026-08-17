@@ -34,6 +34,7 @@ use crate::sign::{cavage, digest, rfc9421};
 use crate::state::AppState;
 
 const HOST: &str = "sakura.test";
+const LOCAL_USER: &str = "alice";
 const REMOTE_HOST: &str = "nekonoverse.test";
 const REMOTE_USER: &str = "carol";
 
@@ -126,6 +127,48 @@ fn build_remote_actor(rsa_pub_pem: &str, ed25519_pub_pem: Option<&str>) -> NewAc
         actor_type: "Person".into(),
         manually_approves_followers: false,
     }
+}
+
+/// テスト用に local actor (受信側 = `{HOST}/users/{LOCAL_USER}`) を組み立てる。
+/// `crates/server/tests/dispatch_pg.rs::local_actor` と同じ形 ── 送信側の
+/// outbound 署名は M3b-2 時点で cavage RSA-SHA256 のみのため、local actor は
+/// RSA 鍵のみ持つ (`priv_pem` はテストでは実際に署名計算に使わないプレース
+/// ホルダで良い、`dispatch_pg.rs` と同じ慣習)。
+fn local_actor(pub_pem: &str, priv_pem: &str) -> NewActor {
+    let ap_id = format!("https://{HOST}/users/{LOCAL_USER}");
+    NewActor {
+        ap_id: ap_id.clone(),
+        preferred_username: LOCAL_USER.into(),
+        host: HOST.into(),
+        display_name: None,
+        summary: None,
+        icon_url: None,
+        image_url: None,
+        inbox_url: format!("{ap_id}/inbox"),
+        shared_inbox_url: Some(format!("https://{HOST}/inbox")),
+        outbox_url: Some(format!("{ap_id}/outbox")),
+        followers_url: None,
+        following_url: None,
+        public_key_id: format!("{ap_id}#main-key"),
+        public_key_pem: pub_pem.into(),
+        private_key_pem: Some(priv_pem.into()),
+        ed25519_public_key_id: None,
+        ed25519_public_key_pem: None,
+        ed25519_private_key_pem: None,
+        also_known_as: vec![],
+        moved_to_ap_id: None,
+        is_local: true,
+        actor_type: "Person".into(),
+        manually_approves_followers: false,
+    }
+}
+
+/// `local_actor` の鍵アカ (`manually_approves_followers = true`) 版。
+/// Issue #66 の RFC9421+Ed25519 回帰テスト (下記) で使う。
+fn locked_local_actor(pub_pem: &str, priv_pem: &str) -> NewActor {
+    let mut a = local_actor(pub_pem, priv_pem);
+    a.manually_approves_followers = true;
+    a
 }
 
 fn headers_to_map(req: &Request<Body>) -> HeaderMap {
@@ -921,5 +964,273 @@ async fn rfc9421_multi_label_all_invalid_returns_401(pool: PgPool) {
         resp.status(),
         StatusCode::UNAUTHORIZED,
         "multi-label: all-failing should return 401"
+    );
+}
+
+// ===========================================================================
+// RFC 9421 + Ed25519 の Follow/Accept 統合テスト
+// (tmp/plan-federation-test-pleroma-mitra-fedibird.md §3/§4)
+//
+// 背景: 既存の `rfc9421_ed25519_valid_signature_is_accepted` は
+// `minimal_body_for` (`type:"View"`, handler 未実装 verb) を使い、署名検証を
+// 抜けて dispatch 入口で 202 が返ることしか確認していなかった。「署名検証層
+// (cavage/rfc9421) を抜けた後の handler ロジックは署名方式で分岐しない」を
+// 実際の Follow activity で検証する。
+//
+// 配置: `crates/server/tests/dispatch_pg.rs` は crate 外の integration test
+// であり、`crate::sign::{cavage, rfc9421}` は `pub(crate)` のため参照できない
+// (このファイルの `build_rfc9421_post*` を再実装せず再利用するには、lib 内の
+// `#[cfg(test)]` モジュールに置く必要がある)。cavage 版の相当テストは
+// dispatch_pg.rs に残したまま、RFC9421+Ed25519 版はここに集約する
+// (plan §4 item 3 の「重複セットアップコストが低い方に寄せてよい」判断)。
+// ===========================================================================
+
+/// cavage 版 `follow_request_enqueues_accept` (`dispatch_pg.rs`) の
+/// RFC9421+Ed25519 移植。新規 Follow → 即 accepted (お一人様 + 自動承認) →
+/// Accept が `delivery_queue` に積まれることを、DB 直 assert で検証する
+/// (plan §4 の「Follow 実体検証」要件も兼ねる)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_ed25519_follow_is_accepted_and_state_transitions(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (_rsa_priv, rsa_pub) = fresh_rsa();
+    let (ed_priv, ed_pub) = fresh_ed25519();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, &local_priv))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let follow_id = format!("{}/activities/follow-rfc9421-{}", remote.ap_id, local.id);
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#ed25519-key", remote.ap_id);
+    let req = build_rfc9421_post(body.as_bytes(), &ed_priv, &keyid, &now_http_date());
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "RFC9421+Ed25519 Follow must be accepted"
+    );
+
+    let follow = sqlx::query!(
+        "SELECT id, ap_id, follower_actor_id, followed_actor_id, state FROM follow WHERE ap_id = $1",
+        follow_id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(follow.state, "accepted");
+    assert_eq!(follow.follower_actor_id, remote.id);
+    assert_eq!(follow.followed_actor_id, local.id);
+
+    let queued = sqlx::query!(
+        r#"SELECT id, inbox_url, activity as "activity: sqlx::types::Json<serde_json::Value>",
+              sender_actor_id, state
+          FROM delivery_queue WHERE sender_actor_id = $1 AND state = 'pending'"#,
+        local.id,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queued.len(), 1, "Accept must be queued for delivery");
+    let row = &queued[0];
+    assert_eq!(row.inbox_url, remote.inbox_url);
+
+    let activity = &row.activity.0;
+    assert_eq!(activity["type"], "Accept");
+    assert_eq!(activity["actor"], local.ap_id);
+    let object = &activity["object"];
+    assert_eq!(object["id"], follow_id);
+    assert_eq!(object["actor"], remote.ap_id);
+    assert_eq!(object["object"], local.ap_id);
+}
+
+/// cavage 版 `duplicate_follow_is_idempotent` (`dispatch_pg.rs`) の
+/// RFC9421+Ed25519 移植。同じ Follow が二度届いても follow 行は 1 つのまま
+/// (accepted に固定、pending へ巻き戻らない) ことを確認する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_ed25519_duplicate_follow_is_idempotent(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (_rsa_priv, rsa_pub) = fresh_rsa();
+    let (ed_priv, ed_pub) = fresh_ed25519();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, &local_priv))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app1 = router(state.clone());
+    let app2 = router(state);
+
+    let follow_id = format!("{}/activities/dupe-rfc9421-{}", remote.ap_id, local.id);
+    let body = serde_json::json!({
+        "id": follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#ed25519-key", remote.ap_id);
+
+    for app in [app1, app2] {
+        let req = build_rfc9421_post(body.as_bytes(), &ed_priv, &keyid, &now_http_date());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    let row = sqlx::query!(
+        "SELECT count(*) as c, max(state) as state FROM follow WHERE ap_id = $1",
+        follow_id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.c.unwrap_or(0), 1, "follow row must not duplicate");
+    assert_eq!(
+        row.state.as_deref(),
+        Some("accepted"),
+        "duplicate Follow must keep state at accepted, not flip back to pending",
+    );
+}
+
+/// cavage 版 `locked_actor_keeps_inbound_follow_pending` (`dispatch_pg.rs`) の
+/// RFC9421+Ed25519 移植。鍵アカ (Issue #66) 宛の Follow は auto-Accept されず
+/// `follow.state = pending` で据え置かれ、`delivery_queue` に Accept は
+/// 積まれないことを確認する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_ed25519_locked_actor_keeps_inbound_follow_pending(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (_rsa_priv, rsa_pub) = fresh_rsa();
+    let (ed_priv, ed_pub) = fresh_ed25519();
+
+    let local = repo::actor::insert(&pool, locked_local_actor(&local_pub, &local_priv))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let follow_id = format!(
+        "{}/activities/locked-follow-rfc9421-{}",
+        remote.ap_id, local.id
+    );
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#ed25519-key", remote.ap_id);
+    let req = build_rfc9421_post(body.as_bytes(), &ed_priv, &keyid, &now_http_date());
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "locked actor still returns 202 for the inbound Follow (silent hold)",
+    );
+
+    let row = sqlx::query!("SELECT state FROM follow WHERE ap_id = $1", follow_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.state, "pending",
+        "locked actor must keep follow row at pending until CLI approval",
+    );
+
+    let queued = sqlx::query!(
+        "SELECT count(*) AS c FROM delivery_queue WHERE sender_actor_id = $1",
+        local.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        queued.c.unwrap_or(0),
+        0,
+        "locked actor must NOT auto-enqueue an Accept activity",
+    );
+
+    let inboxes = repo::follow::list_accepted_inboxes(&pool, local.id)
+        .await
+        .unwrap();
+    assert!(
+        !inboxes.iter().any(|u| u == &remote.inbox_url),
+        "follower of a still-pending Follow must not appear as a delivery target",
+    );
+}
+
+/// cavage 版 `follow_id_host_mismatch_is_rejected` (`dispatch_pg.rs`) の
+/// RFC9421+Ed25519 移植。信頼境界テスト (round-2 F2 回帰) ── 署名検証層を
+/// 抜けた後の handler の host 一致チェックが署名方式に依存しないことを確認
+/// する (plan §3 item 4)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_ed25519_follow_id_host_mismatch_is_rejected(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (_rsa_priv, rsa_pub) = fresh_rsa();
+    let (ed_priv, ed_pub) = fresh_ed25519();
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, &local_priv))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(&pool, build_remote_actor(&rsa_pub, Some(&ed_pub)))
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    // 署名は remote (Ed25519)、body の actor も remote (F3 は通る)、
+    // しかし activity id は good.example のホスト。
+    let spoofed_follow_id = "https://good.example/activities/follow-9999-rfc9421";
+    let body = serde_json::json!({
+        "id": spoofed_follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#ed25519-key", remote.ap_id);
+    let req = build_rfc9421_post(body.as_bytes(), &ed_priv, &keyid, &now_http_date());
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_server_error() || resp.status().is_client_error(),
+        "spoofed Follow id must be rejected, got {}",
+        resp.status(),
+    );
+
+    let count = sqlx::query!(
+        "SELECT count(*) as c FROM follow WHERE ap_id = $1",
+        spoofed_follow_id,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count.c.unwrap_or(0),
+        0,
+        "spoofed Follow id must not be inserted",
     );
 }

@@ -13,6 +13,9 @@ on:
       - "tests/federation/**"
       - ".github/workflows/federation-test.yml"
       - ".github/workflows/federation-test-nekonoverse.yml"
+      - ".github/workflows/federation-test-pleroma.yml"
+      - ".github/workflows/federation-test-mitra.yml"
+      - ".github/workflows/federation-test-fedibird.yml"
       # release-validation は main PR 専用 (docker build + stack smoke)。
       # この workflow ファイル単独の変更で ci まで回す必要はない。
       - ".github/workflows/release-validation.yml"
@@ -25,6 +28,9 @@ on:
       - "tests/federation/**"
       - ".github/workflows/federation-test.yml"
       - ".github/workflows/federation-test-nekonoverse.yml"
+      - ".github/workflows/federation-test-pleroma.yml"
+      - ".github/workflows/federation-test-mitra.yml"
+      - ".github/workflows/federation-test-fedibird.yml"
       - ".github/workflows/release-validation.yml"
 
 permissions:

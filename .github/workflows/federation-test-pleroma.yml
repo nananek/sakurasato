@@ -1,0 +1,88 @@
+name: Federation Test (Pleroma)
+
+# 連合テスト (pytest + httpx) の自動駆動。Pleroma は Mastodon 互換 REST API を
+# 持つため、`test_pleroma.py` は `test_mastodon.py` の中核パターンを踏襲する
+# (tmp/plan-federation-test-pleroma-mitra-fedibird.md §2.A)。
+#
+# 起動契機:
+#   - nightly cron (UTC 20:15 = JST 05:15 ── mastodon (19:00) / nekonoverse
+#     (19:30) / nekonoverse-2sks (19:45) / misskey (20:00) と 15 分刻みで
+#     ずらして runner 競合を緩める)
+#   - workflow_dispatch (= UI から手動キック)
+#   - **main 向け PR** (= develop → main の release PR)。required check 化を
+#     想定し、release 前に必ず通す。develop 向け PR では発火させない。
+#
+# 失敗時の調査:
+#   1. Actions タブの個別 run ログ
+#   2. "Collect logs on failure" step の出力 (各 service の tail-300)
+#   3. `pleroma-entrypoint.sh` は `ghcr.io/explodingcamera/pleroma:stable` の
+#      内部レイアウト (pleroma_ctl の配置場所) を実機未検証のまま複数候補パス
+#      を探索する実装にしてある。bob アカウント作成が失敗する場合は
+#      pleroma-app のログで `pleroma_ctl not found` 等が出ていないか確認し、
+#      判明したパスをスクリプトに追記すること。
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 20 * * *"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: federation-test-pleroma
+  cancel-in-progress: false
+
+jobs:
+  pleroma:
+    name: Pleroma (programmatic)
+    runs-on: ubuntu-latest
+    # Pleroma image pull + sakurasato ビルド + pytest で全体 30 分上限
+    # (Pleroma は事前ビルド image を pull するのみで inline build が無い)。
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: docker compose version
+        run: docker compose version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Run pytest stack
+        # DEBUG_KEEP=1: pytest.sh の `trap cleanup EXIT` (= down -v) を抑止し、
+        # 失敗時にコンテナを残して下の "Collect logs on failure" を実働させる。
+        # 後始末は末尾の "Tear down on failure" (if: always()) が必ず行う。
+        run: DEBUG_KEEP=1 ./scripts/federation-test/pytest.sh pleroma
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          set +e
+          project="sakurasato-fed-pleroma-pytest"
+          compose_file="compose/docker-compose.federation-pleroma.yml"
+          for svc in sakurasato-init sakurasato-server sakurasato-media-proxy \
+                     postgres-sks nginx-sks \
+                     postgres-pl pleroma-app nginx-pl \
+                     sakurasato-token-issuer sakurasato-prefollow-bob; do
+            echo "==> ${svc} logs"
+            docker compose -p "$project" -f "$compose_file" \
+              --profile pytest logs --no-color --tail=300 "$svc" || true
+          done
+          echo "==> pytest logs"
+          docker compose -p "$project" -f "$compose_file" \
+            --profile pytest logs --no-color --tail=500 pytest || true
+
+      - name: Tear down on failure
+        if: always()
+        run: |
+          project="sakurasato-fed-pleroma-pytest"
+          docker compose -p "$project" \
+            -f compose/docker-compose.federation-pleroma.yml \
+            --profile pytest down -v --remove-orphans || true
