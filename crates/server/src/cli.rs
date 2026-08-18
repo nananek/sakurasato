@@ -65,6 +65,16 @@ pub enum Command {
     /// Follow/Like/EmojiReact/mention/Announce は silent drop する
     /// (dispatch 層のホットパスガード、PR3/PR5 で追加)。
     Block(BlockArgs),
+    /// Manage federated domain moderation (計画書 §6 連合ドメインブロック)。
+    ///
+    /// `silence` は新規 inbound Follow のみ拒否 (既存 followee の投稿は止め
+    /// ない、既存フォロー関係にも影響しない)。`suspend` は inbox 受信拒否 +
+    /// 配送停止 + 対象ドメインの既存フォロー関係を全部強制解除する
+    /// (`Undo Follow`/`Reject` は配送せず DB 上の関係解消のみ、計画書 §10
+    /// 確定事項 #2)。`suspend` は破壊的操作だが確認フラグは付けず即座に実行
+    /// する (計画書 §10 確定事項 #5、`move-accept` 等の既存 CLI と同じ
+    /// 非対話・スクリプト実行前提の流儀)。
+    Domain(DomainArgs),
     /// Re-process an inbound `Move` activity from a saved JSON payload (M10).
     ///
     /// 初回受領時に DB / network エラーで 503 を返したケースを CLI で手動
@@ -328,6 +338,44 @@ pub struct BlockIdArgs {
     /// `block.id` (= `block list` で表示される number)。
     #[arg(long)]
     pub id: i64,
+}
+
+#[derive(Debug, Args)]
+pub struct DomainArgs {
+    #[command(subcommand)]
+    pub command: DomainCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DomainCommand {
+    /// 設定済みモデレーション (silence/suspend) 一覧を表示する。
+    List,
+    /// 指定ホストの統計 (既知 actor 数/フォロー数) + フォロー一覧を表示する。
+    Info(DomainHostArgs),
+    /// 配信停止 (新規 inbound Follow のみ拒否、既存関係は維持)。
+    Silence(DomainModerateArgs),
+    /// 完全ブロック (inbox 受信拒否 + 配送停止 + 既存フォロー関係を強制解除)。
+    ///
+    /// 破壊的操作 (対象ホストの全 accepted/pending フォロー関係が即座に
+    /// 解除される) だが、確認フラグは付けず即座に実行する。
+    Suspend(DomainModerateArgs),
+    /// 措置解除。
+    Unset(DomainHostArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DomainHostArgs {
+    /// 対象ホスト名 (例: `mastodon.example`)。
+    pub host: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DomainModerateArgs {
+    /// 対象ホスト名。
+    pub host: String,
+    /// 措置理由 (任意、CLI/TUI 一覧表示に使う)。
+    #[arg(long)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Args)]

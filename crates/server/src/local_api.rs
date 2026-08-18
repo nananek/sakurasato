@@ -42,6 +42,13 @@
 //!   activity 配送 (ユーザーブロック PR2)
 //! - `DELETE /api/v1/block/{id}` ── ブロック解除 (`Undo{Block}` 送出、PR2)
 //! - `GET /api/v1/blocks` ── ブロック中の actor 一覧 (PR2)
+//! - `GET /api/v1/domains` ── 既知ドメイン一覧 + actor 数 + moderation state
+//!   (連合ドメインブロック PR4)
+//! - `GET /api/v1/domains/{host}` ── 統計 + moderation state +
+//!   following/followers 一覧 (PR4)
+//! - `POST /api/v1/domains/{host}/silence` / `POST /api/v1/domains/{host}/suspend`
+//!   ── 措置の実行。`suspend` は既存フォロー関係の強制解除を伴う (PR4)
+//! - `DELETE /api/v1/domains/{host}` ── 措置解除 (PR4)
 //! - `GET /api/v1/actor/{id}/notes` ── 当該 actor の Note 一覧。viewer 視点の
 //!   visibility filter 経由 (M13 PR3)
 //! - `GET /api/v1/lists` / `POST /api/v1/lists` ── リスト一覧・作成
@@ -72,6 +79,7 @@ pub mod actor;
 pub mod actor_admin;
 pub mod auth;
 pub mod block;
+pub mod domain_moderation;
 pub mod emoji_admin;
 pub mod emoji_tag;
 pub mod emojis;
@@ -198,6 +206,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/block", post(block::create))
         .route("/api/v1/block/{id}", axum::routing::delete(block::delete))
         .route("/api/v1/blocks", get(block::list))
+        // PR4 (計画書 §6.6): TUI ドメイン管理画面 (§6.7) が叩く。詳細は
+        // 統計 + moderation state + following/followers 一覧を 1 回で返す。
+        .route("/api/v1/domains", get(domain_moderation::list))
+        .route(
+            "/api/v1/domains/{host}",
+            get(domain_moderation::detail).delete(domain_moderation::unset),
+        )
+        .route(
+            "/api/v1/domains/{host}/silence",
+            post(domain_moderation::silence),
+        )
+        .route(
+            "/api/v1/domains/{host}/suspend",
+            post(domain_moderation::suspend),
+        )
         // #206 PR3: in-app 通知フィードの TUI 一覧 + 一括既読。
         .route("/api/v1/notifications", get(notifications::list))
         .route(

@@ -24,7 +24,9 @@ use sakurasato_core::repo;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::block::{BlockError, BlockOutcome, UnblockOutcome, create_block_core, delete_block_core};
+use crate::block::{
+    BlockError, BlockOutcome, UnblockOutcome, create_block_core, delete_block_core,
+};
 use crate::follow::FollowTarget;
 use crate::state::AppState;
 

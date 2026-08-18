@@ -148,7 +148,9 @@ pub async fn create_block_core(
     })?;
     let block_row = repo::block::insert(&mut *tx, &block_ap_id, local.id, target_actor.id)
         .await
-        .map_err(|e| BlockError::Internal(anyhow::Error::new(e).context("insert block row in tx")))?;
+        .map_err(|e| {
+            BlockError::Internal(anyhow::Error::new(e).context("insert block row in tx"))
+        })?;
     let queued = delivery::enqueue_activity(&mut *tx, local.id, &inbox, &activity)
         .await
         .map_err(|e| BlockError::Internal(e.context(format!("enqueue Block to {inbox}"))))?;
