@@ -56,6 +56,15 @@ pub enum Command {
     /// 同じ相手にもう一度叩いても (`follower`, `followed`) UNIQUE と
     /// 決定論的な activity id で冪等。
     Follow(FollowArgs),
+    /// Manage user blocks (計画書 §5 ユーザーブロック)。
+    ///
+    /// ブロックは双方向フォロー強制解除を伴う破壊的操作。ブロック実行時に
+    /// `local → target` の既存フォローは Undo Follow 送出込みで解除され、
+    /// `target → local` の既存フォローは行削除のみ (Reject は送出しない)。
+    /// その後 `Block` activity を配送する。以後 signer からの
+    /// Follow/Like/EmojiReact/mention/Announce は silent drop する
+    /// (dispatch 層のホットパスガード、PR3/PR5 で追加)。
+    Block(BlockArgs),
     /// Re-process an inbound `Move` activity from a saved JSON payload (M10).
     ///
     /// 初回受領時に DB / network エラーで 503 を返したケースを CLI で手動
@@ -280,6 +289,45 @@ pub struct FollowArgs {
     /// `acct` 引数があっても **こちらを優先** する。
     #[arg(long)]
     pub actor_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BlockArgs {
+    #[command(subcommand)]
+    pub command: BlockCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BlockCommand {
+    /// 指定 acct (`user@host`) または `--actor-uri` をブロックする。
+    ///
+    /// 双方向フォロー強制解除 (自分→相手は Undo Follow 送出、相手→自分は
+    /// 行削除のみ) の後、`Block` activity を配送する。
+    Create(BlockCreateArgs),
+    /// 既存ブロックを解除する (`Undo{Block}` を配送)。フォロー関係は
+    /// 自動復活しない。
+    Unblock(BlockIdArgs),
+    /// ブロック中の actor を一覧表示する。
+    List,
+}
+
+#[derive(Debug, Args)]
+pub struct BlockCreateArgs {
+    /// `acct:user@host` / `@user@host` / `user@host` のいずれでも可。
+    /// `--actor-uri` を併用する場合は `WebFinger` 解決をスキップする。
+    /// `FollowArgs` と同じ理由で `default_value` は付けない。
+    #[arg(required_unless_present = "actor_uri")]
+    pub acct: Option<String>,
+    /// `WebFinger` を経由せず直接 `ActivityPub` actor URI を指定する (オプション)。
+    #[arg(long)]
+    pub actor_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BlockIdArgs {
+    /// `block.id` (= `block list` で表示される number)。
+    #[arg(long)]
+    pub id: i64,
 }
 
 #[derive(Debug, Args)]

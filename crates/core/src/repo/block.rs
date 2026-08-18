@@ -11,12 +11,20 @@ use crate::model::{ActorRow, BlockRow};
 /// `(blocker, blocked)` ペアで block 行を作る。既存行があれば何もせず
 /// そのまま返す (= `ON CONFLICT ... DO UPDATE SET ap_id = block.ap_id` の
 /// no-op update トリックで、conflict 時も `RETURNING` から既存行を取れる)。
-pub async fn insert(
-    pool: &PgPool,
+///
+/// `executor` は generic ── `create_block_core` が「逆方向 follow 行の削除 /
+/// block 行 upsert / Block activity enqueue」を 1 トランザクションに包む
+/// ために `&mut Transaction` からも呼べる必要がある
+/// (`repo::follow::set_state_if_pending` と同じ設計)。
+pub async fn insert<'e, E>(
+    executor: E,
     ap_id: &str,
     blocker_actor_id: i64,
     blocked_actor_id: i64,
-) -> sqlx::Result<BlockRow> {
+) -> sqlx::Result<BlockRow>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as!(
         BlockRow,
         r#"
@@ -30,7 +38,7 @@ pub async fn insert(
         blocker_actor_id,
         blocked_actor_id,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 

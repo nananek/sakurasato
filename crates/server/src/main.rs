@@ -6,8 +6,8 @@ use anyhow::Context;
 use clap::Parser;
 use sakurasato_core::Config;
 use sakurasato_server::{
-    actor_admin, cli, delivery, emoji_import, follow, follow_request, init, list_cli, miauth_cli,
-    move_accept, move_out, notification, prune, serve, token,
+    actor_admin, block, cli, delivery, emoji_import, follow, follow_request, init, list_cli,
+    miauth_cli, move_accept, move_out, notification, prune, serve, token,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::Alias(args) => move_out::run_alias(config, args).await,
         cli::Command::MoveOut(args) => move_out::run_move_out(config, args).await,
         cli::Command::Follow(args) => follow::run(config, args).await,
+        cli::Command::Block(args) => block::run(config, args).await,
         cli::Command::MoveAccept(args) => move_accept::run(config, args).await,
         cli::Command::Actor(args) => actor_admin::run(config, args).await,
         cli::Command::FollowRequest(args) => follow_request::run(config, args).await,

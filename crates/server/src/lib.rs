@@ -10,6 +10,7 @@
 #![recursion_limit = "256"]
 
 pub mod actor_admin;
+pub mod block;
 pub mod cli;
 pub mod delivery;
 pub(crate) mod dispatch;
