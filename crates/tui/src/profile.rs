@@ -99,6 +99,12 @@ impl ProfileScreen {
         )
     }
 
+    /// `b` キー (ユーザーブロック PR6) で「Unblock を撃つべきか」を判断する。
+    #[must_use]
+    pub fn is_blocked(&self) -> bool {
+        self.relationship.is_blocked
+    }
+
     /// notes リストでのキャレット 1 件下移動。空配列 / 末尾では no-op。
     pub fn select_next_note(&mut self) {
         if self.notes.is_empty() {
@@ -172,6 +178,9 @@ mod tests {
             follow_state: state.map(ToOwned::to_owned),
             followed_by: false,
             follow_id: None,
+            is_blocked: false,
+            block_id: None,
+            is_blocked_by: false,
         }
     }
 

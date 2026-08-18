@@ -79,6 +79,11 @@ pub struct Relationship {
     pub follow_id: Option<i64>,
     /// ローカル actor が target をブロックしている (PR2、計画書 §5.7)。
     pub is_blocked: bool,
+    /// ローカル actor → target の `block.id`。`is_blocked` のときのみ
+    /// `Some` (`DELETE /api/v1/block/{block_id}` の引数に使う、PR6:
+    /// TUI Profile 画面のブロックトグルが `follow_id` と同じ要領で使う)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<i64>,
     /// target がローカル actor をブロックしている (PR2、計画書 §5.7)。
     pub is_blocked_by: bool,
 }
@@ -344,9 +349,12 @@ async fn compute_relationship(
     // PR2 (計画書 §5.7): ブロック方向も follow と同じ (local, target) ペアで
     // 引く。自分自身が相手のときも `is_blocked`/`is_blocked_by` は false 相当
     // (block 行は自分自身を対象に作れない設計、create_block_core が拒否する)。
-    let is_blocked = repo::block::is_blocked(state.pool(), local.id, target.id)
+    // `block_id` (PR6 追加) は `get_by_pair` から直接取る ── `follow_id` と
+    // 同じ要領で TUI のトグル操作の引数解決に使う。
+    let block_id = repo::block::get_by_pair(state.pool(), local.id, target.id)
         .await
-        .map_err(|err| ResolveError::Internal(format!("block lookup (out): {err}")))?;
+        .map_err(|err| ResolveError::Internal(format!("block lookup (out): {err}")))?
+        .map(|b| b.id);
     let is_blocked_by = repo::block::is_blocked(state.pool(), target.id, local.id)
         .await
         .map_err(|err| ResolveError::Internal(format!("block lookup (in): {err}")))?;
@@ -357,7 +365,8 @@ async fn compute_relationship(
         follow_state: rel.follow_state,
         followed_by: rel.followed_by,
         follow_id: rel.follow_id,
-        is_blocked,
+        is_blocked: block_id.is_some(),
+        block_id,
         is_blocked_by,
     })
 }
