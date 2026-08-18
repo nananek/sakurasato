@@ -31,7 +31,10 @@ use crate::state::AppState;
 /// 確認する。ホストは大文字小文字を区別せず (RFC 9110 §4.2.3) 比較する。
 ///
 /// `kind` はエラーメッセージ用のラベル ("Follow activity id" 等)。
-fn ensure_same_host(other_uri: &str, signer_ap_id: &str, kind: &str) -> anyhow::Result<()> {
+///
+/// `pub(crate)`: `dispatch/block.rs::handle_block` (PR3) が同じ F4 相当の
+/// 検証を再利用する (計画書 §5.5)。
+pub(crate) fn ensure_same_host(other_uri: &str, signer_ap_id: &str, kind: &str) -> anyhow::Result<()> {
     let other = Url::parse(other_uri)
         .with_context(|| format!("{kind} {other_uri:?} is not a valid URL"))?;
     let signer = Url::parse(signer_ap_id)
