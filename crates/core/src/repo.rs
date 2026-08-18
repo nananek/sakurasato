@@ -11,7 +11,9 @@
 pub mod actor;
 pub mod announce;
 pub mod api_token;
+pub mod block;
 pub mod delivery_queue;
+pub mod domain_moderation;
 pub mod emoji;
 pub mod follow;
 pub mod media;

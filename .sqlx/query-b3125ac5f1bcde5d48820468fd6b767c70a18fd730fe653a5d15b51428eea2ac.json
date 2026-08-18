@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM domain_moderation WHERE host = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b3125ac5f1bcde5d48820468fd6b767c70a18fd730fe653a5d15b51428eea2ac"
+}

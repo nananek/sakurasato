@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE delivery_queue SET state = 'delivered' WHERE id = $1",
+  "query": "DELETE FROM block WHERE id = $1",
   "describe": {
     "columns": [],
     "parameters": {
@@ -10,5 +10,5 @@
     },
     "nullable": []
   },
-  "hash": "5d64a18d4da6768cb1266015b70cd57ff47404927660762fe8355bd6422ee755"
+  "hash": "f3f38f02677ce9e1c2ae4dd1486211449d3242ce2f509053c52176c579ac99f2"
 }
