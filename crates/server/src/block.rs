@@ -368,6 +368,7 @@ fn build_undo_block_activity(
 mod tests {
     use super::*;
     use chrono::Utc;
+    use sqlx::PgPool;
 
     fn fake_block_row(id: i64) -> BlockRow {
         BlockRow {
@@ -410,5 +411,264 @@ mod tests {
         assert_eq!(undo["object"]["actor"], "https://x/users/me");
         assert_eq!(undo["object"]["object"], "https://y/users/bob");
         assert_eq!(undo["@context"], "https://www.w3.org/ns/activitystreams");
+    }
+
+    // ── DB 統合テスト (計画書 §9: "server/block.rs" は core ロジックの
+    // DB テストをここに置く。`dispatch_pg.rs`/`inbox_signature_tests.rs` と
+    // 同じ最小 `Config` 構築パターンを踏襲する) ─────────────────────────
+
+    const HOST: &str = "sakura.test";
+    const USER: &str = "alice";
+
+    fn test_config() -> sakurasato_core::Config {
+        sakurasato_core::Config {
+            server: sakurasato_core::config::ServerConfig {
+                host: HOST.into(),
+                bind: "127.0.0.1:0".into(),
+                local_api_socket: "/tmp/sakurasato.sock".into(),
+                public_listen: None,
+                local_api_listen: None,
+                user: USER.into(),
+                info: sakurasato_core::config::ServerInfo::default(),
+                auto_approve_followers_for_followees: false,
+                max_note_text_length: 3000,
+            },
+            database: sakurasato_core::config::DatabaseConfig {
+                url: "unused-by-tests".into(),
+                password_file: None,
+            },
+            storage: sakurasato_core::config::StorageConfig {
+                endpoint: "http://localhost".into(),
+                bucket: "b".into(),
+                region: "us-east-1".into(),
+                access_key_id: "k".into(),
+                secret_access_key: "s".into(),
+                secret_access_key_file: None,
+                public_base_url: None,
+            },
+            media_proxy: sakurasato_core::config::MediaProxyConfig {
+                socket: "/tmp/x".into(),
+                max_bytes: 1024,
+                max_pixels: 1024,
+                video: sakurasato_core::config::VideoConfig::default(),
+                emoji_import: sakurasato_core::config::EmojiImportConfig::default(),
+            },
+            miauth: None,
+        }
+    }
+
+    fn new_local_actor() -> repo::actor::NewActor {
+        let ap_id = format!("https://{HOST}/users/{USER}");
+        repo::actor::NewActor {
+            ap_id: ap_id.clone(),
+            preferred_username: USER.into(),
+            host: HOST.into(),
+            display_name: None,
+            summary: None,
+            icon_url: None,
+            image_url: None,
+            inbox_url: format!("{ap_id}/inbox"),
+            shared_inbox_url: Some(format!("https://{HOST}/inbox")),
+            outbox_url: None,
+            followers_url: None,
+            following_url: None,
+            public_key_id: format!("{ap_id}#main-key"),
+            public_key_pem: "PEM".into(),
+            private_key_pem: None,
+            ed25519_public_key_id: None,
+            ed25519_public_key_pem: None,
+            ed25519_private_key_pem: None,
+            also_known_as: vec![],
+            moved_to_ap_id: None,
+            is_local: true,
+            actor_type: "Person".into(),
+            manually_approves_followers: false,
+        }
+    }
+
+    fn new_remote_actor(host: &str, user: &str) -> repo::actor::NewActor {
+        let ap_id = format!("https://{host}/users/{user}");
+        repo::actor::NewActor {
+            ap_id: ap_id.clone(),
+            preferred_username: user.into(),
+            host: host.into(),
+            display_name: None,
+            summary: None,
+            icon_url: None,
+            image_url: None,
+            inbox_url: format!("{ap_id}/inbox"),
+            shared_inbox_url: None,
+            outbox_url: None,
+            followers_url: None,
+            following_url: None,
+            public_key_id: format!("{ap_id}#main-key"),
+            public_key_pem: "PEM".into(),
+            private_key_pem: None,
+            ed25519_public_key_id: None,
+            ed25519_public_key_pem: None,
+            ed25519_private_key_pem: None,
+            also_known_as: vec![],
+            moved_to_ap_id: None,
+            is_local: false,
+            actor_type: "Person".into(),
+            manually_approves_followers: false,
+        }
+    }
+
+    async fn queued_activity_types(pool: &sqlx::PgPool, sender_actor_id: i64) -> Vec<String> {
+        let rows = sqlx::query!(
+            r#"SELECT activity as "activity: sqlx::types::Json<serde_json::Value>"
+               FROM delivery_queue WHERE sender_actor_id = $1 ORDER BY id ASC"#,
+            sender_actor_id,
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|r| r.activity.0["type"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn create_block_core_removes_bidirectional_follow_and_enqueues_block(pool: PgPool) {
+        let local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();
+        let remote = repo::actor::insert(&pool, new_remote_actor("remote.test", "bob"))
+            .await
+            .unwrap();
+
+        // local → remote (accepted): create_block_core が delete_follow_core
+        // を経由して Undo Follow 送出 + 行削除するはず。
+        let out_ap_id = format!("https://{HOST}/activities/follow-out-1");
+        let out_row = repo::follow::insert_pending(&pool, &out_ap_id, local.id, remote.id)
+            .await
+            .unwrap();
+        repo::follow::set_state(&pool, out_row.id, sakurasato_core::model::FollowState::Accepted)
+            .await
+            .unwrap();
+        // remote → local (accepted): Reject は送出せず単純削除されるはず。
+        let in_ap_id = "https://remote.test/activities/follow-in-1".to_string();
+        let in_row = repo::follow::insert_pending(&pool, &in_ap_id, remote.id, local.id)
+            .await
+            .unwrap();
+        repo::follow::set_state(&pool, in_row.id, sakurasato_core::model::FollowState::Accepted)
+            .await
+            .unwrap();
+
+        let state = AppState::from_pool(pool.clone(), test_config());
+        let outcome = create_block_core(&state, FollowTarget::ActorId(remote.id))
+            .await
+            .unwrap();
+        assert_eq!(outcome.target.id, remote.id);
+
+        // block 行が (local -> remote) で作られている。
+        let block = repo::block::get_by_pair(&pool, local.id, remote.id)
+            .await
+            .unwrap()
+            .expect("block row must exist");
+        assert_eq!(block.id, outcome.block.id);
+
+        // 双方向 follow ともに削除されている。
+        assert!(
+            repo::follow::get_by_pair(&pool, local.id, remote.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "outbound follow must be removed",
+        );
+        assert!(
+            repo::follow::get_by_pair(&pool, remote.id, local.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "inbound follow must be removed",
+        );
+
+        // delivery_queue: delete_follow_core の Undo Follow (先) + block の
+        // Block activity (後) の 2 件。Reject は送出されない。
+        let types = queued_activity_types(&pool, local.id).await;
+        assert_eq!(types, vec!["Undo".to_string(), "Block".to_string()]);
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn create_block_core_rejects_self_block(pool: PgPool) {
+        let local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();
+        let state = AppState::from_pool(pool.clone(), test_config());
+        let err = create_block_core(&state, FollowTarget::ActorId(local.id))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlockError::Conflict(_)));
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn create_block_core_is_idempotent_for_the_block_row(pool: PgPool) {
+        let local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();
+        let remote = repo::actor::insert(&pool, new_remote_actor("remote.test", "bob"))
+            .await
+            .unwrap();
+        let state = AppState::from_pool(pool.clone(), test_config());
+
+        let first = create_block_core(&state, FollowTarget::ActorId(remote.id))
+            .await
+            .unwrap();
+        let second = create_block_core(&state, FollowTarget::ActorId(remote.id))
+            .await
+            .unwrap();
+        // block 行自体は ON CONFLICT で同一行 (id 不変)。
+        assert_eq!(first.block.id, second.block.id);
+        let count = sqlx::query!(
+            r#"SELECT count(*) AS "c!" FROM block WHERE blocker_actor_id = $1 AND blocked_actor_id = $2"#,
+            local.id,
+            remote.id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .c;
+        assert_eq!(count, 1, "repeated block must not duplicate the row");
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn delete_block_core_removes_row_and_enqueues_undo(pool: PgPool) {
+        let local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();
+        let remote = repo::actor::insert(&pool, new_remote_actor("remote.test", "bob"))
+            .await
+            .unwrap();
+        let ap_id = format!("https://{HOST}/activities/block-cli-{}-{}", local.id, remote.id);
+        let block = repo::block::insert(&pool, &ap_id, local.id, remote.id)
+            .await
+            .unwrap();
+
+        let state = AppState::from_pool(pool.clone(), test_config());
+        let outcome = delete_block_core(&state, block.id).await.unwrap();
+        assert_eq!(outcome.target_ap_id, remote.ap_id);
+
+        assert!(
+            repo::block::get_by_id(&pool, block.id).await.unwrap().is_none(),
+            "block row must be deleted",
+        );
+        let types = queued_activity_types(&pool, local.id).await;
+        assert_eq!(types, vec!["Undo".to_string()]);
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn delete_block_core_rejects_non_owner(pool: PgPool) {
+        let _local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();
+        let remote_a = repo::actor::insert(&pool, new_remote_actor("a.test", "alice2"))
+            .await
+            .unwrap();
+        let remote_b = repo::actor::insert(&pool, new_remote_actor("b.test", "bobby"))
+            .await
+            .unwrap();
+        // local が関与しない block 行 (blocker=remote_a)。
+        let ap_id = "https://a.test/activities/block-1".to_string();
+        let block = repo::block::insert(&pool, &ap_id, remote_a.id, remote_b.id)
+            .await
+            .unwrap();
+
+        let state = AppState::from_pool(pool.clone(), test_config());
+        let err = delete_block_core(&state, block.id).await.unwrap_err();
+        assert!(matches!(err, BlockError::Forbidden(_)));
+        // 権限エラーなので行は消えていない。
+        assert!(repo::block::get_by_id(&pool, block.id).await.unwrap().is_some());
     }
 }

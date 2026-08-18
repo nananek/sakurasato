@@ -318,4 +318,257 @@ mod tests {
     fn normalize_host_rejects_empty() {
         assert!(normalize_host("   ").is_err());
     }
+
+    // ── DB 統合テスト (計画書 §9) ─────────────────────────────────────────
+    // `block.rs` の test module と同じ最小 `Config` 構築パターン。
+
+    use sqlx::PgPool;
+
+    const HOST: &str = "sakura.test";
+    const USER: &str = "alice";
+
+    fn test_config() -> sakurasato_core::Config {
+        sakurasato_core::Config {
+            server: sakurasato_core::config::ServerConfig {
+                host: HOST.into(),
+                bind: "127.0.0.1:0".into(),
+                local_api_socket: "/tmp/sakurasato.sock".into(),
+                public_listen: None,
+                local_api_listen: None,
+                user: USER.into(),
+                info: sakurasato_core::config::ServerInfo::default(),
+                auto_approve_followers_for_followees: false,
+                max_note_text_length: 3000,
+            },
+            database: sakurasato_core::config::DatabaseConfig {
+                url: "unused-by-tests".into(),
+                password_file: None,
+            },
+            storage: sakurasato_core::config::StorageConfig {
+                endpoint: "http://localhost".into(),
+                bucket: "b".into(),
+                region: "us-east-1".into(),
+                access_key_id: "k".into(),
+                secret_access_key: "s".into(),
+                secret_access_key_file: None,
+                public_base_url: None,
+            },
+            media_proxy: sakurasato_core::config::MediaProxyConfig {
+                socket: "/tmp/x".into(),
+                max_bytes: 1024,
+                max_pixels: 1024,
+                video: sakurasato_core::config::VideoConfig::default(),
+                emoji_import: sakurasato_core::config::EmojiImportConfig::default(),
+            },
+            miauth: None,
+        }
+    }
+
+    fn new_local_actor() -> repo::actor::NewActor {
+        let ap_id = format!("https://{HOST}/users/{USER}");
+        repo::actor::NewActor {
+            ap_id: ap_id.clone(),
+            preferred_username: USER.into(),
+            host: HOST.into(),
+            display_name: None,
+            summary: None,
+            icon_url: None,
+            image_url: None,
+            inbox_url: format!("{ap_id}/inbox"),
+            shared_inbox_url: Some(format!("https://{HOST}/inbox")),
+            outbox_url: None,
+            followers_url: None,
+            following_url: None,
+            public_key_id: format!("{ap_id}#main-key"),
+            public_key_pem: "PEM".into(),
+            private_key_pem: None,
+            ed25519_public_key_id: None,
+            ed25519_public_key_pem: None,
+            ed25519_private_key_pem: None,
+            also_known_as: vec![],
+            moved_to_ap_id: None,
+            is_local: true,
+            actor_type: "Person".into(),
+            manually_approves_followers: false,
+        }
+    }
+
+    fn new_remote_actor(host: &str, user: &str) -> repo::actor::NewActor {
+        let ap_id = format!("https://{host}/users/{user}");
+        repo::actor::NewActor {
+            ap_id: ap_id.clone(),
+            preferred_username: user.into(),
+            host: host.into(),
+            display_name: None,
+            summary: None,
+            icon_url: None,
+            image_url: None,
+            inbox_url: format!("{ap_id}/inbox"),
+            shared_inbox_url: None,
+            outbox_url: None,
+            followers_url: None,
+            following_url: None,
+            public_key_id: format!("{ap_id}#main-key"),
+            public_key_pem: "PEM".into(),
+            private_key_pem: None,
+            ed25519_public_key_id: None,
+            ed25519_public_key_pem: None,
+            ed25519_private_key_pem: None,
+            also_known_as: vec![],
+            moved_to_ap_id: None,
+            is_local: false,
+            actor_type: "Person".into(),
+            manually_approves_followers: false,
+        }
+    }
+
+    async fn seed_accepted_follow(pool: &PgPool, follower: i64, followed: i64, tag: &str) {
+        let ap_id = format!("https://{HOST}/activities/follow-{tag}");
+        let row = repo::follow::insert_pending(pool, &ap_id, follower, followed)
+            .await
+            .unwrap();
+        repo::follow::set_state(pool, row.id, sakurasato_core::model::FollowState::Accepted)
+            .await
+            .unwrap();
+    }
+
+    async fn delivery_queue_count(pool: &PgPool) -> i64 {
+        sqlx::query!(r#"SELECT count(*) AS "c!" FROM delivery_queue"#)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .c
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn silence_core_sets_severity_without_touching_follows(pool: PgPool) {
+        let local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();
+        let remote = repo::actor::insert(&pool, new_remote_actor("mastodon.example", "bob"))
+            .await
+            .unwrap();
+        seed_accepted_follow(&pool, local.id, remote.id, "1").await;
+
+        let state = AppState::from_pool(pool.clone(), test_config());
+        let row = silence_core(&state, "Mastodon.Example", Some("spam".into()))
+            .await
+            .unwrap();
+        assert_eq!(row.host, "mastodon.example");
+        assert_eq!(row.severity, "silence");
+        assert_eq!(row.reason.as_deref(), Some("spam"));
+
+        // 既存 follow 関係には一切触れない (§10 確定事項 #3)。
+        let follow = repo::follow::get_by_pair(&pool, local.id, remote.id)
+            .await
+            .unwrap()
+            .expect("follow row must survive silence");
+        assert_eq!(follow.state, "accepted");
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn suspend_core_force_removes_bidirectional_follows_without_delivery(pool: PgPool) {
+        let local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();
+        let remote1 = repo::actor::insert(&pool, new_remote_actor("spammy.example", "eve"))
+            .await
+            .unwrap();
+        let remote2 = repo::actor::insert(&pool, new_remote_actor("spammy.example", "mallory"))
+            .await
+            .unwrap();
+        seed_accepted_follow(&pool, local.id, remote1.id, "out").await;
+        seed_accepted_follow(&pool, remote2.id, local.id, "in").await;
+
+        let state = AppState::from_pool(pool.clone(), test_config());
+        let outcome = suspend_core(&state, "spammy.example", None).await.unwrap();
+        assert_eq!(outcome.row.severity, "suspend");
+        assert_eq!(outcome.forced_unfollow_count, 2);
+
+        assert!(
+            repo::follow::get_by_pair(&pool, local.id, remote1.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "outbound follow must be force-removed",
+        );
+        assert!(
+            repo::follow::get_by_pair(&pool, remote2.id, local.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "inbound follow must be force-removed",
+        );
+        // §10 確定事項 #2: Undo Follow / Reject は一切配送しない。
+        assert_eq!(
+            delivery_queue_count(&pool).await,
+            0,
+            "suspend must not enqueue any delivery",
+        );
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn suspend_core_does_not_affect_other_domains(pool: PgPool) {
+        let local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();
+        let untouched = repo::actor::insert(&pool, new_remote_actor("safe.example", "carol"))
+            .await
+            .unwrap();
+        seed_accepted_follow(&pool, local.id, untouched.id, "safe").await;
+
+        let state = AppState::from_pool(pool.clone(), test_config());
+        let outcome = suspend_core(&state, "spammy.example", None).await.unwrap();
+        assert_eq!(outcome.forced_unfollow_count, 0);
+
+        assert!(
+            repo::follow::get_by_pair(&pool, local.id, untouched.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "unrelated domain's follow must survive",
+        );
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn unset_core_removes_row_and_errors_when_missing(pool: PgPool) {
+        let state = AppState::from_pool(pool.clone(), test_config());
+        silence_core(&state, "mastodon.example", None).await.unwrap();
+        assert!(
+            repo::domain_moderation::get_by_host(&pool, "mastodon.example")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        unset_core(&state, "mastodon.example").await.unwrap();
+        assert!(
+            repo::domain_moderation::get_by_host(&pool, "mastodon.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let err = unset_core(&state, "mastodon.example").await.unwrap_err();
+        assert!(matches!(err, DomainModerationError::NotFound(_)));
+    }
+
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn detail_core_reports_stats_and_lists(pool: PgPool) {
+        let local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();
+        let followee = repo::actor::insert(&pool, new_remote_actor("mastodon.example", "bob"))
+            .await
+            .unwrap();
+        let follower = repo::actor::insert(&pool, new_remote_actor("mastodon.example", "carol"))
+            .await
+            .unwrap();
+        seed_accepted_follow(&pool, local.id, followee.id, "following").await;
+        seed_accepted_follow(&pool, follower.id, local.id, "follower").await;
+
+        let state = AppState::from_pool(pool.clone(), test_config());
+        let detail = detail_core(&state, "mastodon.example").await.unwrap();
+        assert_eq!(detail.host, "mastodon.example");
+        assert!(detail.moderation.is_none());
+        assert_eq!(detail.stats.known_actor_count, 2);
+        assert_eq!(detail.stats.accepted_following_count, 1);
+        assert_eq!(detail.stats.accepted_followers_count, 1);
+        assert_eq!(detail.following.len(), 1);
+        assert_eq!(detail.following[0].actor.id, followee.id);
+        assert_eq!(detail.followers.len(), 1);
+        assert_eq!(detail.followers[0].actor.id, follower.id);
+    }
 }
