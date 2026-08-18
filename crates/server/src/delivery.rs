@@ -5,7 +5,8 @@
 //!    M3b-3 で `Follow` / `Accept` / `Create` の dispatch から呼ばれる想定。
 //! 2. `try_deliver_one` — 単一 queue 行をピックして相手 inbox に POST。
 //!    cavage RSA-SHA256 で署名し、結果に応じて `delivered` / `failed` /
-//!    `dead` に倒す。
+//!    `dead` に倒す。宛先ドメインが suspend 対象なら POST を試みず即座に
+//!    `dead` に倒す (連合ドメインブロック PR5、計画書 §6.4)。
 //!
 //! **本 PR では retry/backoff の本格化と常駐ループは作らない**。M3b-3 で
 //! `tokio::spawn` した worker ループにする。PR2 は CLI 経由 (`sakurasato
@@ -239,6 +240,26 @@ pub async fn try_deliver_one(state: &AppState, queue_id: i64) -> anyhow::Result<
             "sender actor {} is not local; cannot sign outbound delivery",
             sender.ap_id
         );
+    }
+
+    // **PR5 (計画書 §6.4)**: suspend 対象ドメイン宛の配送は行わない。配送
+    // 直前のこの一箇所に集約することで、suspend 実行前から `delivery_queue`
+    // に残っていた行も一律止められる (enqueue 時点のガードだけでは救えない
+    // ケース)。DB エラーは fail-open (= 判定不能なら配送を続行、他の
+    // 一時的失敗系と同じ扱い)。silence は配送自体を止めない (受信側の
+    // 取り込み拒否が主眼で、こちらから配送を止める必然性は薄いため)。
+    if let Some(host) = reqwest::Url::parse(&row.inbox_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        && let Ok(Some(m)) = repo::domain_moderation::get_by_host(state.pool(), &host).await
+        && m.severity == "suspend"
+    {
+        let reason = format!("destination domain {host} is suspended");
+        repo::delivery_queue::mark_dead(state.pool(), queue_id, &reason)
+            .await
+            .context("mark_dead for suspended domain")?;
+        warn!(queue_id, host = %host, "delivery skipped: destination domain suspended");
+        return Ok(DeliveryOutcome::Dead);
     }
 
     match attempt_post(state, &row, &sender).await {

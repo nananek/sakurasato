@@ -104,6 +104,33 @@ pub(crate) async fn handle_follow(
         );
     }
 
+    // **PR5 (計画書 §6.4, §10 確定事項 #3)**: silence 対象ドメインからの
+    // 「新規」Follow はサイレントドロップする。既に accepted な関係の
+    // retry (= Mastodon 等が Accept 再送出を期待するハウスキーピング) は
+    // silence 導入前から続く正当な関係なので妨げない。Create/Like/
+    // EmojiReact/Announce 等、既存 followee を前提とするインタラクションは
+    // ここでは一切触れない (silence は Follow ハンドラのみで完結させる)。
+    if let Some(m) = repo::domain_moderation::get_by_host(state.pool(), &signer.host)
+        .await
+        .context("domain moderation lookup for inbound Follow")?
+        && m.severity == "silence"
+    {
+        let already_accepted =
+            repo::follow::get_by_pair(state.pool(), signer.id, followed.id)
+                .await
+                .context("existing follow lookup for silence guard")?
+                .is_some_and(|row| row.state == FollowState::Accepted.as_str());
+        if !already_accepted {
+            info!(
+                follower = %signer.ap_id,
+                followed = %followed.ap_id,
+                host = %signer.host,
+                "inbound Follow from silenced domain; silently dropping",
+            );
+            return Ok(());
+        }
+    }
+
     let row = repo::follow::upsert_pending(state.pool(), &follow_ap_id, signer.id, followed.id)
         .await
         .context("upsert follow row")?;
