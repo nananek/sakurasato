@@ -899,26 +899,33 @@ async fn reaction_insert_or_get_is_idempotent(pool: PgPool) -> sqlx::Result<()> 
     )
     .await?;
     // 同じ ap_id を 2 回 → 同じ行が返る (= リトライ安全)。
-    let a =
+    let (a, a_is_new) =
         repo::reaction::insert_or_get(&pool, "https://x.test/r/a", note.id, reactor.id, "👍", None)
             .await?;
-    let b =
+    assert!(a_is_new, "初回 insert は is_new == true");
+    let (b, b_is_new) =
         repo::reaction::insert_or_get(&pool, "https://x.test/r/a", note.id, reactor.id, "👍", None)
             .await?;
+    assert!(!b_is_new, "同一 ap_id の再呼び出しは is_new == false");
     assert_eq!(a.id, b.id);
 
     // 別 ap_id だが natural key (note, actor, content) が衝突 → 既存行を返す。
-    let c =
+    let (c, c_is_new) =
         repo::reaction::insert_or_get(&pool, "https://x.test/r/b", note.id, reactor.id, "👍", None)
             .await?;
+    assert!(
+        !c_is_new,
+        "natural key 衝突 (別 Activity ID) も is_new == false"
+    );
     assert_eq!(a.id, c.id);
     // 既存行が返るので ap_id は最初のもの (= "/r/a") のまま。
     assert_eq!(c.ap_id, "https://x.test/r/a");
 
     // 別 content なら新規行。
-    let d =
+    let (d, d_is_new) =
         repo::reaction::insert_or_get(&pool, "https://x.test/r/c", note.id, reactor.id, "🎉", None)
             .await?;
+    assert!(d_is_new, "別 content は新規 insert");
     assert_ne!(a.id, d.id);
     Ok(())
 }

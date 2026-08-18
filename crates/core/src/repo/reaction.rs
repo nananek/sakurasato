@@ -50,9 +50,18 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<Option<Rea
 /// 場合 (= 同じ actor が同じ note に同じ content を別 Activity ID で押し付け
 /// てきた) も既存行を返す。
 ///
+/// 戻り値は `(行, is_new)`。`is_new` は「本呼び出しで **新規 INSERT した**」
+/// かどうか (= 冪等再配送では `false`)。呼び出し側はこれで「既存行への再配送」
+/// と「初回受領」を区別し、in-app 通知 / streaming push 等の副作用を初回だけ
+/// 発火できる。従来は戻り行の `ap_id` と入力 `ap_id` を比較するヒューリスティック
+/// で代用していたが、natural key 衝突 (別 Activity ID) で既存行を返した場合も
+/// `false` になる点が正確である。
+///
 /// 実装: Postgres の `ON CONFLICT (col)` は 1 つの制約しか同時に指定できない
 /// ため、`ON CONFLICT DO NOTHING` (= 任意の衝突を抑える) + RETURNING で空が
-/// 返ってきたら fallback SELECT で既存行を引く。
+/// 返ってきたら fallback SELECT で既存行を引く。RETURNING が返ったときのみ
+/// `is_new == true` (`fetch_optional` が `None` を返すのは衝突時のみで、その他
+/// のエラーは `?` で伝播する)。
 pub async fn insert_or_get(
     pool: &PgPool,
     ap_id: &str,
@@ -60,7 +69,7 @@ pub async fn insert_or_get(
     actor_id: i64,
     content: &str,
     emoji_id: Option<i64>,
-) -> sqlx::Result<ReactionRow> {
+) -> sqlx::Result<(ReactionRow, bool)> {
     let inserted = sqlx::query_as!(
         ReactionRow,
         r#"
@@ -78,7 +87,8 @@ pub async fn insert_or_get(
     .fetch_optional(pool)
     .await?;
     if let Some(row) = inserted {
-        return Ok(row);
+        // RETURNING が返った = 本呼び出しで新規 INSERT した。
+        return Ok((row, true));
     }
     // 衝突 (ap_id か natural key のいずれか) で挿入できなかった。
     // 同じ ap_id を優先して引き、無ければ natural key で引く ──
@@ -94,7 +104,7 @@ pub async fn insert_or_get(
     .fetch_optional(pool)
     .await?
     {
-        return Ok(row);
+        return Ok((row, false));
     }
     sqlx::query_as!(
         ReactionRow,
@@ -108,6 +118,7 @@ pub async fn insert_or_get(
     )
     .fetch_one(pool)
     .await
+    .map(|row| (row, false))
 }
 
 pub async fn delete_by_ap_id(pool: &PgPool, ap_id: &str) -> sqlx::Result<u64> {

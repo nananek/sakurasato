@@ -763,9 +763,10 @@ async fn delete_remote_note_reaction_inlines_undo_object_and_targets_author(pool
     // ローカル user が「他人の remote note」にリアクションを残した状態を直接
     // 生成する (POST 経路は remote note を 404 で拒否するので DB に直挿入)。
     let reaction_ap = "https://example.test/users/alice/activities/reaction-100";
-    let row = repo::reaction::insert_or_get(&pool, reaction_ap, note_id, alice.id, "👍", None)
-        .await
-        .unwrap();
+    let (row, _is_new) =
+        repo::reaction::insert_or_get(&pool, reaction_ap, note_id, alice.id, "👍", None)
+            .await
+            .unwrap();
 
     let raw = issue_token(&pool, "tui").await;
     let state =
@@ -832,7 +833,7 @@ async fn delete_emoji_reaction_undo_preserves_misskey_reaction(pool: PgPool) {
     )
     .await
     .unwrap();
-    let row = repo::reaction::insert_or_get(
+    let (row, _is_new) = repo::reaction::insert_or_get(
         &pool,
         "https://example.test/users/alice/activities/reaction-200",
         note_id,

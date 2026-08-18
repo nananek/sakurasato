@@ -130,7 +130,7 @@ pub(crate) async fn create_reaction_core(
         user = local_actor.preferred_username,
     );
 
-    let inserted = match repo::reaction::insert_or_get(
+    let (inserted, is_new) = match repo::reaction::insert_or_get(
         state.pool(),
         &ap_id,
         note.id,
@@ -147,7 +147,7 @@ pub(crate) async fn create_reaction_core(
         }
     };
 
-    let queued = if inserted.ap_id == ap_id {
+    let queued = if is_new {
         // 新規 reaction のとき (= 冪等再叩きでない) だけ Misskey 互換 `/streaming`
         // の noteUpdated (reacted) へ push。自分のリアクションも購読中クライアント
         // (Aria 等) に反映する。

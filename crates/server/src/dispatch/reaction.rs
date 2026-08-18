@@ -194,7 +194,7 @@ async fn process_inbound_reaction(
     // 保つ。詳細は [`reaction_content_for_storage`] の doc を参照。
     let content = reaction_content_for_storage(content, learned.as_ref());
 
-    let inserted = repo::reaction::insert_or_get(
+    let (inserted, is_new) = repo::reaction::insert_or_get(
         state.pool(),
         &activity_id,
         note.id,
@@ -214,8 +214,27 @@ async fn process_inbound_reaction(
         raw_content = %raw_content,
         content = %content,
         emoji_id = ?emoji_id,
+        is_new,
         "reaction recorded",
     );
+
+    // 冪等再受信 (= 既存 reaction 行を返した再配送) では通知 / streaming を
+    // 発火しない ── 同一 Like の二重投函で通知フィードに二重エントリが積まれる
+    // のを防ぐ (reaction の DB カウントは insert_or_get の UNIQUE で 1 のまま)。
+    // 従来は「既存行への再配送でも必ず streaming を push」していたが、SSE 再接続
+    // 時はクライアントが state を再 fetch する前提なので発火条件を「新規のみ」に
+    // 揃えるのは意図的仕様変更 (Aria 側は reaction map の再描画で吸収していた)。
+    if !is_new {
+        info!(
+            kind = kind.as_str(),
+            reaction_id = inserted.id,
+            note_id = note.id,
+            signer = %signer.ap_id,
+            content = %content,
+            "re-delivery of an already-recorded reaction; skipping notify/streaming"
+        );
+        return Ok(());
+    }
 
     // 通知発火 (fire-and-forget)。通知は **our own (local) note** への reaction
     // のみ ── remote note (= followee 等のタイムライン投稿) への第三者リアク
@@ -229,8 +248,7 @@ async fn process_inbound_reaction(
 
     // Misskey 互換 `/streaming` の noteUpdated へ push (fire-and-forget)。通知と
     // 違い local / remote を問わず、タイムラインに並ぶ note の reaction 増減を
-    // 購読中クライアントに反映する。冪等再受信 (= 既存 reaction の再 insert) でも
-    // 送るが、Aria 側は reaction map の再描画で吸収するので害は無い。
+    // 購読中クライアントに反映する。
     let _ = state
         .stream_sender()
         .send(crate::event_bus::StreamEvent::ReactionUpdated {
