@@ -33,6 +33,7 @@ use tower_http::trace::TraceLayer;
 use crate::state::AppState;
 
 pub mod auth;
+pub mod blocking;
 pub mod check;
 pub mod conv;
 pub mod counts;
@@ -142,6 +143,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/notes/reactions/delete", post(reactions::delete))
         .route("/api/following/create", post(following::create))
         .route("/api/following/delete", post(following::delete))
+        // ユーザーブロック follow-up (PR #355 の続き)。未実装だと Aria の
+        // UserNotifier.block (UserSheet のブロックボタン) が 404 →
+        // ApiService.post で crash する (実機報告で確認)。
+        .route("/api/blocking/create", post(blocking::create))
+        .route("/api/blocking/delete", post(blocking::delete))
+        .route("/api/blocking/list", post(blocking::list))
         // 鍵アカ運用 (#66) の pending Follow を Aria 等から確認・承認・拒否する。
         // 未実装だと Aria の FollowRequestsNotifier が 404 → ApiService.post で
         // crash する。

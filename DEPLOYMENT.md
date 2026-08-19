@@ -508,7 +508,7 @@ UDS のディレクトリ (`/run/sakurasato/`) は server の起動時に nonroo
 | 観点 | 内容 |
 |---|---|
 | **Web UI 無し運用** | 認可 URL `/miauth/{uuid}` は landing 専用 (= "CLI で approve せよ" と表示するだけ)。public 側に Web UI が無いため、誤って公開すると未知のクライアントが UUID を作って polling し続ける状態を放置することになる |
-| **endpoint 表面の拡張** | `/api/miauth/*` / `/api/i` / `/api/notes/*` / `/api/users/*` / `/api/following/*` / `/api/emojis` 等、Misskey 互換 endpoint の全表面が露出する (= 攻撃面の拡大) |
+| **endpoint 表面の拡張** | `/api/miauth/*` / `/api/i` / `/api/notes/*` / `/api/users/*` / `/api/following/*` / `/api/blocking/*` / `/api/emojis` 等、Misskey 互換 endpoint の全表面が露出する (= 攻撃面の拡大) |
 | **token の write 権限** | MiAuth トークンは `write:notes` / `write:reactions` などの permission scope を持つ。token がハイジャックされると **投稿 / リアクション送信 / フォロー操作まで通る** |
 
 #### cloudflared の例 (やってはいけない / OK)
@@ -553,7 +553,7 @@ server {
 
   # MiAuth 経路を明示的に 404 で潰す (二重防壁、一次は UDS 分離)。
   # 正規表現は trailing slash の有無に関係なく捕捉する。
-  location ~ ^/(api/miauth|miauth|api/i|api/notes|api/users|api/following|api/emojis) {
+  location ~ ^/(api/miauth|miauth|api/i|api/notes|api/users|api/following|api/blocking|api/emojis) {
     return 404;
   }
 }
@@ -570,6 +570,7 @@ sakurasato.example.com {
                /api/i /api/notes /api/notes/* \
                /api/users /api/users/* \
                /api/following /api/following/* \
+               /api/blocking /api/blocking/* \
                /api/emojis
   respond @miauth 404
 

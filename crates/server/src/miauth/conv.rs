@@ -1040,6 +1040,11 @@ fn entry_to_actor_lite(entry: &TimelineEntry) -> ActorRow {
 /// の required bool `isFollowing` / `isFollowed` / `hasPendingFollowRequestFromYou`
 /// / `hasPendingFollowRequestToYou` にそのまま載せる。自分自身 (`/api/i` 経由) は
 /// [`crate::follow::FollowRelationship::neutral`] を渡せば良い。
+///
+/// `is_blocking` / `is_blocked` は viewer から見た target との block 関係
+/// ([`crate::block::compute_block_relationship`] の結果)。`isBlocking` /
+/// `isBlocked` にそのまま載せる (`MiAuth` 経由のユーザーブロック対応 follow-up、
+/// PR #355 のフォローアップ)。自分自身は常に `false, false`。
 #[allow(clippy::too_many_arguments)]
 pub fn from_actor_detailed(
     actor: &ActorRow,
@@ -1047,6 +1052,8 @@ pub fn from_actor_detailed(
     following_count: i64,
     notes_count: i64,
     relationship: crate::follow::FollowRelationship,
+    is_blocking: bool,
+    is_blocked: bool,
     emojis: BTreeMap<String, String>,
 ) -> JsonValue {
     let lite = from_actor_and_counts(actor, followers_count, following_count, notes_count, emojis);
@@ -1175,12 +1182,14 @@ pub fn from_actor_detailed(
         // `isBlocked` / `isMuted` / `isRenoteMuted` も **required bool** として
         // 読み、欠けると `type 'Null' is not a subtype of type 'bool'` で crash
         // する (= #174 と同型の required bool 漏れの WithRelations 版。Aria の
-        // `UserNotifier` で実際に発生した)。Sakurasato はブロック / ミュート
-        // 機能を持たないため全て固定 `false`。`notify` / `withReplies` は
-        // nullable だが、wire parity のため Misskey の既定値 (normal / true) を
-        // 載せておく。
-        map.insert("isBlocking".to_string(), JsonValue::Bool(false));
-        map.insert("isBlocked".to_string(), JsonValue::Bool(false));
+        // `UserNotifier` で実際に発生した)。**`isBlocking`/`isBlocked` はユーザー
+        // ブロック機能 (PR #355) の MiAuth follow-up で実値化済み** ── 呼び出し元
+        // ([`crate::block::compute_block_relationship`]) が引く。Sakurasato は
+        // ミュート機能を持たないため `isMuted`/`isRenoteMuted` は引き続き固定
+        // `false`。`notify` / `withReplies` は nullable だが、wire parity のため
+        // Misskey の既定値 (normal / true) を載せておく。
+        map.insert("isBlocking".to_string(), JsonValue::Bool(is_blocking));
+        map.insert("isBlocked".to_string(), JsonValue::Bool(is_blocked));
         map.insert("isMuted".to_string(), JsonValue::Bool(false));
         map.insert("isRenoteMuted".to_string(), JsonValue::Bool(false));
         map.insert("notify".to_string(), JsonValue::String("normal".into()));
@@ -1243,15 +1252,18 @@ pub fn from_actor_me_detailed(
     policies: JsonValue,
     emojis: BTreeMap<String, String>,
 ) -> JsonValue {
-    // 自分自身 (Me) に対しては follow relationship は常に中立 ── `/api/i` の
+    // 自分自身 (Me) に対しては follow/block relationship は常に中立 ── `/api/i` の
     // `UserDetailedNotMe` 部分も required bool が揃っている限り client は
-    // 描画に困らない。
+    // 描画に困らない (自己ブロックは create_block_core が拒否する仕様なので
+    // is_blocking/is_blocked も実データ上常に false)。
     let mut v = from_actor_detailed(
         actor,
         followers_count,
         following_count,
         notes_count,
         crate::follow::FollowRelationship::neutral(),
+        false,
+        false,
         emojis,
     );
     // `from_actor_detailed` は実質 `Object` を返すが、型レベルでは保証されて
@@ -1559,7 +1571,7 @@ mod tests {
             "sakura".to_string(),
             "https://sakurasato.test/media/emoji/local/sakura.webp".to_string(),
         )]);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), emojis.clone());
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), false, false, emojis.clone());
         assert_eq!(
             v["emojis"],
             serde_json::json!({ "sakura": "https://sakurasato.test/media/emoji/local/sakura.webp" })
@@ -1896,7 +1908,16 @@ mod tests {
         actor.summary = Some("hello world".into());
         actor.image_url = Some("https://cdn.test/banner.webp".into());
         actor.actor_type = "Service".into();
-        let v = from_actor_detailed(&actor, 1, 2, 3, neutral_rel(), BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            1,
+            2,
+            3,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         assert_eq!(v["id"], "42");
         assert_eq!(v["description"], "hello world");
         assert_eq!(v["bannerUrl"], "https://cdn.test/banner.webp");
@@ -1933,7 +1954,16 @@ mod tests {
         let mut actor = fake_actor(false, "remote.test", false);
         actor.summary =
             Some(r#"<p>hello <a href="https://remote.test/@me">@me</a></p><p>line2</p>"#.into());
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         assert_eq!(v["description"], "hello @me\n\nline2");
     }
 
@@ -1943,7 +1973,16 @@ mod tests {
         // そのまま (html_to_plain_text を通さない)。
         let mut actor = fake_actor(true, "sakurasato.test", false);
         actor.summary = Some("price < 100 & rising".into());
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         assert_eq!(v["description"], "price < 100 & rising");
     }
 
@@ -1956,7 +1995,16 @@ mod tests {
     fn from_actor_detailed_emits_all_required_userdetailednotme_fields() {
         // remote actor (icon_url 無し) でも avatarUrl が non-null になる経路。
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         // string / number で `as String` / `as num` 直読みされ、null だと throw。
         assert!(v["id"].is_string(), "id must be a string");
         assert!(v["username"].is_string(), "username must be a string");
@@ -1998,7 +2046,16 @@ mod tests {
     #[test]
     fn from_actor_detailed_emits_withrelations_defaults() {
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         assert_eq!(v["notify"], "normal");
         assert_eq!(v["withReplies"], true);
     }
@@ -2018,7 +2075,7 @@ mod tests {
             has_pending_follow_request_from_you: true,
             has_pending_follow_request_to_you: true,
         };
-        let v = from_actor_detailed(&actor, 0, 0, 0, rel, BTreeMap::new());
+        let v = from_actor_detailed(&actor, 0, 0, 0, rel, false, false, BTreeMap::new());
         assert_eq!(
             v["isFollowing"], true,
             "isFollowing must come from `following`"
@@ -2037,6 +2094,28 @@ mod tests {
         );
     }
 
+    /// `MiAuth` 経由のユーザーブロック follow-up: `isBlocking` / `isBlocked` が
+    /// hard-code `false` ではなく `from_actor_detailed` の引数から来ることを
+    /// 固定する回帰テスト。follow relationship の swap 検出テストと同じ理由で
+    /// 2 つの bool を非対称 (`true`/`false`) にして取り違えを検出する。
+    #[test]
+    fn from_actor_detailed_emits_block_relationship_without_swapping() {
+        let actor = fake_actor(false, "remote.test", false);
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), true, false, BTreeMap::new());
+        assert_eq!(
+            v["isBlocking"], true,
+            "isBlocking must come from is_blocking"
+        );
+        assert_eq!(v["isBlocked"], false, "isBlocked must come from is_blocked");
+
+        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), false, true, BTreeMap::new());
+        assert_eq!(
+            v["isBlocking"], false,
+            "isBlocking must come from is_blocking"
+        );
+        assert_eq!(v["isBlocked"], true, "isBlocked must come from is_blocked");
+    }
+
     /// 2026-07-22 調査: `misskey_dart` の `User.fromJson` (=
     /// `MisskeyUsers.search` / `searchByUsernameAndHost` が使う) は
     /// `json.containsKey("url")` の有無だけで `UserLite` / `UserDetailed` を
@@ -2047,7 +2126,16 @@ mod tests {
     #[test]
     fn from_actor_detailed_includes_url_key_for_userdetailed_dispatch() {
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         let map = v.as_object().expect("from_actor_detailed must be object");
         assert!(
             map.contains_key("url"),

@@ -182,9 +182,9 @@ async fn build_detailed_json(
     let actor = crate::remote_actor::refresh_remote_actor_if_stale(state, actor).await;
     let (followers, following, notes) =
         crate::miauth::counts::counts_for_actor(state, &actor).await;
-    let rel = match local_actor_id {
+    let (rel, is_blocking, is_blocked) = match local_actor_id {
         Some(local_id) => {
-            crate::follow::compute_follow_relationship(state.pool(), local_id, actor.id)
+            let rel = crate::follow::compute_follow_relationship(state.pool(), local_id, actor.id)
                 .await
                 .unwrap_or_else(|err| {
                     tracing::warn!(
@@ -194,12 +194,24 @@ async fn build_detailed_json(
                          falling back to neutral",
                     );
                     crate::follow::FollowRelationship::neutral()
-                })
+                });
+            let (is_blocking, is_blocked) =
+                crate::block::compute_block_relationship(state.pool(), local_id, actor.id).await;
+            (rel, is_blocking, is_blocked)
         }
-        None => crate::follow::FollowRelationship::neutral(),
+        None => (crate::follow::FollowRelationship::neutral(), false, false),
     };
     let emojis = resolve_user_emojis(state.pool(), &state.config().server.host, &actor).await;
-    from_actor_detailed(&actor, followers, following, notes, rel, emojis)
+    from_actor_detailed(
+        &actor,
+        followers,
+        following,
+        notes,
+        rel,
+        is_blocking,
+        is_blocked,
+        emojis,
+    )
 }
 
 /// `limit` の既定値・上限。Misskey 公式仕様 (default 10, max 100) に揃える。
@@ -283,10 +295,18 @@ pub async fn search_by_username_and_host(
     for actor in actors {
         let (followers, following, notes) =
             crate::miauth::counts::counts_for_actor(&state, &actor).await;
-        let rel = relationship_or_neutral(&state, local_actor_id, actor.id).await;
+        let (rel, is_blocking, is_blocked) =
+            relationships_or_neutral(&state, local_actor_id, actor.id).await;
         let emojis = resolve_user_emojis(state.pool(), &host, &actor).await;
         out.push(from_actor_detailed(
-            &actor, followers, following, notes, rel, emojis,
+            &actor,
+            followers,
+            following,
+            notes,
+            rel,
+            is_blocking,
+            is_blocked,
+            emojis,
         ));
     }
     Json(out).into_response()
@@ -379,37 +399,48 @@ pub async fn search(
     for actor in actors {
         let (followers, following, notes) =
             crate::miauth::counts::counts_for_actor(&state, &actor).await;
-        let rel = relationship_or_neutral(&state, local_actor_id, actor.id).await;
+        let (rel, is_blocking, is_blocked) =
+            relationships_or_neutral(&state, local_actor_id, actor.id).await;
         let emojis = resolve_user_emojis(state.pool(), &host, &actor).await;
         out.push(from_actor_detailed(
-            &actor, followers, following, notes, rel, emojis,
+            &actor,
+            followers,
+            following,
+            notes,
+            rel,
+            is_blocking,
+            is_blocked,
+            emojis,
         ));
     }
     Json(out).into_response()
 }
 
-/// viewer (= ローカル actor) から見た `target_actor_id` との follow relationship
-/// を計算する。`local_actor_id` が `None` (= 未 init) または DB 障害時は中立値に
-/// フェイルオープンする (= `count_followers` の `.unwrap_or(0)` と同じ方針)。
-async fn relationship_or_neutral(
+/// viewer (= ローカル actor) から見た `target_actor_id` との follow + block
+/// relationship をまとめて計算する。`local_actor_id` が `None` (= 未 init) または
+/// DB 障害時は両方とも中立値にフェイルオープンする (= `count_followers` の
+/// `.unwrap_or(0)` と同じ方針)。block relationship は `MiAuth` 経由のユーザー
+/// ブロック follow-up (`isBlocking`/`isBlocked` 実値化) 用。
+async fn relationships_or_neutral(
     state: &AppState,
     local_actor_id: Option<i64>,
     target_actor_id: i64,
-) -> crate::follow::FollowRelationship {
-    match local_actor_id {
-        Some(local_id) => {
-            crate::follow::compute_follow_relationship(state.pool(), local_id, target_actor_id)
-                .await
-                .unwrap_or_else(|err| {
-                    tracing::warn!(
-                        ?err,
-                        target_actor_id,
-                        "miauth users search: relationship computation failed; \
-                         falling back to neutral",
-                    );
-                    crate::follow::FollowRelationship::neutral()
-                })
-        }
-        None => crate::follow::FollowRelationship::neutral(),
-    }
+) -> (crate::follow::FollowRelationship, bool, bool) {
+    let Some(local_id) = local_actor_id else {
+        return (crate::follow::FollowRelationship::neutral(), false, false);
+    };
+    let rel = crate::follow::compute_follow_relationship(state.pool(), local_id, target_actor_id)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                ?err,
+                target_actor_id,
+                "miauth users search: relationship computation failed; \
+                 falling back to neutral",
+            );
+            crate::follow::FollowRelationship::neutral()
+        });
+    let (is_blocking, is_blocked) =
+        crate::block::compute_block_relationship(state.pool(), local_id, target_actor_id).await;
+    (rel, is_blocking, is_blocked)
 }

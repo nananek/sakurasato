@@ -151,10 +151,19 @@ pub async fn delete(
 async fn build_create_response(state: &AppState, outcome: &FollowOutcome) -> serde_json::Value {
     let (followers, following, notes) =
         crate::miauth::counts::counts_for_actor(state, &outcome.target).await;
-    let rel = compute_relationship_or_neutral(state, outcome.target.id).await;
+    let (rel, is_blocking, is_blocked) = relationships_or_neutral(state, outcome.target.id).await;
     let emojis =
         resolve_user_emojis(state.pool(), &state.config().server.host, &outcome.target).await;
-    from_actor_detailed(&outcome.target, followers, following, notes, rel, emojis)
+    from_actor_detailed(
+        &outcome.target,
+        followers,
+        following,
+        notes,
+        rel,
+        is_blocking,
+        is_blocked,
+        emojis,
+    )
 }
 
 /// `following/delete` の成功 body ── unfollow した相手 user の `UserDetailed`。
@@ -165,10 +174,19 @@ async fn build_delete_response(state: &AppState, outcome: &UnfollowOutcome) -> s
         Ok(Some(actor)) => {
             let (followers, following, notes) =
                 crate::miauth::counts::counts_for_actor(state, &actor).await;
-            let rel = compute_relationship_or_neutral(state, actor.id).await;
+            let (rel, is_blocking, is_blocked) = relationships_or_neutral(state, actor.id).await;
             let emojis =
                 resolve_user_emojis(state.pool(), &state.config().server.host, &actor).await;
-            from_actor_detailed(&actor, followers, following, notes, rel, emojis)
+            from_actor_detailed(
+                &actor,
+                followers,
+                following,
+                notes,
+                rel,
+                is_blocking,
+                is_blocked,
+                emojis,
+            )
         }
         _ => {
             // actor 行が消えていても unfollow 自体は成功している。空 object で返す。
@@ -177,19 +195,22 @@ async fn build_delete_response(state: &AppState, outcome: &UnfollowOutcome) -> s
     }
 }
 
-/// viewer (= ローカル actor) から見た `target_actor_id` との follow relationship
-/// を計算する。local actor 未 init / DB 障害時は中立値にフェイルオープンする
-/// (= `followers`/`following` count の `.unwrap_or(0)` と同じ方針)。
-async fn compute_relationship_or_neutral(
+/// viewer (= ローカル actor) から見た `target_actor_id` との follow + block
+/// relationship をまとめて計算する。local actor 未 init / DB 障害時は両方とも
+/// 中立値にフェイルオープンする (= `followers`/`following` count の
+/// `.unwrap_or(0)` と同じ方針)。block relationship は `MiAuth` 経由のユーザー
+/// ブロック follow-up (`isBlocking`/`isBlocked` 実値化) 用。
+///
+/// `pub(super)`: [`crate::miauth::blocking`] の `blocking/create`・`delete` の
+/// レスポンス組み立てからも再利用する (`resolve_local_actor_id` と同じ理由)。
+pub(super) async fn relationships_or_neutral(
     state: &AppState,
     target_actor_id: i64,
-) -> crate::follow::FollowRelationship {
-    match resolve_local_actor_id(state).await {
-        Some(local_id) => crate::follow::compute_follow_relationship(
-            state.pool(),
-            local_id,
-            target_actor_id,
-        )
+) -> (crate::follow::FollowRelationship, bool, bool) {
+    let Some(local_id) = resolve_local_actor_id(state).await else {
+        return (crate::follow::FollowRelationship::neutral(), false, false);
+    };
+    let rel = crate::follow::compute_follow_relationship(state.pool(), local_id, target_actor_id)
         .await
         .unwrap_or_else(|err| {
             tracing::warn!(
@@ -198,9 +219,10 @@ async fn compute_relationship_or_neutral(
                 "miauth following: relationship computation failed; falling back to neutral",
             );
             crate::follow::FollowRelationship::neutral()
-        }),
-        None => crate::follow::FollowRelationship::neutral(),
-    }
+        });
+    let (is_blocking, is_blocked) =
+        crate::block::compute_block_relationship(state.pool(), local_id, target_actor_id).await;
+    (rel, is_blocking, is_blocked)
 }
 
 /// ローカル actor の DB id を引く。未 init / 非 local のときは `None`。
