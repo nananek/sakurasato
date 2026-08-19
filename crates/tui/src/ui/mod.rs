@@ -231,6 +231,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> PanelRects {
         render_command_prompt(frame, status_area, &app.theme, p);
     }
 
+    // 連合ドメインブロック PR7: ドメイン一覧 / 詳細モーダル。NoteDetail と
+    // 同じ「中央モーダル、PanelRects 非登録、マウス非対応」方式。
+    if app.focus == Focus::DomainAdmin {
+        render_domain_admin(frame, area, app);
+    }
+    if app.focus == Focus::DomainDetail {
+        render_domain_detail(frame, area, app);
+    }
+
+    // ユーザーブロック PR6 / 連合ドメインブロック PR7 共用: 確認オーバーレイ。
+    // 他のどのモーダルより最前面に出す (= 破壊的操作の最終確認のため)。
+    if app.focus == Focus::ConfirmPrompt {
+        render_confirm_prompt(frame, area, app);
+    }
+
     PanelRects {
         timeline: timeline_area,
         timeline_rows: rows,
@@ -2918,6 +2933,9 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Focus::NoteDetail => "note",
         Focus::Lists => "lists",
         Focus::EmojiAdmin => "emojis",
+        Focus::ConfirmPrompt => "confirm",
+        Focus::DomainAdmin => "domains",
+        Focus::DomainDetail => "domain",
     };
     // Issue #131: in-flight な async 操作があれば左端 3 cells に spinner を
     // 出す。0 件のときも 3 cells 確保して後続 span の位置を揺らさない。
@@ -3085,6 +3103,11 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         Line::from(Span::styled("profile", help_section(palette))),
         help_entry(palette, "j / k", "next / prev note"),
         help_entry(palette, "f", "follow / unfollow toggle"),
+        help_entry(
+            palette,
+            "b",
+            "block / unblock toggle (block asks to confirm)",
+        ),
         help_entry(palette, "o", "load older notes"),
         help_entry(palette, "r", "refresh relationship + notes"),
         help_entry(palette, "Esc / q", "back to previous screen"),
@@ -3115,8 +3138,19 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
             "open emoji admin (import zip / copy remote)",
         ),
         help_entry(palette, ":home", "back to home timeline"),
+        help_entry(palette, ":domains", "open federated domain moderation"),
         help_entry(palette, ":q / :quit", "exit TUI"),
         help_entry(palette, "Tab", "complete command head"),
+        Line::from(""),
+        Line::from(Span::styled("domains", help_section(palette))),
+        help_entry(palette, "j / k", "next / prev domain (or entry, in detail)"),
+        help_entry(palette, "Enter", "open detail (or profile, in detail)"),
+        help_entry(palette, "t", "(detail) toggle following / followers tab"),
+        help_entry(palette, "s", "(detail) silence toggle"),
+        help_entry(palette, "x", "(detail) suspend — asks to confirm"),
+        help_entry(palette, "u", "(detail) unset moderation"),
+        help_entry(palette, "r", "refresh"),
+        help_entry(palette, "Esc / q", "back (detail -> list, or close)"),
         Line::from(""),
         Line::from(Span::styled("follow requests", help_section(palette))),
         help_entry(palette, "j / k", "next / prev request"),
@@ -3540,6 +3574,333 @@ fn render_picker_preview(
         )));
         frame.render_widget(placeholder, preview_rect);
     }
+}
+
+// ─── ユーザーブロック (PR6) / 連合ドメインブロック (PR7) ────────────────
+//
+// これらは Profile / NoteDetail と同じ「中央モーダル overlay」方式で描く
+// (= `PanelRects` に専用フィールドを持たせない、マウスクリック非対応)。
+// お一人様サーバではドメインあたりの actor / follow 件数が少数に留まる
+// 想定のため、`top` を毎フレーム `cursor` から直接計算し直す
+// (= `ensure_visible` をメインループから呼ぶ複雑さを避ける簡略化)。
+
+/// カーソルが常に見えるようスクロール開始行を計算する。
+/// `ensure_visible` と同じ式だが、`top` を state に持たず毎フレーム再計算する。
+fn modal_scroll_top(cursor: usize, visible: usize) -> usize {
+    if visible == 0 || cursor < visible {
+        0
+    } else {
+        cursor + 1 - visible
+    }
+}
+
+/// ユーザーブロック PR6 / 連合ドメインブロック PR7 共用の確認オーバーレイ。
+fn render_confirm_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(prompt) = app.confirm_prompt.as_ref() else {
+        return;
+    };
+    let palette = &app.theme.palette;
+    fill_modal_backdrop(frame, area, palette);
+
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = 7u16.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let block = Block::default()
+        .title(Span::styled(
+            "  confirm  ",
+            Style::default()
+                .fg(palette.error)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.error))
+        .padding(Padding::new(1, 1, 1, 0))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    frame.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let msg_rect = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let msg = Paragraph::new(Line::from(prompt.message.clone())).wrap(Wrap { trim: true });
+    frame.render_widget(msg, msg_rect);
+
+    let hint_rect = Rect::new(inner.x, inner.y + msg_rect.height, inner.width, 1);
+    let hint = Paragraph::new(Line::from(Span::styled(
+        "y/Enter = confirm    n/Esc = cancel",
+        Style::default().fg(palette.muted),
+    )));
+    frame.render_widget(hint, hint_rect);
+}
+
+/// 連合ドメインブロック PR7: ドメイン一覧モーダル。
+fn render_domain_admin(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(screen) = app.domain_admin.as_ref() else {
+        return;
+    };
+    let palette = &app.theme.palette;
+    fill_modal_backdrop(frame, area, palette);
+
+    let modal_w = area.width.saturating_sub(4).max(50);
+    let modal_h = area.height.saturating_sub(4).max(10);
+    let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+    let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+    let rect = Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!("  domains ({})  ", screen.items.len()),
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style(palette, app.focus == Focus::DomainAdmin))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    frame.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+
+    let header = Line::from(Span::styled(
+        "  HOST                            ACTORS  STATE       [j/k=move Enter=open r=refresh Esc=back]",
+        Style::default().fg(palette.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(header),
+        Rect::new(inner.x, inner.y, inner.width, 1.min(inner.height)),
+    );
+    let list_rect = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    if list_rect.height == 0 {
+        return;
+    }
+
+    if screen.items.is_empty() {
+        let msg = if screen.fetching {
+            "  loading…"
+        } else {
+            "  (no known remote domains)"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg.to_string(),
+                Style::default().fg(palette.muted),
+            ))),
+            list_rect,
+        );
+        return;
+    }
+
+    let visible = list_rect.height as usize;
+    let top = modal_scroll_top(screen.cursor, visible);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible);
+    for (idx, item) in screen.items.iter().enumerate().skip(top).take(visible) {
+        let selected = idx == screen.cursor;
+        let marker = if selected { "▶ " } else { "  " };
+        let marker_style = if selected {
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        let state_label = match item.severity.as_deref() {
+            Some("suspend") => ("SUSPENDED", palette.error),
+            Some("silence") => ("SILENCED", palette.warning),
+            _ => ("-", palette.muted),
+        };
+        let host = truncate_for_width(&item.host, 30);
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), marker_style),
+            Span::styled(
+                format!("{host:<30} "),
+                Style::default().fg(palette.foreground),
+            ),
+            Span::styled(
+                format!("{:>6}  ", item.actor_count),
+                Style::default().fg(palette.foreground),
+            ),
+            Span::styled(state_label.0, Style::default().fg(state_label.1)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), list_rect);
+}
+
+/// 連合ドメインブロック PR7: ドメイン詳細モーダル。
+#[allow(
+    clippy::too_many_lines,
+    reason = "統計/タブ/一覧/footer のレイアウト計算 + 描画を 1 関数で素直に並べているだけ"
+)]
+fn render_domain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(screen) = app.domain_detail.as_ref() else {
+        return;
+    };
+    let palette = &app.theme.palette;
+    fill_modal_backdrop(frame, area, palette);
+
+    let modal_w = area.width.saturating_sub(4).max(50);
+    let modal_h = area.height.saturating_sub(4).max(12);
+    let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+    let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+    let rect = Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+    let (state_label, state_color) = match screen.severity.as_deref() {
+        Some("suspend") => ("SUSPENDED", palette.error),
+        Some("silence") => ("SILENCED", palette.warning),
+        _ => ("-", palette.muted),
+    };
+    let title = if let Some(reason) = screen.reason.as_deref() {
+        format!("  {} — {state_label} ({reason})  ", screen.host)
+    } else {
+        format!("  {} — {state_label}  ", screen.host)
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(state_color)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style(palette, app.focus == Focus::DomainDetail))
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        );
+    frame.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+
+    let stats = Line::from(Span::styled(
+        format!(
+            "  known actors: {}   following: {} ({} pending)   followers: {} ({} pending)",
+            screen.known_actor_count,
+            screen.accepted_following_count,
+            screen.pending_following_count,
+            screen.accepted_followers_count,
+            screen.pending_followers_count,
+        ),
+        Style::default().fg(palette.muted),
+    ));
+    let tab_label = format!(
+        "  [{}] {}   [{}] {}    t=toggle",
+        if screen.tab == crate::domain_admin::DomainFollowTab::Following {
+            "*"
+        } else {
+            " "
+        },
+        crate::domain_admin::DomainFollowTab::Following.label(),
+        if screen.tab == crate::domain_admin::DomainFollowTab::Followers {
+            "*"
+        } else {
+            " "
+        },
+        crate::domain_admin::DomainFollowTab::Followers.label(),
+    );
+    let footer = Line::from(Span::styled(
+        "  [j/k=move t=tab Enter=profile s=silence x=suspend(!) u=unset r=refresh Esc=back]",
+        Style::default().fg(palette.muted),
+    ));
+
+    let footer_height: u16 = 1;
+    let stats_height: u16 = 1;
+    let tab_height: u16 = 1;
+    let list_height = inner
+        .height
+        .saturating_sub(stats_height + tab_height + footer_height);
+    let stats_rect = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        stats_height.min(inner.height),
+    );
+    let tab_rect = Rect::new(inner.x, inner.y + stats_height, inner.width, tab_height);
+    let list_rect = Rect::new(
+        inner.x,
+        inner.y + stats_height + tab_height,
+        inner.width,
+        list_height,
+    );
+    let footer_rect = Rect::new(
+        inner.x,
+        inner.y + stats_height + tab_height + list_height,
+        inner.width,
+        footer_height,
+    );
+    frame.render_widget(Paragraph::new(stats), stats_rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            tab_label,
+            Style::default().fg(palette.accent),
+        ))),
+        tab_rect,
+    );
+    frame.render_widget(Paragraph::new(footer), footer_rect);
+
+    let entries = screen.current_entries();
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  (no {})", screen.tab.label()),
+                Style::default().fg(palette.muted),
+            ))),
+            list_rect,
+        );
+        return;
+    }
+    let visible = list_rect.height as usize;
+    let top = modal_scroll_top(screen.selected, visible);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible);
+    for (idx, entry) in entries.iter().enumerate().skip(top).take(visible) {
+        let selected = idx == screen.selected;
+        let marker = if selected { "▶ " } else { "  " };
+        let marker_style = if selected {
+            Style::default()
+                .fg(palette.accent_strong)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        let acct = format!("@{}@{}", entry.actor.preferred_username, entry.actor.host);
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), marker_style),
+            Span::styled(
+                truncate_for_width(&acct, inner.width.saturating_sub(20)),
+                Style::default().fg(palette.foreground),
+            ),
+            Span::styled(
+                format!("  {}", entry.follow_state),
+                Style::default().fg(palette.muted),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), list_rect);
 }
 
 fn border_style(palette: &Palette, focused: bool) -> Style {

@@ -65,7 +65,7 @@ pub(crate) struct SignatureInfo {
     pub label: Option<String>,
 }
 
-/// 署名検証中に発生したエラー。HTTP レスポンスとして 400 / 401 に対応。
+/// 署名検証中に発生したエラー。HTTP レスポンスとして 400 / 401 / 403 に対応。
 ///
 /// **情報漏洩防止のため詳細メッセージはレスポンスに含めず**、`tracing::warn!`
 /// にだけ出す。相手には汎用文言 (`"bad request"` / `"unauthorized"`) を返す。
@@ -105,6 +105,13 @@ pub(crate) enum SigError {
     #[error("alg parameter does not match keyId kind")]
     AlgMismatch,
 
+    // --- 403 Forbidden: 連合ドメインブロック (PR5、計画書 §6.4)。actor
+    //     自体は正当だが、そのドメインが suspend 対象なので受理を拒否する。
+    //     署名検証コストを避けるため、actor 解決直後・crypto 検証の前に
+    //     判定する (`extract.rs::SignedInboxBody::from_request`)。
+    #[error("actor's domain is suspended")]
+    DomainSuspended,
+
     // --- 503 Service Unavailable: サーバ側の一時障害 (DB 接続失敗等)。
     //     Mastodon は 5xx を長めに保持してリトライするので、DB が回復すれば
     //     アクティビティを失わない。401 (UnknownActor) で握ると相手側キュー
@@ -117,6 +124,7 @@ pub(crate) enum SigError {
 enum SigErrorClass {
     BadRequest,
     Unauthorized,
+    Forbidden,
     Internal,
 }
 
@@ -137,6 +145,7 @@ impl SigError {
             | Self::ActorKeyUnparseable(_)
             | Self::UnsupportedKeyKind(_)
             | Self::AlgMismatch => SigErrorClass::Unauthorized,
+            Self::DomainSuspended => SigErrorClass::Forbidden,
             Self::Internal => SigErrorClass::Internal,
         }
     }
@@ -158,6 +167,10 @@ impl IntoResponse for SigError {
             SigErrorClass::Unauthorized => {
                 tracing::warn!(error = %self, "inbox signature verification failed");
                 (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+            }
+            SigErrorClass::Forbidden => {
+                tracing::warn!(error = %self, "inbox rejected: domain suspended");
+                (StatusCode::FORBIDDEN, "forbidden").into_response()
             }
         }
     }

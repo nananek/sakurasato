@@ -38,6 +38,17 @@
 //! - `DELETE /api/v1/follow/{id}` ── Undo Follow 送出 + follow 行削除 (M13 PR2)
 //! - `GET /api/v1/following` ── 自分が follow している accepted 一覧 (M13 PR3)
 //! - `GET /api/v1/followers` ── 自分を follow している accepted 一覧 (M13 PR3)
+//! - `POST /api/v1/block` ── ブロック実行。双方向フォロー強制解除 + `Block`
+//!   activity 配送 (ユーザーブロック PR2)
+//! - `DELETE /api/v1/block/{id}` ── ブロック解除 (`Undo{Block}` 送出、PR2)
+//! - `GET /api/v1/blocks` ── ブロック中の actor 一覧 (PR2)
+//! - `GET /api/v1/domains` ── 既知ドメイン一覧 + actor 数 + moderation state
+//!   (連合ドメインブロック PR4)
+//! - `GET /api/v1/domains/{host}` ── 統計 + moderation state +
+//!   following/followers 一覧 (PR4)
+//! - `POST /api/v1/domains/{host}/silence` / `POST /api/v1/domains/{host}/suspend`
+//!   ── 措置の実行。`suspend` は既存フォロー関係の強制解除を伴う (PR4)
+//! - `DELETE /api/v1/domains/{host}` ── 措置解除 (PR4)
 //! - `GET /api/v1/actor/{id}/notes` ── 当該 actor の Note 一覧。viewer 視点の
 //!   visibility filter 経由 (M13 PR3)
 //! - `GET /api/v1/lists` / `POST /api/v1/lists` ── リスト一覧・作成
@@ -67,6 +78,8 @@ use crate::state::AppState;
 pub mod actor;
 pub mod actor_admin;
 pub mod auth;
+pub mod block;
+pub mod domain_moderation;
 pub mod emoji_admin;
 pub mod emoji_tag;
 pub mod emojis;
@@ -85,6 +98,10 @@ pub mod timeline;
 pub mod user_list;
 pub mod whoami;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "route 登録を列挙しているだけの straight-line 関数 (機能追加のたびに行数が伸びる想定)"
+)]
 pub fn router(state: AppState) -> Router {
     // M7: 画像アップロードはサニタイズ前段で media-proxy.max_bytes に達する
     // 想定の大きいバイト列を受ける。axum の DefaultBodyLimit (= 2 MiB) を
@@ -187,6 +204,27 @@ pub fn router(state: AppState) -> Router {
         // `DELETE` は本人の follow のみ削除可能 (= 403 ガード)。
         .route("/api/v1/follow", post(follow::create))
         .route("/api/v1/follow/{id}", axum::routing::delete(follow::delete))
+        // PR2 (計画書 §5.7): TUI Profile 画面のブロック操作 / `:block` コマンド。
+        // `POST` は双方向フォロー強制解除 + Block 配送、`DELETE` は本人の
+        // ブロックのみ解除可能 (= 403 ガード)、`GET /api/v1/blocks` は一覧。
+        .route("/api/v1/block", post(block::create))
+        .route("/api/v1/block/{id}", axum::routing::delete(block::delete))
+        .route("/api/v1/blocks", get(block::list))
+        // PR4 (計画書 §6.6): TUI ドメイン管理画面 (§6.7) が叩く。詳細は
+        // 統計 + moderation state + following/followers 一覧を 1 回で返す。
+        .route("/api/v1/domains", get(domain_moderation::list))
+        .route(
+            "/api/v1/domains/{host}",
+            get(domain_moderation::detail).delete(domain_moderation::unset),
+        )
+        .route(
+            "/api/v1/domains/{host}/silence",
+            post(domain_moderation::silence),
+        )
+        .route(
+            "/api/v1/domains/{host}/suspend",
+            post(domain_moderation::suspend),
+        )
         // #206 PR3: in-app 通知フィードの TUI 一覧 + 一括既読。
         .route("/api/v1/notifications", get(notifications::list))
         .route(

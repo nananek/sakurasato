@@ -421,6 +421,108 @@ impl LocalApi {
         decode_json(resp).await
     }
 
+    /// `POST /api/v1/block` ── ユーザーブロック PR6。body 形式は `follow` と
+    /// 同じ `FollowTarget` (`acct`/`actor_uri`/`actor_id` の排他 3 択) を再利用する。
+    pub async fn block(&self, target: &FollowTarget) -> Result<BlockResponse, ApiError> {
+        let body = serde_json::to_vec(target)?;
+        let request = self
+            .request_builder(Method::POST, "/api/v1/block")?
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// `DELETE /api/v1/block/{id}` ── ユーザーブロック PR6。`block_id` は
+    /// `Relationship::block_id` (= `is_blocked` のときのみ `Some`) から取る。
+    pub async fn unblock(&self, block_id: i64) -> Result<UnblockResponse, ApiError> {
+        let path = format!("/api/v1/block/{block_id}");
+        let request = self
+            .request_builder(Method::DELETE, &path)?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// `GET /api/v1/blocks` ── ブロック中の actor 一覧 (ユーザーブロック PR6)。
+    pub async fn list_blocks(&self) -> Result<BlockListResponse, ApiError> {
+        self.get_json("/api/v1/blocks").await
+    }
+
+    /// `GET /api/v1/domains` ── 連合ドメインブロック PR7。既知ドメイン一覧 +
+    /// actor 数 + 現在の moderation state。
+    pub async fn list_domains(&self) -> Result<DomainListResponse, ApiError> {
+        self.get_json("/api/v1/domains").await
+    }
+
+    /// `GET /api/v1/domains/{host}` ── 統計 + moderation state +
+    /// following/followers 一覧 (連合ドメインブロック PR7)。
+    pub async fn domain_detail(&self, host: &str) -> Result<DomainDetailResponse, ApiError> {
+        let encoded_host: String = url::form_urlencoded::byte_serialize(host.as_bytes()).collect();
+        let path = format!("/api/v1/domains/{encoded_host}");
+        self.get_json(&path).await
+    }
+
+    /// `POST /api/v1/domains/{host}/silence` ── 連合ドメインブロック PR7。
+    pub async fn domain_silence(
+        &self,
+        host: &str,
+        reason: Option<&str>,
+    ) -> Result<DomainActionResponse, ApiError> {
+        self.domain_moderate(host, "silence", reason).await
+    }
+
+    /// `POST /api/v1/domains/{host}/suspend` ── 連合ドメインブロック PR7。
+    /// 破壊的操作 (対象ドメインの全フォロー関係を強制解除)。TUI 側は
+    /// [`crate::confirm::ConfirmPrompt`] で確認を挟んでからここを呼ぶ。
+    pub async fn domain_suspend(
+        &self,
+        host: &str,
+        reason: Option<&str>,
+    ) -> Result<DomainActionResponse, ApiError> {
+        self.domain_moderate(host, "suspend", reason).await
+    }
+
+    async fn domain_moderate(
+        &self,
+        host: &str,
+        action: &str,
+        reason: Option<&str>,
+    ) -> Result<DomainActionResponse, ApiError> {
+        let encoded_host: String = url::form_urlencoded::byte_serialize(host.as_bytes()).collect();
+        let path = format!("/api/v1/domains/{encoded_host}/{action}");
+        let body = serde_json::to_vec(&DomainActionRequest {
+            reason: reason.map(str::to_string),
+        })?;
+        let request = self
+            .request_builder(Method::POST, &path)?
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::from(Bytes::from(body)))
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        decode_json(resp).await
+    }
+
+    /// `DELETE /api/v1/domains/{host}` ── 措置解除 (連合ドメインブロック PR7)。
+    /// server は `204 No Content` を返す。
+    pub async fn domain_unset(&self, host: &str) -> Result<(), ApiError> {
+        let encoded_host: String = url::form_urlencoded::byte_serialize(host.as_bytes()).collect();
+        let path = format!("/api/v1/domains/{encoded_host}");
+        let request = self
+            .request_builder(Method::DELETE, &path)?
+            .body(Full::default())
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.send(request).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body_string(resp.into_body()).await.unwrap_or_default();
+            return Err(ApiError::Status { status, body });
+        }
+        Ok(())
+    }
+
     /// `GET /api/v1/lists` ── リスト一覧 (Mastodon/Misskey 互換のリスト機能)。
     pub async fn list_lists(&self) -> Result<ListsResponse, ApiError> {
         self.get_json("/api/v1/lists").await
@@ -1132,6 +1234,98 @@ pub struct UnfollowResponse {
     pub inbox_url: String,
 }
 
+/// `POST /api/v1/block` の応答 (ユーザーブロック PR6)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockResponse {
+    pub block_id: i64,
+    pub ap_id: String,
+    pub target_actor_id: i64,
+    pub target_ap_id: String,
+    pub delivery_queue_id: i64,
+    pub inbox_url: String,
+}
+
+/// `DELETE /api/v1/block/{id}` の応答。
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnblockResponse {
+    pub block_id: i64,
+    pub target_ap_id: String,
+    pub delivery_queue_id: i64,
+    pub inbox_url: String,
+}
+
+/// `GET /api/v1/blocks` の 1 件分。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockListEntry {
+    pub block_id: i64,
+    pub block_created_at: chrono::DateTime<chrono::Utc>,
+    pub actor: ActorProfile,
+}
+
+/// `GET /api/v1/blocks` のレスポンス body。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockListResponse {
+    pub entries: Vec<BlockListEntry>,
+}
+
+/// `GET /api/v1/domains` の 1 件分 (連合ドメインブロック PR7)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DomainSummary {
+    pub host: String,
+    pub actor_count: i64,
+    #[serde(default)]
+    pub severity: Option<String>,
+}
+
+/// `GET /api/v1/domains` のレスポンス body。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DomainListResponse {
+    pub domains: Vec<DomainSummary>,
+}
+
+/// `GET /api/v1/domains/{host}` の following/followers 1 件分。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DomainFollowEntry {
+    pub follow_id: i64,
+    pub follow_state: String,
+    pub follow_created_at: chrono::DateTime<chrono::Utc>,
+    pub actor: ActorProfile,
+}
+
+/// `GET /api/v1/domains/{host}` のレスポンス body。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DomainDetailResponse {
+    pub host: String,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub known_actor_count: i64,
+    pub accepted_following_count: i64,
+    pub accepted_followers_count: i64,
+    pub pending_following_count: i64,
+    pub pending_followers_count: i64,
+    pub following: Vec<DomainFollowEntry>,
+    pub followers: Vec<DomainFollowEntry>,
+}
+
+/// `POST /api/v1/domains/{host}/silence|suspend` の body。
+#[derive(Debug, Clone, Serialize, Default)]
+struct DomainActionRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// `POST /api/v1/domains/{host}/silence` の応答。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DomainActionResponse {
+    pub host: String,
+    pub severity: String,
+    /// `suspend` のときのみ、強制解除した follow 行数。`silence` は常に 0。
+    #[serde(default)]
+    pub forced_unfollow_count: u64,
+}
+
 /// `GET /api/v1/emojis` の各要素。
 /// `server::local_api::emojis::EmojiItem` と JSON 形を合わせる。
 ///
@@ -1377,6 +1571,10 @@ pub struct ActorProfile {
 
 /// `GET /api/v1/actor/{id}/relationship` の応答 + `ActorWithRelationship` 内側。
 #[derive(Debug, Clone, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "follow/block 双方向関係の bool 4 件を 1 構造体で運ぶ設計 (server 側 Relationship と対称)"
+)]
 pub struct Relationship {
     pub following: bool,
     #[serde(default)]
@@ -1388,6 +1586,17 @@ pub struct Relationship {
     /// 表面に出ない (= UI 側で「現在 not following」を出す)。
     #[serde(default)]
     pub follow_id: Option<i64>,
+    /// ローカル actor が target をブロックしている (ユーザーブロック PR6)。
+    #[serde(default)]
+    pub is_blocked: bool,
+    /// local → target の `block.id`。`is_blocked` のときのみ `Some`。
+    /// Profile `b` toggle で unblock 経路 (`DELETE /api/v1/block/{id}`) を
+    /// 撃つときに使う (`follow_id` と同じ役割)。
+    #[serde(default)]
+    pub block_id: Option<i64>,
+    /// target がローカル actor をブロックしている (ユーザーブロック PR6)。
+    #[serde(default)]
+    pub is_blocked_by: bool,
 }
 
 impl Relationship {
@@ -1400,6 +1609,9 @@ impl Relationship {
             follow_state: None,
             followed_by: false,
             follow_id: None,
+            is_blocked: false,
+            block_id: None,
+            is_blocked_by: false,
         }
     }
 }

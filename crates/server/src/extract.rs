@@ -10,6 +10,11 @@
 //! 失敗は [`crate::sign::SigError`] 経由で `IntoResponse` で 401 / 400 を
 //! 返し、handler に到達させない。これにより未知 actor (DB に無い keyId) は
 //! M3b-2 では一律 401 で弾かれ、remote actor fetch は M3b-3 に委ねられる。
+//! **連合ドメインブロック (PR5)**: actor 解決直後に
+//! `repo::domain_moderation::get_by_host` を見て、そのドメインが suspend
+//! 対象なら crypto 検証を試みずに 403 (`SigError::DomainSuspended`) で
+//! 拒否する。silence は本 extractor では判定しない (inbox 受信自体は許可
+//! し、効果を新規 Follow 拒否のみに限定するため。計画書 §10 確定事項 #3)。
 //!
 //! ボディサイズ上限は 1 MiB。ActivityPub Activity JSON は数 KB 以下が
 //! 標準で、これを超えるものは攻撃か誤設定の可能性が高い。
@@ -48,6 +53,10 @@ where
 {
     type Rejection = SigError;
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "署名スキーム判定 → actor 解決 → 連合ドメインブロック判定 → 検証、の縦の流れを 1 関数で素直に並べているだけ"
+    )]
     async fn from_request(
         req: Request<axum::body::Body>,
         state: &AppState,
@@ -129,6 +138,26 @@ where
                     return Err(SigError::Internal);
                 }
             };
+
+            // 4.5. 連合ドメインブロック (PR5、計画書 §6.4): suspend 対象
+            // ドメインの actor は crypto 検証を試みる前に拒否する (検証
+            // コスト削減)。silence は inbox 受信自体を妨げない (§10 確定
+            // 事項 #3、効果は handle_follow 側のガードに限定)。
+            match repo::domain_moderation::get_by_host(state.pool(), &actor.host).await {
+                Ok(Some(m)) if m.severity == "suspend" => {
+                    tracing::warn!(
+                        actor_ap_id = %actor.ap_id,
+                        host = %actor.host,
+                        "inbox rejected: actor's domain is suspended",
+                    );
+                    return Err(SigError::DomainSuspended);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, host = %actor.host, "DB error during domain moderation lookup");
+                    return Err(SigError::Internal);
+                }
+            }
 
             // 5. 検証本体。成功すればここで return。失敗は次ラベルへ。
             let scheme = info.scheme;

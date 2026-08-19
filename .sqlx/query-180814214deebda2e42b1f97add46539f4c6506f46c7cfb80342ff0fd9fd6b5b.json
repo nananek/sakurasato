@@ -1,0 +1,45 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT a.host AS \"host!\", count(*) AS \"actor_count!\", dm.severity AS \"severity?\"\n        FROM actor a\n        LEFT JOIN domain_moderation dm ON dm.host = a.host\n        WHERE a.is_local = FALSE\n        GROUP BY a.host, dm.severity\n        ORDER BY count(*) DESC, a.host ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "host!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "host"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "actor_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "severity?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "domain_moderation",
+            "name": "severity"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      false
+    ]
+  },
+  "hash": "180814214deebda2e42b1f97add46539f4c6506f46c7cfb80342ff0fd9fd6b5b"
+}

@@ -19,6 +19,7 @@
 //! - `:lists` ── リスト機能 (Mastodon/Misskey 互換) の一覧画面 ([`crate::lists`])
 //! - `:emojis` ── 絵文字管理画面 (zip インポート / リモート絵文字コピー、
 //!   [`crate::emoji_admin`])
+//! - `:domains` ── 連合ドメインブロック管理画面 ([`crate::domain_admin`])
 //! - `:home` ── 表示中タイムラインを home (フォロー中) に戻す
 //! - `:q` / `:quit` ── 終了
 //! - `:help` / `:?` ── ヘルプ overlay を開く
@@ -51,6 +52,7 @@
 /// `parse` の `match` に追加した head はここにも足す ── grep で見つけやすい
 /// よう、両方を 1 ファイル内に置く。`?` は単一記号のため補完対象外。
 pub const COMMAND_HEADS: &[&str] = &[
+    "domains",
     "emojis",
     "follow",
     "followers",
@@ -198,6 +200,8 @@ pub enum Command {
     OpenLists,
     /// 絵文字管理画面 (zip インポート / リモート絵文字コピー) を開く。
     OpenEmojiAdmin,
+    /// 連合ドメインブロック PR7: ドメイン管理一覧画面を開く。
+    OpenDomainAdmin,
     /// 表示中タイムラインを home (フォロー中) に戻す。リスト表示中のみ意味を
     /// 持つ (= 既に home ならタイムラインを再取得するだけ)。
     HomeTimeline,
@@ -243,6 +247,7 @@ pub fn parse(raw: &str) -> Command {
         "notifications" => no_arg(&rest, Command::OpenNotifications, "notifications"),
         "lists" => no_arg(&rest, Command::OpenLists, "lists"),
         "emojis" => no_arg(&rest, Command::OpenEmojiAdmin, "emojis"),
+        "domains" => no_arg(&rest, Command::OpenDomainAdmin, "domains"),
         "home" => no_arg(&rest, Command::HomeTimeline, "home"),
         "renote" => no_arg(&rest, Command::Renote, "renote"),
         "unrenote" => no_arg(&rest, Command::Unrenote, "unrenote"),
@@ -470,6 +475,12 @@ mod tests {
     fn parse_requests_no_args() {
         assert_eq!(parse("requests"), Command::OpenRequests);
         assert!(matches!(parse("requests extra"), Command::Invalid { .. }));
+    }
+
+    #[test]
+    fn parse_domains_no_args() {
+        assert_eq!(parse("domains"), Command::OpenDomainAdmin);
+        assert!(matches!(parse("domains extra"), Command::Invalid { .. }));
     }
 
     #[test]

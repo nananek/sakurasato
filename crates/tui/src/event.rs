@@ -134,6 +134,15 @@ pub enum Action {
     ProfileBack,
     /// M13 PR4: Profile 画面で `r` ── actor + relationship + 直近 notes を再取得。
     ProfileRefresh,
+    /// ユーザーブロック PR6: Profile 画面で `b` ── block / unblock を toggle。
+    /// block 実行前は確認オーバーレイ ([`crate::confirm::ConfirmPrompt`]) を
+    /// 挟む (破壊的操作、計画書 §5.9)。unblock は即座に実行する。
+    ProfileToggleBlock,
+    /// ユーザーブロック PR6 / 連合ドメインブロック PR7 共用: 確認オーバーレイ
+    /// で `y`/`Enter` ── 確定。
+    ConfirmYes,
+    /// 確認オーバーレイで `n`/`Esc` ── キャンセル。
+    ConfirmNo,
     /// M13 PR5: コマンドプロンプトを開く (`:` キー)。
     OpenCommand,
     /// M13 PR5: コマンドプロンプト中の文字入力。
@@ -289,6 +298,34 @@ pub enum Action {
     EmojiAdminSearchSubmit,
     /// 絵文字管理画面: 検索窓のキャンセル (`Esc`)。
     EmojiAdminSearchCancel,
+    /// `DomainAdmin` 一覧で `j`/`Down` ── カーソル下移動。
+    DomainAdminSelectNext,
+    /// `DomainAdmin` 一覧で `k`/`Up` ── カーソル上移動。
+    DomainAdminSelectPrev,
+    /// `DomainAdmin` 一覧で `Enter` ── 選択中ホストの詳細画面を開く。
+    DomainAdminOpenSelected,
+    /// `DomainAdmin` 一覧で `r` ── 再取得。
+    DomainAdminRefresh,
+    /// `DomainAdmin` 一覧で `Esc`/`q` ── 画面を閉じる。
+    DomainAdminClose,
+    /// `DomainDetail` で `j`/`Down` ── 現在タブでカーソル下移動。
+    DomainDetailSelectNext,
+    /// `DomainDetail` で `k`/`Up` ── 現在タブでカーソル上移動。
+    DomainDetailSelectPrev,
+    /// `DomainDetail` で `t` ── following/followers タブ切替。
+    DomainDetailToggleTab,
+    /// `DomainDetail` で `Enter` ── 選択中 actor の Profile を push。
+    DomainDetailOpenSelected,
+    /// `DomainDetail` で `s` ── silence を toggle (既に silence なら unset)。
+    DomainDetailToggleSilence,
+    /// `DomainDetail` で `x` ── suspend を実行 (確認オーバーレイを挟む)。
+    DomainDetailSuspend,
+    /// `DomainDetail` で `u` ── 措置解除。
+    DomainDetailUnset,
+    /// `DomainDetail` で `r` ── 再取得。
+    DomainDetailRefresh,
+    /// `DomainDetail` で `Esc`/`q` ── `DomainAdmin` 一覧へ戻る。
+    DomainDetailClose,
 }
 
 /// crossterm イベント → Action。
@@ -370,6 +407,9 @@ fn translate_key(
         Focus::NoteDetail => translate_note_detail_key(k),
         Focus::Lists => translate_lists_key(k, lists_input_active),
         Focus::EmojiAdmin => translate_emoji_admin_key(k, emoji_admin_search_active),
+        Focus::ConfirmPrompt => translate_confirm_key(k),
+        Focus::DomainAdmin => translate_domain_admin_key(k),
+        Focus::DomainDetail => translate_domain_detail_key(k),
     }
 }
 
@@ -535,7 +575,48 @@ fn translate_profile_key(k: KeyEvent) -> Action {
         (KeyCode::Char('k') | KeyCode::Up, _) => Action::ProfileSelectPrev,
         (KeyCode::Char('o'), m) if m.is_empty() => Action::ProfileLoadMoreNotes,
         (KeyCode::Char('f'), m) if m.is_empty() => Action::ProfileToggleFollow,
+        (KeyCode::Char('b'), m) if m.is_empty() => Action::ProfileToggleBlock,
         (KeyCode::Char('r'), m) if m.is_empty() => Action::ProfileRefresh,
+        _ => Action::Noop,
+    }
+}
+
+/// ユーザーブロック PR6 / 連合ドメインブロック PR7 共用の確認オーバーレイ。
+fn translate_confirm_key(k: KeyEvent) -> Action {
+    match (k.code, k.modifiers) {
+        (KeyCode::Char('y') | KeyCode::Enter, m) if m.is_empty() => Action::ConfirmYes,
+        (KeyCode::Char('n'), m) if m.is_empty() => Action::ConfirmNo,
+        (KeyCode::Esc, _) => Action::ConfirmNo,
+        _ => Action::Noop,
+    }
+}
+
+/// 連合ドメインブロック PR7: ドメイン一覧画面。
+fn translate_domain_admin_key(k: KeyEvent) -> Action {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => Action::DomainAdminClose,
+        (KeyCode::Char('q'), m) if m.is_empty() => Action::DomainAdminClose,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::DomainAdminSelectNext,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::DomainAdminSelectPrev,
+        (KeyCode::Enter, m) if m.is_empty() => Action::DomainAdminOpenSelected,
+        (KeyCode::Char('r'), m) if m.is_empty() => Action::DomainAdminRefresh,
+        _ => Action::Noop,
+    }
+}
+
+/// 連合ドメインブロック PR7: ドメイン詳細画面。
+fn translate_domain_detail_key(k: KeyEvent) -> Action {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => Action::DomainDetailClose,
+        (KeyCode::Char('q'), m) if m.is_empty() => Action::DomainDetailClose,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::DomainDetailSelectNext,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::DomainDetailSelectPrev,
+        (KeyCode::Char('t'), m) if m.is_empty() => Action::DomainDetailToggleTab,
+        (KeyCode::Enter, m) if m.is_empty() => Action::DomainDetailOpenSelected,
+        (KeyCode::Char('s'), m) if m.is_empty() => Action::DomainDetailToggleSilence,
+        (KeyCode::Char('x'), m) if m.is_empty() => Action::DomainDetailSuspend,
+        (KeyCode::Char('u'), m) if m.is_empty() => Action::DomainDetailUnset,
+        (KeyCode::Char('r'), m) if m.is_empty() => Action::DomainDetailRefresh,
         _ => Action::Noop,
     }
 }
@@ -995,6 +1076,13 @@ mod tests {
         ));
         assert!(matches!(
             translate(
+                Event::Key(key(KeyCode::Char('b'), KeyModifiers::NONE)),
+                Focus::Profile,
+            ),
+            Action::ProfileToggleBlock,
+        ));
+        assert!(matches!(
+            translate(
                 Event::Key(key(KeyCode::Char('o'), KeyModifiers::NONE)),
                 Focus::Profile,
             ),
@@ -1382,6 +1470,110 @@ mod tests {
                 true,
             ),
             Action::EmojiAdminSearchChar('j'),
+        ));
+    }
+
+    #[test]
+    fn confirm_prompt_keys_route_correctly() {
+        for code in [KeyCode::Char('y'), KeyCode::Enter] {
+            assert!(matches!(
+                translate(
+                    Event::Key(key(code, KeyModifiers::NONE)),
+                    Focus::ConfirmPrompt,
+                ),
+                Action::ConfirmYes,
+            ));
+        }
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            assert!(matches!(
+                translate(
+                    Event::Key(key(code, KeyModifiers::NONE)),
+                    Focus::ConfirmPrompt,
+                ),
+                Action::ConfirmNo,
+            ));
+        }
+    }
+
+    #[test]
+    fn domain_admin_keys_route_correctly() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(matches!(
+                translate(
+                    Event::Key(key(code, KeyModifiers::NONE)),
+                    Focus::DomainAdmin,
+                ),
+                Action::DomainAdminClose,
+            ));
+        }
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)),
+                Focus::DomainAdmin,
+            ),
+            Action::DomainAdminSelectNext,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)),
+                Focus::DomainAdmin,
+            ),
+            Action::DomainAdminOpenSelected,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('r'), KeyModifiers::NONE)),
+                Focus::DomainAdmin,
+            ),
+            Action::DomainAdminRefresh,
+        ));
+    }
+
+    #[test]
+    fn domain_detail_keys_route_correctly() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(matches!(
+                translate(
+                    Event::Key(key(code, KeyModifiers::NONE)),
+                    Focus::DomainDetail,
+                ),
+                Action::DomainDetailClose,
+            ));
+        }
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('t'), KeyModifiers::NONE)),
+                Focus::DomainDetail,
+            ),
+            Action::DomainDetailToggleTab,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('s'), KeyModifiers::NONE)),
+                Focus::DomainDetail,
+            ),
+            Action::DomainDetailToggleSilence,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('x'), KeyModifiers::NONE)),
+                Focus::DomainDetail,
+            ),
+            Action::DomainDetailSuspend,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Char('u'), KeyModifiers::NONE)),
+                Focus::DomainDetail,
+            ),
+            Action::DomainDetailUnset,
+        ));
+        assert!(matches!(
+            translate(
+                Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)),
+                Focus::DomainDetail,
+            ),
+            Action::DomainDetailOpenSelected,
         ));
     }
 }

@@ -31,7 +31,14 @@ use crate::state::AppState;
 /// 確認する。ホストは大文字小文字を区別せず (RFC 9110 §4.2.3) 比較する。
 ///
 /// `kind` はエラーメッセージ用のラベル ("Follow activity id" 等)。
-fn ensure_same_host(other_uri: &str, signer_ap_id: &str, kind: &str) -> anyhow::Result<()> {
+///
+/// `pub(crate)`: `dispatch/block.rs::handle_block` (PR3) が同じ F4 相当の
+/// 検証を再利用する (計画書 §5.5)。
+pub(crate) fn ensure_same_host(
+    other_uri: &str,
+    signer_ap_id: &str,
+    kind: &str,
+) -> anyhow::Result<()> {
     let other = Url::parse(other_uri)
         .with_context(|| format!("{kind} {other_uri:?} is not a valid URL"))?;
     let signer = Url::parse(signer_ap_id)
@@ -99,6 +106,32 @@ pub(crate) async fn handle_follow(
             "Follow target {} is an Application actor; refusing to accept",
             followed.ap_id,
         );
+    }
+
+    // **PR5 (計画書 §6.4, §10 確定事項 #3)**: silence 対象ドメインからの
+    // 「新規」Follow はサイレントドロップする。既に accepted な関係の
+    // retry (= Mastodon 等が Accept 再送出を期待するハウスキーピング) は
+    // silence 導入前から続く正当な関係なので妨げない。Create/Like/
+    // EmojiReact/Announce 等、既存 followee を前提とするインタラクションは
+    // ここでは一切触れない (silence は Follow ハンドラのみで完結させる)。
+    if let Some(m) = repo::domain_moderation::get_by_host(state.pool(), &signer.host)
+        .await
+        .context("domain moderation lookup for inbound Follow")?
+        && m.severity == "silence"
+    {
+        let already_accepted = repo::follow::get_by_pair(state.pool(), signer.id, followed.id)
+            .await
+            .context("existing follow lookup for silence guard")?
+            .is_some_and(|row| row.state == FollowState::Accepted.as_str());
+        if !already_accepted {
+            info!(
+                follower = %signer.ap_id,
+                followed = %followed.ap_id,
+                host = %signer.host,
+                "inbound Follow from silenced domain; silently dropping",
+            );
+            return Ok(());
+        }
     }
 
     let row = repo::follow::upsert_pending(state.pool(), &follow_ap_id, signer.id, followed.id)

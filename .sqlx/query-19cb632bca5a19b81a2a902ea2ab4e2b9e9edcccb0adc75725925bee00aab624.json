@@ -1,0 +1,78 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO block (ap_id, blocker_actor_id, blocked_actor_id)\n        VALUES ($1, $2, $3)\n        ON CONFLICT (blocker_actor_id, blocked_actor_id) DO UPDATE\n            SET ap_id = block.ap_id\n        RETURNING id, ap_id, blocker_actor_id, blocked_actor_id, created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "block",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ap_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "block",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "blocker_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "block",
+            "name": "blocker_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "blocked_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "block",
+            "name": "blocked_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "block",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "19cb632bca5a19b81a2a902ea2ab4e2b9e9edcccb0adc75725925bee00aab624"
+}

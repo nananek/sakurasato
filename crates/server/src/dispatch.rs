@@ -2,10 +2,11 @@
 //!
 //! `extract::SignedInboxBody` で署名検証を通過した body を JSON としてパースし、
 //! `type` ごとに `handler::*` / `reaction::*` / `move_handler::*` / `note::*` /
-//! `delete::*` / `update::*` / `announce::*` に振る。M3b-3 PR2 で Follow /
-//! Accept / Reject を、M8 PR2 で `Like` / `EmojiReact` / `Undo` を、M9 で
-//! `Move` を、M11 で `Create`/`Note` / `Delete` / `Update` / `Announce` の
-//! 受信を実装した (= inbox dispatch 完全化)。
+//! `delete::*` / `update::*` / `announce::*` / `block::*` に振る。M3b-3 PR2 で
+//! Follow / Accept / Reject を、M8 PR2 で `Like` / `EmojiReact` / `Undo` を、
+//! M9 で `Move` を、M11 で `Create`/`Note` / `Delete` / `Update` / `Announce`
+//! の受信を実装した (= inbox dispatch 完全化)。ユーザーブロック PR3 で
+//! `Block` / `Undo{Block}` を追加した。
 //!
 //! ## F3: Activity body actor と署名者の一致 (PR #19 で挙がった必須項目)
 //!
@@ -34,6 +35,7 @@ use tracing::{debug, warn};
 use crate::state::AppState;
 
 pub(crate) mod announce;
+pub(crate) mod block;
 pub(crate) mod delete;
 pub(crate) mod handler;
 pub(crate) mod move_handler;
@@ -84,6 +86,13 @@ pub(crate) enum DispatchError {
         follow_ap_id: String,
     },
 
+    /// **`Undo{Block}` の signer が元 Block の blocker と一致しない**
+    /// (PR3、計画書 §5.5): 自分が振った block ではない `ap_id` を騙って
+    /// 別 actor が Undo を送ってきたなりすまし試行。401 で拒否する
+    /// (`UnrelatedAcceptor` と同種のガード)。
+    #[error("Undo{{Block}} signer {signer:?} is not the blocker of block {block_ap_id:?}")]
+    UnrelatedBlockUndo { signer: String, block_ap_id: String },
+
     /// 仕様外 / 受け入れ不能なフィールド構造。
     #[error("activity is malformed: {0}")]
     Malformed(String),
@@ -102,7 +111,8 @@ impl DispatchError {
             }
             Self::ActorMismatch { .. }
             | Self::NestedObjectActorMismatch { .. }
-            | Self::UnrelatedAcceptor { .. } => StatusCode::UNAUTHORIZED,
+            | Self::UnrelatedAcceptor { .. }
+            | Self::UnrelatedBlockUndo { .. } => StatusCode::UNAUTHORIZED,
             Self::Internal(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -226,6 +236,32 @@ pub(crate) async fn dispatch(
         verify_nested_object_actor(&activity, &signer.ap_id)?;
     }
 
+    // PR3 (ユーザーブロック、計画書 §5.6): 自分が signer をブロックしている
+    // なら、ユーザー起点の Activity 全般 (Follow/Like/EmojiReact/Create/
+    // Announce 等) を 202 silent accept で握りつぶす。dispatch.rs の共通入口
+    // で一括ガードすることで、各 handler (`handle_follow` 等) 個別にチェック
+    // を入れる必要がなくなる。
+    //
+    // 例外: `Accept`/`Reject`/`Undo` (= 我々が送った Follow への応答。ブロック
+    // 相手へ自分から Follow を送ることは通常ないが、レースで有り得るため
+    // 素通しする) と `Block` (= signer が我々をブロックしてきた記録自体。
+    // 相互ブロックのケースでも記録を欠かさないため素通しする)。
+    if !matches!(
+        activity_type.as_str(),
+        "Accept" | "Reject" | "Undo" | "Block"
+    ) && let Some(local_id) = local_actor_id_opt(state).await
+        && sakurasato_core::repo::block::is_blocked(state.pool(), local_id, signer.id)
+            .await
+            .unwrap_or(false)
+    {
+        debug!(
+            activity_type = %activity_type,
+            signer = %signer.ap_id,
+            "inbox dispatch: signer is blocked; silently accepting",
+        );
+        return Ok((StatusCode::ACCEPTED, "accepted; signer blocked").into_response());
+    }
+
     match activity_type.as_str() {
         "Follow" => {
             handler::handle_follow(state, signer, &activity)
@@ -273,10 +309,17 @@ pub(crate) async fn dispatch(
             announce::handle_announce(state, signer, &activity).await?;
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
+        "Block" => {
+            block::handle_block(state, signer, &activity)
+                .await
+                .map_err(DispatchError::Internal)?;
+            Ok((StatusCode::ACCEPTED, "accepted").into_response())
+        }
         other => {
-            // M11 完了時点で AS2 の中で我々がまだ実装していないのは Add /
-            // Remove / Block / Flag / Question / Read / View など低頻度な
-            // もののみ。連合相手の retry ループに乗らないよう 202 で受け流す。
+            // PR3 (ユーザーブロック) 完了時点で AS2 の中で我々がまだ実装して
+            // いないのは Add / Remove / Flag / Question / Read / View など
+            // 低頻度なもののみ。連合相手の retry ループに乗らないよう 202 で
+            // 受け流す。
             // info ではなく debug に下げて、通常運用ログでは雑音にしない
             // (= 統計を見たい場合は RUST_LOG=debug で拾う)。
             debug!(
@@ -291,9 +334,9 @@ pub(crate) async fn dispatch(
 
 /// `Undo` activity の sub-dispatcher。`object.type` (inline) を見て
 /// Like/EmojiReact → [`reaction::handle_undo`]、Announce →
-/// [`announce::handle_undo_announce`] に振る。`object` が URI 文字列のみ
-/// (= inline 無し) の場合は `reaction` と `announce` の両テーブルを順に
-/// 探して、見つかった側を消す。
+/// [`announce::handle_undo_announce`]、Block → [`block::handle_undo_block`]
+/// に振る。`object` が URI 文字列のみ (= inline 無し) の場合は `announce` →
+/// `block` → `reaction` の順にテーブルを探して、見つかった側を消す。
 ///
 /// Follow の Undo (= remote 側からのフォロー解除) は本 PR ではまだ未対応。
 /// 必要になった時点で `handler::handle_undo_follow` を生やす。
@@ -320,11 +363,18 @@ async fn dispatch_undo(
         if t.eq_ignore_ascii_case("Like") || t.eq_ignore_ascii_case("EmojiReact") {
             return reaction::handle_undo(state, signer, activity).await;
         }
+        if t.eq_ignore_ascii_case("Block") {
+            let target = map
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| DispatchError::Malformed("Undo.object has no string `id`".into()))?;
+            return block::handle_undo_block(state, signer, target).await;
+        }
         // 未対応 inline type は `reaction` 経路 (ap_id を URI として扱う) に
         // 渡してみる ── reaction テーブルに無ければ silent no-op。
     }
 
-    // URI のみ (= type 無し)。announce → reaction の順に lookup する。
+    // URI のみ (= type 無し)。announce → block → reaction の順に lookup する。
     // `is_some()` で十分 ── `handle_undo_announce` が内部で再 fetch する
     // ([[m11-pr-review]] minor 2)。
     let target = extract_object_uri(activity)?.to_string();
@@ -334,6 +384,13 @@ async fn dispatch_undo(
         .is_some()
     {
         return announce::handle_undo_announce(state, signer, &target).await;
+    }
+    if sakurasato_core::repo::block::get_by_ap_id(state.pool(), &target)
+        .await
+        .map_err(|e| DispatchError::Internal(e.into()))?
+        .is_some()
+    {
+        return block::handle_undo_block(state, signer, &target).await;
     }
     reaction::handle_undo(state, signer, activity).await
 }
@@ -347,6 +404,21 @@ pub(crate) fn extract_activity_id(activity: &JsonValue) -> Result<&str, Dispatch
         .get("id")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| DispatchError::Malformed("activity has no string `id`".into()))
+}
+
+/// ブロックガード用に local actor の id を引く best-effort lookup。
+/// 失敗 / 未 init は `None` → ガードは効かず通常の dispatch に進む
+/// (`dispatch/note.rs::local_actor_id_opt` と同じ方針の複製。crate 内に
+/// 同種の最小 local actor lookup が複数箇所にあるのは既存の設計慣習)。
+async fn local_actor_id_opt(state: &AppState) -> Option<i64> {
+    let host = &state.config().server.host;
+    let user = &state.config().server.user;
+    sakurasato_core::repo::actor::get_by_username_host(state.pool(), user, host)
+        .await
+        .ok()
+        .flatten()
+        .filter(|a| a.is_local)
+        .map(|a| a.id)
 }
 
 /// `object` フィールドから URI を取り出す (文字列 or `{id: ...}`)。

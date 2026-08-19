@@ -67,6 +67,10 @@ pub struct ActorOnly {
 }
 
 #[derive(Debug, Serialize, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "follow/block 双方向関係の bool 4 件を 1 構造体で運ぶ設計 (crate::follow::FollowRelationship と同種)"
+)]
 pub struct Relationship {
     pub following: bool,
     pub follow_state: Option<FollowState>,
@@ -77,6 +81,15 @@ pub struct Relationship {
     /// `rejected` / 行無しのときは `None`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_id: Option<i64>,
+    /// ローカル actor が target をブロックしている (PR2、計画書 §5.7)。
+    pub is_blocked: bool,
+    /// ローカル actor → target の `block.id`。`is_blocked` のときのみ
+    /// `Some` (`DELETE /api/v1/block/{block_id}` の引数に使う、PR6:
+    /// TUI Profile 画面のブロックトグルが `follow_id` と同じ要領で使う)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<i64>,
+    /// target がローカル actor をブロックしている (PR2、計画書 §5.7)。
+    pub is_blocked_by: bool,
 }
 
 /// `GET /api/v1/actor?acct=...|ap_id=...`
@@ -337,6 +350,18 @@ async fn compute_relationship(
     let rel = crate::follow::compute_follow_relationship(state.pool(), local.id, target.id)
         .await
         .map_err(|err| ResolveError::Internal(format!("follow relationship: {err:#}")))?;
+    // PR2 (計画書 §5.7): ブロック方向も follow と同じ (local, target) ペアで
+    // 引く。自分自身が相手のときも `is_blocked`/`is_blocked_by` は false 相当
+    // (block 行は自分自身を対象に作れない設計、create_block_core が拒否する)。
+    // `block_id` (PR6 追加) は `get_by_pair` から直接取る ── `follow_id` と
+    // 同じ要領で TUI のトグル操作の引数解決に使う。
+    let block_id = repo::block::get_by_pair(state.pool(), local.id, target.id)
+        .await
+        .map_err(|err| ResolveError::Internal(format!("block lookup (out): {err}")))?
+        .map(|b| b.id);
+    let is_blocked_by = repo::block::is_blocked(state.pool(), target.id, local.id)
+        .await
+        .map_err(|err| ResolveError::Internal(format!("block lookup (in): {err}")))?;
     // 新規の pending 系 2 フィールドはローカル API wire shape には載せない
     // (= `Relationship` の JSON shape は従来どおり)。
     Ok(Relationship {
@@ -344,6 +369,9 @@ async fn compute_relationship(
         follow_state: rel.follow_state,
         followed_by: rel.followed_by,
         follow_id: rel.follow_id,
+        is_blocked: block_id.is_some(),
+        block_id,
+        is_blocked_by,
     })
 }
 

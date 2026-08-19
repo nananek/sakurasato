@@ -568,7 +568,10 @@ pub async fn run_with_state(state: &AppState, args: FollowArgs) -> anyhow::Resul
 
 /// `FollowTarget` を `ActorRow` に解決する。`ActorId` 経路は remote fetch を
 /// 行わず DB lookup のみ。
-async fn resolve_target_actor(
+///
+/// `pub(crate)`: `block.rs::create_block_core` が同じ 3 択解決ロジックを
+/// 再利用する (tmp/plan-block-unfollow-domain-block.md §5.4)。
+pub(crate) async fn resolve_target_actor(
     state: &AppState,
     target: FollowTarget,
 ) -> Result<ActorRow, FollowError> {
@@ -614,7 +617,9 @@ async fn resolve_target_actor(
     }
 }
 
-async fn resolve_local_actor(state: &AppState) -> Result<ActorRow, FollowError> {
+/// `pub(crate)`: `block.rs::create_block_core` / `delete_block_core` が
+/// 同じ local actor 解決ロジックを再利用する。
+pub(crate) async fn resolve_local_actor(state: &AppState) -> Result<ActorRow, FollowError> {
     let host = &state.config().server.host;
     let user = &state.config().server.user;
     match repo::actor::get_by_username_host(state.pool(), user, host).await? {

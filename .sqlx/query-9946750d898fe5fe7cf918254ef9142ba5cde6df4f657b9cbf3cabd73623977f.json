@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, ap_id, blocker_actor_id, blocked_actor_id, created_at\n        FROM block WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "block",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ap_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "block",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "blocker_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "block",
+            "name": "blocker_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "blocked_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "block",
+            "name": "blocked_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "block",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9946750d898fe5fe7cf918254ef9142ba5cde6df4f657b9cbf3cabd73623977f"
+}

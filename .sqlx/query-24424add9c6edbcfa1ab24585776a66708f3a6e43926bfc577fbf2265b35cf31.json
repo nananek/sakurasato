@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            (SELECT count(*) FROM actor WHERE host = $2 AND is_local = FALSE) AS \"known_actor_count!\",\n            (SELECT count(*) FROM follow f JOIN actor a ON a.id = f.followed_actor_id\n                WHERE f.follower_actor_id = $1 AND a.host = $2 AND f.state = 'accepted') AS \"accepted_following_count!\",\n            (SELECT count(*) FROM follow f JOIN actor a ON a.id = f.follower_actor_id\n                WHERE f.followed_actor_id = $1 AND a.host = $2 AND f.state = 'accepted') AS \"accepted_followers_count!\",\n            (SELECT count(*) FROM follow f JOIN actor a ON a.id = f.followed_actor_id\n                WHERE f.follower_actor_id = $1 AND a.host = $2 AND f.state = 'pending') AS \"pending_following_count!\",\n            (SELECT count(*) FROM follow f JOIN actor a ON a.id = f.follower_actor_id\n                WHERE f.followed_actor_id = $1 AND a.host = $2 AND f.state = 'pending') AS \"pending_followers_count!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "known_actor_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "accepted_following_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "accepted_followers_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "pending_following_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "pending_followers_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "24424add9c6edbcfa1ab24585776a66708f3a6e43926bfc577fbf2265b35cf31"
+}

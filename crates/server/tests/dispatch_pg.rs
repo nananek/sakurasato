@@ -2827,3 +2827,399 @@ async fn update_note_with_emoji_tag_learns_remote_emoji(pool: PgPool) {
     assert_eq!(learned.shortcode, "edited_emoji");
     assert_eq!(learned.host.as_deref(), Some("remote.test"));
 }
+
+// ─── ユーザーブロック PR3 / 連合ドメインブロック PR5 (計画書 §9) ─────────
+//
+// `handle_block` / `handle_undo_block` / silence ガード / suspend 403 /
+// ユーザーブロックのホットパスガードを、既存パターン (署名済みリクエストを
+// 組み立てて `/inbox` に投げ、DB 状態を検証する) で通す。
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn inbound_block_is_recorded_and_removes_existing_follow(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let _ = local_priv;
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    // remote が既に local を follow 済み (accepted)。Block 受信でこの関係は
+    // 強制解除されるはず (Undo Follow は送り返さない)。
+    let follow_ap_id = "https://remote.test/activities/follow-1".to_string();
+    let follow_row = repo::follow::insert_pending(&pool, &follow_ap_id, remote.id, local.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(
+        &pool,
+        follow_row.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let block_ap_id = "https://remote.test/activities/block-1".to_string();
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": block_ap_id,
+        "type": "Block",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let block = repo::block::get_by_pair(&pool, remote.id, local.id)
+        .await
+        .unwrap()
+        .expect("inbound block row must exist");
+    assert_eq!(block.ap_id, block_ap_id);
+
+    assert!(
+        repo::follow::get_by_pair(&pool, remote.id, local.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "existing follow must be force-removed on inbound Block",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn undo_block_removes_row_and_rejects_unrelated_actor(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (a_priv, a_pub) = fresh_rsa();
+    let (b_priv, b_pub) = fresh_rsa();
+    let _ = local_priv;
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote_a = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "a.test",
+            "alice2",
+            &a_pub,
+            "https://a.test/users/alice2/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    let remote_b = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "b.test",
+            "bobby",
+            &b_pub,
+            "https://b.test/users/bobby/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let block_ap_id = "https://a.test/activities/block-1".to_string();
+    repo::block::insert(&pool, &block_ap_id, remote_a.id, local.id)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app1 = router(state.clone());
+    let app2 = router(state);
+
+    let undo_body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://b.test/activities/undo-block-spoof",
+        "type": "Undo",
+        "actor": remote_b.ap_id,
+        "object": block_ap_id,
+    })
+    .to_string();
+    let keyid_b = format!("{}#main-key", remote_b.ap_id);
+    let req = build_signed_post(
+        undo_body.as_bytes(),
+        "/inbox",
+        &b_priv,
+        &keyid_b,
+        LOCAL_HOST,
+    );
+    let resp = app1.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "Undo{{Block}} from a non-blocker actor must be rejected",
+    );
+    assert!(
+        repo::block::get_by_ap_id(&pool, &block_ap_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "block row must survive the spoofed Undo",
+    );
+
+    let undo_body2 = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://a.test/activities/undo-block-1",
+        "type": "Undo",
+        "actor": remote_a.ap_id,
+        "object": block_ap_id,
+    })
+    .to_string();
+    let keyid_a = format!("{}#main-key", remote_a.ap_id);
+    let req2 = build_signed_post(
+        undo_body2.as_bytes(),
+        "/inbox",
+        &a_priv,
+        &keyid_a,
+        LOCAL_HOST,
+    );
+    let resp2 = app2.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::ACCEPTED);
+    assert!(
+        repo::block::get_by_ap_id(&pool, &block_ap_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "block row must be removed by the legitimate Undo",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn blocked_signer_follow_is_silently_dropped(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let _ = local_priv;
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    // local が remote をブロック済み。
+    repo::block::insert(
+        &pool,
+        &format!(
+            "https://{LOCAL_HOST}/activities/block-cli-{}-{}",
+            local.id, remote.id
+        ),
+        local.id,
+        remote.id,
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let follow_id = format!(
+        "https://remote.test/users/bob/activities/follow-{}",
+        local.id
+    );
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "blocked signer's Follow must be silently accepted (not processed)",
+    );
+
+    let follow = sqlx::query!(
+        "SELECT count(*) AS \"c!\" FROM follow WHERE ap_id = $1",
+        follow_id
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        follow.c, 0,
+        "no follow row must be created for a blocked signer"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn domain_silence_drops_new_follow_but_allows_existing_relationship_retry(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let _ = local_priv;
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "silenced.example",
+            "bob",
+            &remote_pub,
+            "https://silenced.example/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    repo::domain_moderation::upsert(&pool, "silenced.example", "silence", None)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app1 = router(state.clone());
+    let app2 = router(state);
+
+    // 新規 Follow: silence 対象ドメインなのでサイレントドロップされる。
+    let follow_id = format!(
+        "https://silenced.example/users/bob/activities/follow-{}",
+        local.id
+    );
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+    let resp = app1.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert!(
+        repo::follow::get_by_pair(&pool, remote.id, local.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "new Follow from a silenced domain must not create a follow row",
+    );
+
+    // 既に accepted な関係の retry は妨げない (Accept 再送出のハウス
+    // キーピング)。
+    let existing_ap_id = "https://silenced.example/activities/follow-existing".to_string();
+    let existing = repo::follow::insert_pending(&pool, &existing_ap_id, remote.id, local.id)
+        .await
+        .unwrap();
+    repo::follow::set_state(
+        &pool,
+        existing.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await
+    .unwrap();
+    let retry_body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": existing_ap_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let req2 = build_signed_post(
+        retry_body.as_bytes(),
+        "/inbox",
+        &remote_priv,
+        &keyid,
+        LOCAL_HOST,
+    );
+    let resp2 = app2.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::ACCEPTED);
+
+    let queued = sqlx::query!(
+        r#"SELECT activity as "activity: sqlx::types::Json<serde_json::Value>"
+           FROM delivery_queue WHERE sender_actor_id = $1"#,
+        local.id,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        queued.iter().any(|r| r.activity.0["type"] == "Accept"),
+        "retry of an already-accepted relationship must still re-send Accept",
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn domain_suspend_rejects_inbox_with_403(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let _ = local_priv;
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "suspended.example",
+            "bob",
+            &remote_pub,
+            "https://suspended.example/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+    repo::domain_moderation::upsert(&pool, "suspended.example", "suspend", None)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let follow_id = format!(
+        "https://suspended.example/users/bob/activities/follow-{}",
+        local.id
+    );
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "inbox from a suspended domain must be rejected before dispatch",
+    );
+    assert!(
+        repo::follow::get_by_pair(&pool, remote.id, local.id)
+            .await
+            .unwrap()
+            .is_none(),
+    );
+}

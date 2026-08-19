@@ -151,6 +151,20 @@ pub enum Focus {
     /// [`crate::emoji_admin::EmojiAdminScreen`] 内部の `tab` で切り替わる
     /// (= `Lists` と同じ「画面内タブ、Focus は増やさない」設計)。
     EmojiAdmin,
+    /// ユーザーブロック PR6 / 連合ドメインブロック PR7 共用: 破壊的操作の
+    /// Yes/No 確認オーバーレイ。`App::confirm_prompt` が `Some` のときのみ
+    /// 取りうる。`y`/`Enter` で確定、`n`/`Esc` でキャンセルし、
+    /// `ConfirmPrompt::return_focus` に戻る。
+    ConfirmPrompt,
+    /// 連合ドメインブロック PR7: ドメイン一覧画面。`:domains` で開く。
+    /// `App::domain_admin` が `Some` のときのみ取りうる。`Enter` で詳細画面
+    /// ([`Self::DomainDetail`]) を開く。
+    DomainAdmin,
+    /// 連合ドメインブロック PR7: ドメイン詳細画面。`App::domain_admin` から
+    /// `Enter` で開く。`App::domain_detail` が `Some` のときのみ取りうる。
+    /// following/followers タブ切替、silence/suspend/unset 操作、選択中
+    /// actor の Profile push を行う。
+    DomainDetail,
 }
 
 /// 現在 `App::notes` / `next_before_ts_ms` / `timeline_exhausted` が表示して
@@ -263,6 +277,15 @@ pub struct App {
     /// 絵文字管理画面の state。`:emojis` で開く。`Focus::EmojiAdmin` の
     /// あいだだけ `Some`。
     pub emoji_admin: Option<crate::emoji_admin::EmojiAdminScreen>,
+    /// ユーザーブロック PR6 / 連合ドメインブロック PR7 共用の確認オーバー
+    /// レイ state。`Focus::ConfirmPrompt` のあいだだけ `Some`。
+    pub confirm_prompt: Option<crate::confirm::ConfirmPrompt>,
+    /// 連合ドメインブロック PR7: ドメイン一覧画面の state。`:domains` で開く。
+    /// `Focus::DomainAdmin` のあいだだけ `Some`。
+    pub domain_admin: Option<crate::domain_admin::DomainAdminScreen>,
+    /// 連合ドメインブロック PR7: ドメイン詳細画面の state。`Focus::DomainDetail`
+    /// のあいだだけ `Some`。`domain_admin` を抜けずに `Enter`/`Esc` で往復する。
+    pub domain_detail: Option<crate::domain_admin::DomainDetailScreen>,
     /// Help overlay の scroll 状態。`Focus::Help` の入り口で `scroll = 0` に
     /// リセットされる ── 毎回先頭から読めるようにする。
     pub help_state: HelpState,
@@ -334,6 +357,9 @@ impl App {
             note_detail: None,
             lists: None,
             emoji_admin: None,
+            confirm_prompt: None,
+            domain_admin: None,
+            domain_detail: None,
             help_state: HelpState::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             last_compose_defaults,

@@ -616,8 +616,13 @@ async fn apply_action(
                 | Focus::Picker
                 | Focus::EmojiSearch
                 | Focus::AltPrompt
-                | Focus::Command => {
-                    // overlay 中は背後 Timeline を動かさない。
+                | Focus::Command
+                | Focus::ConfirmPrompt
+                | Focus::DomainAdmin
+                | Focus::DomainDetail => {
+                    // overlay 中は背後 Timeline を動かさない。DomainAdmin /
+                    // DomainDetail (PR7) はマウスホイールでのカーソル移動は
+                    // 未対応 (キーボード j/k のみ、モーダル overlay 方式)。
                 }
                 _ => {
                     if delta > 0 {
@@ -822,6 +827,45 @@ async fn apply_action(
         Action::ProfileToggleFollow => profile_toggle_follow(app, api).await,
         Action::ProfileBack => profile_back(app),
         Action::ProfileRefresh => profile_refresh(app, api, page_size).await,
+        Action::ProfileToggleBlock => profile_toggle_block(app, api).await,
+        Action::ConfirmYes => confirm_yes(app, api).await,
+        Action::ConfirmNo => confirm_no(app),
+        Action::DomainAdminSelectNext => {
+            if let Some(s) = app.domain_admin.as_mut() {
+                s.select_next();
+            }
+        }
+        Action::DomainAdminSelectPrev => {
+            if let Some(s) = app.domain_admin.as_mut() {
+                s.select_prev();
+            }
+        }
+        Action::DomainAdminOpenSelected => domain_admin_open_selected(app, api).await,
+        Action::DomainAdminRefresh => domain_admin_refresh(app, api).await,
+        Action::DomainAdminClose => domain_admin_close(app),
+        Action::DomainDetailSelectNext => {
+            if let Some(s) = app.domain_detail.as_mut() {
+                s.select_next();
+            }
+        }
+        Action::DomainDetailSelectPrev => {
+            if let Some(s) = app.domain_detail.as_mut() {
+                s.select_prev();
+            }
+        }
+        Action::DomainDetailToggleTab => {
+            if let Some(s) = app.domain_detail.as_mut() {
+                s.toggle_tab();
+            }
+        }
+        Action::DomainDetailOpenSelected => {
+            domain_detail_open_selected(app, api, page_size).await;
+        }
+        Action::DomainDetailToggleSilence => domain_detail_toggle_silence(app, api).await,
+        Action::DomainDetailSuspend => domain_detail_confirm_suspend(app),
+        Action::DomainDetailUnset => domain_detail_unset(app, api).await,
+        Action::DomainDetailRefresh => domain_detail_refresh(app, api).await,
+        Action::DomainDetailClose => domain_detail_close(app),
         Action::OpenCommand => open_command(app),
         Action::CommandInsertChar(c) => {
             if let Some(p) = app.command.as_mut() {
@@ -1241,6 +1285,9 @@ async fn profile_toggle_follow(app: &mut App, api: &LocalApi) {
                         follow_state: None,
                         followed_by: p.relationship.followed_by,
                         follow_id: None,
+                        is_blocked: p.relationship.is_blocked,
+                        block_id: p.relationship.block_id,
+                        is_blocked_by: p.relationship.is_blocked_by,
                     });
                 }
                 app.set_status(
@@ -1271,6 +1318,9 @@ async fn profile_toggle_follow(app: &mut App, api: &LocalApi) {
                         follow_state: Some(resp.state.clone()),
                         followed_by: p.relationship.followed_by,
                         follow_id: Some(resp.follow_id),
+                        is_blocked: p.relationship.is_blocked,
+                        block_id: p.relationship.block_id,
+                        is_blocked_by: p.relationship.is_blocked_by,
                     });
                 }
                 app.set_status(label, StatusKind::Success, Some(Duration::from_secs(3)));
@@ -1291,9 +1341,12 @@ fn profile_back(app: &mut App) {
     if app.profile_stack.is_empty() {
         // M13 PR5: Profile を抜けたあと FollowList が下層に居れば戻る。
         // 例: Timeline → `:following` → FollowList → Enter → Profile → Esc
-        // → FollowList。
+        // → FollowList。連合ドメインブロック PR7: `DomainDetail` から
+        // Profile を push したケースも同様に戻す。
         app.focus = if app.follow_list.is_some() {
             Focus::FollowList
+        } else if app.domain_detail.is_some() {
+            Focus::DomainDetail
         } else {
             Focus::Timeline
         };
@@ -1335,6 +1388,131 @@ async fn profile_refresh(app: &mut App, api: &LocalApi, page_size: i64) {
                 Some(Duration::from_secs(5)),
             );
         }
+    }
+}
+
+// ─── ユーザーブロック (PR6、計画書 §5) ───────────────────────────────────
+
+/// `b` ── block / unblock を toggle。block は破壊的操作 (双方向フォロー
+/// 強制解除) なので確認オーバーレイを挟む (計画書 §5.9)。unblock は関係の
+/// 巻き戻しに過ぎないため確認無しで即実行する。
+async fn profile_toggle_block(app: &mut App, api: &LocalApi) {
+    let Some(profile) = app.current_profile() else {
+        return;
+    };
+    if profile.actor.ap_id == app.whoami.ap_id {
+        app.set_status(
+            "cannot block yourself",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    }
+    if profile.is_blocked() {
+        profile_unblock(app, api).await;
+        return;
+    }
+    let label = profile.acct();
+    app.confirm_prompt = Some(crate::confirm::ConfirmPrompt::new(
+        format!("block {label}? this removes any existing follow relationship"),
+        crate::confirm::ConfirmKind::BlockActor,
+        Focus::Profile,
+    ));
+    app.focus = Focus::ConfirmPrompt;
+}
+
+async fn profile_unblock(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(profile) = app.current_profile() else {
+        return;
+    };
+    let Some(block_id) = profile.relationship.block_id else {
+        app.set_status(
+            "relationship has no block_id; refresh and try again",
+            StatusKind::Warning,
+            Some(Duration::from_secs(4)),
+        );
+        return;
+    };
+    let label = profile.acct();
+    match api.unblock(block_id).await {
+        Ok(_) => {
+            if let Some(p) = app.current_profile_mut() {
+                p.relationship.is_blocked = false;
+                p.relationship.block_id = None;
+            }
+            app.set_status(
+                format!("unblocked {label}"),
+                StatusKind::Success,
+                Some(Duration::from_secs(3)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("unblock failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// 確認済みの block を実行する (`confirm_yes` から呼ぶ)。
+async fn profile_block_confirmed(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(profile) = app.current_profile() else {
+        return;
+    };
+    let actor_id = profile.actor.id;
+    let label = profile.acct();
+    match api.block(&FollowTarget::for_actor_id(actor_id)).await {
+        Ok(resp) => {
+            if let Some(p) = app.current_profile_mut() {
+                p.relationship.is_blocked = true;
+                p.relationship.block_id = Some(resp.block_id);
+                // block 実行はサーバ側で双方向フォロー強制解除を伴うため、
+                // follow 側の relationship も中立に倒しておく (次回 `r` で
+                // 正確な値に上書きされる)。
+                p.relationship.following = false;
+                p.relationship.follow_state = None;
+                p.relationship.follow_id = None;
+            }
+            app.set_status(
+                format!("blocked {label}"),
+                StatusKind::Success,
+                Some(Duration::from_secs(3)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("block failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+// ─── 確認オーバーレイ (PR6 / PR7 共用) ───────────────────────────────────
+
+/// `y`/`Enter` ── `ConfirmKind` に応じて実処理へ分岐する。
+async fn confirm_yes(app: &mut App, api: &LocalApi) {
+    let Some(prompt) = app.confirm_prompt.take() else {
+        return;
+    };
+    app.focus = prompt.return_focus;
+    match prompt.kind {
+        crate::confirm::ConfirmKind::BlockActor => profile_block_confirmed(app, api).await,
+        crate::confirm::ConfirmKind::SuspendDomain => {
+            domain_detail_suspend_confirmed(app, api).await;
+        }
+    }
+}
+
+/// `n`/`Esc` ── 何もせずキャンセルし、呼び出し元画面に戻る。
+fn confirm_no(app: &mut App) {
+    if let Some(prompt) = app.confirm_prompt.take() {
+        app.focus = prompt.return_focus;
     }
 }
 
@@ -2094,7 +2272,10 @@ fn handle_click(app: &mut App, rects: &ui::PanelRects, col: u16, row: u16) {
             | Focus::EmojiSearch
             | Focus::AltPrompt
             | Focus::Command
-            | Focus::NoteDetail,
+            | Focus::NoteDetail
+            | Focus::ConfirmPrompt
+            | Focus::DomainAdmin
+            | Focus::DomainDetail,
     ) {
         return;
     }
@@ -2379,6 +2560,7 @@ async fn command_submit(app: &mut App, api: &LocalApi, page_size: i64) {
         Command::OpenNotifications => command_open_notifications(app, api).await,
         Command::OpenLists => command_open_lists(app, api).await,
         Command::OpenEmojiAdmin => command_open_emoji_admin(app, api).await,
+        Command::OpenDomainAdmin => command_open_domain_admin(app, api).await,
         Command::HomeTimeline => command_home_timeline(app, api, page_size).await,
         Command::Renote => send_renote(app, api, page_size).await,
         Command::Unrenote => undo_renote(app, api, page_size).await,
@@ -2716,6 +2898,289 @@ async fn requests_refresh(app: &mut App, api: &LocalApi) {
 fn requests_close(app: &mut App) {
     app.follow_requests = None;
     app.focus = Focus::Timeline;
+}
+
+// ─── 連合ドメインブロック (PR7、計画書 §6) ───────────────────────────────
+
+/// `:domains` ── 一覧画面を開く + 初回 fetch。失敗しても画面は開く (=
+/// 空表示でユーザに通知、[`command_open_requests`] と同じ組み立て)。
+async fn command_open_domain_admin(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let mut screen = crate::domain_admin::DomainAdminScreen::new();
+    screen.fetching = true;
+    app.domain_admin = Some(screen);
+    app.focus = Focus::DomainAdmin;
+    match api.list_domains().await {
+        Ok(resp) => {
+            if let Some(s) = app.domain_admin.as_mut() {
+                s.replace(resp.domains);
+            }
+        }
+        Err(err) => {
+            if let Some(s) = app.domain_admin.as_mut() {
+                s.fetching = false;
+            }
+            app.set_status(
+                format!(":domains fetch failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `r` ── 一覧の再取得。
+async fn domain_admin_refresh(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(screen) = app.domain_admin.as_mut() else {
+        return;
+    };
+    screen.fetching = true;
+    match api.list_domains().await {
+        Ok(resp) => {
+            if let Some(s) = app.domain_admin.as_mut() {
+                s.replace(resp.domains);
+            }
+        }
+        Err(err) => {
+            if let Some(s) = app.domain_admin.as_mut() {
+                s.fetching = false;
+            }
+            app.set_status(
+                format!("refresh failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `Esc` / `q` ── 画面を閉じて Timeline へ戻る。
+fn domain_admin_close(app: &mut App) {
+    app.domain_admin = None;
+    app.focus = Focus::Timeline;
+}
+
+/// `Enter` ── 選択中ホストの詳細画面を開く。
+async fn domain_admin_open_selected(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(screen) = app.domain_admin.as_ref() else {
+        return;
+    };
+    let Some(host) = screen.current().map(|d| d.host.clone()) else {
+        app.set_status(
+            "no domain selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(3)),
+        );
+        return;
+    };
+    match api.domain_detail(&host).await {
+        Ok(resp) => {
+            app.domain_detail = Some(crate::domain_admin::DomainDetailScreen::from_response(resp));
+            app.focus = Focus::DomainDetail;
+        }
+        Err(err) => {
+            app.set_status(
+                format!("domain detail fetch failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `Esc` / `q` ── `DomainAdmin` 一覧へ戻る (一覧が既に閉じていれば Timeline)。
+fn domain_detail_close(app: &mut App) {
+    app.domain_detail = None;
+    app.focus = if app.domain_admin.is_some() {
+        Focus::DomainAdmin
+    } else {
+        Focus::Timeline
+    };
+}
+
+/// `r` ── 詳細の再取得。現在タブは維持する。
+async fn domain_detail_refresh(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(host) = app.domain_detail.as_ref().map(|s| s.host.clone()) else {
+        return;
+    };
+    let prev_tab = app.domain_detail.as_ref().map(|s| s.tab);
+    match api.domain_detail(&host).await {
+        Ok(resp) => {
+            let mut screen = crate::domain_admin::DomainDetailScreen::from_response(resp);
+            if let Some(tab) = prev_tab {
+                screen.tab = tab;
+            }
+            app.domain_detail = Some(screen);
+            app.set_status(
+                "domain refreshed",
+                StatusKind::Success,
+                Some(Duration::from_secs(2)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("domain refresh failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(5)),
+            );
+        }
+    }
+}
+
+/// `Enter` ── 選択中 actor の Profile を push する。
+/// [`follow_list_open_selected`] と同じ [`push_profile_for_actor_id`] を使う。
+async fn domain_detail_open_selected(app: &mut App, api: &LocalApi, page_size: i64) {
+    let Some(screen) = app.domain_detail.as_ref() else {
+        return;
+    };
+    let Some(entry) = screen.current_entry() else {
+        app.set_status(
+            "no entry selected",
+            StatusKind::Warning,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    };
+    let actor_id = entry.actor.id;
+    push_profile_for_actor_id(app, api, actor_id, page_size).await;
+}
+
+/// `s` ── silence を toggle。既に silence 中なら unset (措置解除) する、
+/// そうでなければ silence を設定する。suspend 中のホストに `s` を押しても
+/// 何もしない (先に `u` で解除してから silence を選ぶ設計)。
+async fn domain_detail_toggle_silence(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(screen) = app.domain_detail.as_ref() else {
+        return;
+    };
+    if screen.is_suspended() {
+        app.set_status(
+            "host is suspended; unset first (u) to change to silence",
+            StatusKind::Warning,
+            Some(Duration::from_secs(4)),
+        );
+        return;
+    }
+    let host = screen.host.clone();
+    let currently_silenced = screen.is_silenced();
+    let result = if currently_silenced {
+        api.domain_unset(&host).await.map(|()| None)
+    } else {
+        api.domain_silence(&host, None).await.map(Some)
+    };
+    match result {
+        Ok(severity) => {
+            if let Some(s) = app.domain_detail.as_mut() {
+                s.severity = severity.map(|r| r.severity);
+            }
+            let label = if currently_silenced {
+                "unset"
+            } else {
+                "silenced"
+            };
+            app.set_status(
+                format!("{label} host={host}"),
+                StatusKind::Success,
+                Some(Duration::from_secs(3)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("silence toggle failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `x` ── suspend を要求する。破壊的操作 (対象ホストの全フォロー関係を
+/// 強制解除) なので確認オーバーレイを挟む (計画書 §10 確定事項 #4)。
+fn domain_detail_confirm_suspend(app: &mut App) {
+    let Some(screen) = app.domain_detail.as_ref() else {
+        return;
+    };
+    if screen.is_suspended() {
+        app.set_status(
+            "host is already suspended",
+            StatusKind::Info,
+            Some(Duration::from_secs(2)),
+        );
+        return;
+    }
+    let host = screen.host.clone();
+    app.confirm_prompt = Some(crate::confirm::ConfirmPrompt::new(
+        format!(
+            "suspend {host}? this force-removes ALL follow relationships \
+             with this domain (no Undo/Reject is sent)"
+        ),
+        crate::confirm::ConfirmKind::SuspendDomain,
+        Focus::DomainDetail,
+    ));
+    app.focus = Focus::ConfirmPrompt;
+}
+
+/// 確認済みの suspend を実行する (`confirm_yes` から呼ぶ)。
+async fn domain_detail_suspend_confirmed(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(host) = app.domain_detail.as_ref().map(|s| s.host.clone()) else {
+        return;
+    };
+    match api.domain_suspend(&host, None).await {
+        Ok(resp) => {
+            if let Some(s) = app.domain_detail.as_mut() {
+                s.severity = Some(resp.severity);
+            }
+            app.set_status(
+                format!(
+                    "suspended host={host} forced_unfollow_count={}",
+                    resp.forced_unfollow_count
+                ),
+                StatusKind::Success,
+                Some(Duration::from_secs(5)),
+            );
+            // following/followers 一覧は強制解除で古くなっているため
+            // 再取得しておく (タブ・カーソルは維持)。
+            domain_detail_refresh(app, api).await;
+        }
+        Err(err) => {
+            app.set_status(
+                format!("suspend failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
+}
+
+/// `u` ── 措置解除。
+async fn domain_detail_unset(app: &mut App, api: &LocalApi) {
+    let _g = InFlightGuard::new(app.in_flight.clone());
+    let Some(host) = app.domain_detail.as_ref().map(|s| s.host.clone()) else {
+        return;
+    };
+    match api.domain_unset(&host).await {
+        Ok(()) => {
+            if let Some(s) = app.domain_detail.as_mut() {
+                s.severity = None;
+            }
+            app.set_status(
+                format!("moderation unset for host={host}"),
+                StatusKind::Success,
+                Some(Duration::from_secs(3)),
+            );
+        }
+        Err(err) => {
+            app.set_status(
+                format!("unset failed: {err}"),
+                StatusKind::Error,
+                Some(Duration::from_secs(6)),
+            );
+        }
+    }
 }
 
 // ─── リスト機能 (Mastodon/Misskey 互換) ─────────────────────────────────

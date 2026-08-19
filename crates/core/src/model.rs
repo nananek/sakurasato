@@ -204,6 +204,30 @@ pub struct FollowRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Row of the `block` table (ユーザーブロック / migration 0031)。
+/// `follow` と対称の設計だが `state` 列は持たない ── ブロックは相手の同意を
+/// 要さない一方的な宣言のため `pending` 状態が存在しない。
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct BlockRow {
+    pub id: i64,
+    pub ap_id: String,
+    pub blocker_actor_id: i64,
+    pub blocked_actor_id: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Row of the `domain_moderation` table (連合ドメインブロック / migration 0032)。
+/// 行が存在しない = 通常運用。`severity` は `"silence"` / `"suspend"`。
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct DomainModerationRow {
+    pub id: i64,
+    pub host: String,
+    pub severity: String,
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Row of the `user_list` table (Mastodon/Misskey 互換のユーザーリスト)。
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct UserListRow {
@@ -384,6 +408,28 @@ impl FollowState {
             Self::Pending => "pending",
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// 連合ドメインブロックの重大度 (mirrors `domain_moderation.severity`)。
+///
+/// - `Silence` (配信停止相当): 新規 inbound Follow のみ拒否。既存フォロー関係
+///   や既存 followee の Note/Like/EmojiReact/Announce は止めない。
+/// - `Suspend` (完全ブロック相当): inbox 受信を signature 検証前に一律拒否 +
+///   配送停止 + 既存双方向フォロー関係を強制解除。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainSeverity {
+    Silence,
+    Suspend,
+}
+
+impl DomainSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Silence => "silence",
+            Self::Suspend => "suspend",
         }
     }
 }
