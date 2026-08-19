@@ -432,14 +432,6 @@ impl DomainSeverity {
             Self::Suspend => "suspend",
         }
     }
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "silence" => Some(Self::Silence),
-            "suspend" => Some(Self::Suspend),
-            _ => None,
-        }
-    }
 }
 
 /// Row of the `notification_channel` table.
