@@ -24,8 +24,9 @@ use anyhow::Context;
 use sakurasato_core::model::{ActorRow, BlockRow};
 use sakurasato_core::repo;
 use serde_json::{Value as JsonValue, json};
+use sqlx::PgPool;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cli::{BlockArgs, BlockCommand, BlockCreateArgs, BlockIdArgs};
 use crate::delivery;
@@ -243,6 +244,51 @@ pub async fn delete_block_core(
         queue_id: queued.id,
         inbox_url: inbox,
     })
+}
+
+/// viewer (`local_id`) から見た `target_id` との block relationship
+/// (`is_blocking`, `is_blocked_by`) を計算する。`local_api/actor.rs::compute_relationship`
+/// と同じクエリ形 (`repo::block::is_blocked` を双方向で 2 回) だが、
+/// MiAuth 側の `isBlocking`/`isBlocked` 実値化 (フォローアップ計画書 §4) 用に
+/// 単純な bool タプルを返す形で切り出した ── `local_api/actor.rs` 側の
+/// 実装は触らない (計画書 §4.3 の判断どおり、既存の動いているコードを
+/// リファクタで壊すリスクを避ける)。
+///
+/// 自分自身が相手のとき、または DB 障害時は `(false, false)` にフェイルオープン
+/// する (自己ブロックは `create_block_core` が拒否する仕様なので実データ上も
+/// 常に false。DB 障害時のフェイルオープンは miauth 側の他の relationship
+/// 計算 [`crate::follow::compute_follow_relationship`] 呼び出し元と同じ方針)。
+pub async fn compute_block_relationship(
+    pool: &PgPool,
+    local_id: i64,
+    target_id: i64,
+) -> (bool, bool) {
+    if local_id == target_id {
+        return (false, false);
+    }
+    let is_blocking = repo::block::is_blocked(pool, local_id, target_id)
+        .await
+        .unwrap_or_else(|err| {
+            warn!(
+                ?err,
+                local_id,
+                target_id,
+                "block relationship (is_blocking) lookup failed; falling back to false",
+            );
+            false
+        });
+    let is_blocked = repo::block::is_blocked(pool, target_id, local_id)
+        .await
+        .unwrap_or_else(|err| {
+            warn!(
+                ?err,
+                local_id,
+                target_id,
+                "block relationship (is_blocked) lookup failed; falling back to false",
+            );
+            false
+        });
+    (is_blocking, is_blocked)
 }
 
 /// CLI `sakurasato-server block <create|unblock|list>` の入口。

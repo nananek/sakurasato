@@ -20,6 +20,12 @@
 //!   でプロフィール編集 (Aria `INotifier` の crash fix)、`MeDetailed` を返し
 //!   `Update` activity をフォロワーに配送する
 //! - scope 細分化: `write:reactions` のみの token で `notes/create` が 401
+//! - `blocking/create { i, userId }` で Block 配送 + 既存の双方向 follow 強制解除
+//!   (MiAuth 経由のユーザーブロック follow-up, PR #355 のフォローアップ)
+//! - `blocking/delete { i, userId }` で Undo Block 配送
+//! - `blocking/list { i }` でブロック中の actor 一覧
+//! - `users/show` のレスポンスで `isBlocking`/`isBlocked` が実値化されている
+//!   (= `conv.rs::from_actor_detailed` のハードコード `false` 撤廃の回帰確認)
 //!
 //! ## AGPL discipline
 //!
@@ -1957,4 +1963,220 @@ async fn i_update_is_locked_flips_flag_and_enqueues_update_for_followers(pool: P
         queued >= 1,
         "delivery_queue should have the Update activity"
     );
+}
+
+// ─── blocking/create, blocking/delete, blocking/list ──────────────────
+// (MiAuth 経由のユーザーブロック follow-up, PR #355 のフォローアップ,
+// tmp/plan-miauth-blocking.md §6 準拠)
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn blocking_create_enqueues_block_and_removes_existing_follow(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    // alice → bob (accepted) を事前に作っておき、ブロックで強制解除されることを確認する
+    // (`create_block_core` の双方向 unfollow 挙動、`crates/server/src/block.rs` 参照)。
+    accepted_follow(&pool, alice, bob).await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:blocks"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/blocking/create",
+        json!({"i": token, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["username"], "bob");
+    assert_eq!(v["isBlocking"], true, "{v}");
+    assert_eq!(v["isBlocked"], false, "{v}");
+
+    assert!(
+        repo::follow::get_by_pair(&pool, alice, bob)
+            .await
+            .unwrap()
+            .is_none(),
+        "existing follow must be force-removed on block",
+    );
+    assert!(
+        repo::block::get_by_pair(&pool, alice, bob)
+            .await
+            .unwrap()
+            .is_some(),
+        "block row must exist",
+    );
+
+    // delivery_queue: delete_follow_core の Undo Follow (先) + block の Block
+    // activity (後) の 2 件。
+    let queued: i64 = sqlx::query_scalar!("SELECT count(*) FROM delivery_queue")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert!(
+        queued >= 2,
+        "delivery_queue should have undo-follow + block (got {queued})"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn blocking_create_self_returns_conflict(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:blocks"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/blocking/create",
+        json!({"i": token, "userId": alice.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "ALREADY_BLOCKING");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn blocking_delete_removes_block_and_enqueues_undo(pool: PgPool) {
+    let alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:blocks"]).await;
+
+    // Block first.
+    let _ = post_json(
+        app.clone(),
+        "/api/blocking/create",
+        json!({"i": token.clone(), "userId": bob.to_string()}),
+    )
+    .await;
+
+    // Then unblock.
+    let resp = post_json(
+        app,
+        "/api/blocking/delete",
+        json!({"i": token, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["username"], "bob");
+    assert_eq!(v["isBlocking"], false, "{v}");
+
+    assert!(
+        repo::block::get_by_pair(&pool, alice, bob)
+            .await
+            .unwrap()
+            .is_none(),
+        "block row must be removed",
+    );
+
+    // delivery_queue: block の Block activity (先) + unblock の Undo Block (後)。
+    let queued: i64 = sqlx::query_scalar!("SELECT count(*) FROM delivery_queue")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert!(
+        queued >= 2,
+        "delivery_queue should have block + undo-block (got {queued})"
+    );
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn blocking_delete_not_blocking_returns_404(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:blocks"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/blocking/delete",
+        json!({"i": token, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "NOT_BLOCKING");
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn blocking_list_returns_blocked_actors(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:blocks", "read:blocks"]).await;
+
+    let _ = post_json(
+        app.clone(),
+        "/api/blocking/create",
+        json!({"i": token.clone(), "userId": bob.to_string()}),
+    )
+    .await;
+
+    let resp = post_json(app, "/api/blocking/list", json!({"i": token})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    let arr = v.as_array().expect("blocking/list must return an array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["blockeeId"], bob.to_string());
+    assert_eq!(arr[0]["blockee"]["username"], "bob");
+    assert!(arr[0]["id"].is_string());
+    assert!(arr[0]["createdAt"].is_string());
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn blocking_create_without_scope_is_403(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    // scope 細分化: write:notes のみ → blocking/create は 403 PERMISSION_DENIED。
+    let token = issue_token_with_scopes(&pool, &["write:notes"]).await;
+
+    let resp = post_json(
+        app,
+        "/api/blocking/create",
+        json!({"i": token, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "PERMISSION_DENIED");
+}
+
+/// MiAuth follow-up の中心的回帰テスト: `conv.rs::from_actor_detailed` の
+/// `isBlocking`/`isBlocked` がハードコード `false` ではなく実値になっている
+/// ことを `users/show` 経由で end-to-end に確認する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_show_reports_is_blocking_after_block(pool: PgPool) {
+    let _alice = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let bob = seed_remote_actor(&pool, "misskey.io", "bob").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:blocks", "read:account"]).await;
+
+    let _ = post_json(
+        app.clone(),
+        "/api/blocking/create",
+        json!({"i": token.clone(), "userId": bob.to_string()}),
+    )
+    .await;
+
+    let resp = post_json(
+        app,
+        "/api/users/show",
+        json!({"i": token, "userId": bob.to_string()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_json(resp).await;
+    assert_eq!(v["isBlocking"], true, "{v}");
+    assert_eq!(v["isBlocked"], false, "{v}");
 }

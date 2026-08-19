@@ -90,6 +90,10 @@ const SUPPORTED_ENDPOINTS: &[&str] = &[
     "following/requests/accept",
     "following/requests/reject",
     "following/requests/cancel",
+    // ユーザーブロック follow-up (PR #355 のフォローアップ)。
+    "blocking/create",
+    "blocking/delete",
+    "blocking/list",
     "drive/files/create",
     "drive/files",
     "drive/files/show",
