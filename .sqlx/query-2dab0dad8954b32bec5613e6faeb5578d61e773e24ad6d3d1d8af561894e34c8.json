@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT emoji_id FROM reaction WHERE note_id = $1 AND content = ':foo:'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "emoji_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "reaction",
+            "name": "emoji_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "2dab0dad8954b32bec5613e6faeb5578d61e773e24ad6d3d1d8af561894e34c8"
+}

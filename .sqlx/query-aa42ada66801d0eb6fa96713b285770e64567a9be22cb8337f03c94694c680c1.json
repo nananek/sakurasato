@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT activity as \"activity: sqlx::types::Json<serde_json::Value>\"\n               FROM delivery_queue WHERE sender_actor_id = $1 ORDER BY id ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "activity: sqlx::types::Json<serde_json::Value>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "activity"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "aa42ada66801d0eb6fa96713b285770e64567a9be22cb8337f03c94694c680c1"
+}

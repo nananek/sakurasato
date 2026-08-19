@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT activity AS \"activity: sqlx::types::Json<serde_json::Value>\"\n           FROM delivery_queue WHERE inbox_url = $1 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "activity: sqlx::types::Json<serde_json::Value>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "delivery_queue",
+            "name": "activity"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fb586374f6669c7bc82d94867b3fca7f308004e0cdb80ec899e21e1725747265"
+}

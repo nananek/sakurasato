@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO follow (ap_id, follower_actor_id, followed_actor_id, state)\n          VALUES ($1, $2, $3, 'pending')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "edbb34ce241307fb66cd3db598c3280c11586d002bc495b0e4916f0648cae0f3"
+}

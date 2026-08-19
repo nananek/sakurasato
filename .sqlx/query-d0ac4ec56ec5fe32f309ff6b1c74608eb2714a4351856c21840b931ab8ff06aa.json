@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, ap_id, follower_actor_id, followed_actor_id, state FROM follow WHERE ap_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ap_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "ap_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "follower_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "follower_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "followed_actor_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "followed_actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "follow",
+            "name": "state"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d0ac4ec56ec5fe32f309ff6b1c74608eb2714a4351856c21840b931ab8ff06aa"
+}
