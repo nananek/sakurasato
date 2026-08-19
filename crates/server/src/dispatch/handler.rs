@@ -34,7 +34,11 @@ use crate::state::AppState;
 ///
 /// `pub(crate)`: `dispatch/block.rs::handle_block` (PR3) が同じ F4 相当の
 /// 検証を再利用する (計画書 §5.5)。
-pub(crate) fn ensure_same_host(other_uri: &str, signer_ap_id: &str, kind: &str) -> anyhow::Result<()> {
+pub(crate) fn ensure_same_host(
+    other_uri: &str,
+    signer_ap_id: &str,
+    kind: &str,
+) -> anyhow::Result<()> {
     let other = Url::parse(other_uri)
         .with_context(|| format!("{kind} {other_uri:?} is not a valid URL"))?;
     let signer = Url::parse(signer_ap_id)
@@ -115,11 +119,10 @@ pub(crate) async fn handle_follow(
         .context("domain moderation lookup for inbound Follow")?
         && m.severity == "silence"
     {
-        let already_accepted =
-            repo::follow::get_by_pair(state.pool(), signer.id, followed.id)
-                .await
-                .context("existing follow lookup for silence guard")?
-                .is_some_and(|row| row.state == FollowState::Accepted.as_str());
+        let already_accepted = repo::follow::get_by_pair(state.pool(), signer.id, followed.id)
+            .await
+            .context("existing follow lookup for silence guard")?
+            .is_some_and(|row| row.state == FollowState::Accepted.as_str());
         if !already_accepted {
             info!(
                 follower = %signer.ap_id,

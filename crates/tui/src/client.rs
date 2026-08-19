@@ -422,7 +422,7 @@ impl LocalApi {
     }
 
     /// `POST /api/v1/block` ── ユーザーブロック PR6。body 形式は `follow` と
-    /// 同じ `FollowTarget` (acct/actor_uri/actor_id の排他 3 択) を再利用する。
+    /// 同じ `FollowTarget` (`acct`/`actor_uri`/`actor_id` の排他 3 択) を再利用する。
     pub async fn block(&self, target: &FollowTarget) -> Result<BlockResponse, ApiError> {
         let body = serde_json::to_vec(target)?;
         let request = self
@@ -460,8 +460,7 @@ impl LocalApi {
     /// `GET /api/v1/domains/{host}` ── 統計 + moderation state +
     /// following/followers 一覧 (連合ドメインブロック PR7)。
     pub async fn domain_detail(&self, host: &str) -> Result<DomainDetailResponse, ApiError> {
-        let encoded_host: String =
-            url::form_urlencoded::byte_serialize(host.as_bytes()).collect();
+        let encoded_host: String = url::form_urlencoded::byte_serialize(host.as_bytes()).collect();
         let path = format!("/api/v1/domains/{encoded_host}");
         self.get_json(&path).await
     }
@@ -492,8 +491,7 @@ impl LocalApi {
         action: &str,
         reason: Option<&str>,
     ) -> Result<DomainActionResponse, ApiError> {
-        let encoded_host: String =
-            url::form_urlencoded::byte_serialize(host.as_bytes()).collect();
+        let encoded_host: String = url::form_urlencoded::byte_serialize(host.as_bytes()).collect();
         let path = format!("/api/v1/domains/{encoded_host}/{action}");
         let body = serde_json::to_vec(&DomainActionRequest {
             reason: reason.map(str::to_string),
@@ -510,8 +508,7 @@ impl LocalApi {
     /// `DELETE /api/v1/domains/{host}` ── 措置解除 (連合ドメインブロック PR7)。
     /// server は `204 No Content` を返す。
     pub async fn domain_unset(&self, host: &str) -> Result<(), ApiError> {
-        let encoded_host: String =
-            url::form_urlencoded::byte_serialize(host.as_bytes()).collect();
+        let encoded_host: String = url::form_urlencoded::byte_serialize(host.as_bytes()).collect();
         let path = format!("/api/v1/domains/{encoded_host}");
         let request = self
             .request_builder(Method::DELETE, &path)?
@@ -1574,6 +1571,10 @@ pub struct ActorProfile {
 
 /// `GET /api/v1/actor/{id}/relationship` の応答 + `ActorWithRelationship` 内側。
 #[derive(Debug, Clone, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "follow/block 双方向関係の bool 4 件を 1 構造体で運ぶ設計 (server 側 Relationship と対称)"
+)]
 pub struct Relationship {
     pub following: bool,
     #[serde(default)]

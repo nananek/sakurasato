@@ -3,6 +3,10 @@
 //! `follow` テーブルと対称の設計だが `state` 列を持たない (= ブロックは相手の
 //! 同意を要さない一方的な宣言のため `pending` 状態が存在しない)。
 
+// block.{blocker,blocked}_actor_id naturally share a prefix; this is the
+// AP terminology and aliasing would harm readability (follow.rs と同じ理由)。
+#![allow(clippy::similar_names)]
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 

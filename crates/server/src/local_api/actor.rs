@@ -67,6 +67,10 @@ pub struct ActorOnly {
 }
 
 #[derive(Debug, Serialize, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "follow/block 双方向関係の bool 4 件を 1 構造体で運ぶ設計 (crate::follow::FollowRelationship と同種)"
+)]
 pub struct Relationship {
     pub following: bool,
     pub follow_state: Option<FollowState>,

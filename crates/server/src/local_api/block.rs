@@ -117,7 +117,11 @@ pub async fn list(State(state): State<AppState>) -> Response {
     let rows = match repo::block::list_blocked_by_local(state.pool(), local.id).await {
         Ok(rows) => rows,
         Err(err) => {
-            error!(?err, local_id = local.id, "list_blocked_by_local query failed");
+            error!(
+                ?err,
+                local_id = local.id,
+                "list_blocked_by_local query failed"
+            );
             return service_unavailable("block list query failed; check server logs");
         }
     };

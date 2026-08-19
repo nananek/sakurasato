@@ -293,7 +293,8 @@ mod tests {
     fn current_entry_matches_tab() {
         let s = detail();
         assert_eq!(
-            s.current_entry().map(|e| e.actor.preferred_username.as_str()),
+            s.current_entry()
+                .map(|e| e.actor.preferred_username.as_str()),
             Some("alice")
         );
     }

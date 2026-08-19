@@ -129,11 +129,10 @@ pub async fn create_block_core(
         .to_string();
     let activity = build_block_activity(&block_ap_id, &local.ap_id, &target_actor.ap_id);
 
-    let mut tx = state
-        .pool()
-        .begin()
-        .await
-        .map_err(|e| BlockError::Internal(anyhow::Error::new(e).context("begin transaction")))?;
+    let mut tx =
+        state.pool().begin().await.map_err(|e| {
+            BlockError::Internal(anyhow::Error::new(e).context("begin transaction"))
+        })?;
     // target → local: Reject は送出せず単純に行を削除するだけに留める
     // (計画書 §10 確定事項 #1)。
     sqlx::query!(
@@ -214,11 +213,10 @@ pub async fn delete_block_core(
         .to_string();
     let activity = build_undo_block_activity(&undo_ap_id, &local.ap_id, &row, &target.ap_id);
 
-    let mut tx = state
-        .pool()
-        .begin()
-        .await
-        .map_err(|e| BlockError::Internal(anyhow::Error::new(e).context("begin transaction")))?;
+    let mut tx =
+        state.pool().begin().await.map_err(|e| {
+            BlockError::Internal(anyhow::Error::new(e).context("begin transaction"))
+        })?;
     let queued = delivery::enqueue_activity(&mut *tx, local.id, &inbox, &activity)
         .await
         .map_err(|e| BlockError::Internal(e.context(format!("enqueue Undo Block to {inbox}"))))?;
@@ -525,7 +523,12 @@ mod tests {
         .await
         .unwrap();
         rows.into_iter()
-            .map(|r| r.activity.0["type"].as_str().unwrap_or_default().to_string())
+            .map(|r| {
+                r.activity.0["type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect()
     }
 
@@ -542,17 +545,25 @@ mod tests {
         let out_row = repo::follow::insert_pending(&pool, &out_ap_id, local.id, remote.id)
             .await
             .unwrap();
-        repo::follow::set_state(&pool, out_row.id, sakurasato_core::model::FollowState::Accepted)
-            .await
-            .unwrap();
+        repo::follow::set_state(
+            &pool,
+            out_row.id,
+            sakurasato_core::model::FollowState::Accepted,
+        )
+        .await
+        .unwrap();
         // remote → local (accepted): Reject は送出せず単純削除されるはず。
         let in_ap_id = "https://remote.test/activities/follow-in-1".to_string();
         let in_row = repo::follow::insert_pending(&pool, &in_ap_id, remote.id, local.id)
             .await
             .unwrap();
-        repo::follow::set_state(&pool, in_row.id, sakurasato_core::model::FollowState::Accepted)
-            .await
-            .unwrap();
+        repo::follow::set_state(
+            &pool,
+            in_row.id,
+            sakurasato_core::model::FollowState::Accepted,
+        )
+        .await
+        .unwrap();
 
         let state = AppState::from_pool(pool.clone(), test_config());
         let outcome = create_block_core(&state, FollowTarget::ActorId(remote.id))
@@ -633,7 +644,10 @@ mod tests {
         let remote = repo::actor::insert(&pool, new_remote_actor("remote.test", "bob"))
             .await
             .unwrap();
-        let ap_id = format!("https://{HOST}/activities/block-cli-{}-{}", local.id, remote.id);
+        let ap_id = format!(
+            "https://{HOST}/activities/block-cli-{}-{}",
+            local.id, remote.id
+        );
         let block = repo::block::insert(&pool, &ap_id, local.id, remote.id)
             .await
             .unwrap();
@@ -643,7 +657,10 @@ mod tests {
         assert_eq!(outcome.target_ap_id, remote.ap_id);
 
         assert!(
-            repo::block::get_by_id(&pool, block.id).await.unwrap().is_none(),
+            repo::block::get_by_id(&pool, block.id)
+                .await
+                .unwrap()
+                .is_none(),
             "block row must be deleted",
         );
         let types = queued_activity_types(&pool, local.id).await;
@@ -669,6 +686,11 @@ mod tests {
         let err = delete_block_core(&state, block.id).await.unwrap_err();
         assert!(matches!(err, BlockError::Forbidden(_)));
         // 権限エラーなので行は消えていない。
-        assert!(repo::block::get_by_id(&pool, block.id).await.unwrap().is_some());
+        assert!(
+            repo::block::get_by_id(&pool, block.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

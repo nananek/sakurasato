@@ -298,8 +298,6 @@ pub enum Action {
     EmojiAdminSearchSubmit,
     /// 絵文字管理画面: 検索窓のキャンセル (`Esc`)。
     EmojiAdminSearchCancel,
-    /// 連合ドメインブロック PR7: `:domains` ── ドメイン一覧画面を開く。
-    OpenDomainAdmin,
     /// `DomainAdmin` 一覧で `j`/`Down` ── カーソル下移動。
     DomainAdminSelectNext,
     /// `DomainAdmin` 一覧で `k`/`Up` ── カーソル上移動。
@@ -586,7 +584,7 @@ fn translate_profile_key(k: KeyEvent) -> Action {
 /// ユーザーブロック PR6 / 連合ドメインブロック PR7 共用の確認オーバーレイ。
 fn translate_confirm_key(k: KeyEvent) -> Action {
     match (k.code, k.modifiers) {
-        (KeyCode::Char('y'), m) | (KeyCode::Enter, m) if m.is_empty() => Action::ConfirmYes,
+        (KeyCode::Char('y') | KeyCode::Enter, m) if m.is_empty() => Action::ConfirmYes,
         (KeyCode::Char('n'), m) if m.is_empty() => Action::ConfirmNo,
         (KeyCode::Esc, _) => Action::ConfirmNo,
         _ => Action::Noop,

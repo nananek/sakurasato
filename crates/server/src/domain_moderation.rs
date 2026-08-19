@@ -175,6 +175,10 @@ pub async fn list_core(
 }
 
 /// `host` の統計 + moderation state + フォロー一覧をまとめて返す。
+#[allow(
+    clippy::similar_names,
+    reason = "state (AppState 引数) と stats (統計結果) は意味の異なる既存の慣習的な命名"
+)]
 pub async fn detail_core(
     state: &AppState,
     host: &str,
@@ -422,6 +426,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::similar_names,
+        reason = "follower/followed は AP 用語でこの語対が最も明確"
+    )]
     async fn seed_accepted_follow(pool: &PgPool, follower: i64, followed: i64, tag: &str) {
         let ap_id = format!("https://{HOST}/activities/follow-{tag}");
         let row = repo::follow::insert_pending(pool, &ap_id, follower, followed)
@@ -527,7 +535,9 @@ mod tests {
     #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
     async fn unset_core_removes_row_and_errors_when_missing(pool: PgPool) {
         let state = AppState::from_pool(pool.clone(), test_config());
-        silence_core(&state, "mastodon.example", None).await.unwrap();
+        silence_core(&state, "mastodon.example", None)
+            .await
+            .unwrap();
         assert!(
             repo::domain_moderation::get_by_host(&pool, "mastodon.example")
                 .await

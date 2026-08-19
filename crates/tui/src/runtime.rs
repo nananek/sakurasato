@@ -3076,7 +3076,11 @@ async fn domain_detail_toggle_silence(app: &mut App, api: &LocalApi) {
             if let Some(s) = app.domain_detail.as_mut() {
                 s.severity = severity.map(|r| r.severity);
             }
-            let label = if currently_silenced { "unset" } else { "silenced" };
+            let label = if currently_silenced {
+                "unset"
+            } else {
+                "silenced"
+            };
             app.set_status(
                 format!("{label} host={host}"),
                 StatusKind::Success,

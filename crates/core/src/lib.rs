@@ -65,6 +65,10 @@ mod tests {
         //   followingCount/notesCount に出す値の出所)
         // 0030 note_source (= MFM ソース列。ローカル投稿の生本文を AP
         //   `Note.source` / `_misskey_content` として配送するために保存する)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 30);
+        // 0031 block (= ユーザーブロック。blocker_actor_id/blocked_actor_id を
+        //   持つ follow テーブル対称の設計、state 列は無し)
+        // 0032 domain_moderation (= 連合ドメインブロック。host 単位で
+        //   severity ('silence'/'suspend') を持つ)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 32);
     }
 }

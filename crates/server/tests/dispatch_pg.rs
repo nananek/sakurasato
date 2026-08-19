@@ -2861,9 +2861,13 @@ async fn inbound_block_is_recorded_and_removes_existing_follow(pool: PgPool) {
     let follow_row = repo::follow::insert_pending(&pool, &follow_ap_id, remote.id, local.id)
         .await
         .unwrap();
-    repo::follow::set_state(&pool, follow_row.id, sakurasato_core::model::FollowState::Accepted)
-        .await
-        .unwrap();
+    repo::follow::set_state(
+        &pool,
+        follow_row.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await
+    .unwrap();
 
     let state = AppState::from_pool(pool.clone(), make_config());
     let app = router(state);
@@ -2909,13 +2913,23 @@ async fn undo_block_removes_row_and_rejects_unrelated_actor(pool: PgPool) {
         .unwrap();
     let remote_a = repo::actor::insert(
         &pool,
-        remote_actor("a.test", "alice2", &a_pub, "https://a.test/users/alice2/inbox"),
+        remote_actor(
+            "a.test",
+            "alice2",
+            &a_pub,
+            "https://a.test/users/alice2/inbox",
+        ),
     )
     .await
     .unwrap();
     let remote_b = repo::actor::insert(
         &pool,
-        remote_actor("b.test", "bobby", &b_pub, "https://b.test/users/bobby/inbox"),
+        remote_actor(
+            "b.test",
+            "bobby",
+            &b_pub,
+            "https://b.test/users/bobby/inbox",
+        ),
     )
     .await
     .unwrap();
@@ -2938,7 +2952,13 @@ async fn undo_block_removes_row_and_rejects_unrelated_actor(pool: PgPool) {
     })
     .to_string();
     let keyid_b = format!("{}#main-key", remote_b.ap_id);
-    let req = build_signed_post(undo_body.as_bytes(), "/inbox", &b_priv, &keyid_b, LOCAL_HOST);
+    let req = build_signed_post(
+        undo_body.as_bytes(),
+        "/inbox",
+        &b_priv,
+        &keyid_b,
+        LOCAL_HOST,
+    );
     let resp = app1.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
@@ -2946,7 +2966,10 @@ async fn undo_block_removes_row_and_rejects_unrelated_actor(pool: PgPool) {
         "Undo{{Block}} from a non-blocker actor must be rejected",
     );
     assert!(
-        repo::block::get_by_ap_id(&pool, &block_ap_id).await.unwrap().is_some(),
+        repo::block::get_by_ap_id(&pool, &block_ap_id)
+            .await
+            .unwrap()
+            .is_some(),
         "block row must survive the spoofed Undo",
     );
 
@@ -2959,11 +2982,20 @@ async fn undo_block_removes_row_and_rejects_unrelated_actor(pool: PgPool) {
     })
     .to_string();
     let keyid_a = format!("{}#main-key", remote_a.ap_id);
-    let req2 = build_signed_post(undo_body2.as_bytes(), "/inbox", &a_priv, &keyid_a, LOCAL_HOST);
+    let req2 = build_signed_post(
+        undo_body2.as_bytes(),
+        "/inbox",
+        &a_priv,
+        &keyid_a,
+        LOCAL_HOST,
+    );
     let resp2 = app2.oneshot(req2).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::ACCEPTED);
     assert!(
-        repo::block::get_by_ap_id(&pool, &block_ap_id).await.unwrap().is_none(),
+        repo::block::get_by_ap_id(&pool, &block_ap_id)
+            .await
+            .unwrap()
+            .is_none(),
         "block row must be removed by the legitimate Undo",
     );
 }
@@ -2992,7 +3024,10 @@ async fn blocked_signer_follow_is_silently_dropped(pool: PgPool) {
     // local が remote をブロック済み。
     repo::block::insert(
         &pool,
-        &format!("https://{LOCAL_HOST}/activities/block-cli-{}-{}", local.id, remote.id),
+        &format!(
+            "https://{LOCAL_HOST}/activities/block-cli-{}-{}",
+            local.id, remote.id
+        ),
         local.id,
         remote.id,
     )
@@ -3023,11 +3058,17 @@ async fn blocked_signer_follow_is_silently_dropped(pool: PgPool) {
         "blocked signer's Follow must be silently accepted (not processed)",
     );
 
-    let follow = sqlx::query!("SELECT count(*) AS \"c!\" FROM follow WHERE ap_id = $1", follow_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(follow.c, 0, "no follow row must be created for a blocked signer");
+    let follow = sqlx::query!(
+        "SELECT count(*) AS \"c!\" FROM follow WHERE ap_id = $1",
+        follow_id
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        follow.c, 0,
+        "no follow row must be created for a blocked signer"
+    );
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
@@ -3089,9 +3130,13 @@ async fn domain_silence_drops_new_follow_but_allows_existing_relationship_retry(
     let existing = repo::follow::insert_pending(&pool, &existing_ap_id, remote.id, local.id)
         .await
         .unwrap();
-    repo::follow::set_state(&pool, existing.id, sakurasato_core::model::FollowState::Accepted)
-        .await
-        .unwrap();
+    repo::follow::set_state(
+        &pool,
+        existing.id,
+        sakurasato_core::model::FollowState::Accepted,
+    )
+    .await
+    .unwrap();
     let retry_body = serde_json::json!({
         "@context": "https://www.w3.org/ns/activitystreams",
         "id": existing_ap_id,
@@ -3100,7 +3145,13 @@ async fn domain_silence_drops_new_follow_but_allows_existing_relationship_retry(
         "object": local.ap_id,
     })
     .to_string();
-    let req2 = build_signed_post(retry_body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+    let req2 = build_signed_post(
+        retry_body.as_bytes(),
+        "/inbox",
+        &remote_priv,
+        &keyid,
+        LOCAL_HOST,
+    );
     let resp2 = app2.oneshot(req2).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::ACCEPTED);
 

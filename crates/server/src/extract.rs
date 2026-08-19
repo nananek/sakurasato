@@ -53,6 +53,10 @@ where
 {
     type Rejection = SigError;
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "署名スキーム判定 → actor 解決 → 連合ドメインブロック判定 → 検証、の縦の流れを 1 関数で素直に並べているだけ"
+    )]
     async fn from_request(
         req: Request<axum::body::Body>,
         state: &AppState,

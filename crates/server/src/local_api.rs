@@ -98,6 +98,10 @@ pub mod timeline;
 pub mod user_list;
 pub mod whoami;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "route 登録を列挙しているだけの straight-line 関数 (機能追加のたびに行数が伸びる想定)"
+)]
 pub fn router(state: AppState) -> Router {
     // M7: 画像アップロードはサニタイズ前段で media-proxy.max_bytes に達する
     // 想定の大きいバイト列を受ける。axum の DefaultBodyLimit (= 2 MiB) を

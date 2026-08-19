@@ -3103,7 +3103,11 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Rect {
         Line::from(Span::styled("profile", help_section(palette))),
         help_entry(palette, "j / k", "next / prev note"),
         help_entry(palette, "f", "follow / unfollow toggle"),
-        help_entry(palette, "b", "block / unblock toggle (block asks to confirm)"),
+        help_entry(
+            palette,
+            "b",
+            "block / unblock toggle (block asks to confirm)",
+        ),
         help_entry(palette, "o", "load older notes"),
         help_entry(palette, "r", "refresh relationship + notes"),
         help_entry(palette, "Esc / q", "back to previous screen"),
@@ -3623,7 +3627,12 @@ fn render_confirm_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let msg_rect = Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1));
+    let msg_rect = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
     let msg = Paragraph::new(Line::from(prompt.message.clone())).wrap(Wrap { trim: true });
     frame.render_widget(msg, msg_rect);
 
@@ -3678,7 +3687,12 @@ fn render_domain_admin(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(header),
         Rect::new(inner.x, inner.y, inner.width, 1.min(inner.height)),
     );
-    let list_rect = Rect::new(inner.x, inner.y + 1, inner.width, inner.height.saturating_sub(1));
+    let list_rect = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
     if list_rect.height == 0 {
         return;
     }
@@ -3735,6 +3749,10 @@ fn render_domain_admin(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// 連合ドメインブロック PR7: ドメイン詳細モーダル。
+#[allow(
+    clippy::too_many_lines,
+    reason = "統計/タブ/一覧/footer のレイアウト計算 + 描画を 1 関数で素直に並べているだけ"
+)]
 fn render_domain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(screen) = app.domain_detail.as_ref() else {
         return;
@@ -3761,7 +3779,9 @@ fn render_domain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
             title,
-            Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(state_color)
+                .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_style(border_style(palette, app.focus == Focus::DomainDetail))
@@ -3814,7 +3834,12 @@ fn render_domain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let list_height = inner
         .height
         .saturating_sub(stats_height + tab_height + footer_height);
-    let stats_rect = Rect::new(inner.x, inner.y, inner.width, stats_height.min(inner.height));
+    let stats_rect = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        stats_height.min(inner.height),
+    );
     let tab_rect = Rect::new(inner.x, inner.y + stats_height, inner.width, tab_height);
     let list_rect = Rect::new(
         inner.x,
@@ -3862,10 +3887,7 @@ fn render_domain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             Style::default().fg(palette.muted)
         };
-        let acct = format!(
-            "@{}@{}",
-            entry.actor.preferred_username, entry.actor.host
-        );
+        let acct = format!("@{}@{}", entry.actor.preferred_username, entry.actor.host);
         lines.push(Line::from(vec![
             Span::styled(marker.to_string(), marker_style),
             Span::styled(

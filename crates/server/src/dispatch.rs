@@ -246,8 +246,10 @@ pub(crate) async fn dispatch(
     // 相手へ自分から Follow を送ることは通常ないが、レースで有り得るため
     // 素通しする) と `Block` (= signer が我々をブロックしてきた記録自体。
     // 相互ブロックのケースでも記録を欠かさないため素通しする)。
-    if !matches!(activity_type.as_str(), "Accept" | "Reject" | "Undo" | "Block")
-        && let Some(local_id) = local_actor_id_opt(state).await
+    if !matches!(
+        activity_type.as_str(),
+        "Accept" | "Reject" | "Undo" | "Block"
+    ) && let Some(local_id) = local_actor_id_opt(state).await
         && sakurasato_core::repo::block::is_blocked(state.pool(), local_id, signer.id)
             .await
             .unwrap_or(false)
