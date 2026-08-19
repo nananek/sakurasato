@@ -1,5 +1,5 @@
 //! `POST /api/blocking/create` / `POST /api/blocking/delete` /
-//! `POST /api/blocking/list` ── MiAuth 経由のユーザーブロック対応
+//! `POST /api/blocking/list` ── `MiAuth` 経由のユーザーブロック対応
 //! (PR #355 `feature/block-unfollow-domain-block` のフォローアップ、
 //! `tmp/plan-miauth-blocking.md` 準拠)。
 //!
@@ -153,7 +153,11 @@ pub async fn delete(
             );
         }
         Err(err) => {
-            tracing::error!(?err, target_id, "miauth blocking/delete: get_by_pair failed");
+            tracing::error!(
+                ?err,
+                target_id,
+                "miauth blocking/delete: get_by_pair failed"
+            );
             return error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -231,11 +235,19 @@ async fn build_delete_response(state: &AppState, outcome: &UnblockOutcome) -> se
 /// `blocking/list`(一覧の各行) が共有する
 /// ([`crate::miauth::following::build_create_response`] と同型)。
 async fn build_response(state: &AppState, actor: &ActorRow) -> serde_json::Value {
-    let (followers, following, notes) =
-        crate::miauth::counts::counts_for_actor(state, actor).await;
+    let (followers, following, notes) = crate::miauth::counts::counts_for_actor(state, actor).await;
     let (rel, is_blocking, is_blocked) = relationships_or_neutral(state, actor.id).await;
     let emojis = resolve_user_emojis(state.pool(), &state.config().server.host, actor).await;
-    from_actor_detailed(actor, followers, following, notes, rel, is_blocking, is_blocked, emojis)
+    from_actor_detailed(
+        actor,
+        followers,
+        following,
+        notes,
+        rel,
+        is_blocking,
+        is_blocked,
+        emojis,
+    )
 }
 
 fn parse_user_id(s: Option<&str>) -> Option<i64> {

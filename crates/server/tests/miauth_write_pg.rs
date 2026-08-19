@@ -21,7 +21,7 @@
 //!   `Update` activity をフォロワーに配送する
 //! - scope 細分化: `write:reactions` のみの token で `notes/create` が 401
 //! - `blocking/create { i, userId }` で Block 配送 + 既存の双方向 follow 強制解除
-//!   (MiAuth 経由のユーザーブロック follow-up, PR #355 のフォローアップ)
+//!   (`MiAuth` 経由のユーザーブロック follow-up, PR #355 のフォローアップ)
 //! - `blocking/delete { i, userId }` で Undo Block 配送
 //! - `blocking/list { i }` でブロック中の actor 一覧
 //! - `users/show` のレスポンスで `isBlocking`/`isBlocked` が実値化されている
@@ -2151,7 +2151,7 @@ async fn blocking_create_without_scope_is_403(pool: PgPool) {
     assert_eq!(v["error"]["code"], "PERMISSION_DENIED");
 }
 
-/// MiAuth follow-up の中心的回帰テスト: `conv.rs::from_actor_detailed` の
+/// `MiAuth` follow-up の中心的回帰テスト: `conv.rs::from_actor_detailed` の
 /// `isBlocking`/`isBlocked` がハードコード `false` ではなく実値になっている
 /// ことを `users/show` 経由で end-to-end に確認する。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

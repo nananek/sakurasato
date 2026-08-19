@@ -249,7 +249,7 @@ pub async fn delete_block_core(
 /// viewer (`local_id`) から見た `target_id` との block relationship
 /// (`is_blocking`, `is_blocked_by`) を計算する。`local_api/actor.rs::compute_relationship`
 /// と同じクエリ形 (`repo::block::is_blocked` を双方向で 2 回) だが、
-/// MiAuth 側の `isBlocking`/`isBlocked` 実値化 (フォローアップ計画書 §4) 用に
+/// `MiAuth` 側の `isBlocking`/`isBlocked` 実値化 (フォローアップ計画書 §4) 用に
 /// 単純な bool タプルを返す形で切り出した ── `local_api/actor.rs` 側の
 /// 実装は触らない (計画書 §4.3 の判断どおり、既存の動いているコードを
 /// リファクタで壊すリスクを避ける)。

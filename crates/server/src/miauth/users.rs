@@ -202,7 +202,16 @@ async fn build_detailed_json(
         None => (crate::follow::FollowRelationship::neutral(), false, false),
     };
     let emojis = resolve_user_emojis(state.pool(), &state.config().server.host, &actor).await;
-    from_actor_detailed(&actor, followers, following, notes, rel, is_blocking, is_blocked, emojis)
+    from_actor_detailed(
+        &actor,
+        followers,
+        following,
+        notes,
+        rel,
+        is_blocking,
+        is_blocked,
+        emojis,
+    )
 }
 
 /// `limit` の既定値・上限。Misskey 公式仕様 (default 10, max 100) に揃える。
@@ -410,7 +419,7 @@ pub async fn search(
 /// viewer (= ローカル actor) から見た `target_actor_id` との follow + block
 /// relationship をまとめて計算する。`local_actor_id` が `None` (= 未 init) または
 /// DB 障害時は両方とも中立値にフェイルオープンする (= `count_followers` の
-/// `.unwrap_or(0)` と同じ方針)。block relationship は MiAuth 経由のユーザー
+/// `.unwrap_or(0)` と同じ方針)。block relationship は `MiAuth` 経由のユーザー
 /// ブロック follow-up (`isBlocking`/`isBlocked` 実値化) 用。
 async fn relationships_or_neutral(
     state: &AppState,

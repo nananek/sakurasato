@@ -1043,7 +1043,7 @@ fn entry_to_actor_lite(entry: &TimelineEntry) -> ActorRow {
 ///
 /// `is_blocking` / `is_blocked` は viewer から見た target との block 関係
 /// ([`crate::block::compute_block_relationship`] の結果)。`isBlocking` /
-/// `isBlocked` にそのまま載せる (MiAuth 経由のユーザーブロック対応 follow-up、
+/// `isBlocked` にそのまま載せる (`MiAuth` 経由のユーザーブロック対応 follow-up、
 /// PR #355 のフォローアップ)。自分自身は常に `false, false`。
 #[allow(clippy::too_many_arguments)]
 pub fn from_actor_detailed(
@@ -1908,7 +1908,16 @@ mod tests {
         actor.summary = Some("hello world".into());
         actor.image_url = Some("https://cdn.test/banner.webp".into());
         actor.actor_type = "Service".into();
-        let v = from_actor_detailed(&actor, 1, 2, 3, neutral_rel(), false, false, BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            1,
+            2,
+            3,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         assert_eq!(v["id"], "42");
         assert_eq!(v["description"], "hello world");
         assert_eq!(v["bannerUrl"], "https://cdn.test/banner.webp");
@@ -1945,7 +1954,16 @@ mod tests {
         let mut actor = fake_actor(false, "remote.test", false);
         actor.summary =
             Some(r#"<p>hello <a href="https://remote.test/@me">@me</a></p><p>line2</p>"#.into());
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), false, false, BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         assert_eq!(v["description"], "hello @me\n\nline2");
     }
 
@@ -1955,7 +1973,16 @@ mod tests {
         // そのまま (html_to_plain_text を通さない)。
         let mut actor = fake_actor(true, "sakurasato.test", false);
         actor.summary = Some("price < 100 & rising".into());
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), false, false, BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         assert_eq!(v["description"], "price < 100 & rising");
     }
 
@@ -1968,7 +1995,16 @@ mod tests {
     fn from_actor_detailed_emits_all_required_userdetailednotme_fields() {
         // remote actor (icon_url 無し) でも avatarUrl が non-null になる経路。
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), false, false, BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         // string / number で `as String` / `as num` 直読みされ、null だと throw。
         assert!(v["id"].is_string(), "id must be a string");
         assert!(v["username"].is_string(), "username must be a string");
@@ -2010,7 +2046,16 @@ mod tests {
     #[test]
     fn from_actor_detailed_emits_withrelations_defaults() {
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), false, false, BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         assert_eq!(v["notify"], "normal");
         assert_eq!(v["withReplies"], true);
     }
@@ -2049,7 +2094,7 @@ mod tests {
         );
     }
 
-    /// MiAuth 経由のユーザーブロック follow-up: `isBlocking` / `isBlocked` が
+    /// `MiAuth` 経由のユーザーブロック follow-up: `isBlocking` / `isBlocked` が
     /// hard-code `false` ではなく `from_actor_detailed` の引数から来ることを
     /// 固定する回帰テスト。follow relationship の swap 検出テストと同じ理由で
     /// 2 つの bool を非対称 (`true`/`false`) にして取り違えを検出する。
@@ -2057,11 +2102,17 @@ mod tests {
     fn from_actor_detailed_emits_block_relationship_without_swapping() {
         let actor = fake_actor(false, "remote.test", false);
         let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), true, false, BTreeMap::new());
-        assert_eq!(v["isBlocking"], true, "isBlocking must come from is_blocking");
+        assert_eq!(
+            v["isBlocking"], true,
+            "isBlocking must come from is_blocking"
+        );
         assert_eq!(v["isBlocked"], false, "isBlocked must come from is_blocked");
 
         let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), false, true, BTreeMap::new());
-        assert_eq!(v["isBlocking"], false, "isBlocking must come from is_blocking");
+        assert_eq!(
+            v["isBlocking"], false,
+            "isBlocking must come from is_blocking"
+        );
         assert_eq!(v["isBlocked"], true, "isBlocked must come from is_blocked");
     }
 
@@ -2075,7 +2126,16 @@ mod tests {
     #[test]
     fn from_actor_detailed_includes_url_key_for_userdetailed_dispatch() {
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), false, false, BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            BTreeMap::new(),
+        );
         let map = v.as_object().expect("from_actor_detailed must be object");
         assert!(
             map.contains_key("url"),

@@ -198,7 +198,7 @@ async fn build_delete_response(state: &AppState, outcome: &UnfollowOutcome) -> s
 /// viewer (= ローカル actor) から見た `target_actor_id` との follow + block
 /// relationship をまとめて計算する。local actor 未 init / DB 障害時は両方とも
 /// 中立値にフェイルオープンする (= `followers`/`following` count の
-/// `.unwrap_or(0)` と同じ方針)。block relationship は MiAuth 経由のユーザー
+/// `.unwrap_or(0)` と同じ方針)。block relationship は `MiAuth` 経由のユーザー
 /// ブロック follow-up (`isBlocking`/`isBlocked` 実値化) 用。
 ///
 /// `pub(super)`: [`crate::miauth::blocking`] の `blocking/create`・`delete` の
