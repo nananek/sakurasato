@@ -28,7 +28,7 @@ COPY vendor ./vendor
 # (= disk 使用量は数倍になるが、registry cache は warm でも < 500MB 程度)。
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=sakurasato-server-registry \
     --mount=type=cache,target=/build/target,id=sakurasato-server-target \
-    SQLX_OFFLINE=true cargo build --release --target x86_64-unknown-linux-musl -p sakurasato-server && \
+    SQLX_OFFLINE=true cargo build --release --locked --target x86_64-unknown-linux-musl -p sakurasato-server && \
     cp target/x86_64-unknown-linux-musl/release/sakurasato-server /sakurasato-server
 
 # 名前付き volume が初回マウントされる際の ownership を `nonroot:nonroot 0700`
