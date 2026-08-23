@@ -1,0 +1,6 @@
+# result_large_err の閾値緩和。
+# 本プロジェクトは core 関数が face 非依存の http::Response<axum::body::Body>
+# (~130B+) を Err として返す設計であり、既定値 128 では過剰検知になるため。
+# (Rust 1.98 stable の clippy で新規検知されるようになった。CI の
+#  dtolnay/rust-toolchain@stable は浮動のため追従が必要)
+large-error-threshold = 256

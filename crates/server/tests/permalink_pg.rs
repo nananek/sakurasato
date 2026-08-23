@@ -243,7 +243,7 @@ async fn permalink_returns_ap_json_when_accept_activitystreams(pool: PgPool) {
     assert_eq!(json["attributedTo"], "https://example.test/users/alice");
     assert_eq!(
         json["id"],
-        format!("https://example.test/notes/n1"),
+        "https://example.test/notes/n1".to_string(),
         "AP id must equal stored ap_id: {json}",
     );
     // ld+json (profile 付き) でも JSON が返る。
