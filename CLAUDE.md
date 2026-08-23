@@ -259,12 +259,12 @@ chmod 644 secrets/postgres_password.txt secrets/s3_secret_key.txt
 
 ```bash
 # 開発 (Docker 内 cargo。実体は scripts/dev/cargo.sh)
-make build          # = cargo build --workspace
-make clippy         # = cargo clippy --workspace --all-targets -- -D warnings
-make test           # = cargo test --workspace
+make build          # = cargo build --workspace --locked
+make clippy         # = cargo clippy --workspace --all-targets --locked -- -D warnings
+make test           # = cargo test --workspace --locked
 make check          # fmt --check + clippy + test (ci.yml と同じ 3 点セット)
-make cargo ARGS='tree -i crossterm'   # 任意 cargo
-./scripts/dev/cargo.sh build --workspace   # make を介さない直接呼びも可
+make cargo ARGS='tree --locked -i crossterm'   # 任意 cargo
+./scripts/dev/cargo.sh build --workspace --locked   # make を介さない直接呼びも可
 
 # DB マイグレーション (sqlx-cli も Docker 経由が望ましいが未ラップ)
 sqlx migrate run

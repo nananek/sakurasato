@@ -5,6 +5,13 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # 通常の新規リリースは観測期間を置いてから取り込む。
+    # セキュリティ更新は Dependabot の仕様上 cooldown の対象外で、即時提案される。
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 7
     open-pull-requests-limit: 10
     commit-message:
       prefix: "deps"
@@ -28,6 +35,9 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Actions の新規リリースにも7日間の観測期間を置く。
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "ci"
 
@@ -36,5 +46,8 @@ updates:
     directory: "/docker"
     schedule:
       interval: weekly
+    # ベースイメージのタグ更新にも7日間の観測期間を置く。
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "docker"

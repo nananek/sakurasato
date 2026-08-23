@@ -88,7 +88,8 @@ jobs:
         if: steps.cargo.outputs.present == 'true'
         env:
           SQLX_OFFLINE: "true"
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # 依存解決をコミット済み Cargo.lock から逸脱させない。
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: test
         if: steps.cargo.outputs.present == 'true'
@@ -97,4 +98,4 @@ jobs:
           SQLX_OFFLINE: "true"
           # runtime での #[sqlx::test] が使う接続文字列。
           DATABASE_URL: "postgres://sakurasato:sakurasato@localhost:5432/sakurasato"
-        run: cargo test --workspace
+        run: cargo test --workspace --locked

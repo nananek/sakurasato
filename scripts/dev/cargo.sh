@@ -3,9 +3,9 @@
 # 「ビルドは常に Docker」で完結させるためのもの (§9)。
 #
 # 使い方:
-#   scripts/dev/cargo.sh build --workspace
-#   scripts/dev/cargo.sh clippy --workspace --all-targets -- -D warnings
-#   scripts/dev/cargo.sh test --workspace
+#   scripts/dev/cargo.sh build --workspace --locked
+#   scripts/dev/cargo.sh clippy --workspace --all-targets --locked -- -D warnings
+#   scripts/dev/cargo.sh test --workspace --locked
 #   scripts/dev/cargo.sh fmt --all -- --check
 #
 # 設計メモ:

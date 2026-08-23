@@ -71,7 +71,7 @@ COPY vendor ./vendor
 # (= compose 並列ビルドの race 回避)。
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=sakurasato-tui-registry \
     --mount=type=cache,target=/build/target,id=sakurasato-tui-target \
-    SQLX_OFFLINE=true cargo build --release --target x86_64-unknown-linux-musl -p sakurasato-tui && \
+    SQLX_OFFLINE=true cargo build --release --locked --target x86_64-unknown-linux-musl -p sakurasato-tui && \
     cp target/x86_64-unknown-linux-musl/release/sakurasato-tui /sakurasato-tui
 
 # `--read-only` で起動するときの mount target stub。distroless/static には
