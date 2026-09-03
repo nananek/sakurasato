@@ -43,7 +43,7 @@
 #     代替経路もあるが、引数追加無しで動く volume 名指定を例示する。
 
 # ---- builder ----
-FROM rust:1.97-alpine AS builder
+FROM rust:1.98-alpine AS builder
 
 RUN apk add --no-cache musl-dev pkgconfig
 

@@ -2,7 +2,7 @@
 # Sakurasato media-proxy: 隔離コンテナ。distroless + rootless、musl 静的バイナリ。
 
 # ---- builder ----
-FROM rust:1.97-alpine AS builder
+FROM rust:1.98-alpine AS builder
 
 RUN apk add --no-cache musl-dev pkgconfig
 
