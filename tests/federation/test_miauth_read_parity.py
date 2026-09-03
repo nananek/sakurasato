@@ -52,6 +52,9 @@ pytestmark = pytest.mark.skipif(
 
 # Misskey の MissNote が **少なくとも持つ** 必須キー。`misskey-py` で本物
 # admin が自分の `i()` 後に投稿 → `notes_show` で観察できる集合。
+# `localOnly` / `renoteCount` / `repliesCount` は misskey_dart の
+# `Note.fromJson` が default なしで `as bool` / `as num` 直読みする
+# required scalar (= Miria Null→bool crash guard)。
 REQUIRED_MISS_NOTE_KEYS = {
     "id",
     "createdAt",
@@ -67,6 +70,9 @@ REQUIRED_MISS_NOTE_KEYS = {
     # `emojis` (deprecated 空 object) も emit するが、両者が確実に持つのは
     # `reactionEmojis` なので必須キーはこちらで照合する (#201)。
     "reactionEmojis",
+    "localOnly",
+    "renoteCount",
+    "repliesCount",
 }
 
 # Misskey の MissUser が `users/show` で返す必須キー。
@@ -237,6 +243,11 @@ def test_misskey_notes_create_then_timeline_returns_required_keys(misskey_py_cli
         assert shown["visibility"] in ("public", "home", "followers", "specified")
         # reactions は object。
         assert _type_of(shown["reactions"]) == "object"
+        # misskey_dart required scalar (= Miria Null→bool crash guard)。
+        # bool は int の subclass なので _type_of の順序 (= bool 先判定) で混同回避。
+        assert _type_of(shown["localOnly"]) == "boolean"
+        assert _type_of(shown["renoteCount"]) == "number"
+        assert _type_of(shown["repliesCount"]) == "number"
     finally:
         try:
             misskey_py_client.notes_delete(note_id=created["id"])

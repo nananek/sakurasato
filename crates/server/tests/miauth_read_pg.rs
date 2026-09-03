@@ -333,6 +333,11 @@ async fn timeline_returns_miss_notes_in_id_desc(pool: PgPool) {
     assert!(notes[0]["files"].is_array());
     assert!(notes[0]["reactions"].is_object());
     assert!(notes[0]["emojis"].is_object());
+    // misskey_dart `Note.fromJson` required scalar (= Miria Null→bool crash guard)。
+    assert_eq!(notes[0]["localOnly"], false);
+    assert!(notes[0]["localOnly"].is_boolean());
+    assert!(notes[0]["renoteCount"].is_number());
+    assert!(notes[0]["repliesCount"].is_number());
 }
 
 /// ハッシュタグ入り投稿 (`tag.Hashtag` + content に `<a class="hashtag">`) が
@@ -1823,6 +1828,11 @@ async fn notifications_list_returns_misskey_shape(pool: PgPool) {
     assert_eq!(first["user"]["username"], "bob");
     assert_eq!(first["note"]["id"], note_id.to_string());
     assert_eq!(first["isRead"], false);
+    // misskey_dart `Note.fromJson` required scalar: nested notification.note も同形。
+    assert_eq!(first["note"]["localOnly"], false);
+    assert!(first["note"]["localOnly"].is_boolean());
+    assert!(first["note"]["renoteCount"].is_number());
+    assert!(first["note"]["repliesCount"].is_number());
 
     // follow 通知は user あり / note 無し。
     let follow = arr.iter().find(|n| n["type"] == "follow").unwrap();
