@@ -302,6 +302,11 @@ async fn notes_create_returns_created_note(pool: PgPool) {
     );
     // visibility: "public" (default) → "public" (= map_visibility identity)。
     assert_eq!(note["visibility"], "public");
+    // misskey_dart `Note.fromJson` required scalar (= Miria Null→bool crash guard)。
+    assert_eq!(note["localOnly"], false);
+    assert!(note["localOnly"].is_boolean());
+    assert!(note["renoteCount"].is_number());
+    assert!(note["repliesCount"].is_number());
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
@@ -949,6 +954,13 @@ async fn notes_renote_announces_remote_note(pool: PgPool) {
     );
     assert_eq!(created["renoteId"], target_id.to_string());
     assert_eq!(created["renote"]["id"], target_id.to_string());
+    // misskey_dart required scalar: wrapper と nested Note の双方で型保証。
+    for n in [created, &created["renote"]] {
+        assert_eq!(n["localOnly"], false);
+        assert!(n["localOnly"].is_boolean());
+        assert!(n["renoteCount"].is_number());
+        assert!(n["repliesCount"].is_number());
+    }
 
     // announce 行が立つ (= boost が記録される)。
     let row = repo::announce::get_by_pair(&pool, target_id, alice)

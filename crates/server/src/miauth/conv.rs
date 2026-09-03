@@ -331,6 +331,16 @@ pub(crate) fn map_visibility(internal: &str) -> &'static str {
 /// `reactions` は `BTreeMap<String, i64>` で **key 安定順** ── Misskey は
 /// 「初回 reaction 時刻順」で並べるが、本 PR では key 辞書順で代替する
 /// (= wire 上は `{}` で key 順序は仕様上未定義、テスト安定性のため固定)。
+///
+/// ## `misskey_dart` required Note scalar (= Miria / `misskey_dart` 互換)
+///
+/// `localOnly: bool` / `renoteCount: int` / `repliesCount: int` は
+/// `misskey_dart` の `Note.fromJson` (= `_$NoteFromJson`) が **default / null
+/// guard なし** で `as bool` / `as num` 直読みする required scalar。欠けると
+/// `type 'Null' is not a subtype of type 'bool'` で client crash するため、
+/// **`Option` や `skip_serializing_if` は使わず** 常に key と型を保証する。
+/// `repliesCount` は現時点で bulk 集計 API が無いため互換 default `0`
+/// (= 過少表示だが型安全・情報非漏洩側。正確な集計は follow-up)。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MissNote {
@@ -365,6 +375,18 @@ pub struct MissNote {
     /// `MissRirica` は `emojis` を読み続けているので両方出す。
     pub emojis: BTreeMap<String, String>,
     pub tags: Vec<String>,
+    /// `misskey_dart` required bool。Sakurasato core に LTL 限定 / local-only
+    /// 概念が無く、`notes/create` の `localOnly` 入力も「受理するが無視」のため
+    /// 常に `false`。
+    pub local_only: bool,
+    /// `misskey_dart` required int。既存 bulk 集計
+    /// (`repo::announce::counts_for_notes` → `NoteSummary.announce`) を反映し、
+    /// 集計なし / 失敗時は `0`。
+    pub renote_count: i64,
+    /// `misskey_dart` required int。現時点では bulk 集計 API が無いため互換
+    /// default `0` (= 正確な reply count は follow-up で `in_reply_to_note_id`
+    /// の bulk count を追加)。
+    pub replies_count: i64,
     /// remote note は元 AP URI、local note は `Some(canonical_url)`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
@@ -893,6 +915,11 @@ pub(crate) fn timeline_entry_to_miss_note(
         my_reaction: summary.my_reaction.clone(),
         emojis: emojis_in_text,
         tags,
+        // misskey_dart required scalar: local-only 概念が無いため false、
+        // renote 件数は既存 bulk 集計を反映、reply 件数は互換 default 0。
+        local_only: false,
+        renote_count: summary.announce.as_ref().map_or(0, |row| row.count),
+        replies_count: 0,
         uri,
         url,
     }
@@ -942,6 +969,12 @@ pub(crate) fn build_renote_miss_note(
         my_reaction: None,
         emojis: BTreeMap::new(),
         tags: Vec::new(),
+        // 合成 renote wrapper 自身は misskey_dart required scalar を
+        // 互換 default で emit。nested `renote` は通常 builder 由来なので
+        // 元 Note の既存 Announce 集計が入る。
+        local_only: false,
+        renote_count: 0,
+        replies_count: 0,
         uri: if announce_ap_id.is_empty() {
             None
         } else {
@@ -2265,5 +2298,106 @@ mod tests {
             json["user"]["host"].is_null(),
             "dev local_host with port must still emit user.host: null"
         );
+    }
+
+    // ── `misskey_dart` Note required scalar (Miria Null→bool crash) ──
+
+    /// 通常 Note が `misskey_dart` の required scalar 3 件を正しい型で emit する。
+    /// `_$NoteFromJson` は `localOnly as bool` / `renoteCount as num` /
+    /// `repliesCount as num` を default なしで読むため、欠落 = Null cast crash。
+    #[test]
+    fn timeline_entry_emits_misskey_dart_required_note_scalars() {
+        use sakurasato_core::repo::announce::AnnounceSummaryRow;
+        let entry = fake_timeline_entry("https://sakurasato.test/users/alice");
+        let summary = NoteSummary {
+            reactions: Vec::new(),
+            announce: Some(AnnounceSummaryRow {
+                note_id: entry.id,
+                count: 3,
+                viewer_renoted: true,
+            }),
+            my_reaction: None,
+        };
+        let note = timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test", &EMPTY_EMOJIS);
+        let json = serde_json::to_value(&note).unwrap();
+        assert_eq!(json["localOnly"], false, "localOnly must be false boolean");
+        assert!(
+            json["localOnly"].is_boolean(),
+            "localOnly must be boolean, not null: {:?}",
+            json["localOnly"]
+        );
+        assert_eq!(
+            json["renoteCount"], 3,
+            "renoteCount must reflect announce count"
+        );
+        assert!(json["renoteCount"].is_number());
+        assert_eq!(json["repliesCount"], 0, "repliesCount compat default is 0");
+        assert!(json["repliesCount"].is_number());
+    }
+
+    /// `announce=None` (= 集計なし / 失敗時) なら `renoteCount == 0`。
+    #[test]
+    fn timeline_entry_without_announce_emits_zero_renote_count() {
+        let entry = fake_timeline_entry("https://sakurasato.test/users/alice");
+        let note =
+            timeline_entry_to_miss_note(&entry, &empty_summary(), "sakurasato.test", &EMPTY_EMOJIS);
+        let json = serde_json::to_value(&note).unwrap();
+        assert_eq!(json["localOnly"], false);
+        assert!(json["localOnly"].is_boolean());
+        assert_eq!(json["renoteCount"], 0);
+        assert!(json["renoteCount"].is_number());
+        assert_eq!(json["repliesCount"], 0);
+        assert!(json["repliesCount"].is_number());
+    }
+
+    /// 合成 renote wrapper と nested `renote` の双方が 3 field を正しい型で持つ。
+    /// wrapper は `false/0/0`、nested は通常 builder 由来の announce 集計値。
+    #[allow(clippy::similar_names)] // renoter (= 行為者) / renoted (= 対象) は AP 用語
+    #[test]
+    fn renote_wrapper_and_nested_note_emit_required_scalars() {
+        use sakurasato_core::repo::announce::AnnounceSummaryRow;
+        let entry = fake_timeline_entry("https://sakurasato.test/users/alice");
+        let summary = NoteSummary {
+            reactions: Vec::new(),
+            announce: Some(AnnounceSummaryRow {
+                note_id: entry.id,
+                count: 2,
+                viewer_renoted: false,
+            }),
+            my_reaction: None,
+        };
+        let renoted =
+            timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test", &EMPTY_EMOJIS);
+        let renoter = from_actor_and_counts(
+            &fake_actor(true, "sakurasato.test", false),
+            0,
+            0,
+            0,
+            BTreeMap::new(),
+        );
+        let wrapper = build_renote_miss_note(
+            99,
+            "https://sakurasato.test/announces/99",
+            "2026-09-03T00:00:00.000Z",
+            renoter,
+            42,
+            renoted,
+        );
+        let json = serde_json::to_value(&wrapper).unwrap();
+        // wrapper 自身は互換 default。
+        assert_eq!(json["localOnly"], false);
+        assert!(json["localOnly"].is_boolean());
+        assert_eq!(json["renoteCount"], 0);
+        assert!(json["renoteCount"].is_number());
+        assert_eq!(json["repliesCount"], 0);
+        assert!(json["repliesCount"].is_number());
+        // nested 元 Note は通常 builder の集計値を保持。
+        let nested = &json["renote"];
+        assert_eq!(nested["localOnly"], false);
+        assert!(nested["localOnly"].is_boolean());
+        assert_eq!(nested["renoteCount"], 2);
+        assert!(nested["renoteCount"].is_number());
+        assert_eq!(nested["repliesCount"], 0);
+        assert!(nested["repliesCount"].is_number());
     }
 }

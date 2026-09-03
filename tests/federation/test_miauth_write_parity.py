@@ -104,6 +104,12 @@ def test_misskey_notes_create_returns_created_note_envelope(misskey_py_client):
         assert _type_of(note["id"]) == "string"
         assert _type_of(note["userId"]) == "string"
         assert _type_of(note["createdAt"]) == "string"
+        # misskey_dart required scalar (= Miria Null→bool crash guard)。
+        for key in ("localOnly", "renoteCount", "repliesCount"):
+            assert key in note, f"createdNote missing key {key!r}: {sorted(note.keys())}"
+        assert _type_of(note["localOnly"]) == "boolean"
+        assert _type_of(note["renoteCount"]) == "number"
+        assert _type_of(note["repliesCount"]) == "number"
         note_id = note["id"]
     finally:
         if note_id:
