@@ -160,10 +160,11 @@ where
             }
 
             // 5. 検証本体。成功すればここで return。失敗は次ラベルへ。
+            //    鍵種別は検証側が actor の鍵と突き合わせて確定した値を使う
+            //    (keyId の fragment 由来の暫定値ではない、#374)。
             let scheme = info.scheme;
-            let key_kind = info.key_kind;
             match sign::verify_request_with_actor(&ctx, &info, &actor) {
-                Ok(()) => {
+                Ok(key_kind) => {
                     tracing::info!(
                         scheme = ?scheme,
                         key_kind = ?key_kind,

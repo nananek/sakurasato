@@ -183,7 +183,7 @@ fn build_path_and_query(url: &reqwest::Url) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sign::{RequestContext, SigScheme, SignatureInfo, keyid::KeyKind};
+    use crate::sign::{RequestContext, SigScheme, SignatureInfo};
     use chrono::Utc;
     use http::HeaderMap;
     use reqwest::Client;
@@ -276,7 +276,6 @@ mod tests {
         let info = SignatureInfo {
             scheme: SigScheme::Cavage,
             key_id: actor.public_key_id.clone(),
-            key_kind: KeyKind::Rsa,
             label: None,
         };
         let headers: HeaderMap = req.headers().clone();
@@ -354,7 +353,6 @@ mod tests {
         let info = SignatureInfo {
             scheme: SigScheme::Cavage,
             key_id: actor.public_key_id.clone(),
-            key_kind: KeyKind::Rsa,
             label: None,
         };
         let headers: HeaderMap = req.headers().clone();

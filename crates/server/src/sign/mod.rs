@@ -56,11 +56,14 @@ pub(crate) enum SigScheme {
 ///
 /// RFC 9421 の複数ラベル送信に対応するため、ラベル名を保持する。cavage は
 /// 構造的に単一署名なので `label: None`。
+///
+/// **鍵種別 (`KeyKind`) は持たない** ── keyId の fragment 名から種別を推定
+/// できるという前提が実装依存で崩れるため (Mastodon 4.7 の `#rsa-<hex>`,
+/// #374)。種別は actor を引いた後に [`resolve_key_kind`] が確定させる。
 #[derive(Debug, Clone)]
 pub(crate) struct SignatureInfo {
     pub scheme: SigScheme,
     pub key_id: String,
-    pub key_kind: KeyKind,
     /// RFC 9421 ラベル名 (`sig1` 等)。cavage では使わない (`None`)。
     pub label: Option<String>,
 }
@@ -196,11 +199,12 @@ pub(crate) fn extract_signature_infos(headers: &HeaderMap) -> Result<Vec<Signatu
                 .keyid
                 .ok_or_else(|| SigError::SignatureMalformed("missing keyid parameter".into()))?
                 .to_string();
-            let kind = classify_key_id(&key_id)?;
+            // keyId の構造 (`<ap_id>#<fragment>`) だけはここで検証しておく
+            // (壊れていれば 400 で即返す)。種別判定は actor 取得後。
+            classify_key_id(&key_id)?;
             out.push(SignatureInfo {
                 scheme: SigScheme::Rfc9421,
                 key_id,
-                key_kind: kind,
                 label: Some(parsed.label.to_string()),
             });
         }
@@ -210,11 +214,10 @@ pub(crate) fn extract_signature_infos(headers: &HeaderMap) -> Result<Vec<Signatu
         let parsed = cavage::parse_signature_header(sig_raw)
             .map_err(|e| SigError::SignatureMalformed(e.to_string()))?;
         let key_id = parsed.key_id.to_string();
-        let kind = classify_key_id(&key_id)?;
+        classify_key_id(&key_id)?;
         Ok(vec![SignatureInfo {
             scheme: SigScheme::Cavage,
             key_id,
-            key_kind: kind,
             label: None,
         }])
     } else {
@@ -233,6 +236,60 @@ pub(crate) fn extract_signature_info(headers: &HeaderMap) -> Result<SignatureInf
 fn classify_key_id(key_id: &str) -> Result<KeyKind, SigError> {
     let parsed = keyid::parse(key_id).map_err(|e| SigError::KeyIdMalformed(e.to_string()))?;
     Ok(parsed.kind())
+}
+
+/// `keyId` と actor が公開している鍵 ID を突き合わせて、検証に使う鍵種別を
+/// 決める。
+///
+/// **fragment 名に依存しない**のがポイント。`#main-key` / `#ed25519-key` は
+/// Sakurasato と Mastodon 旧版の *慣習* にすぎず、keyId の fragment は各実装
+/// が自由に決めてよい部分である。実際 Mastodon 4.7 は鍵ごとに
+/// `#rsa-<hex>` という一意な fragment を振るようになり、fragment 名だけを
+/// 見る旧実装では `KeyKind::Other` に落ちて全 inbox が 401 になった (#374)。
+///
+/// 判定は確実な順に 3 段:
+///
+/// 1. **actor JSON 由来の鍵 ID と完全一致** ── `publicKey.id` /
+///    `assertionMethod` の Multikey id は actor 本人が公開している正準値
+///    なので、一致すれば種別は確定する。
+/// 2. **慣習的な fragment 名** ── actor の鍵 ID が (鍵ローテーション等で)
+///    まだ DB に取り込まれていない場合の保険。
+/// 3. **actor が実際に持っている鍵からの推測** ── 上記で決まらない未知の
+///    fragment。fragment が Ed25519 を示唆し、かつ actor が Ed25519 鍵を
+///    公開しているときだけ Ed25519、それ以外は RSA (連合の主流) とみなす。
+///
+/// 種別を取り違えても **なりすましは成立しない** ── 検証に使う鍵はどちらも
+/// actor 本人が公開したものであり、種別が違えば単に署名検証が失敗する
+/// (401) だけ。したがって 3 段目のような広めの fallback を置いても安全側は
+/// 崩れず、相互運用性だけが上がる。
+fn resolve_key_kind(key_id: &str, actor: &ActorRow) -> Result<KeyKind, SigError> {
+    // keyId 自体の構造 (`<ap_id>#<fragment>`) が壊れている場合はここで 400。
+    let conventional = classify_key_id(key_id)?;
+
+    // 1. actor が公開している鍵 ID との完全一致。
+    if actor.public_key_id == key_id {
+        return Ok(KeyKind::Rsa);
+    }
+    if actor.ed25519_public_key_id.as_deref() == Some(key_id) {
+        return Ok(KeyKind::Ed25519);
+    }
+
+    // 2. 慣習的な fragment 名。
+    match conventional {
+        KeyKind::Rsa => Ok(KeyKind::Rsa),
+        KeyKind::Ed25519 => Ok(KeyKind::Ed25519),
+        // 3. 未知 fragment。actor の鍵構成から推測する。
+        KeyKind::Other => {
+            let hints_ed25519 = key_id
+                .rsplit_once('#')
+                .is_some_and(|(_, frag)| frag.to_ascii_lowercase().contains("ed25519"));
+            if hints_ed25519 && actor.ed25519_public_key_pem.is_some() {
+                Ok(KeyKind::Ed25519)
+            } else {
+                Ok(KeyKind::Rsa)
+            }
+        }
+    }
 }
 
 fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, SigError> {
@@ -258,13 +315,14 @@ pub(crate) struct RequestContext<'a> {
 /// DB から引いた `ActorRow` の鍵を使って、digest / clock skew / 署名を
 /// 実際に検証する。
 ///
-/// `info.scheme` で cavage / RFC 9421 を分岐、`info.key_kind` で RSA /
-/// Ed25519 を分岐する。
+/// `info.scheme` で cavage / RFC 9421 を分岐、[`resolve_key_kind`] が
+/// 確定させた鍵種別で RSA / Ed25519 を分岐する。検証に使った鍵種別を
+/// 呼び出し元へ返す (ログ用)。
 pub(crate) fn verify_request_with_actor(
     ctx: &RequestContext<'_>,
     info: &SignatureInfo,
     actor: &ActorRow,
-) -> Result<(), SigError> {
+) -> Result<KeyKind, SigError> {
     verify_request_with_actor_at(ctx, info, actor, SystemTime::now)
 }
 
@@ -275,27 +333,32 @@ pub(crate) fn verify_request_with_actor_at<F: Fn() -> SystemTime>(
     info: &SignatureInfo,
     actor: &ActorRow,
     now: F,
-) -> Result<(), SigError> {
+) -> Result<KeyKind, SigError> {
+    // 鍵種別は **actor を引いた後** に確定する。`info.key_kind` は keyId の
+    // fragment から付けた暫定値でしかなく、Mastodon 4.7 のような実装固有
+    // fragment では当てにならない (#374)。
+    let key_kind = resolve_key_kind(&info.key_id, actor)?;
     match info.scheme {
-        SigScheme::Cavage => verify_cavage_with_actor(ctx, info, actor, now()),
-        SigScheme::Rfc9421 => verify_rfc9421_with_actor(ctx, info, actor, now()),
+        SigScheme::Cavage => verify_cavage_with_actor(ctx, actor, key_kind, now())?,
+        SigScheme::Rfc9421 => verify_rfc9421_with_actor(ctx, info, actor, key_kind, now())?,
     }
+    Ok(key_kind)
 }
 
 fn verify_cavage_with_actor(
     ctx: &RequestContext<'_>,
-    info: &SignatureInfo,
     actor: &ActorRow,
+    key_kind: KeyKind,
     now: SystemTime,
 ) -> Result<(), SigError> {
     // cavage は伝統的に RSA-SHA256 が de-facto。Nekonoverse が「cavage 形式の
-    // `Signature` ヘッダに Ed25519 鍵 (`#ed25519-key`) を載せて送ってくる」
-    // ケースに合わせて Ed25519 もサポートする (RFC 9421 への upgrade は別軸)。
-    // `KeyKind::Other` は #main-key / #ed25519-key 以外の fragment で、運用上
-    // 解釈できないので reject する。
-    match info.key_kind {
+    // `Signature` ヘッダに Ed25519 鍵を載せて送ってくる」ケースに合わせて
+    // Ed25519 もサポートする (RFC 9421 への upgrade は別軸)。
+    // `key_kind` は [`resolve_key_kind`] が actor の鍵と突き合わせて確定
+    // 済みなので、ここに `Other` は来ない (防御的に reject だけ残す)。
+    match key_kind {
         KeyKind::Rsa | KeyKind::Ed25519 => {}
-        KeyKind::Other => return Err(SigError::UnsupportedKeyKind(info.key_kind)),
+        KeyKind::Other => return Err(SigError::UnsupportedKeyKind(key_kind)),
     }
 
     let sig_header = header_value(ctx.headers, "signature")?;
@@ -338,7 +401,7 @@ fn verify_cavage_with_actor(
 
     // key_kind に応じて RSA-SHA256 / Ed25519 をディスパッチ。signature base
     // の組み立て規則は cavage の同じ仕様で共通。
-    match info.key_kind {
+    match key_kind {
         KeyKind::Rsa => {
             // public_key_pem は actor テーブルで NOT NULL なので unwrap 相当。
             cavage::verify_rsa_sha256(base.as_bytes(), parsed.signature_b64, &actor.public_key_pem)
@@ -357,7 +420,7 @@ fn verify_cavage_with_actor(
                 .map_err(|e| map_rfc9421_verify_err(KeyKind::Ed25519, &e))
         }
         // Other は上のガードで既に弾いてある。到達不能。
-        KeyKind::Other => unreachable!("KeyKind::Other rejected at entry"),
+        KeyKind::Other => Err(SigError::UnsupportedKeyKind(KeyKind::Other)),
     }
 }
 
@@ -389,6 +452,7 @@ fn verify_rfc9421_with_actor(
     ctx: &RequestContext<'_>,
     info: &SignatureInfo,
     actor: &ActorRow,
+    key_kind: KeyKind,
     now: SystemTime,
 ) -> Result<(), SigError> {
     let input_header = header_value(ctx.headers, "signature-input")?;
@@ -420,7 +484,7 @@ fn verify_rfc9421_with_actor(
 
     // alg が明記されていれば key_kind との整合を確認。
     if let Some(alg) = parsed.alg {
-        match (info.key_kind, alg) {
+        match (key_kind, alg) {
             (KeyKind::Ed25519, "ed25519") | (KeyKind::Rsa, "rsa-v1_5-sha256") => {}
             _ => return Err(SigError::AlgMismatch),
         }
@@ -465,7 +529,7 @@ fn verify_rfc9421_with_actor(
     let sig_bytes = rfc9421::extract_signature_bytes(sig_header, parsed.label)
         .map_err(|e| SigError::SignatureMalformed(e.to_string()))?;
 
-    match info.key_kind {
+    match key_kind {
         KeyKind::Ed25519 => {
             let pem = actor
                 .ed25519_public_key_pem
@@ -511,8 +575,19 @@ fn require_covered_cavage(headers: &[&str]) -> Result<(), SigError> {
     Ok(())
 }
 
-/// RFC 9421 POST inbox に必須な最小 covered components。`host` は
-/// `@authority` (derived component) で代替できる。
+/// RFC 9421 POST inbox に必須な最小 covered components。
+///
+/// `@target-uri` は scheme + authority + path を含む **完全 URI** なので、
+/// これが covered にあれば宛先ホストへのコミットは既に成立している。かつて
+/// は `host` / `@authority` のどちらかを追加で必須にしていたが、Mastodon
+/// 4.7 は `("@method" "@target-uri" "content-digest")` の 3 点だけで署名して
+/// くるため、この上乗せ要件が全 inbox を弾いていた (#374)。
+///
+/// 検証側の `@target-uri` は [`crate::extract`] が **設定値の
+/// `server.host`** から組み立てる (リクエストの `Host` ヘッダ由来ではない)
+/// ので、`host` ヘッダを covered に含めるより強い ── 攻撃者が Host を
+/// 差し替えても signature base が変わって検証が落ちる。したがって上乗せ
+/// 要件を外してもリプレイ耐性は後退しない。
 fn require_covered_rfc9421(covered: &[&str]) -> Result<(), SigError> {
     for needed in ["@method", "@target-uri", "content-digest"] {
         if !covered.contains(&needed) {
@@ -520,11 +595,6 @@ fn require_covered_rfc9421(covered: &[&str]) -> Result<(), SigError> {
                 "RFC 9421 covered must include {needed}"
             )));
         }
-    }
-    if !covered.contains(&"host") && !covered.contains(&"@authority") {
-        return Err(SigError::SignatureMalformed(
-            "RFC 9421 covered must include host or @authority".to_string(),
-        ));
     }
     Ok(())
 }
@@ -584,7 +654,7 @@ mod tests {
         let info = extract_signature_info(&h).unwrap();
         assert_eq!(info.scheme, SigScheme::Cavage);
         assert_eq!(info.key_id, "https://x.test/users/a#main-key");
-        assert_eq!(info.key_kind, KeyKind::Rsa);
+        assert_eq!(classify_key_id(&info.key_id).unwrap(), KeyKind::Rsa);
     }
 
     #[test]
@@ -598,7 +668,7 @@ mod tests {
         ]);
         let info = extract_signature_info(&h).unwrap();
         assert_eq!(info.scheme, SigScheme::Rfc9421);
-        assert_eq!(info.key_kind, KeyKind::Ed25519);
+        assert_eq!(classify_key_id(&info.key_id).unwrap(), KeyKind::Ed25519);
     }
 
     #[test]
@@ -754,10 +824,19 @@ mod tests {
     }
 
     #[test]
-    fn require_covered_rfc9421_rejects_missing_host_and_authority() {
-        // F4: host も @authority も無ければ宛先 binding が無い。
-        let err =
-            require_covered_rfc9421(&["@method", "@target-uri", "content-digest"]).unwrap_err();
+    fn require_covered_rfc9421_accepts_without_host_and_authority() {
+        // #374: `@target-uri` は scheme + authority + path を含む完全 URI
+        // なので、これがあれば宛先 binding は成立している。host / @authority
+        // の上乗せは要求しない (Mastodon 4.7 はこの 3 点だけで署名する)。
+        require_covered_rfc9421(&["@method", "@target-uri", "content-digest"]).unwrap();
+    }
+
+    #[test]
+    fn require_covered_rfc9421_still_rejects_missing_target_uri() {
+        // 宛先 binding そのものが無いケースは引き続き拒否する ── host だけ
+        // 載せて `@target-uri` を省く形も通さない (scheme / path が縛られず、
+        // 同一ホストの別エンドポイントへ転送できてしまうため)。
+        let err = require_covered_rfc9421(&["@method", "host", "content-digest"]).unwrap_err();
         assert!(matches!(err, SigError::SignatureMalformed(_)));
     }
 }
