@@ -328,6 +328,69 @@ fn build_rfc9421_post_with_covered(
     req
 }
 
+/// [`build_remote_actor`] の `publicKey.id` 差し替え版。
+///
+/// Mastodon 4.7 は鍵ごとに `#rsa-<hex>` という実装固有 fragment を振る
+/// ようになった (#374)。`#main-key` 決め打ちでない keyId でも検証が通る
+/// ことを確かめるために使う。
+fn build_remote_actor_with_key_id(rsa_pub_pem: &str, public_key_id: &str) -> NewActor {
+    NewActor {
+        public_key_id: public_key_id.to_string(),
+        ..build_remote_actor(rsa_pub_pem, None)
+    }
+}
+
+/// RSA 鍵で署名した RFC 9421 POST inbox を組み立てる。
+///
+/// [`build_rfc9421_post_with_covered`] は Ed25519 専用 (`alg="ed25519"`) な
+/// ので、Mastodon 4.7 が送ってくる「RSA + `alg` パラメタ無し」の形を再現
+/// するための別ビルダー。covered も呼び出し側から与える。
+fn build_rfc9421_rsa_post_with_covered(
+    body: &[u8],
+    rsa_priv_pem: &str,
+    keyid: &str,
+    date: &str,
+    covered: &[&str],
+) -> Request<Body> {
+    let path = "/inbox";
+    let target_uri = format!("https://{HOST}{path}");
+    let content_digest = digest::format_content_digest(body);
+    #[allow(clippy::cast_possible_wrap, reason = "test fixture, secs fits in i64")]
+    let created = httpdate::parse_http_date(date)
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut req = Request::post(path)
+        .header("host", HOST)
+        .header("date", date)
+        .header("content-digest", &content_digest)
+        .header("content-type", "application/activity+json")
+        .body(Body::from(body.to_vec()))
+        .unwrap();
+    let headers = headers_to_map(&req);
+    let covered_quoted = covered
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Mastodon 4.7 は `alg` を載せない (keyId から鍵を引く前提)。
+    let raw_value = format!(r#"({covered_quoted});created={created};keyid="{keyid}""#);
+    let base =
+        rfc9421::build_signature_base("POST", &target_uri, covered, &headers, &raw_value).unwrap();
+    let sig_bytes = cavage::sign_rsa_sha256(base.as_bytes(), rsa_priv_pem).unwrap();
+    let sig_b64 = B64.encode(sig_bytes);
+    req.headers_mut().insert(
+        HeaderName::from_static("signature-input"),
+        HeaderValue::from_str(&format!("sig1={raw_value}")).unwrap(),
+    );
+    req.headers_mut().insert(
+        HeaderName::from_static("signature"),
+        HeaderValue::from_str(&format!("sig1=:{sig_b64}:")).unwrap(),
+    );
+    req
+}
+
 fn now_http_date() -> String {
     httpdate::fmt_http_date(std::time::SystemTime::now())
 }
@@ -526,6 +589,103 @@ async fn missing_signature_header_returns_400(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// **#374 回帰**: Mastodon 4.7 形式の keyId (`#rsa-<hex>`) を cavage で
+/// 受けられること。
+///
+/// 4.7 は `publicKey.id` の fragment を鍵ごとの一意な値にした。fragment 名
+/// (`#main-key`) だけで鍵種別を決めていた頃はここが `KeyKind::Other` に落ち、
+/// Mastodon からの全 inbox が 401 になっていた。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn cavage_rsa_with_mastodon_4_7_style_keyid_is_accepted(pool: PgPool) {
+    let (priv_pem, pub_pem) = fresh_rsa();
+    // 実測値と同じ形 (Mastodon 4.7.1 が送ってきた fragment)。
+    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#rsa-a5546e0773af71c9");
+    repo::actor::insert(&pool, build_remote_actor_with_key_id(&pub_pem, &keyid))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let body = minimal_body_for(&format!("https://{REMOTE_HOST}/users/{REMOTE_USER}"));
+    let req = build_cavage_post(&body, &priv_pem, &keyid, &now_http_date(), None);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+/// **#374 回帰**: 未知 fragment かつ actor の `publicKey.id` とも一致しない
+/// keyId でも、RSA として検証を試みること。
+///
+/// 鍵ローテーション直後などで DB の `public_key_id` が古い場合に相当する。
+/// 鍵はどのみち actor 本人が公開したものしか使わないので、種別推測を広げても
+/// なりすましは成立しない (外れれば 401 になるだけ)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn cavage_rsa_with_unknown_fragment_falls_back_to_rsa(pool: PgPool) {
+    let (priv_pem, pub_pem) = fresh_rsa();
+    // actor 側は `#main-key` のまま登録し、署名側だけ別 fragment を名乗る。
+    repo::actor::insert(&pool, build_remote_actor(&pub_pem, None))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let body = minimal_body_for(&format!("https://{REMOTE_HOST}/users/{REMOTE_USER}"));
+    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#some-other-key");
+    let req = build_cavage_post(&body, &priv_pem, &keyid, &now_http_date(), None);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+/// **#374 回帰**: RFC 9421 で covered が
+/// `("@method" "@target-uri" "content-digest")` だけでも受理すること。
+///
+/// Mastodon 4.7 が送ってくる実際の covered set。`@target-uri` は完全 URI で
+/// 宛先ホストにコミットしているので、`host` / `@authority` の上乗せは不要。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_rsa_without_host_or_authority_is_accepted(pool: PgPool) {
+    let (priv_pem, pub_pem) = fresh_rsa();
+    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#rsa-a5546e0773af71c9");
+    repo::actor::insert(&pool, build_remote_actor_with_key_id(&pub_pem, &keyid))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let body = minimal_body_for(&format!("https://{REMOTE_HOST}/users/{REMOTE_USER}"));
+    let req = build_rfc9421_rsa_post_with_covered(
+        &body,
+        &priv_pem,
+        &keyid,
+        &now_http_date(),
+        &["@method", "@target-uri", "content-digest"],
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+/// **#374 回帰**: covered 要件を緩めたのは `host` / `@authority` の上乗せ
+/// だけで、`content-digest` の必須は維持していること (ボディ完全性の保護)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn rfc9421_without_content_digest_is_still_rejected(pool: PgPool) {
+    let (priv_pem, pub_pem) = fresh_rsa();
+    let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#rsa-a5546e0773af71c9");
+    repo::actor::insert(&pool, build_remote_actor_with_key_id(&pub_pem, &keyid))
+        .await
+        .unwrap();
+    let state = AppState::from_pool(pool, make_config());
+    let app = router(state);
+
+    let body = minimal_body_for(&format!("https://{REMOTE_HOST}/users/{REMOTE_USER}"));
+    let req = build_rfc9421_rsa_post_with_covered(
+        &body,
+        &priv_pem,
+        &keyid,
+        &now_http_date(),
+        &["@method", "@target-uri"],
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn rsa_signature_with_ed25519_keyid_is_rejected(pool: PgPool) {
     let (rsa_priv, rsa_pub) = fresh_rsa();
@@ -537,9 +697,9 @@ async fn rsa_signature_with_ed25519_keyid_is_rejected(pool: PgPool) {
     let app = router(state);
 
     let body = br#"{"type":"Follow"}"#;
-    // cavage 経路で `#ed25519-key` keyId を主張する不整合。
-    // sign module は keyKind を fragment から判定し、cavage の場合は
-    // KeyKind::Ed25519 を拒否する (UnsupportedKeyKind → 401)。
+    // cavage 経路で `#ed25519-key` keyId を主張する不整合。keyId は actor の
+    // `ed25519_public_key_id` と一致するので Ed25519 鍵で検証され、実際の
+    // 署名は RSA なので検証に失敗する (→ 401)。
     let keyid = format!("https://{REMOTE_HOST}/users/{REMOTE_USER}#ed25519-key");
     let req = build_cavage_post(body, &rsa_priv, &keyid, &now_http_date(), None);
     let resp = app.oneshot(req).await.unwrap();
