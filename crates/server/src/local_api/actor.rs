@@ -7,8 +7,10 @@
 //!   profile + ローカル actor との関係を返す。
 //! - `GET /api/v1/actor/{id}` ── DB id で actor を取得 (= 既知 actor の再 fetch)。
 //! - `GET /api/v1/actor/{id}/relationship` ── ローカル actor からの関係のみ。
-//! - `GET /api/v1/actor/{id}/notes?limit=&before_id=` ── 当該 actor が author の
-//!   Note を `note.id DESC` 順で列挙 (M13 PR3)。visibility filter:
+//! - `GET /api/v1/actor/{id}/notes?limit=&before_ts_ms=` ── 当該 actor が author の
+//!   Note を `published_at DESC` 順で列挙 (M13 PR3。当初 `note.id DESC` だったが
+//!   followee boost 経由の未知 Note fetch で挿入順と真の投稿日時が逆転しうる
+//!   バグがあったため、home timeline 等と同じ `published_at` 順に修正)。visibility filter:
 //!   `public` / `unlisted` は常に見える、`followers` は viewer が accepted で
 //!   follow しているとき、`direct` は viewer が `to_recipients` /
 //!   `cc_recipients` に乗っているとき。author 自身を viewer にすると全件返る。
@@ -36,6 +38,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use chrono::{TimeZone, Utc};
 use sakurasato_core::model::{ActorRow, FollowState};
 use sakurasato_core::repo;
 use serde::{Deserialize, Serialize};
@@ -177,20 +180,29 @@ pub async fn relationship(State(state): State<AppState>, Path(id): Path<i64>) ->
 pub struct NotesQuery {
     #[serde(default)]
     pub limit: Option<i64>,
+    /// 次ページのカーソル。**epoch ミリ秒**で、これより前 (`published_at` が
+    /// この時刻より小さい) の note を返す (= home timeline `before_ts_ms` と
+    /// 同じ方式)。整数なのでクエリエンコードの曖昧さが無い。ミリ秒への丸めで
+    /// `repo::note::list_by_author` が持つページ境界の既知の取りこぼし
+    /// (同一 `published_at` の複数行) が、理論上はミリ秒未満で一致する行にも
+    /// 広がりうるが、home timeline 等の既存カーソルと同じ丸め方式であり新規の
+    /// トレードオフではない。
     #[serde(default)]
-    pub before_id: Option<i64>,
+    pub before_ts_ms: Option<i64>,
 }
 
-/// プロフィール画面の note 一覧レスポンス。home timeline (`TimelineResponse`) と
-/// 違い、特定 author の note を **id 降順** で並べるだけで renote は混ざらない
-/// ため、カーソルは従来どおり `before_id` (note id) のまま据え置く。
+/// プロフィール画面の note 一覧レスポンス。home timeline と違い renote は
+/// 混ざらないが、カーソルは `published_at` ベース (`before_ts_ms`) ── 挿入順
+/// (`id`) でページングすると、followee boost 経由の未知 Note fetch 等で
+/// 挿入順と `published_at` 順が食い違う Note がページ境界で恒久的に欠落しうる
+/// ため (= このモジュールが元々持っていた表示順バグの再発防止)。
 #[derive(Debug, Serialize)]
 pub struct AuthorNotesResponse {
     pub notes: Vec<TimelineNote>,
-    pub next_before_id: Option<i64>,
+    pub next_before_ts_ms: Option<i64>,
 }
 
-/// `GET /api/v1/actor/{id}/notes?limit=&before_id=`
+/// `GET /api/v1/actor/{id}/notes?limit=&before_ts_ms=`
 ///
 /// 当該 actor が author の Note を visibility filter 経由で列挙する。
 /// - `id` が存在しなければ 404。
@@ -216,12 +228,17 @@ pub async fn list_notes(
     };
 
     let limit = timeline_api::clamp_limit(q.limit);
+    // before_ts_ms (epoch ミリ秒) を DateTime に。範囲外は無視 (= カーソル無し、
+    // `timeline::home` の `before_ts_ms` 変換と同じ方式)。
+    let before_published_at = q
+        .before_ts_ms
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single());
     let entries = match repo::note::list_by_author(
         state.pool(),
         target.id,
         viewer.id,
         &viewer.ap_id,
-        q.before_id,
+        before_published_at,
         limit,
     )
     .await
@@ -234,7 +251,7 @@ pub async fn list_notes(
     };
 
     let host = &state.config().server.host;
-    let next_before_id = entries.last().map(|e| e.id);
+    let next_before_ts_ms = entries.last().map(|e| e.published_at.timestamp_millis());
 
     // M8 PR3 と同じくリアクション集計を 1 クエリで取り、失敗時は warn だけ。
     // #151: announce 集計も同パターンで追加 (viewer = `viewer` = local actor)。
@@ -286,7 +303,7 @@ pub async fn list_notes(
 
     Json(AuthorNotesResponse {
         notes,
-        next_before_id,
+        next_before_ts_ms,
     })
     .into_response()
 }

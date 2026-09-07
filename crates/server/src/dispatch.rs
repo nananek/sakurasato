@@ -27,6 +27,7 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, Utc};
 use sakurasato_core::model::ActorRow;
 use serde_json::Value as JsonValue;
 use thiserror::Error;
@@ -430,10 +431,90 @@ pub(crate) fn extract_object_uri(activity: &JsonValue) -> Result<&str, DispatchE
         .ok_or_else(|| DispatchError::Malformed("activity `object` has no usable URI".into()))
 }
 
+/// 未来日時を現在時刻より進ませない。
+///
+/// クロックがズレた、あるいは悪意あるリモートサーバが遠い未来の時刻を送って
+/// くると、`published_at DESC` で並ぶ一覧 (home timeline・プロフィール・
+/// mentions) でその Note が実時間が追いつくまでずっと最上部に固定され続けて
+/// しまう。
+fn clamp_future_timestamp(dt: DateTime<Utc>) -> DateTime<Utc> {
+    dt.min(Utc::now())
+}
+
+/// AP オブジェクトの時刻フィールド (`published`/`updated`) 1 個分の値をパース
+/// する。呼び出し側が `obj.get(field)` してから渡す形 (`&JsonValue` でも
+/// `&serde_json::Map<String, JsonValue>` でも `.get()` の戻り値をそのまま渡せる
+/// ため、呼び出し元のコンテナ型を問わない)。
+///
+/// `note::build_remote_note` (`published_at`) / `announce::handle`
+/// (`published_at`) / `update::handle_update_note` (`edited_at`) で共通に使う。
+/// パース失敗/欠落時は受信時刻 (`Utc::now()`) にフォールバックし、パースできた
+/// 値は [`clamp_future_timestamp`] を必ず通す (3 箇所で個別にクランプし忘れる
+/// 事故を防ぐ)。
+pub(crate) fn parse_ap_timestamp(value: Option<&JsonValue>) -> DateTime<Utc> {
+    value
+        .and_then(JsonValue::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map_or_else(Utc::now, |dt| {
+            clamp_future_timestamp(dt.with_timezone(&Utc))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
     use serde_json::json;
+
+    #[test]
+    fn clamp_future_timestamp_pins_far_future_to_now() {
+        let far_future = Utc::now() + Duration::days(3650);
+        let clamped = clamp_future_timestamp(far_future);
+        assert!(clamped <= Utc::now());
+        assert!(clamped > Utc::now() - Duration::seconds(5));
+    }
+
+    #[test]
+    fn clamp_future_timestamp_keeps_past_untouched() {
+        let past = Utc::now() - Duration::days(1);
+        assert_eq!(clamp_future_timestamp(past), past);
+    }
+
+    #[test]
+    fn parse_ap_timestamp_uses_field_when_present() {
+        let obj = json!({"published": "2020-01-02T03:04:05Z"});
+        let dt = parse_ap_timestamp(obj.get("published"));
+        assert_eq!(dt.to_rfc3339(), "2020-01-02T03:04:05+00:00");
+    }
+
+    #[test]
+    fn parse_ap_timestamp_falls_back_to_now_when_missing_or_invalid() {
+        let missing = json!({});
+        let invalid = json!({"published": "not a date"});
+        for obj in [&missing, &invalid] {
+            let dt = parse_ap_timestamp(obj.get("published"));
+            assert!(dt > Utc::now() - Duration::seconds(5));
+        }
+    }
+
+    #[test]
+    fn parse_ap_timestamp_clamps_future_field_value() {
+        let obj = json!({"updated": "2999-01-01T00:00:00Z"});
+        let dt = parse_ap_timestamp(obj.get("updated"));
+        assert!(dt <= Utc::now());
+        assert!(dt > Utc::now() - Duration::seconds(5));
+    }
+
+    #[test]
+    fn parse_ap_timestamp_works_from_map_get_too() {
+        // `note::build_remote_note` / `update::handle_update_note` は
+        // `&serde_json::Map<String, JsonValue>` から `.get()` した `Option<&JsonValue>`
+        // を渡す。`&JsonValue` からの `.get()` と同じく問題なく使えることを確認する。
+        let obj = json!({"published": "2021-06-01T00:00:00Z"});
+        let map = obj.as_object().unwrap();
+        let dt = parse_ap_timestamp(map.get("published"));
+        assert_eq!(dt.to_rfc3339(), "2021-06-01T00:00:00+00:00");
+    }
 
     #[test]
     fn extract_actor_uri_handles_string_and_object() {

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,\n            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,\n            n.to_recipients as \"to_recipients: Json<Vec<String>>\",\n            n.cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            n.attachments as \"attachments: Json<JsonValue>\",\n            n.tags as \"tags: Json<JsonValue>\",\n            n.is_local, n.url, n.published_at, n.edited_at, n.created_at, n.updated_at,\n            a.ap_id AS actor_ap_id,\n            a.preferred_username AS actor_preferred_username,\n            a.display_name AS actor_display_name,\n            a.icon_url AS actor_icon_url\n        FROM note n\n        JOIN actor a ON a.id = n.actor_id\n        WHERE n.actor_id = $1\n          AND (\n            $1 = $2\n            OR n.visibility IN ('public', 'unlisted')\n            OR (\n              n.visibility = 'followers'\n              AND EXISTS (\n                SELECT 1 FROM follow\n                WHERE follower_actor_id = $2\n                  AND followed_actor_id = $1\n                  AND state = 'accepted'\n              )\n            )\n            OR (\n              n.visibility = 'direct'\n              AND (n.to_recipients @> $3::jsonb OR n.cc_recipients @> $3::jsonb)\n            )\n          )\n          AND ($4::BIGINT IS NULL OR n.id < $4)\n        ORDER BY n.id DESC\n        LIMIT $5\n        ",
+  "query": "\n        SELECT\n            n.id, n.ap_id, n.actor_id, n.content, n.language, n.in_reply_to_ap_id,\n            n.in_reply_to_note_id, n.summary, n.visibility, n.sensitive,\n            n.to_recipients as \"to_recipients: Json<Vec<String>>\",\n            n.cc_recipients as \"cc_recipients: Json<Vec<String>>\",\n            n.attachments as \"attachments: Json<JsonValue>\",\n            n.tags as \"tags: Json<JsonValue>\",\n            n.is_local, n.url, n.published_at, n.edited_at, n.created_at, n.updated_at,\n            a.ap_id AS actor_ap_id,\n            a.preferred_username AS actor_preferred_username,\n            a.display_name AS actor_display_name,\n            a.icon_url AS actor_icon_url\n        FROM note n\n        JOIN actor a ON a.id = n.actor_id\n        WHERE n.actor_id = $1\n          AND (\n            $1 = $2\n            OR n.visibility IN ('public', 'unlisted')\n            OR (\n              n.visibility = 'followers'\n              AND EXISTS (\n                SELECT 1 FROM follow\n                WHERE follower_actor_id = $2\n                  AND followed_actor_id = $1\n                  AND state = 'accepted'\n              )\n            )\n            OR (\n              n.visibility = 'direct'\n              AND (n.to_recipients @> $3::jsonb OR n.cc_recipients @> $3::jsonb)\n            )\n          )\n          AND ($4::TIMESTAMPTZ IS NULL OR n.published_at < $4)\n        ORDER BY n.published_at DESC, n.id DESC\n        LIMIT $5\n        ",
   "describe": {
     "columns": [
       {
@@ -273,7 +273,7 @@
         "Int8",
         "Int8",
         "Jsonb",
-        "Int8",
+        "Timestamptz",
         "Int8"
       ]
     },
@@ -304,5 +304,5 @@
       true
     ]
   },
-  "hash": "fff04b63bccd42639137099f341a5bfa9cac7be7a06cb3a6377d8650150e49fb"
+  "hash": "e789b9d4ad2b715fbdd95d7113a6df4c4b2b5ff33c4984bd0daf4d8a02948b80"
 }

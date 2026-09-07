@@ -2601,7 +2601,7 @@ async fn actor_notes_503_when_local_actor_missing(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
-/// `GET /api/v1/actor/{id}/notes?limit=&before_id=` のページネーション。
+/// `GET /api/v1/actor/{id}/notes?limit=&before_ts_ms=` のページネーション。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn actor_notes_pagination(pool: PgPool) {
     let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
@@ -2645,17 +2645,24 @@ async fn actor_notes_pagination(pool: PgPool) {
     let json = read_json(resp).await;
     let notes = json["notes"].as_array().unwrap();
     assert_eq!(notes.len(), 2);
-    // note.id DESC 並び (= 最新が先頭)。
+    // published_at DESC 並び (= 最新が先頭)。
     assert_eq!(notes[0]["id"].as_i64().unwrap(), ids[2]);
     assert_eq!(notes[1]["id"].as_i64().unwrap(), ids[1]);
-    let next = json["next_before_id"].as_i64().unwrap();
-    assert_eq!(next, ids[1]);
+    let next = json["next_before_ts_ms"].as_i64().unwrap();
+    // カーソルはページ最後のエントリ (ids[1]) の published_at を epoch ミリ秒に
+    // したもの。ただの非 null チェックに緩めない (#1 相当のカーソル計算ミスを
+    // 検出できるようにする)。
+    let last_published_at = notes[1]["published_at"].as_str().unwrap();
+    let expected_next = chrono::DateTime::parse_from_rfc3339(last_published_at)
+        .unwrap()
+        .timestamp_millis();
+    assert_eq!(next, expected_next);
 
     let app = sakurasato_server::local_api::router(state);
     let resp = app
         .oneshot(
             Request::get(format!(
-                "/api/v1/actor/{}/notes?limit=2&before_id={next}",
+                "/api/v1/actor/{}/notes?limit=2&before_ts_ms={next}",
                 bob.id,
             ))
             .header(header::AUTHORIZATION, format!("Bearer {raw}"))

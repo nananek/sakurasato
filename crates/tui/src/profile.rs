@@ -27,9 +27,9 @@ pub struct ProfileScreen {
     pub actor: ActorProfile,
     pub relationship: Relationship,
     pub notes: Vec<TimelineNote>,
-    /// `actor/{id}/notes` ページネーション用 (= 次取得時の `before_id`)。
-    /// `None` で末尾到達。
-    pub next_before_id: Option<i64>,
+    /// `actor/{id}/notes` ページネーション用 (= 次取得時の `before_ts_ms`,
+    /// `published_at` の epoch ミリ秒)。`None` で末尾到達。
+    pub next_before_ts_ms: Option<i64>,
     /// notes が空配列で返って「もう続きが無い」と確定したか。
     pub notes_exhausted: bool,
     /// notes 一覧で選択中の index。0 = 先頭。空配列のときも 0 (= 範囲外でも
@@ -45,14 +45,14 @@ impl ProfileScreen {
         actor: ActorProfile,
         relationship: Relationship,
         notes: Vec<TimelineNote>,
-        next_before_id: Option<i64>,
+        next_before_ts_ms: Option<i64>,
     ) -> Self {
         let notes_exhausted = notes.is_empty();
         Self {
             actor,
             relationship,
             notes,
-            next_before_id,
+            next_before_ts_ms,
             notes_exhausted,
             selected_note: 0,
             note_top: 0,
@@ -123,13 +123,17 @@ impl ProfileScreen {
     }
 
     /// notes ページ追記。空配列なら `notes_exhausted = true`。
-    pub fn append_older_notes(&mut self, mut more: Vec<TimelineNote>, next_before_id: Option<i64>) {
+    pub fn append_older_notes(
+        &mut self,
+        mut more: Vec<TimelineNote>,
+        next_before_ts_ms: Option<i64>,
+    ) {
         if more.is_empty() {
             self.notes_exhausted = true;
             return;
         }
         self.notes.append(&mut more);
-        self.next_before_id = next_before_id;
+        self.next_before_ts_ms = next_before_ts_ms;
     }
 
     /// follow toggle 後の更新。`Relationship` を入れ替えるだけ。

@@ -1190,7 +1190,7 @@ async fn push_profile_for_actor_id(app: &mut App, api: &LocalApi, actor_id: i64,
             );
             crate::client::AuthorNotesResponse {
                 notes: Vec::new(),
-                next_before_id: None,
+                next_before_ts_ms: None,
             }
         }
     };
@@ -1199,7 +1199,7 @@ async fn push_profile_for_actor_id(app: &mut App, api: &LocalApi, actor_id: i64,
         actor,
         relationship,
         notes.notes,
-        notes.next_before_id,
+        notes.next_before_ts_ms,
     ));
     app.focus = Focus::Profile;
     app.set_status(
@@ -1223,12 +1223,12 @@ async fn profile_load_more_notes(app: &mut App, api: &LocalApi, page_size: i64) 
         return;
     }
     let actor_id = profile.actor.id;
-    let before = profile.next_before_id;
+    let before = profile.next_before_ts_ms;
     match api.list_actor_notes(actor_id, before, page_size).await {
         Ok(resp) => {
             let n = resp.notes.len();
             if let Some(p) = app.current_profile_mut() {
-                p.append_older_notes(resp.notes, resp.next_before_id);
+                p.append_older_notes(resp.notes, resp.next_before_ts_ms);
             }
             app.set_status(
                 format!("loaded {n} older"),
@@ -1370,7 +1370,7 @@ async fn profile_refresh(app: &mut App, api: &LocalApi, page_size: i64) {
         Ok(resp) => {
             if let Some(p) = app.current_profile_mut() {
                 p.notes = resp.notes;
-                p.next_before_id = resp.next_before_id;
+                p.next_before_ts_ms = resp.next_before_ts_ms;
                 p.notes_exhausted = p.notes.is_empty();
                 p.selected_note = 0;
                 p.note_top = 0;
@@ -2650,7 +2650,7 @@ async fn push_profile_from_lookup(
             );
             crate::client::AuthorNotesResponse {
                 notes: Vec::new(),
-                next_before_id: None,
+                next_before_ts_ms: None,
             }
         }
     };
@@ -2658,7 +2658,7 @@ async fn push_profile_from_lookup(
         resp.actor,
         resp.relationship,
         notes.notes,
-        notes.next_before_id,
+        notes.next_before_ts_ms,
     ));
     app.focus = Focus::Profile;
     app.set_status(

@@ -21,7 +21,6 @@
 //!   (= ホスト混入 spoofing 防御)。
 
 use anyhow::{Context, anyhow};
-use chrono::{DateTime, Utc};
 use sakurasato_core::model::{ActorRow, NoteRow, Visibility};
 use sakurasato_core::repo;
 use serde_json::Value as JsonValue;
@@ -446,11 +445,7 @@ async fn build_remote_note(
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
     let url = obj.get("url").and_then(extract_url_string);
-    let published_at = obj
-        .get("published")
-        .and_then(JsonValue::as_str)
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
+    let published_at = super::parse_ap_timestamp(obj.get("published"));
     let attachments = obj
         .get("attachment")
         .cloned()
