@@ -565,7 +565,14 @@ pub async fn count_local(pool: &PgPool) -> sqlx::Result<i64> {
 }
 
 /// **M13 PR3 (Issue #79) `GET /api/v1/actor/{id}/notes`** ── 指定 actor が
-/// author の Note を `note.id DESC` 順 (= 受信順) で列挙する。
+/// author の Note を `published_at DESC` 順 (= 実際の投稿日時順) で列挙する。
+///
+/// 当初 `note.id DESC` (= DB 挿入順 = サーバがその Note を処理/取得した順) で
+/// 実装されていたが、followee の boost 経由で未知 Note を fetch する経路
+/// (`dispatch::note::fetch_and_store_remote_note`) では「いつ fetch されたか」と
+/// 「本来いつ投稿されたか」が無関係にズレうるため、挿入順と真の時系列が逆転して
+/// 表示されるバグがあった。[`list_by_author_window`] と同じ
+/// `published_at DESC, id DESC` に統一する。
 ///
 /// ## Visibility filter
 ///
@@ -585,14 +592,26 @@ pub async fn count_local(pool: &PgPool) -> sqlx::Result<i64> {
 /// `to_recipients` / `cc_recipients` は `jsonb` 配列なので index も
 /// (将来) GIN で効かせられる。
 ///
-/// `before_id` / `limit` は `list_home_timeline` と同じカーソル方式。
+/// `before_published_at` / `limit` は [`list_by_author_window`] と同じ
+/// `published_at` 排他境界カーソル方式 (`id` 一本のカーソルだと、挿入順と
+/// `published_at` 順が食い違う Note がページ境界で恒久的に欠落しうるため)。
+///
+/// ## カーソルの既知の制約 (= [`list_by_author_window`] と共有)
+///
+/// 境界は `published_at` 一本 (排他)。`ORDER BY` は `id DESC` を tiebreak に
+/// 持つので **同一ページ内** の順序は決定的だが、**ページ境界に秒以下まで
+/// 同一の `published_at` が複数並ぶ** と排他境界が取りこぼし得る (= 2 つの id
+/// 空間をまたぐ複合カーソルが組めないため)。旧 `id DESC` カーソルはこの取り
+/// こぼしが原理的に起きなかったが、挿入順表示バグの方が実害が大きいため、
+/// 他の `published_at` 順一覧と同じこのトレードオフを受け入れる。実害は
+/// remote の秒精度 timestamp が同秒に密集した稀ケースに限られる。
 #[allow(clippy::similar_names)]
 pub async fn list_by_author(
     pool: &PgPool,
     author_actor_id: i64,
     viewer_actor_id: i64,
     viewer_ap_id: &str,
-    before_id: Option<i64>,
+    before_published_at: Option<DateTime<Utc>>,
     limit: i64,
 ) -> sqlx::Result<Vec<TimelineEntry>> {
     let viewer_inbox_array =
@@ -632,14 +651,14 @@ pub async fn list_by_author(
               AND (n.to_recipients @> $3::jsonb OR n.cc_recipients @> $3::jsonb)
             )
           )
-          AND ($4::BIGINT IS NULL OR n.id < $4)
-        ORDER BY n.id DESC
+          AND ($4::TIMESTAMPTZ IS NULL OR n.published_at < $4)
+        ORDER BY n.published_at DESC, n.id DESC
         LIMIT $5
         "#,
         author_actor_id,
         viewer_actor_id,
         viewer_inbox_array,
-        before_id,
+        before_published_at,
         limit,
     )
     .fetch_all(pool)
@@ -653,10 +672,10 @@ pub async fn list_by_author(
 ///
 /// ## `list_by_author` との差分
 ///
-/// - カーソルが `before_id` (= note id 1 本) ではなく `since_date` / `until_date`
-///   (= `published_at` の **排他** 境界 `>` / `<`)。これは `users/notes` が
-///   renote (= 別連番の `announce`) と時刻順マージされるため、id ではなく
-///   時刻でページングする必要があるから (`list_home_timeline_window` と対称)。
+/// - カーソルが `before_published_at` 1 本ではなく `since_date` / `until_date`
+///   (= `published_at` の **排他** 境界 `>` / `<` の両方)。これは `users/notes` が
+///   renote (= 別連番の `announce`) と時刻順マージされるため、下限も上限も
+///   `published_at` で表現する必要があるから (`list_home_timeline_window` と対称)。
 /// - `with_replies = false` のとき返信を除外する。ただし **自己スレッド**
 ///   (= 自分の note への返信) は Misskey 仕様どおり残す ── 親 note が自分の
 ///   ものか `in_reply_to_note_id` で判定する。親 note を我々が把握していない

@@ -19,7 +19,6 @@
 //! - Note 編集: `note.actor_id` == `signer.id` 必須。Delete と同じ author check。
 
 use anyhow::Context;
-use chrono::Utc;
 use sakurasato_core::model::ActorRow;
 use sakurasato_core::repo;
 use serde_json::Value as JsonValue;
@@ -172,12 +171,9 @@ async fn update_note(
         ));
     }
 
-    // edited_at は object.updated を優先、無ければ受信時刻。
-    let edited_at = obj
-        .get("updated")
-        .and_then(JsonValue::as_str)
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
+    // edited_at は object.updated を優先、無ければ受信時刻 (未来日時はクランプ、
+    // `super::parse_ap_timestamp`)。
+    let edited_at = super::parse_ap_timestamp(obj.get("updated"));
 
     let updated = repo::note::update_content(
         state.pool(),

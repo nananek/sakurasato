@@ -368,20 +368,21 @@ impl LocalApi {
         self.get_json(&path).await
     }
 
-    /// `GET /api/v1/actor/{id}/notes?limit=&before_id=` ── M13 PR4 (Issue #79)。
+    /// `GET /api/v1/actor/{id}/notes?limit=&before_ts_ms=` ── M13 PR4 (Issue #79)。
     ///
     /// Profile 画面下部の「最近の投稿」用。visibility filter は viewer (=
     /// local actor) 視点で server 側 SQL が評価するため、TUI は素直に表示する。
+    /// カーソルは `published_at` の epoch ミリ秒 (home timeline と同じ方式)。
     pub async fn list_actor_notes(
         &self,
         actor_id: i64,
-        before_id: Option<i64>,
+        before_ts_ms: Option<i64>,
         limit: i64,
     ) -> Result<AuthorNotesResponse, ApiError> {
         use std::fmt::Write as _;
         let mut path = format!("/api/v1/actor/{actor_id}/notes?limit={limit}");
-        if let Some(b) = before_id {
-            write!(&mut path, "&before_id={b}").expect("write to String");
+        if let Some(b) = before_ts_ms {
+            write!(&mut path, "&before_ts_ms={b}").expect("write to String");
         }
         self.get_json(&path).await
     }
@@ -960,12 +961,14 @@ pub struct TimelineResponse {
 }
 
 /// プロフィール画面の note 一覧レスポンス。home timeline と違い renote は
-/// 混ざらず id 降順なので、カーソルは従来どおり `before_id` (note id)。
+/// 混ざらないが、カーソルは `published_at` ベース (`next_before_ts_ms`、epoch
+/// ミリ秒) ── 挿入順 (`id`) だと followee boost 経由の未知 Note fetch 等で
+/// 挿入順と `published_at` 順が食い違う Note がページ境界で欠落しうるため。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthorNotesResponse {
     pub notes: Vec<TimelineNote>,
     #[serde(default)]
-    pub next_before_id: Option<i64>,
+    pub next_before_ts_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

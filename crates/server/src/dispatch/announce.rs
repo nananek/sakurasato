@@ -23,7 +23,6 @@
 //! 黙って捨てる (従来の no-op と同じ着地)。
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use sakurasato_core::model::ActorRow;
 use sakurasato_core::repo;
 use serde_json::Value as JsonValue;
@@ -85,11 +84,7 @@ pub(crate) async fn handle_announce(
         }
     };
 
-    let published_at = activity
-        .get("published")
-        .and_then(JsonValue::as_str)
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
+    let published_at = super::parse_ap_timestamp(activity.get("published"));
 
     let row =
         repo::announce::insert_or_get(state.pool(), &activity_id, note.id, signer.id, published_at)

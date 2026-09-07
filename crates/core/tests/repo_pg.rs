@@ -324,6 +324,73 @@ async fn list_by_hashtag_filters_visibility_and_tag(pool: PgPool) -> sqlx::Resul
     Ok(())
 }
 
+/// `list_by_author` は `published_at DESC` で並ぶこと (= DB 挿入順 `id DESC`
+/// ではない)。followee の boost 経由で未知 Note を fetch する経路では、挿入順
+/// (id) と真の投稿日時 (`published_at`) がズレうる ── ここでは「先に投稿された
+/// note を後から挿入する」ことでそのズレを直接再現し、修正前は `id DESC` で
+/// 表示順が逆転していたことの回帰テストとする。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn list_by_author_orders_by_published_at_not_insertion_order(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let author = repo::actor::insert(&pool, sample_local_actor("order")).await?;
+    let mk = |suffix: &str, content: &str, published_at: chrono::DateTime<chrono::Utc>| {
+        repo::note::NewNote {
+            ap_id: format!("https://example.test/notes/order-{suffix}"),
+            actor_id: author.id,
+            content: content.into(),
+            language: None,
+            in_reply_to_ap_id: None,
+            in_reply_to_note_id: None,
+            summary: None,
+            visibility: Visibility::Public,
+            sensitive: false,
+            to_recipients: vec!["https://www.w3.org/ns/activitystreams#Public".into()],
+            cc_recipients: vec![],
+            attachments: serde_json::json!([]),
+            tags: serde_json::json!([]),
+            is_local: false,
+            url: None,
+            source: None,
+            published_at,
+        }
+    };
+    let now = chrono::Utc::now();
+    let older_published = now - chrono::Duration::hours(2);
+    let newer_published = now - chrono::Duration::hours(1);
+
+    // "newer" (published_at が新しい) を先に挿入して低い id を取らせ、
+    // "older" (published_at が古い) を後から挿入して高い id を取らせる ──
+    // id 順と published_at 順が食い違う状態を意図的に作る。
+    let _ = repo::note::insert(&pool, mk("newer", "newer", newer_published)).await?;
+    let _ = repo::note::insert(&pool, mk("older", "older", older_published)).await?;
+
+    let rows =
+        repo::note::list_by_author(&pool, author.id, author.id, &author.ap_id, None, 50).await?;
+    let contents: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec!["newer", "older"],
+        "must be published_at DESC, not insertion (id) order; got {contents:?}"
+    );
+
+    // カーソル (`before_published_at`) も published_at ベースで正しく機能する
+    // こと ── "newer" の published_at を境界にすると "older" だけが返る。
+    let paged = repo::note::list_by_author(
+        &pool,
+        author.id,
+        author.id,
+        &author.ap_id,
+        Some(newer_published),
+        50,
+    )
+    .await?;
+    let paged_contents: Vec<&str> = paged.iter().map(|r| r.content.as_str()).collect();
+    assert_eq!(paged_contents, vec!["older"], "got {paged_contents:?}");
+
+    Ok(())
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn follow_state_transitions(pool: PgPool) -> sqlx::Result<()> {
     let me = repo::actor::insert(&pool, sample_local_actor("a")).await?;
