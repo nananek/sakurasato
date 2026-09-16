@@ -208,6 +208,12 @@ async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
             );
         }
     };
+    // `notes/show` の通常経路と同じ viewer 視点の可視性ゲート。renote 経路は
+    // announce 行の存在だけで元 note を返していたため、タイムライン SQL が
+    // 除外する followers 限定 note が `rn:<id>` 経由で読めてしまっていた。
+    if !viewer_can_view_entry(state, &entry, viewer).await {
+        return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
+    }
     let renoter = match sakurasato_core::repo::actor::get_by_id(state.pool(), ann.actor_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {

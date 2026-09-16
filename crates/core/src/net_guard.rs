@@ -13,8 +13,9 @@
 //!   一致するか。配送ループ防止と自己 fetch 抑止に使う。
 //!
 //! IPv4 / IPv6 の遮断レンジ:
-//! - IPv4 = loopback / private / link-local (169.254/16 メタデータ) / 未指定 /
-//!   broadcast / documentation / RFC 6598 CGNAT 100.64.0.0/10
+//! - IPv4 = グローバルユニキャスト以外。loopback / private / link-local /
+//!   documentation / CGNAT に加え、IETF protocol assignment・benchmarking・
+//!   multicast・将来用途の予約範囲も遮断する
 //! - IPv6 = loopback / 未指定 / multicast / link-local (`fe80::/10`) /
 //!   unique-local (`fc00::/7`) / documentation (`2001:db8::/32`) /
 //!   IPv4-mapped で埋め込み IPv4 が private な場合
@@ -26,16 +27,18 @@
 //!
 //! ## なぜ完全な SSRF 対策ではないか
 //!
-//! 本モジュールは DNS 解決の **前** の URL 文字列だけを見る。`evil.example`
-//! の A レコードが `127.0.0.1` に向いている (= DNS rebinding) ケースは
-//! 防げない。これは server 直の暫定構成 (#23) の既知制限。本格的な多層防御
-//! (custom connector で socket レベル検証) は media-proxy 経由に移行する際に
-//! 実装する。
+//! 本モジュールの [`host_blocked`] は DNS 解決の **前** の URL 文字列だけを
+//! 見る。`evil.example` の A レコードが `127.0.0.1` に向いている (= DNS
+//! rebinding) ケースは単体では防げないため、外向き HTTP クライアントは
+//! **custom DNS resolver で解決後の全 IP を [`filter_resolved_addrs`] に
+//! 通す** こと (server / media-proxy の `dns_guard` が実装)。これで
+//! wildcard DNS (`*.nip.io`)・Docker 単一ラベル名・Tailscale `MagicDNS` を
+//! 経由した private / loopback / link-local / CGNAT への到達を塞ぐ。
 //!
 //! TUI 側からは redirect ごとに本関数を再呼び出しして「リダイレクト先も検証
 //! 漏れしない」原則を担保する (PR #35 claude-review 指摘)。
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// `url` の host が外向き HTTP の宛先として **遮断すべき** 範囲なら、
 /// その理由を `&'static str` で返す。通過させてよい場合は `None`。
@@ -48,6 +51,75 @@ pub fn host_blocked(url: &url::Url) -> Option<&'static str> {
         url::Host::Ipv6(ip) => ipv6_block_reason(ip),
         url::Host::Domain(d) => domain_block_reason(d),
     }
+}
+
+/// テスト / Docker 内連合テスト専用のオプトイン環境変数。
+///
+/// `"1"` / `"true"` (ASCII 大文字小文字無視) のときだけ、外向き HTTP の
+/// resolver が private / loopback / link-local / CGNAT への接続を許可する。
+/// **本番では設定しないこと** ── 設定すると [`host_blocked`] と resolver の
+/// 二段ガードが両方とも緩む。
+pub const ALLOW_PRIVATE_EGRESS_ENV: &str = "SAKURASATO_ALLOW_PRIVATE_EGRESS";
+
+/// 環境変数 [`ALLOW_PRIVATE_EGRESS_ENV`] から `allow_private` を解決する。
+/// 未設定 / それ以外の値は `false` (安全側)。
+pub fn allow_private_egress_from_env() -> bool {
+    allow_private_egress_value(std::env::var(ALLOW_PRIVATE_EGRESS_ENV).ok().as_deref())
+}
+
+fn allow_private_egress_value(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"))
+}
+
+/// `ip` 単体の遮断判定。[`host_blocked`] の IP リテラル判定と **同じ規則** を
+/// 解決後アドレスにも適用するための公開エントリポイント。
+///
+/// 外向き HTTP クライアントの custom DNS resolver は、解決結果の各 IP を
+/// 本関数にかけ、`Some(reason)` のアドレスを接続候補から除外する。
+pub fn ip_blocked(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => ipv4_block_reason(v4),
+        IpAddr::V6(v6) => ipv6_block_reason(v6),
+    }
+}
+
+/// DNS 解決済みアドレス列を検証し、接続に使ってよいものだけを返す。
+///
+/// - `allow_private` が `false` (本番) のとき、[`ip_blocked`] が `Some` を
+///   返すアドレスは除外する。**全アドレスが除外された場合は `Err(reason)`**
+///   ── 呼び出し側 (resolver) は接続を拒否する。
+/// - `allow_private` が `true` (テスト / Docker 内連合テスト) のときは
+///   無検証で全件返す。明示的なオプトインでのみ緩む。
+///
+/// public / private が混在する場合は public だけを残す (= 攻撃者ドメインが
+/// private IP を混ぜて rebinding するケースでも、private 側は使われない)。
+pub fn filter_resolved_addrs<I>(
+    addrs: I,
+    allow_private: bool,
+) -> Result<Vec<SocketAddr>, &'static str>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    if allow_private {
+        return Ok(addrs.into_iter().collect());
+    }
+    let mut blocked: Option<&'static str> = None;
+    let allowed: Vec<SocketAddr> = addrs
+        .into_iter()
+        .filter(|addr| match ip_blocked(addr.ip()) {
+            Some(reason) => {
+                blocked.get_or_insert(reason);
+                false
+            }
+            None => true,
+        })
+        .collect();
+    if allowed.is_empty()
+        && let Some(reason) = blocked
+    {
+        return Err(reason);
+    }
+    Ok(allowed)
 }
 
 /// `url` の host が `server_host` (本インスタンスの公開ホスト名) と
@@ -100,6 +172,18 @@ fn ipv4_block_reason(ip: Ipv4Addr) -> Option<&'static str> {
         Some("documentation")
     } else if is_ipv4_cgnat(ip) {
         Some("cgnat-shared")
+    } else if in_ipv4_cidr(ip, Ipv4Addr::UNSPECIFIED, 8) {
+        Some("this-network")
+    } else if in_ipv4_cidr(ip, Ipv4Addr::new(192, 0, 0, 0), 24) {
+        Some("ietf-protocol-assignment")
+    } else if in_ipv4_cidr(ip, Ipv4Addr::new(192, 88, 99, 0), 24) {
+        Some("deprecated-6to4-relay")
+    } else if in_ipv4_cidr(ip, Ipv4Addr::new(198, 18, 0, 0), 15) {
+        Some("benchmarking")
+    } else if ip.is_multicast() {
+        Some("multicast")
+    } else if u32::from(ip) & 0xF000_0000 == 0xF000_0000 {
+        Some("reserved")
     } else {
         None
     }
@@ -108,6 +192,12 @@ fn ipv4_block_reason(ip: Ipv4Addr) -> Option<&'static str> {
 /// RFC 6598 `100.64.0.0/10` (CGNAT) の判定。
 fn is_ipv4_cgnat(ip: Ipv4Addr) -> bool {
     u32::from(ip) & 0xFFC0_0000 == 0x6440_0000
+}
+
+/// IPv4 CIDR 内包判定。`prefix_len` は本モジュール内の定数だけを渡す。
+fn in_ipv4_cidr(ip: Ipv4Addr, network: Ipv4Addr, prefix_len: u32) -> bool {
+    let mask = u32::MAX.checked_shl(32 - prefix_len).unwrap_or(0);
+    u32::from(ip) & mask == u32::from(network) & mask
 }
 
 fn ipv6_block_reason(ip: Ipv6Addr) -> Option<&'static str> {
@@ -181,6 +271,36 @@ mod tests {
     }
 
     #[test]
+    fn blocks_non_global_ipv4_special_use_ranges() {
+        for (address, reason) in [
+            (Ipv4Addr::new(0, 1, 2, 3), "this-network"),
+            (Ipv4Addr::new(192, 0, 0, 42), "ietf-protocol-assignment"),
+            (Ipv4Addr::new(192, 88, 99, 1), "deprecated-6to4-relay"),
+            (Ipv4Addr::new(198, 18, 0, 1), "benchmarking"),
+            (Ipv4Addr::new(198, 19, 255, 254), "benchmarking"),
+            (Ipv4Addr::new(224, 0, 0, 1), "multicast"),
+            (Ipv4Addr::new(239, 255, 255, 255), "multicast"),
+            (Ipv4Addr::new(240, 0, 0, 1), "reserved"),
+            (Ipv4Addr::new(255, 255, 255, 254), "reserved"),
+        ] {
+            assert_eq!(ip_blocked(IpAddr::V4(address)), Some(reason), "{address}");
+        }
+    }
+
+    #[test]
+    fn allows_global_unicast_adjacent_to_special_use_ranges() {
+        for address in [
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(192, 0, 1, 1),
+            Ipv4Addr::new(198, 17, 255, 255),
+            Ipv4Addr::new(198, 20, 0, 0),
+            Ipv4Addr::new(223, 255, 255, 255),
+        ] {
+            assert_eq!(ip_blocked(IpAddr::V4(address)), None, "{address}");
+        }
+    }
+
+    #[test]
     fn allows_ipv4_adjacent_to_cgnat() {
         assert_eq!(host_blocked(&url("http://100.63.255.255/x")), None);
         assert_eq!(host_blocked(&url("http://100.128.0.0/x")), None);
@@ -216,6 +336,67 @@ mod tests {
     #[test]
     fn allows_public_ipv4_literal() {
         assert_eq!(host_blocked(&url("http://1.1.1.1/x")), None);
+    }
+
+    #[test]
+    fn allow_private_egress_env_value_is_strict() {
+        assert!(!allow_private_egress_value(None));
+        assert!(!allow_private_egress_value(Some("")));
+        assert!(!allow_private_egress_value(Some("0")));
+        assert!(!allow_private_egress_value(Some("no")));
+        assert!(allow_private_egress_value(Some("1")));
+        assert!(allow_private_egress_value(Some("true")));
+        assert!(allow_private_egress_value(Some("TRUE")));
+    }
+
+    #[test]
+    fn ip_blocked_matches_host_blocked_for_literals() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        assert_eq!(
+            ip_blocked(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Some("loopback")
+        );
+        assert_eq!(
+            ip_blocked(IpAddr::V4(Ipv4Addr::new(100, 100, 0, 1))),
+            Some("cgnat-shared")
+        );
+        assert_eq!(
+            ip_blocked(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            Some("loopback")
+        );
+        assert_eq!(ip_blocked(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))), None);
+    }
+
+    #[test]
+    fn filter_resolved_addrs_drops_private_and_keeps_public() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let addrs = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443),
+        ];
+        let filtered = filter_resolved_addrs(addrs, false).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].ip().to_string(), "1.1.1.1");
+    }
+
+    #[test]
+    fn filter_resolved_addrs_rejects_all_private() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        // Docker 内部名 (`versitygw`) や `*.nip.io` が private に解決される
+        // ケースを想定した全滅パターン。
+        let addrs = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 80),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 100, 0, 1)), 80),
+        ];
+        assert_eq!(filter_resolved_addrs(addrs, false), Err("private"),);
+    }
+
+    #[test]
+    fn filter_resolved_addrs_allows_private_when_opted_in() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let addrs = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80)];
+        let filtered = filter_resolved_addrs(addrs, true).unwrap();
+        assert_eq!(filtered.len(), 1);
     }
 
     #[test]

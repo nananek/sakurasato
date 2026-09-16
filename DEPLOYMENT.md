@@ -717,6 +717,30 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 
 実装状況の追跡は [#11](https://github.com/nananek/sakurasato/issues/11) (全体トラッカ) 参照。
 
+### 7.2 SSRF ガード (解決後 IP 検証) とテスト専用 env
+
+外向き HTTP (AP 配送 / remote actor・Note fetch / media-proxy の画像・WebFinger 取得) は
+**二段** の SSRF ガードを通る:
+
+1. **URL 文字列検査** ([`net_guard::host_blocked`](crates/core/src/net_guard.rs)) ── IP リテラルの
+   private / loopback / link-local / CGNAT (`100.64.0.0/10`) / reserved と、
+   `localhost` / `*.localhost` / `*.local` を遮断。
+2. **custom DNS resolver による解決後 IP 検査** ([`crates/server/src/dns_guard.rs`](crates/server/src/dns_guard.rs) /
+   [`crates/media-proxy/src/dns_guard.rs`](crates/media-proxy/src/dns_guard.rs)) ── `reqwest` の
+   `dns_resolver` に登録し、接続に使われる全アドレスを同じ規則で検証する。
+
+2 が無いと `169.254.169.254.nip.io` のような wildcard DNS、Docker サービス名 (`versitygw`)、
+Tailscale `MagicDNS` (`*.ts.net`) で 1 を回避できるため、**緩めないこと**。
+
+**テスト / Docker 内連合テスト専用**: `SAKURASATO_ALLOW_PRIVATE_EGRESS=1` (または `true`) を
+設定すると、単一ラベル・private IP literal を含む 1 と 2 をともにスキップして private IP への
+外向き接続を許可する (scheme / self-host 検査は維持)。本番 compose / override では
+**設定しない**こと。`compose/docker-compose.federation-*.yml` は Docker 内の単一ラベル名で
+連合するため、server と media-proxy の双方に意図的に同 env を設定している。
+
+media-proxy は `egress` ネットワークのみに参加し `internal` には接続しない
+(postgres / versitygw / local API への横移動面を遮断。UDS は volume 越しなのでネットワーク不要)。
+
 ---
 
 ## 8. 運用タスク

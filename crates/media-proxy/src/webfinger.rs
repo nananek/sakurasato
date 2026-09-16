@@ -94,7 +94,9 @@ async fn resolve_inner(
         .map_err(|e| ApiError::bad_request("invalid_host", format!("parse url: {e}")))?;
     url.query_pairs_mut().append_pair("resource", &resource);
 
-    if let Some(reason) = host_blocked(&url) {
+    if !state.allows_private_egress()
+        && let Some(reason) = host_blocked(&url)
+    {
         return Err(ApiError::blocked(
             reason,
             format!(

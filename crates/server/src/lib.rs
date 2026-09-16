@@ -14,6 +14,7 @@ pub mod block;
 pub mod cli;
 pub mod delivery;
 pub(crate) mod dispatch;
+pub(crate) mod dns_guard;
 pub mod domain_moderation;
 pub mod emoji_backfill;
 pub mod emoji_import;

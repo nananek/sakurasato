@@ -17,7 +17,7 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use sakurasato_core::repo;
 use serde::Serialize;
@@ -77,7 +77,14 @@ pub async fn custom_emojis(State(state): State<AppState>) -> Response {
             })
         })
         .collect();
-    Json(items).into_response()
+    // ローカル絵文字のみ・無認証の一覧は数百 KB になりうるので、CDN / ブラウザ
+    // キャッシュを許可する (絵文字の追加 / 編集は稀なので 5 分で十分)。
+    let mut response = Json(items).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
+    response
 }
 
 /// Misskey `EmojiSimple`。`isSensitive` / `localOnly` は camelCase wire。
@@ -129,5 +136,10 @@ pub async fn misskey_emojis(State(state): State<AppState>) -> Response {
             })
         })
         .collect();
-    Json(EmojisResponse { emojis }).into_response()
+    let mut response = Json(EmojisResponse { emojis }).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
+    response
 }

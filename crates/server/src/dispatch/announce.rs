@@ -38,6 +38,11 @@ pub(crate) async fn handle_announce(
     activity: &JsonValue,
 ) -> Result<(), DispatchError> {
     let activity_id = super::extract_activity_id(activity)?.to_string();
+    // **activity id の host 束縛**: Like / EmojiReact と同じ規則。これが無いと
+    // `other.test` の署名者が `victim.test` の Announce ap_id を先取りし、
+    // ap_id UNIQUE 衝突で正規 Announce / Undo が恒久的に 503 になる。
+    super::handler::ensure_same_host(&activity_id, &signer.ap_id, "Announce activity id")
+        .map_err(|e| DispatchError::Malformed(e.to_string()))?;
     let target_uri = super::extract_object_uri(activity)?.to_string();
 
     // followee gate. お一人様 follow グラフ自体が小さいので毎回 LIST して

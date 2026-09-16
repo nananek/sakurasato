@@ -28,7 +28,7 @@ use crate::media_proxy_route::{ProxyQuery, fetch_and_respond, validate};
 use crate::state::AppState;
 
 pub async fn handle(State(state): State<AppState>, Query(q): Query<ProxyQuery>) -> Response {
-    let parsed = match validate(&q) {
+    let parsed = match validate(&q, state.allows_private_egress()) {
         Ok(u) => u,
         Err(resp) => return resp,
     };

@@ -153,6 +153,13 @@ async fn process_inbound_reaction(
     kind: ReactionKind,
 ) -> Result<(), DispatchError> {
     let activity_id = super::extract_activity_id(activity)?.to_string();
+    // **activity id の host 束縛**: Follow (`handler::ensure_same_host`) と同じ
+    // 規則で、Like / EmojiReact の `id` が signer のホストと一致することを要求
+    // する。これが無いと、`other.test` の有効署名者が `victim.test` の Like
+    // ap_id を先取りして reaction 行の帰属をすり替えられる (および ap_id UNIQUE
+    // 衝突で正規の reaction が記録されなくなる)。
+    super::handler::ensure_same_host(&activity_id, &signer.ap_id, "reaction activity id")
+        .map_err(|e| DispatchError::Malformed(e.to_string()))?;
     let object_uri = super::extract_object_uri(activity)?.to_string();
     let raw_content = extract_content(activity, kind)?;
     // Issue #186: inbound 側でも `:foo@host:` の `@host` suffix を剥がし、

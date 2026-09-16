@@ -77,6 +77,10 @@ services:
       SAKURASATO_SERVER__LOCAL_API_SOCKET: /home/nonroot/local.sock
       SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
       SSL_CERT_FILE: /certs/ca.crt
+      # Docker 内連合テストは `sakurasato` / `fedibird` のような単一ラベル名が
+      # private IP に解決されるため、DNS 解決後 IP 検証をテスト用に緩める
+      # (本番 compose では設定しない)。
+      SAKURASATO_ALLOW_PRIVATE_EGRESS: "true"
     depends_on:
       sakurasato-init:
         condition: service_completed_successfully
@@ -100,6 +104,7 @@ services:
     environment:
       SAKURASATO_MEDIA_PROXY__SOCKET: /run/sakurasato/media.sock
       SSL_CERT_FILE: /certs/ca.crt
+      SAKURASATO_ALLOW_PRIVATE_EGRESS: "true"
     depends_on:
       certs:
         condition: service_completed_successfully

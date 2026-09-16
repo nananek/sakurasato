@@ -57,7 +57,9 @@ async fn fetch_inner(state: &ProxyState, req: &FetchRequest) -> Result<Response,
         ));
     }
 
-    if let Some(reason) = host_blocked(&url) {
+    if !state.allows_private_egress()
+        && let Some(reason) = host_blocked(&url)
+    {
         return Err(ApiError::blocked(
             reason,
             format!(
