@@ -11,8 +11,9 @@
 //!
 //! ## 本文の扱い
 //!
-//! `GetObject` のレスポンスボディを `media_proxy.max_bytes` (既定 25 MiB) で
-//! 頭打ちにしながら一括バッファリングして `Body::from(bytes)` で返す。
+//! `GetObject` のレスポンスボディを画像は `media_proxy.max_bytes` (既定 25 MiB)、
+//! 動画は `media_proxy.video.max_bytes` (既定 200 MiB) で頭打ちにしながら
+//! 一括バッファリングして `Body::from(bytes)` で返す。
 //! アップロード経路はサニタイザ側で同値を強制しているが、バケットに上限超過
 //! オブジェクトが存在しても (運用事故 / S3 直書き / 旧バージョンの残骸)
 //! 1 リクエストで無制限にメモリを消费しないよう、配信側でも
@@ -163,12 +164,16 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
         .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
     let content_length = resp.content_length();
 
-    // **メモリ上限**: バケットにアップロード経路の上限 (`media_proxy.max_bytes`)
+    // **メモリ上限**: バケットにアップロード経路の上限
     // を超えるオブジェクトが存在しても (運用事故 / 旧バージョンの残骸 /
     // S3 直書き)、1 リクエストで無制限にバッファしない。`Content-Length` が
     // 申告されている場合は即拒否し、無い / 嘘の場合もストリーミングで
     // 数えながら `max_bytes + 1` で打ち切る。
-    let max_bytes = state.config().media_proxy.max_bytes;
+    let max_bytes = delivery_max_bytes(
+        resp.content_type(),
+        state.config().media_proxy.max_bytes,
+        state.config().media_proxy.video.max_bytes,
+    );
     if let Some(len) = content_length
         && u64::try_from(len).unwrap_or(u64::MAX) > max_bytes
     {
@@ -209,6 +214,17 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
         headers.insert(header::CONTENT_LENGTH, hv);
     }
     response
+}
+
+/// S3 に保存した Content-Type に合わせて配信時の上限を選ぶ。
+///
+/// 不明・不正な Content-Type は小さい画像上限へ倒す。media-proxy が受理する
+/// 動画は `video/mp4` / `video/webm` で、いずれも `video/` に一致する。
+fn delivery_max_bytes(content_type: Option<&str>, image_max: u64, video_max: u64) -> u64 {
+    let is_video = content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().to_ascii_lowercase().starts_with("video/"));
+    if is_video { video_max } else { image_max }
 }
 
 /// `ByteStream` を `max_bytes` で頭打ちにしながら `Vec<u8>` へ読む。
@@ -329,7 +345,28 @@ fn is_safe_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOCAL_EMOJI_KEY_PREFIX, REMOTE_EMOJI_KEY_PREFIX, is_safe_key};
+    use super::{LOCAL_EMOJI_KEY_PREFIX, REMOTE_EMOJI_KEY_PREFIX, delivery_max_bytes, is_safe_key};
+
+    #[test]
+    fn delivery_limit_uses_video_limit_for_video_content_type() {
+        assert_eq!(delivery_max_bytes(Some("video/mp4"), 25, 200), 200);
+        assert_eq!(delivery_max_bytes(Some("VIDEO/webm"), 25, 200), 200);
+        assert_eq!(
+            delivery_max_bytes(Some("video/mp4; codecs=avc1"), 25, 200),
+            200
+        );
+    }
+
+    #[test]
+    fn delivery_limit_falls_back_to_image_limit() {
+        assert_eq!(delivery_max_bytes(Some("image/webp"), 25, 200), 25);
+        assert_eq!(
+            delivery_max_bytes(Some("application/octet-stream"), 25, 200),
+            25
+        );
+        assert_eq!(delivery_max_bytes(Some("videotext/plain"), 25, 200), 25);
+        assert_eq!(delivery_max_bytes(None, 25, 200), 25);
+    }
 
     #[test]
     fn safe_keys_pass() {

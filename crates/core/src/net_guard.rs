@@ -13,8 +13,9 @@
 //!   一致するか。配送ループ防止と自己 fetch 抑止に使う。
 //!
 //! IPv4 / IPv6 の遮断レンジ:
-//! - IPv4 = loopback / private / link-local (169.254/16 メタデータ) / 未指定 /
-//!   broadcast / documentation / RFC 6598 CGNAT 100.64.0.0/10
+//! - IPv4 = グローバルユニキャスト以外。loopback / private / link-local /
+//!   documentation / CGNAT に加え、IETF protocol assignment・benchmarking・
+//!   multicast・将来用途の予約範囲も遮断する
 //! - IPv6 = loopback / 未指定 / multicast / link-local (`fe80::/10`) /
 //!   unique-local (`fc00::/7`) / documentation (`2001:db8::/32`) /
 //!   IPv4-mapped で埋め込み IPv4 が private な場合
@@ -171,6 +172,18 @@ fn ipv4_block_reason(ip: Ipv4Addr) -> Option<&'static str> {
         Some("documentation")
     } else if is_ipv4_cgnat(ip) {
         Some("cgnat-shared")
+    } else if in_ipv4_cidr(ip, Ipv4Addr::new(0, 0, 0, 0), 8) {
+        Some("this-network")
+    } else if in_ipv4_cidr(ip, Ipv4Addr::new(192, 0, 0, 0), 24) {
+        Some("ietf-protocol-assignment")
+    } else if in_ipv4_cidr(ip, Ipv4Addr::new(192, 88, 99, 0), 24) {
+        Some("deprecated-6to4-relay")
+    } else if in_ipv4_cidr(ip, Ipv4Addr::new(198, 18, 0, 0), 15) {
+        Some("benchmarking")
+    } else if ip.is_multicast() {
+        Some("multicast")
+    } else if u32::from(ip) & 0xF000_0000 == 0xF000_0000 {
+        Some("reserved")
     } else {
         None
     }
@@ -179,6 +192,12 @@ fn ipv4_block_reason(ip: Ipv4Addr) -> Option<&'static str> {
 /// RFC 6598 `100.64.0.0/10` (CGNAT) の判定。
 fn is_ipv4_cgnat(ip: Ipv4Addr) -> bool {
     u32::from(ip) & 0xFFC0_0000 == 0x6440_0000
+}
+
+/// IPv4 CIDR 内包判定。`prefix_len` は本モジュール内の定数だけを渡す。
+fn in_ipv4_cidr(ip: Ipv4Addr, network: Ipv4Addr, prefix_len: u32) -> bool {
+    let mask = u32::MAX.checked_shl(32 - prefix_len).unwrap_or(0);
+    u32::from(ip) & mask == u32::from(network) & mask
 }
 
 fn ipv6_block_reason(ip: Ipv6Addr) -> Option<&'static str> {
@@ -248,6 +267,36 @@ mod tests {
             "http://100.127.255.254/x",
         ] {
             assert_eq!(host_blocked(&url(s)), Some("cgnat-shared"), "{s}");
+        }
+    }
+
+    #[test]
+    fn blocks_non_global_ipv4_special_use_ranges() {
+        for (address, reason) in [
+            (Ipv4Addr::new(0, 1, 2, 3), "this-network"),
+            (Ipv4Addr::new(192, 0, 0, 42), "ietf-protocol-assignment"),
+            (Ipv4Addr::new(192, 88, 99, 1), "deprecated-6to4-relay"),
+            (Ipv4Addr::new(198, 18, 0, 1), "benchmarking"),
+            (Ipv4Addr::new(198, 19, 255, 254), "benchmarking"),
+            (Ipv4Addr::new(224, 0, 0, 1), "multicast"),
+            (Ipv4Addr::new(239, 255, 255, 255), "multicast"),
+            (Ipv4Addr::new(240, 0, 0, 1), "reserved"),
+            (Ipv4Addr::new(255, 255, 255, 254), "reserved"),
+        ] {
+            assert_eq!(ip_blocked(IpAddr::V4(address)), Some(reason), "{address}");
+        }
+    }
+
+    #[test]
+    fn allows_global_unicast_adjacent_to_special_use_ranges() {
+        for address in [
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(192, 0, 1, 1),
+            Ipv4Addr::new(198, 17, 255, 255),
+            Ipv4Addr::new(198, 20, 0, 0),
+            Ipv4Addr::new(223, 255, 255, 255),
+        ] {
+            assert_eq!(ip_blocked(IpAddr::V4(address)), None, "{address}");
         }
     }
 

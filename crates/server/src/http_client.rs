@@ -45,6 +45,10 @@ pub(crate) fn build_client(allow_private: bool) -> anyhow::Result<Client> {
     Client::builder()
         .user_agent(USER_AGENT)
         .redirect(Policy::none())
+        // 環境変数 HTTP_PROXY / HTTPS_PROXY を使うと、名前解決は proxy 側で
+        // 行われて GuardedResolver が検査できない。SSRF guard の前提を守る
+        // ため、このクライアントは常に宛先へ直接接続する。
+        .no_proxy()
         .dns_resolver(GuardedResolver::new(allow_private))
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)

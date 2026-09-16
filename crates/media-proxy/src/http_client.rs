@@ -66,6 +66,9 @@ pub fn build_client(allow_private: bool) -> anyhow::Result<Client> {
     Client::builder()
         .user_agent(USER_AGENT)
         .redirect(redirect)
+        // 環境 proxy に宛先ホストの DNS 解決を委ねると GuardedResolver を
+        // 迂回できるため、SSRF guard 対象の取得では proxy を無効化する。
+        .no_proxy()
         .dns_resolver(GuardedResolver::new(allow_private))
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
