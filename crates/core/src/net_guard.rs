@@ -20,7 +20,9 @@
 //!   IPv4-mapped で埋め込み IPv4 が private な場合
 //!
 //! ドメイン側は RFC 6761 `localhost.` / `*.localhost`、`localhost.localdomain`、
-//! RFC 6762 mDNS `.local` を遮断する。
+//! RFC 6762 mDNS `.local`、および **ドットを含まない単一ラベルのホスト名**
+//! (docker compose の internal network サービス名 `postgres`/`versitygw` 等と
+//! 衝突し得るため) を遮断する。
 //!
 //! ## なぜ完全な SSRF 対策ではないか
 //!
@@ -69,6 +71,16 @@ fn domain_block_reason(domain: &str) -> Option<&'static str> {
     #[allow(clippy::case_sensitive_file_extension_comparisons)]
     if lower == "local" || lower.ends_with(".local") {
         return Some("mdns-local");
+    }
+    // 単一ラベル (ドットを含まない) ホスト名は、正当な公開 Fediverse ドメイン
+    // としてはあり得ない (実在する TLD 直下の 1 ラベルドメインは事実上存在
+    // しない) 一方、docker compose のサービス名 (`postgres` / `versitygw` /
+    // `media-proxy` 等、internal network 上で DNS 解決される) や社内ホスト名
+    // とは一致し得る。`GET /media-proxy` ([[media-proxy-miauth]]) を無認証で
+    // 公開した結果、この経路が internal network 限定サービスへの到達性
+    // プロービングに使われ得るため、ここで遮断して多層防御を足す。
+    if !lower.contains('.') {
+        return Some("single-label-host");
     }
     None
 }
@@ -255,6 +267,29 @@ mod tests {
         assert_eq!(host_blocked(&url("https://localhost.com/x")), None);
         assert_eq!(host_blocked(&url("https://mylocal.example/x")), None);
         assert_eq!(host_blocked(&url("https://site.locally/x")), None);
+    }
+
+    /// docker compose の internal network 上でだけ解決されるサービス名
+    /// (`postgres` / `versitygw` / `media-proxy` 等) はドットを含まない
+    /// 単一ラベルなので遮断する。無認証で公開した `GET /media-proxy`
+    /// ([[media-proxy-miauth]]) 経由の到達性プロービング対策。
+    #[test]
+    fn blocks_single_label_hostnames() {
+        for s in [
+            "http://postgres/x",
+            "http://versitygw:7070/x",
+            "http://media-proxy/x",
+            "http://internalhost/x",
+        ] {
+            assert_eq!(host_blocked(&url(s)), Some("single-label-host"), "{s}");
+        }
+    }
+
+    /// 通常のドット入りドメインは (この規則では) 引き続き通過する。
+    #[test]
+    fn allows_multi_label_hostnames() {
+        assert_eq!(host_blocked(&url("https://mastodon.social/x")), None);
+        assert_eq!(host_blocked(&url("https://a.b.c/x")), None);
     }
 
     #[test]

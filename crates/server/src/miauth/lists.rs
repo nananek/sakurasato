@@ -512,7 +512,7 @@ pub async fn timeline(
         // renoter も `user_emojis` (= renoter_ids を含む) から引く ── actor
         // ごと 1 回の解決に畳む (N+1 抑止)。
         let renoter_emojis = user_emojis.get(&actor.id).unwrap_or(&EMPTY_EMOJIS);
-        let renoter = from_actor_and_counts(actor, 0, 0, 0, renoter_emojis.clone());
+        let renoter = from_actor_and_counts(actor, host, 0, 0, 0, renoter_emojis.clone());
         let created_at = r
             .announce_published_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);

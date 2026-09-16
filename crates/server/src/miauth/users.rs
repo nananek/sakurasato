@@ -201,9 +201,11 @@ async fn build_detailed_json(
         }
         None => (crate::follow::FollowRelationship::neutral(), false, false),
     };
-    let emojis = resolve_user_emojis(state.pool(), &state.config().server.host, &actor).await;
+    let host = &state.config().server.host;
+    let emojis = resolve_user_emojis(state.pool(), host, &actor).await;
     from_actor_detailed(
         &actor,
+        host,
         followers,
         following,
         notes,
@@ -300,6 +302,7 @@ pub async fn search_by_username_and_host(
         let emojis = resolve_user_emojis(state.pool(), &host, &actor).await;
         out.push(from_actor_detailed(
             &actor,
+            &host,
             followers,
             following,
             notes,
@@ -404,6 +407,7 @@ pub async fn search(
         let emojis = resolve_user_emojis(state.pool(), &host, &actor).await;
         out.push(from_actor_detailed(
             &actor,
+            &host,
             followers,
             following,
             notes,

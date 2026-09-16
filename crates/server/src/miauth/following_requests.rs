@@ -125,7 +125,8 @@ pub async fn list(
         crate::miauth::counts::counts_for_actor(&state, &me).await;
     let host = state.config().server.host.clone();
     let me_emojis = resolve_user_emojis(state.pool(), &host, &me).await;
-    let followee = from_actor_and_counts(&me, me_followers, me_following, me_notes, me_emojis);
+    let followee =
+        from_actor_and_counts(&me, &host, me_followers, me_following, me_notes, me_emojis);
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -161,6 +162,7 @@ pub async fn list(
         let follower_emojis = resolve_user_emojis(state.pool(), &host, &follower_actor).await;
         let follower = from_actor_and_counts(
             &follower_actor,
+            &host,
             f_followers,
             f_following,
             f_notes,

@@ -194,7 +194,8 @@ pub(crate) async fn build_self_me_detailed(state: &AppState) -> Result<JsonValue
     // できるようにする)。解決できない shortcode は fail-open で空 map になる。
     let emojis = resolve_user_emojis(state.pool(), host, &actor).await;
 
-    let mut me = from_actor_me_detailed(&actor, followers, following, notes, policies, emojis);
+    let mut me =
+        from_actor_me_detailed(&actor, host, followers, following, notes, policies, emojis);
     if let Some(map) = me.as_object_mut() {
         map.insert(
             "unreadNotificationsCount".to_string(),

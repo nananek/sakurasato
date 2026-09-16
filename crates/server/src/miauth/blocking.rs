@@ -237,9 +237,11 @@ async fn build_delete_response(state: &AppState, outcome: &UnblockOutcome) -> se
 async fn build_response(state: &AppState, actor: &ActorRow) -> serde_json::Value {
     let (followers, following, notes) = crate::miauth::counts::counts_for_actor(state, actor).await;
     let (rel, is_blocking, is_blocked) = relationships_or_neutral(state, actor.id).await;
-    let emojis = resolve_user_emojis(state.pool(), &state.config().server.host, actor).await;
+    let host = &state.config().server.host;
+    let emojis = resolve_user_emojis(state.pool(), host, actor).await;
     from_actor_detailed(
         actor,
+        host,
         followers,
         following,
         notes,
