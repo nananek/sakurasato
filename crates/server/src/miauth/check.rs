@@ -176,9 +176,44 @@ async fn handle_consumed(state: &AppState, session: &MiAuthSessionRow) -> Respon
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    // raw token の返却は polling 冪等のための一時的なもの。発行から
+    // `session_ttl_secs` を過ぎたら返さない ── UUID を後から知った第三者が
+    // 同じ token を取得し続けられないようにする。期限後の client は手元の
+    // token を保持して使い続ける契約 (wire 仕様、token: null で通知)。
+    let ttl_secs = state
+        .config()
+        .miauth
+        .as_ref()
+        .map_or(600, |m| m.session_ttl_secs);
+    let token = match session.issued_token_id {
+        Some(_) => match repo::miauth::find_token_by_session(state.pool(), session.uuid).await {
+            Ok(Some(token_row)) => {
+                let age = chrono::Utc::now().signed_duration_since(token_row.created_at);
+                if age.num_seconds() > i64::try_from(ttl_secs).unwrap_or(i64::MAX) {
+                    tracing::info!(
+                        uuid = %session.uuid,
+                        "MiAuth consumed session raw token expired; returning null (client keeps its copy)",
+                    );
+                    None
+                } else {
+                    session.raw_token_for_polling.clone()
+                }
+            }
+            Ok(None) => session.raw_token_for_polling.clone(),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    uuid = %session.uuid,
+                    "miauth_token lookup failed; returning raw token (fail-open)",
+                );
+                session.raw_token_for_polling.clone()
+            }
+        },
+        None => session.raw_token_for_polling.clone(),
+    };
     Json(CheckResponse {
         ok: true,
-        token: session.raw_token_for_polling.clone(),
+        token,
         user: Some(user),
     })
     .into_response()

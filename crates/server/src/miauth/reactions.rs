@@ -49,7 +49,9 @@ use crate::miauth::notes::{resolve_self_actor_id, viewer_can_view_entry};
 use crate::state::AppState;
 
 const SCOPE_WRITE_REACTIONS: &str = "write:reactions";
-/// `notes/reactions` (read) は `read:account` scope。`notes/show` と揃える。
+/// Misskey の permission 体系では reaction 一覧は `read:reactions`。
+/// 既存 deploy の `read:account` トークンとも互換を取る。
+const SCOPE_READ_REACTIONS: &str = "read:reactions";
 const SCOPE_READ_ACCOUNT: &str = "read:account";
 
 /// `notes/reactions` の limit 既定/上限 (Misskey 既定は 10)。
@@ -163,11 +165,17 @@ pub async fn list(
     body: Option<Json<ListReactionsBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let _token =
-        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
-            Ok(t) => t,
-            Err(e) => return e.into_response(),
-        };
+    let _token = match auth::require_scope_any(
+        &state,
+        &headers,
+        body.i.as_deref(),
+        &[SCOPE_READ_REACTIONS, SCOPE_READ_ACCOUNT],
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     let Some(note_id) = body.note_id.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
         return error_resp(StatusCode::NOT_FOUND, "NO_SUCH_NOTE", "no such note");
     };

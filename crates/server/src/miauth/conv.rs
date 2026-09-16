@@ -762,6 +762,19 @@ fn build_miss_file(
     local_host: &str,
 ) -> Option<MissFile> {
     let url = raw.get("url").and_then(JsonValue::as_str)?;
+    // **無認証クライアントへ生 URL を返す前の検証**: 非画像添付は media-proxy の
+    // 画像 fetch 経路を通せない (remote 動画 fetch が無い) ため URL をそのまま
+    // Aria 等に渡す。scheme と host レンジをここで検証し、`javascript:` /
+    // `data:` / private・loopback リテラル等を弾く。ドメインが private に
+    // 解決されるケースはクライアント側の解決に依存するため残存リスク
+    // (単一ユーザー・Tailscale 前提での許容)。
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    if sakurasato_core::net_guard::host_blocked(&parsed).is_some() {
+        return None;
+    }
     let mime_type = raw
         .get("mediaType")
         .and_then(JsonValue::as_str)
@@ -2686,5 +2699,31 @@ mod tests {
             .expect("url is present");
         assert_eq!(f.url, "https://misskey.example/files/video.mp4");
         assert!(f.thumbnail_url.is_none());
+    }
+
+    /// 非画像添付は生 URL をクライアントへ返すため、scheme / host レンジを
+    /// サーバ側で検証し、危険な URL は添付ごと落とす。
+    #[test]
+    fn build_miss_file_rejects_unsafe_attachment_urls() {
+        for url in [
+            "javascript:alert(1)",
+            "data:image/svg+xml;base64,AAAA",
+            "file:///etc/passwd",
+            "http://127.0.0.1/private.png",
+            "http://10.0.0.1/admin.png",
+            "http://internal/x.png",
+        ] {
+            let raw = json!({"url": url, "mediaType": "video/mp4"});
+            assert!(
+                build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false, "sakurasato.test")
+                    .is_none(),
+                "unsafe attachment url must be dropped: {url}",
+            );
+        }
+        // 通常の http(s) 公開ホストは従来どおり通る。
+        let raw = json!({"url": "https://cdn.example/x.mp4", "mediaType": "video/mp4"});
+        assert!(
+            build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false, "sakurasato.test").is_some()
+        );
     }
 }

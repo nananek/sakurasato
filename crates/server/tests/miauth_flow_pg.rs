@@ -373,6 +373,63 @@ async fn check_after_approve_returns_token_and_user(pool: PgPool) {
     assert_eq!(body2["user"]["username"], "alice");
 }
 
+/// consumed session の raw token は `session_ttl_secs` 経過後に null を返す
+/// (UUID を後から知った第三者が同じ token を取得し続けられない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn check_after_consume_returns_token_only_within_ttl(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
+    let app = miauth::router(state.clone());
+
+    let uuid = Uuid::new_v4();
+    repo::miauth::insert_session(
+        &pool,
+        repo::miauth::NewMiAuthSession {
+            uuid,
+            app_name: "TestApp".into(),
+            callback_url: None,
+            permissions: vec!["read:account".into()],
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        },
+    )
+    .await
+    .unwrap();
+    let rows = repo::miauth::approve_session(&pool, uuid, &["read:account".into()])
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+
+    let path = format!("/api/miauth/{uuid}/check");
+    let resp = app
+        .clone()
+        .oneshot(Request::post(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_json(resp).await;
+    assert!(body["token"].is_string(), "first check returns raw token");
+
+    // token の作成時刻を TTL より過去に倒し、2 回目の check を打つ。
+    sqlx::query("UPDATE miauth_token SET created_at = now() - interval '2 hours'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let resp2 = app
+        .oneshot(Request::post(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let body2 = read_json(resp2).await;
+    assert_eq!(body2["ok"], true);
+    assert!(
+        body2["token"].is_null(),
+        "expired raw token must not be returned: {body2:?}",
+    );
+}
+
 /// rejected session への check は 404。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn check_rejected_session_returns_404(pool: PgPool) {

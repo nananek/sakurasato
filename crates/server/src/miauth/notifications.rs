@@ -49,9 +49,12 @@ use crate::miauth::conv::{
 use crate::miauth::error::error_resp;
 use crate::state::AppState;
 
-/// 読み取り権限。`/api/i` と同じく `read:account` を要求する (= 通知は account
-/// scope の一部。お一人様サーバなので token = 当該 user に閉じる)。
+/// 読み取り権限。Misskey の permission 体系 (`read:notifications`) と、既存
+/// deploy のトークンが要求してきた `read:account` のどちらでも通す。
+const SCOPE_READ_NOTIFICATIONS: &str = "read:notifications";
 const SCOPE_READ_ACCOUNT: &str = "read:account";
+/// 既読化 (write) 用。Misskey は `write:notifications`。
+const SCOPE_WRITE_NOTIFICATIONS: &str = "write:notifications";
 
 const LIMIT_DEFAULT: i64 = 20;
 const LIMIT_MAX: i64 = 100;
@@ -86,11 +89,17 @@ pub async fn list(
     body: Option<Json<NotificationsBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let _token =
-        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
-            Ok(t) => t,
-            Err(e) => return e.into_response(),
-        };
+    let _token = match auth::require_scope_any(
+        &state,
+        &headers,
+        body.i.as_deref(),
+        &[SCOPE_READ_NOTIFICATIONS, SCOPE_READ_ACCOUNT],
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     let Some(recipient) = resolve_self_actor_id(&state).await else {
         return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -154,11 +163,17 @@ pub async fn mark_all_read(
     body: Option<Json<MarkAllBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let _token =
-        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
-            Ok(t) => t,
-            Err(e) => return e.into_response(),
-        };
+    let _token = match auth::require_scope_any(
+        &state,
+        &headers,
+        body.i.as_deref(),
+        &[SCOPE_WRITE_NOTIFICATIONS, SCOPE_READ_ACCOUNT],
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     let Some(recipient) = resolve_self_actor_id(&state).await else {
         return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,

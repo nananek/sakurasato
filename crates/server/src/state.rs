@@ -101,6 +101,12 @@ struct Inner {
     /// トークンまで枯渇させてしまい、同一 host への正規のフェデレーション
     /// 処理を巻き添えで詰まらせる。
     media_proxy_rate_limiter: DomainRateLimiter,
+    /// 公開 (無認証) `GET /media-proxy` の **プロセス全体の同時実行数** 上限。
+    ///
+    /// per-domain バケットだけでは、宛先ホストをローテートする flood
+    /// (wildcard DNS 等) で外部 fetch が並列に増える。ここで並列度を bound
+    /// し、media-proxy の同時実行ゲート (2) と組で帯域 / メモリを守る。
+    media_proxy_gate: Arc<Semaphore>,
     /// 外向き AP object fetch の **プロセス全体の同時実行数** 上限。
     ///
     /// per-domain レート制限は「同一 host への連投」しか抑えないため、
@@ -115,6 +121,10 @@ struct Inner {
 /// 外向き fetch の同時実行上限。お一人様サーバの通常運用 (散発的な actor /
 /// Note fetch) には十分で、flood 時だけ drop される値。
 const MAX_CONCURRENT_OUTBOUND_FETCHES: usize = 4;
+
+/// 公開 `GET /media-proxy` の同時実行上限。無認証のため、通常のブラウザ
+/// 画像取得 (数枚) は通しつつ flood を bound する値。
+const MAX_CONCURRENT_PUBLIC_MEDIA_PROXY_FETCHES: usize = 4;
 
 impl AppState {
     /// Build the `AppState` by resolving the DB URL (with password file
@@ -161,6 +171,7 @@ impl AppState {
             delivery_notify: Arc::new(Notify::new()),
             fetch_rate_limiter: DomainRateLimiter::new(),
             media_proxy_rate_limiter: DomainRateLimiter::new(),
+            media_proxy_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_PUBLIC_MEDIA_PROXY_FETCHES)),
             fetch_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_FETCHES)),
         })))
     }
@@ -197,6 +208,7 @@ impl AppState {
             delivery_notify: Arc::new(Notify::new()),
             fetch_rate_limiter: DomainRateLimiter::new(),
             media_proxy_rate_limiter: DomainRateLimiter::new(),
+            media_proxy_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_PUBLIC_MEDIA_PROXY_FETCHES)),
             fetch_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_FETCHES)),
         }))
     }
@@ -262,6 +274,12 @@ impl AppState {
     /// のドキュメント参照)。
     pub(crate) fn try_acquire_media_proxy_fetch(&self, host: &str) -> bool {
         self.0.media_proxy_rate_limiter.try_acquire(host)
+    }
+
+    /// 公開 `/media-proxy` の同時実行 permit を **待たずに** 取る。取れなければ
+    /// `None` (= 呼び出し側は 429)。permit は fetch 完了まで保持する。
+    pub(crate) fn try_acquire_media_proxy_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.0.media_proxy_gate.try_acquire().ok()
     }
 
     /// 外向き fetch のプロセス全体 permit を **待たずに** 取る。取れなければ

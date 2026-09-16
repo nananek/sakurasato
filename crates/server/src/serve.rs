@@ -44,6 +44,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .as_ref()
         .map(sakurasato_core::config::MiAuthConfig::listener)
         .transpose()?;
+    // MiAuth の scope 検査が既定で無効 (アナーキー) であることを明示する。
+    // 同意画面に表示される permission は監査用の記録で、強制はされない。
+    if let Some(cfg) = config.miauth.as_ref()
+        && cfg.ignore_scope
+    {
+        warn!(
+            "MiAuth ignore_scope=true (default): approved tokens grant full read/write \
+             regardless of the permissions shown on the consent page. Set \
+             [miauth] ignore_scope = false and re-approve tokens for strict enforcement \
+             (see DEPLOYMENT.md §6.1)."
+        );
+    }
     let state = AppState::from_config(config).await?;
 
     MIGRATOR
