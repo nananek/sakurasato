@@ -319,7 +319,7 @@ impl ConnState {
             .unwrap_or_default();
         let renoted = timeline_entry_to_miss_note(&entry, summary, host, &user_emojis);
         let renoter_emojis = resolve_user_emojis(state.pool(), host, &renoter).await;
-        let renoter_user = from_actor_and_counts(&renoter, 0, 0, 0, renoter_emojis);
+        let renoter_user = from_actor_and_counts(&renoter, host, 0, 0, 0, renoter_emojis);
         let created_at = announce
             .published_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);

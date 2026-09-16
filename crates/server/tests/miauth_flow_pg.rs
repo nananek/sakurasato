@@ -101,7 +101,10 @@ async fn seed_local_actor(pool: &PgPool, host: &str, user: &str) -> i64 {
         host: host.into(),
         display_name: Some("Alice".into()),
         summary: Some("hello".into()),
-        icon_url: Some("https://cdn.test/avatar.webp".into()),
+        // 自鯖 host 上の `/media/` URL (= 実運用の local actor アバターと同じ
+        // shape)。[[media-proxy-miauth]] で `media_proxy_url` が「自鯖 host +
+        // `/media/` prefix」を無変換パススルーする対象になる。
+        icon_url: Some(format!("https://{host}/media/avatar.webp")),
         image_url: None,
         inbox_url: format!("{ap_id}/inbox"),
         shared_inbox_url: Some(format!("https://{host}/inbox")),
@@ -522,7 +525,10 @@ async fn api_i_with_body_token_returns_miss_user(pool: PgPool) {
     assert_eq!(miss["username"], "alice");
     assert!(miss["host"].is_null());
     assert_eq!(miss["name"], "Alice");
-    assert_eq!(miss["avatarUrl"], "https://cdn.test/avatar.webp");
+    assert_eq!(
+        miss["avatarUrl"],
+        "https://sakurasato.test/media/avatar.webp"
+    );
     assert_eq!(miss["isLocked"], false);
     // id is stringified i64.
     let id_str = miss["id"].as_str().expect("id must be string");
@@ -852,7 +858,7 @@ async fn api_i_returns_me_detailed_shape(pool: PgPool) {
     assert_eq!(me["username"], "alice");
     assert!(me["host"].is_null());
     assert_eq!(me["name"], "Alice");
-    assert_eq!(me["avatarUrl"], "https://cdn.test/avatar.webp");
+    assert_eq!(me["avatarUrl"], "https://sakurasato.test/media/avatar.webp");
     assert_eq!(me["isLocked"], false);
 
     // UserDetailed 部分 (= #170 で `/api/i` も含むよう拡張)。

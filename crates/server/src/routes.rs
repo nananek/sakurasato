@@ -13,6 +13,7 @@ pub mod emoji;
 pub mod emojis;
 pub mod inbox;
 pub mod media;
+pub mod media_proxy;
 pub mod nodeinfo;
 pub mod outbox;
 pub mod permalink;
@@ -44,6 +45,9 @@ pub fn router(state: AppState) -> Router {
         // `{*key}` で `/media/path/to/object.png` のスラッシュ入りキーを 1 つの
         // `String` にキャプチャする (axum 0.8 ワイルドカード)。
         .route("/media/{*key}", get(media::handle))
+        // MiAuth 経路 (Aria 等) が返す remote origin 画像を media-proxy 経由に
+        // 橋渡しする無認証エンドポイント。`routes/media_proxy.rs` 参照。
+        .route("/media-proxy", get(media_proxy::handle))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

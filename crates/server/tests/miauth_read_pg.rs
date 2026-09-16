@@ -101,7 +101,10 @@ async fn seed_local_actor(pool: &PgPool, host: &str, user: &str) -> i64 {
         host: host.into(),
         display_name: Some("Alice".into()),
         summary: Some("hello".into()),
-        icon_url: Some("https://cdn.test/avatar.webp".into()),
+        // 自鯖 host 上の `/media/` URL (= 実運用の local actor アバターと同じ
+        // shape)。[[media-proxy-miauth]] で `media_proxy_url` が「自鯖 host +
+        // `/media/` prefix」を無変換パススルーする対象になる。
+        icon_url: Some(format!("https://{host}/media/avatar.webp")),
         image_url: None,
         inbox_url: format!("{ap_id}/inbox"),
         shared_inbox_url: Some(format!("https://{host}/inbox")),

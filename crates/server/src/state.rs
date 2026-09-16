@@ -89,6 +89,15 @@ struct Inner {
     /// chokepoint) が宛先 host ごとにトークンを引く。悪意ある followee の
     /// `Announce` flood 等で外部ドメインへの増幅 fetch を抑える。
     fetch_rate_limiter: DomainRateLimiter,
+    /// 公開 (無認証) `GET /media-proxy` ([`crate::routes::media_proxy`]) の
+    /// per-domain レート制限。
+    ///
+    /// [`Inner::fetch_rate_limiter`] とは意図的に **別バケット**。同じもの
+    /// を共有すると、本エンドポイント (呼び出し元を認証しない) への flood
+    /// が正規の AP object fetch (署名検証 / Follow / Announce 処理) 用の
+    /// トークンまで枯渇させてしまい、同一 host への正規のフェデレーション
+    /// 処理を巻き添えで詰まらせる。
+    media_proxy_rate_limiter: DomainRateLimiter,
 }
 
 impl AppState {
@@ -131,6 +140,7 @@ impl AppState {
             media_proxy,
             delivery_notify: Arc::new(Notify::new()),
             fetch_rate_limiter: DomainRateLimiter::new(),
+            media_proxy_rate_limiter: DomainRateLimiter::new(),
         })))
     }
 
@@ -160,6 +170,7 @@ impl AppState {
             media_proxy,
             delivery_notify: Arc::new(Notify::new()),
             fetch_rate_limiter: DomainRateLimiter::new(),
+            media_proxy_rate_limiter: DomainRateLimiter::new(),
         }))
     }
 
@@ -210,6 +221,15 @@ impl AppState {
     /// drop)。[`crate::remote_actor::fetch_object_json`] から呼ぶ。
     pub(crate) fn try_acquire_fetch(&self, host: &str) -> bool {
         self.0.fetch_rate_limiter.try_acquire(host)
+    }
+
+    /// `host` 宛の公開 `GET /media-proxy` fetch を 1 件分試みる。bucket に
+    /// 空きがあれば `true`、枯渇していれば `false` (= 呼び出し側が 429 を返す)。
+    /// [`crate::routes::media_proxy`] から呼ぶ。[`Self::try_acquire_fetch`]
+    /// (AP object fetch 用) とは別バケットを引く ([`Inner::media_proxy_rate_limiter`]
+    /// のドキュメント参照)。
+    pub(crate) fn try_acquire_media_proxy_fetch(&self, host: &str) -> bool {
+        self.0.media_proxy_rate_limiter.try_acquire(host)
     }
 
     /// Compute the canonical AP actor `id` URI for `username` against the

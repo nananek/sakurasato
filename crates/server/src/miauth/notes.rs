@@ -233,7 +233,7 @@ async fn show_renote(state: &AppState, announce_id_str: &str) -> Response {
     let entry_emojis = actor_emojis.get(&entry.actor_id).unwrap_or(&EMPTY_EMOJIS);
     let renoted = timeline_entry_to_miss_note(&entry, &summary, host, entry_emojis);
     let renoter_emojis = resolve_user_emojis(state.pool(), host, &renoter).await;
-    let renoter_user = from_actor_and_counts(&renoter, 0, 0, 0, renoter_emojis);
+    let renoter_user = from_actor_and_counts(&renoter, host, 0, 0, 0, renoter_emojis);
     let created_at = ann
         .published_at
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -410,7 +410,7 @@ pub async fn timeline(
         let entry_emojis = user_emojis.get(&entry.actor_id).unwrap_or(&EMPTY_EMOJIS);
         let renoted = timeline_entry_to_miss_note(entry, summary, host, entry_emojis);
         let renoter_emojis = user_emojis.get(&actor.id).unwrap_or(&EMPTY_EMOJIS);
-        let renoter = from_actor_and_counts(actor, 0, 0, 0, renoter_emojis.clone());
+        let renoter = from_actor_and_counts(actor, host, 0, 0, 0, renoter_emojis.clone());
         let created_at = r
             .announce_published_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -903,7 +903,7 @@ pub async fn users_notes(
         let renoted = timeline_entry_to_miss_note(entry, summary, host, entry_emojis);
         // renoter は常に対象ユーザ本人。
         let renoter_emojis = user_emojis.get(&target.id).unwrap_or(&EMPTY_EMOJIS);
-        let renoter = from_actor_and_counts(&target, 0, 0, 0, renoter_emojis.clone());
+        let renoter = from_actor_and_counts(&target, host, 0, 0, 0, renoter_emojis.clone());
         let created_at = r
             .announce_published_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -1368,7 +1368,7 @@ async fn handle_renote(state: &AppState, renote_id: Option<&str>) -> Response {
         .unwrap_or(&EMPTY_EMOJIS);
     let renoted = timeline_entry_to_miss_note(&target_entry, &summary, host, entry_emojis);
     let renoter_emojis = resolve_user_emojis(state.pool(), host, &local_actor).await;
-    let renoter = from_actor_and_counts(&local_actor, 0, 0, 0, renoter_emojis);
+    let renoter = from_actor_and_counts(&local_actor, host, 0, 0, 0, renoter_emojis);
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let created_note = build_renote_miss_note(

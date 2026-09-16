@@ -119,6 +119,45 @@ pub struct MissUser {
     pub emojis: BTreeMap<String, String>,
 }
 
+/// リモート origin の画像 URL を自鯖の公開 `/media-proxy` 経由に書き換える
+/// (= [[media-proxy-miauth]])。
+///
+/// `raw_url` が自鯖 host 由来 (= 既に `/media/<key>` 等でサニタイズ済み・
+/// 自鯖配信) なら**そのまま**返す。それ以外 (= 相手サーバの生 URL) は
+/// `https://{host}/media-proxy?url=<raw_url>&variant=<variant>` に書き換える
+/// ── Misskey 互換クライアント (Aria 等) がこの JSON を読んで画像を直接 GET
+/// する際に、必ず [`crate::routes::media_proxy`] (= media-proxy 経由の
+/// SSRF ガード + WebP 再エンコード) を通させるため。
+///
+/// `host` は呼び出し側が渡す **自鯖の公開 AP host** (`config.server.host`)。
+/// `raw_url` が空 / パース不能なときは書き換えず素通しする (= 呼び出し側が
+/// 元々 `None`/`null` を意図していた空文字列のケースを壊さない安全側)。
+///
+/// 「自鯖由来 = サニタイズ済み」の判定は **host 一致だけでなく `/media/`
+/// prefix も要求する**。host だけで判定すると、悪意ある remote actor が
+/// `icon.url` に `https://{host}/media-proxy?url=...&variant=...` のような
+/// 「自鯖 host だが別 path」の URL を仕込んだとき、それを無条件でそのまま
+/// 信用して emit してしまう (= 自分自身の他 path への誘導を許す)。
+fn media_proxy_url(host: &str, raw_url: &str, variant: &str) -> String {
+    if raw_url.is_empty() {
+        return raw_url.to_string();
+    }
+    let Ok(parsed) = url::Url::parse(raw_url) else {
+        // パース不能な URL は書き換えても media-proxy 側で弾かれるだけで
+        // 安全上の利得が無い。元の (どのみち client 側でも読めない) 値を
+        // そのまま返す。
+        return raw_url.to_string();
+    };
+    if is_same_host(raw_url, host) && parsed.path().starts_with("/media/") {
+        return raw_url.to_string();
+    }
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("url", raw_url)
+        .append_pair("variant", variant)
+        .finish();
+    format!("https://{host}/media-proxy?{query}")
+}
+
 /// Sakurasato の [`ActorRow`] + 集計 count から `MissUser` を組み立てる。
 ///
 /// 呼び出し側 (= [`crate::miauth::i`] handler) は `repo::actor::get_by_*` +
@@ -126,11 +165,16 @@ pub struct MissUser {
 /// から本関数に渡す。本関数はアロケーションだけで I/O を持たない (= unit test
 /// で DB を立てずに変換ロジックだけ検証可能)。
 ///
+/// `local_host` は自鯖の公開 AP host (`config.server.host`)。remote actor の
+/// `avatar_url` を [`media_proxy_url`] 経由に書き換えるために使う (= 呼び出し
+/// 側は `resolve_user_emojis` に渡すのと同じ host 文字列をそのまま渡せばよい)。
+///
 /// `emojis` は呼び出し側が [`resolve_user_emojis`] で解決済みの shortcode →
 /// URL map を渡す (= 本関数は純変換のまま、I/O を呼び出し側に残す)。
 #[allow(clippy::too_many_arguments)]
 pub fn from_actor_and_counts(
     actor: &ActorRow,
+    local_host: &str,
     followers_count: i64,
     following_count: i64,
     notes_count: i64,
@@ -148,10 +192,13 @@ pub fn from_actor_and_counts(
         },
         // M14 #174: misskey-dart UserLite は avatarUrl: Uri (non-null required)。
         // icon_url が None でも crash しないよう identicon URL を合成する。
-        avatar_url: actor
-            .icon_url
-            .clone()
-            .unwrap_or_else(|| identicon_url_for(&actor.host, actor.id)),
+        // icon_url が有れば [`media_proxy_url`] を通す ── local actor (= 自鯖
+        // `/media/` URL) はそのまま、remote actor (= 相手サーバの生 URL) は
+        // `/media-proxy` 経由に書き換わる。
+        avatar_url: actor.icon_url.as_deref().map_or_else(
+            || identicon_url_for(&actor.host, actor.id),
+            |url| media_proxy_url(local_host, url, "avatar"),
+        ),
         is_locked: actor.manually_approves_followers,
         followers_count,
         following_count,
@@ -603,10 +650,11 @@ pub(crate) fn build_reactions(
         let key = trim_reaction_emoji_key(&row.content);
         // Issue #135: local / remote 共に versitygw キー形式 (`emoji/...`) を
         // 自鯖 `/media/` URL に展開。旧 row (= remote URL を `image_key` に
-        // 直接入れていた頃のデータ) は `http(s)://` 形式なので素通し ──
+        // 直接入れていた頃のデータ) は `http(s)://` 形式なので、
+        // [`media_proxy_url`] 経由 (= [[media-proxy-miauth]]) に倒す ──
         // 再 upsert で `emoji/remote/...` に書き換わるまでの graceful。
         let url = if is_absolute_url(image_key) {
-            image_key.to_string()
+            media_proxy_url(host, image_key, "emoji")
         } else {
             format!("https://{host}/media/{image_key}")
         };
@@ -634,6 +682,10 @@ fn trim_reaction_emoji_key(content: &str) -> String {
 
 /// `note.tags` JSONB を走査し `type == "Emoji"` の `name` (= `:shortcode:`)
 /// と icon URL の map を返す。Misskey 本文 `emojis` フィールド相当。
+///
+/// `local_host` は自鯖の公開 AP host。tag の icon URL が自鯖由来なら
+/// そのまま、相手サーバの生 URL なら [`media_proxy_url`] 経由に書き換える
+/// (= [[media-proxy-miauth]])。
 pub(crate) fn build_text_emojis(raw: &JsonValue, local_host: &str) -> BTreeMap<String, String> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     let JsonValue::Array(arr) = raw else {
@@ -653,11 +705,7 @@ pub(crate) fn build_text_emojis(raw: &JsonValue, local_host: &str) -> BTreeMap<S
             .and_then(JsonValue::as_str)
             .filter(|u| u.starts_with("https://") || u.starts_with("http://"));
         if let Some(url) = url {
-            // local 判定が出来なくても `:foo:` 形は URL を素のまま入れて返す
-            // (= local emoji なら自分の host 由来、remote なら相手 host 由来)。
-            // ホスト比較は handler が必要に応じて行うが、本関数は MAP に絞る。
-            let _ = local_host; // host 比較は将来用に引数だけ残す
-            out.insert(key, url.to_string());
+            out.insert(key, media_proxy_url(local_host, url, "emoji"));
         }
     }
     out
@@ -702,7 +750,17 @@ pub(crate) fn build_mentions(raw: &JsonValue) -> Vec<String> {
 /// AP `Document.name` は alt text (= Mastodon 慣行) なので [`MissFile::comment`]
 /// に置き、Misskey-dart 期待の non-null [`MissFile::name`] は **URL basename**
 /// から組み立てる (= M14 #172、Aria 実機検証で判明)。
-fn build_miss_file(raw: &JsonValue, created_at: &str, sensitive: bool) -> Option<MissFile> {
+///
+/// `local_host` は自鯖の公開 AP host。`id`/`name` は元 URL (= 相手サーバの生
+/// URL のことがある) から安定的に導出する一方、実際にクライアントへ渡す
+/// `url`/`thumbnail_url` は [`media_proxy_url`] 経由に書き換える
+/// (= [[media-proxy-miauth]]、remote note の添付を Aria が直接 GET しないため)。
+fn build_miss_file(
+    raw: &JsonValue,
+    created_at: &str,
+    sensitive: bool,
+    local_host: &str,
+) -> Option<MissFile> {
     let url = raw.get("url").and_then(JsonValue::as_str)?;
     let mime_type = raw
         .get("mediaType")
@@ -716,6 +774,7 @@ fn build_miss_file(raw: &JsonValue, created_at: &str, sensitive: bool) -> Option
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     // Misskey-dart `DriveFile.name` (= non-null) は URL basename を使う。
+    // `id`/`name` は元 URL から導出する (= proxy 書き換え前の安定した値)。
     let file_name = miss_file_name_from_url(url);
     let id = miss_file_id_from_url(url);
     // AP `Document` に width / height が乗っている場合 (= Mastodon / Misskey
@@ -724,6 +783,18 @@ fn build_miss_file(raw: &JsonValue, created_at: &str, sensitive: bool) -> Option
     let height = raw.get("height").and_then(JsonValue::as_i64);
     // `mime_type` は下の struct field に move するので、画像判定は先に取る。
     let is_image = mime_type.starts_with("image/");
+    // media-proxy の `/v1/image/fetch` (= [[media-proxy-miauth]] が使う経路)
+    // は画像デコード専用で、動画/音声を渡すと `unsupported_format`/
+    // `decode_failed` で 502 になる。**画像のときだけ** proxy 経由に倒し、
+    // 非画像 (動画/音声等) は既存どおり元 URL をそのまま返す ── media-proxy
+    // 側に remote 動画取得の経路が無いため (アップロード時のサニタイズ専用
+    // `/v1/video/sanitize` のみ)、ここで無理に proxy へ倒すと添付が読めなく
+    // なる regression になる。
+    let proxied_url = if is_image {
+        media_proxy_url(local_host, url, "preview")
+    } else {
+        url.to_string()
+    };
     Some(MissFile {
         id,
         created_at: created_at.to_string(),
@@ -731,14 +802,14 @@ fn build_miss_file(raw: &JsonValue, created_at: &str, sensitive: bool) -> Option
         mime_type,
         md5: String::new(),
         size: 0,
-        url: url.to_string(),
+        url: proxied_url.clone(),
         // Aria 等の Misskey クライアントはタイムラインのインラインサムネイルに
         // `thumbnailUrl` を使う。null だとサムネイルが出ず、タップ時の `url`
         // (= フル画像) しか開けない (Aria 実機検証で判明)。Sakurasato は添付を
         // `preview` variant (≤1280px webp) 1 枚で保存し別サムネイルを持たないので、
         // **画像なら `url` をそのまま thumbnail にも使う** (= 既に十分小さい)。
         // 動画/音声等の非画像は画像サムネイルが無いので `null` のまま。
-        thumbnail_url: is_image.then(|| url.to_string()),
+        thumbnail_url: is_image.then(|| proxied_url.clone()),
         comment: alt_text,
         is_sensitive: sensitive,
         properties: MissFileProperties {
@@ -849,7 +920,7 @@ pub(crate) fn timeline_entry_to_miss_note(
     // の `normalize_host_for_compare` と同じ流儀。
     let mut actor = entry_to_actor_lite(entry);
     actor.is_local = is_same_host(&entry.actor_ap_id, host);
-    let user = from_actor_and_counts(&actor, 0, 0, 0, user_emojis.clone());
+    let user = from_actor_and_counts(&actor, host, 0, 0, 0, user_emojis.clone());
 
     let created_at = entry
         .published_at
@@ -863,7 +934,7 @@ pub(crate) fn timeline_entry_to_miss_note(
     let mut file_ids: Vec<String> = Vec::new();
     if let JsonValue::Array(arr) = &entry.attachments.0 {
         for v in arr {
-            if let Some(f) = build_miss_file(v, &created_at, entry.sensitive) {
+            if let Some(f) = build_miss_file(v, &created_at, entry.sensitive, host) {
                 file_ids.push(f.id.clone());
                 files.push(f);
             }
@@ -1081,6 +1152,7 @@ fn entry_to_actor_lite(entry: &TimelineEntry) -> ActorRow {
 #[allow(clippy::too_many_arguments)]
 pub fn from_actor_detailed(
     actor: &ActorRow,
+    local_host: &str,
     followers_count: i64,
     following_count: i64,
     notes_count: i64,
@@ -1089,7 +1161,14 @@ pub fn from_actor_detailed(
     is_blocked: bool,
     emojis: BTreeMap<String, String>,
 ) -> JsonValue {
-    let lite = from_actor_and_counts(actor, followers_count, following_count, notes_count, emojis);
+    let lite = from_actor_and_counts(
+        actor,
+        local_host,
+        followers_count,
+        following_count,
+        notes_count,
+        emojis,
+    );
     let mut v = serde_json::to_value(lite).unwrap_or_else(|_| json!({}));
     if let JsonValue::Object(ref mut map) = v {
         map.insert(
@@ -1118,12 +1197,13 @@ pub fn from_actor_detailed(
             None => JsonValue::Null,
         };
         map.insert("description".to_string(), description);
+        // remote actor のバナー画像も avatarUrl と同じく [`media_proxy_url`]
+        // 経由に書き換える (= [[media-proxy-miauth]])。
         map.insert(
             "bannerUrl".to_string(),
-            actor
-                .image_url
-                .clone()
-                .map_or(JsonValue::Null, JsonValue::String),
+            actor.image_url.as_deref().map_or(JsonValue::Null, |url| {
+                JsonValue::String(media_proxy_url(local_host, url, "header"))
+            }),
         );
         let is_bot = matches!(actor.actor_type.as_str(), "Service" | "Application" | "Bot");
         map.insert("isBot".to_string(), JsonValue::Bool(is_bot));
@@ -1279,6 +1359,7 @@ pub fn from_actor_detailed(
 #[allow(clippy::too_many_arguments)]
 pub fn from_actor_me_detailed(
     actor: &ActorRow,
+    local_host: &str,
     followers_count: i64,
     following_count: i64,
     notes_count: i64,
@@ -1291,6 +1372,7 @@ pub fn from_actor_me_detailed(
     // is_blocking/is_blocked も実データ上常に false)。
     let mut v = from_actor_detailed(
         actor,
+        local_host,
         followers_count,
         following_count,
         notes_count,
@@ -1499,7 +1581,7 @@ mod tests {
     #[test]
     fn local_actor_host_is_null() {
         let actor = fake_actor(true, "sakurasato", false);
-        let miss = from_actor_and_counts(&actor, 3, 5, 7, BTreeMap::new());
+        let miss = from_actor_and_counts(&actor, "sakurasato", 3, 5, 7, BTreeMap::new());
         assert_eq!(miss.id, "42");
         assert_eq!(miss.username, "me");
         assert_eq!(miss.name.as_deref(), Some("Alice"));
@@ -1514,7 +1596,7 @@ mod tests {
     #[test]
     fn remote_actor_host_is_some() {
         let actor = fake_actor(false, "remote.test", false);
-        let miss = from_actor_and_counts(&actor, 0, 0, 0, BTreeMap::new());
+        let miss = from_actor_and_counts(&actor, "sakurasato", 0, 0, 0, BTreeMap::new());
         assert_eq!(miss.host.as_deref(), Some("remote.test"));
     }
 
@@ -1522,7 +1604,7 @@ mod tests {
     #[test]
     fn locked_actor_serializes_as_locked() {
         let actor = fake_actor(true, "sakurasato", true);
-        let miss = from_actor_and_counts(&actor, 0, 0, 0, BTreeMap::new());
+        let miss = from_actor_and_counts(&actor, "sakurasato", 0, 0, 0, BTreeMap::new());
         assert!(miss.is_locked);
     }
 
@@ -1530,7 +1612,7 @@ mod tests {
     #[test]
     fn json_shape_matches_misskey_userlite_minimum() {
         let actor = fake_actor(true, "sakurasato", false);
-        let miss = from_actor_and_counts(&actor, 11, 12, 13, BTreeMap::new());
+        let miss = from_actor_and_counts(&actor, "sakurasato", 11, 12, 13, BTreeMap::new());
         let json = serde_json::to_value(&miss).unwrap();
         assert_eq!(json["id"], "42");
         assert_eq!(json["username"], "me");
@@ -1539,7 +1621,12 @@ mod tests {
             json["host"].is_null(),
             "host must be JSON null, not omitted"
         );
-        assert_eq!(json["avatarUrl"], "https://cdn.test/avatar.webp");
+        // fixture の icon_url ("cdn.test") は local_host ("sakurasato") と
+        // 別 host なので media-proxy 経由に書き換わる。
+        assert_eq!(
+            json["avatarUrl"],
+            media_proxy_url("sakurasato", "https://cdn.test/avatar.webp", "avatar")
+        );
         assert_eq!(json["isLocked"], false);
         assert_eq!(json["followersCount"], 11);
         assert_eq!(json["followingCount"], 12);
@@ -1557,7 +1644,7 @@ mod tests {
         let mut actor = fake_actor(true, "sakurasato", false);
         actor.display_name = None;
         actor.icon_url = None;
-        let miss = from_actor_and_counts(&actor, 0, 0, 0, BTreeMap::new());
+        let miss = from_actor_and_counts(&actor, "sakurasato", 0, 0, 0, BTreeMap::new());
         let json = serde_json::to_value(&miss).unwrap();
         assert!(json["name"].is_null());
         // **non-null**: icon_url が None でも identicon URL で fallback。
@@ -1583,7 +1670,7 @@ mod tests {
                 "https://sakurasato.test/media/emoji/local/blobcat.webp".to_string(),
             ),
         ]);
-        let miss = from_actor_and_counts(&actor, 0, 0, 0, emojis.clone());
+        let miss = from_actor_and_counts(&actor, "sakurasato", 0, 0, 0, emojis.clone());
         assert_eq!(miss.emojis, emojis);
         let json = serde_json::to_value(&miss).unwrap();
         assert_eq!(
@@ -1604,7 +1691,17 @@ mod tests {
             "sakura".to_string(),
             "https://sakurasato.test/media/emoji/local/sakura.webp".to_string(),
         )]);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), false, false, emojis.clone());
+        let v = from_actor_detailed(
+            &actor,
+            "sakurasato.test",
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            false,
+            emojis.clone(),
+        );
         assert_eq!(
             v["emojis"],
             serde_json::json!({ "sakura": "https://sakurasato.test/media/emoji/local/sakura.webp" })
@@ -1731,7 +1828,8 @@ mod tests {
             "url": "https://example.test/media/abc123.webp",
             "mediaType": "image/webp",
         });
-        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).expect("url is present");
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false, "example.test")
+            .expect("url is present");
         // `name` は string、URL basename。null ではない。
         assert_eq!(f.name, "abc123.webp");
     }
@@ -1745,7 +1843,7 @@ mod tests {
             "url": "https://example.test/media/abc.webp",
             "name": "Sakura petals in spring",
         });
-        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).unwrap();
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false, "example.test").unwrap();
         assert_eq!(f.name, "abc.webp", "file name comes from URL basename");
         assert_eq!(
             f.comment.as_deref(),
@@ -1762,7 +1860,7 @@ mod tests {
             "width": 800,
             "height": 600,
         });
-        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).unwrap();
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false, "example.test").unwrap();
         assert_eq!(f.properties.width, Some(800));
         assert_eq!(f.properties.height, Some(600));
         // AP には orientation / avg_color が無いので null。
@@ -1779,7 +1877,7 @@ mod tests {
             "url": "https://example.test/media/abc.webp",
             "mediaType": "image/webp",
         });
-        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).unwrap();
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false, "example.test").unwrap();
         assert_eq!(
             f.thumbnail_url.as_deref(),
             Some("https://example.test/media/abc.webp"),
@@ -1796,7 +1894,7 @@ mod tests {
             "url": "https://example.test/media/clip.mp4",
             "mediaType": "video/mp4",
         });
-        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).unwrap();
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false, "example.test").unwrap();
         assert!(
             f.thumbnail_url.is_none(),
             "non-image attachments must keep thumbnailUrl null"
@@ -1811,7 +1909,7 @@ mod tests {
             "url": "https://example.test/media/audio.mp3",
             "mediaType": "audio/mpeg",
         });
-        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false).unwrap();
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false, "example.test").unwrap();
         // serialize して JSON shape を直接確認。
         let v = serde_json::to_value(&f).unwrap();
         assert!(v.get("properties").is_some(), "properties must be present");
@@ -1892,10 +1990,14 @@ mod tests {
             emojis["blob@misskey.io"],
             "https://sakurasato.test/media/emoji/remote/misskey.io/blob.webp"
         );
-        // 旧 row (URL 直入れ) は素通し。
+        // 旧 row (URL 直入れ) は [[media-proxy-miauth]] で media-proxy 経由に倒す。
         assert_eq!(
             emojis["legacy@old.test"],
-            "https://old.test/files/legacy.webp"
+            media_proxy_url(
+                "sakurasato.test",
+                "https://old.test/files/legacy.webp",
+                "emoji"
+            )
         );
     }
 
@@ -1928,11 +2030,17 @@ mod tests {
             {"type": "Emoji", "name": ":blob@misskey.io:", "icon": {"url": "https://misskey.io/files/blob.webp"}},
         ]);
         let out = build_text_emojis(&tags, "local.test");
+        // 自鯖 (`local.test`) 由来の icon URL はそのまま。
         assert_eq!(
             out["sakura"],
             "https://local.test/media/emoji/local/sakura.webp"
         );
-        assert_eq!(out["blob@misskey.io"], "https://misskey.io/files/blob.webp");
+        // 相手サーバ (`misskey.io`) 由来の icon URL は media-proxy 経由に
+        // 書き換わる ([[media-proxy-miauth]])。
+        assert_eq!(
+            out["blob@misskey.io"],
+            media_proxy_url("local.test", "https://misskey.io/files/blob.webp", "emoji")
+        );
     }
 
     #[test]
@@ -1943,6 +2051,7 @@ mod tests {
         actor.actor_type = "Service".into();
         let v = from_actor_detailed(
             &actor,
+            "sakurasato.test",
             1,
             2,
             3,
@@ -1953,7 +2062,12 @@ mod tests {
         );
         assert_eq!(v["id"], "42");
         assert_eq!(v["description"], "hello world");
-        assert_eq!(v["bannerUrl"], "https://cdn.test/banner.webp");
+        // fixture の image_url ("cdn.test") は local_host ("sakurasato.test") と
+        // 別 host なので media-proxy 経由に書き換わる。
+        assert_eq!(
+            v["bannerUrl"],
+            media_proxy_url("sakurasato.test", "https://cdn.test/banner.webp", "header")
+        );
         assert_eq!(v["isBot"], true);
         assert_eq!(v["isCat"], false);
         // createdAt は ISO8601 で `Z` 終端。
@@ -1989,6 +2103,7 @@ mod tests {
             Some(r#"<p>hello <a href="https://remote.test/@me">@me</a></p><p>line2</p>"#.into());
         let v = from_actor_detailed(
             &actor,
+            "sakurasato.test",
             0,
             0,
             0,
@@ -2008,6 +2123,7 @@ mod tests {
         actor.summary = Some("price < 100 & rising".into());
         let v = from_actor_detailed(
             &actor,
+            "sakurasato.test",
             0,
             0,
             0,
@@ -2030,6 +2146,7 @@ mod tests {
         let actor = fake_actor(false, "remote.test", false);
         let v = from_actor_detailed(
             &actor,
+            "sakurasato.test",
             0,
             0,
             0,
@@ -2081,6 +2198,7 @@ mod tests {
         let actor = fake_actor(false, "remote.test", false);
         let v = from_actor_detailed(
             &actor,
+            "sakurasato.test",
             0,
             0,
             0,
@@ -2108,7 +2226,17 @@ mod tests {
             has_pending_follow_request_from_you: true,
             has_pending_follow_request_to_you: true,
         };
-        let v = from_actor_detailed(&actor, 0, 0, 0, rel, false, false, BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            "sakurasato.test",
+            0,
+            0,
+            0,
+            rel,
+            false,
+            false,
+            BTreeMap::new(),
+        );
         assert_eq!(
             v["isFollowing"], true,
             "isFollowing must come from `following`"
@@ -2134,14 +2262,34 @@ mod tests {
     #[test]
     fn from_actor_detailed_emits_block_relationship_without_swapping() {
         let actor = fake_actor(false, "remote.test", false);
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), true, false, BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            "sakurasato.test",
+            0,
+            0,
+            0,
+            neutral_rel(),
+            true,
+            false,
+            BTreeMap::new(),
+        );
         assert_eq!(
             v["isBlocking"], true,
             "isBlocking must come from is_blocking"
         );
         assert_eq!(v["isBlocked"], false, "isBlocked must come from is_blocked");
 
-        let v = from_actor_detailed(&actor, 0, 0, 0, neutral_rel(), false, true, BTreeMap::new());
+        let v = from_actor_detailed(
+            &actor,
+            "sakurasato.test",
+            0,
+            0,
+            0,
+            neutral_rel(),
+            false,
+            true,
+            BTreeMap::new(),
+        );
         assert_eq!(
             v["isBlocking"], false,
             "isBlocking must come from is_blocking"
@@ -2161,6 +2309,7 @@ mod tests {
         let actor = fake_actor(false, "remote.test", false);
         let v = from_actor_detailed(
             &actor,
+            "sakurasato.test",
             0,
             0,
             0,
@@ -2370,6 +2519,7 @@ mod tests {
             timeline_entry_to_miss_note(&entry, &summary, "sakurasato.test", &EMPTY_EMOJIS);
         let renoter = from_actor_and_counts(
             &fake_actor(true, "sakurasato.test", false),
+            "sakurasato.test",
             0,
             0,
             0,
@@ -2399,5 +2549,142 @@ mod tests {
         assert!(nested["renoteCount"].is_number());
         assert_eq!(nested["repliesCount"], 0);
         assert!(nested["repliesCount"].is_number());
+    }
+
+    // ── [[media-proxy-miauth]]: MiAuth 経由の remote origin 画像を
+    //    media-proxy 経由に書き換える ─────────────────────────────────────
+
+    #[test]
+    fn media_proxy_url_passes_through_same_host() {
+        // 自鯖 host の URL (= 既にサニタイズ済み) はそのまま。
+        assert_eq!(
+            media_proxy_url(
+                "sakurasato.test",
+                "https://sakurasato.test/media/abc.webp",
+                "avatar"
+            ),
+            "https://sakurasato.test/media/abc.webp"
+        );
+    }
+
+    #[test]
+    fn media_proxy_url_passes_through_empty_string() {
+        // 呼び出し側が空文字列を渡すケース (= `None` 相当) は書き換えない。
+        assert_eq!(media_proxy_url("sakurasato.test", "", "avatar"), "");
+    }
+
+    #[test]
+    fn media_proxy_url_rewrites_remote_host_with_percent_encoding() {
+        let url = media_proxy_url(
+            "sakurasato.test",
+            "https://misskey.example/files/a b.webp?x=1&y=2",
+            "preview",
+        );
+        assert!(
+            url.starts_with("https://sakurasato.test/media-proxy?"),
+            "must point at the local /media-proxy endpoint, got {url}"
+        );
+        // クエリは `url::form_urlencoded` で組み立てているので、パースし直せば
+        // 元の値がそのまま復元できる (= percent-encoding が壊れていない)。
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(
+            pairs.get("url").map(String::as_str),
+            Some("https://misskey.example/files/a b.webp?x=1&y=2")
+        );
+        assert_eq!(pairs.get("variant").map(String::as_str), Some("preview"));
+    }
+
+    /// host が一致していても `/media/` prefix 以外の path は信用せず proxy に
+    /// 倒す ── 悪意ある remote actor が自鯖 host を騙った URL (例えば
+    /// `/media-proxy?...` 自体) を仕込んでそのまま信用させる経路を塞ぐ。
+    #[test]
+    fn media_proxy_url_only_trusts_media_prefix_on_same_host() {
+        let url = media_proxy_url(
+            "sakurasato.test",
+            "https://sakurasato.test/media-proxy?url=evil&variant=avatar",
+            "avatar",
+        );
+        assert!(
+            url.starts_with("https://sakurasato.test/media-proxy?url=https%3A%2F%2Fsakurasato.test%2Fmedia-proxy"),
+            "non-/media/ path on our own host must still be wrapped, got {url}"
+        );
+    }
+
+    /// パース不能な URL は書き換えずそのまま返す (= media-proxy に投げても
+    /// 弾かれるだけで安全上の利得が無いため)。
+    #[test]
+    fn media_proxy_url_passes_through_unparseable_url() {
+        let raw = "not a valid url";
+        assert_eq!(media_proxy_url("sakurasato.test", raw, "avatar"), raw);
+    }
+
+    /// remote actor の avatarUrl は `/media-proxy` 経由に書き換わる (= 本 PR の
+    /// 主目的、報告された「MiAuth 経路で media-proxy が使われない」の直接対応)。
+    #[test]
+    fn avatar_url_for_remote_actor_is_proxied() {
+        let mut actor = fake_actor(false, "misskey.example", false);
+        actor.icon_url = Some("https://misskey.example/files/avatar.webp".into());
+        let miss = from_actor_and_counts(&actor, "sakurasato.test", 0, 0, 0, BTreeMap::new());
+        assert_eq!(
+            miss.avatar_url,
+            media_proxy_url(
+                "sakurasato.test",
+                "https://misskey.example/files/avatar.webp",
+                "avatar"
+            )
+        );
+        assert!(
+            miss.avatar_url
+                .starts_with("https://sakurasato.test/media-proxy?")
+        );
+    }
+
+    /// 自鯖 (`local_host`) と同じ host の `icon_url` (= local actor の実運用値)
+    /// はプロキシを経由せずそのまま。
+    #[test]
+    fn avatar_url_for_local_actor_is_not_proxied() {
+        let mut actor = fake_actor(true, "sakurasato.test", false);
+        actor.icon_url = Some("https://sakurasato.test/media/avatar.webp".into());
+        let miss = from_actor_and_counts(&actor, "sakurasato.test", 0, 0, 0, BTreeMap::new());
+        assert_eq!(miss.avatar_url, "https://sakurasato.test/media/avatar.webp");
+    }
+
+    /// remote note の添付は `url`/`thumbnailUrl` とも `/media-proxy` 経由に
+    /// 書き換わる (= [[media-proxy-miauth]])。`name`/`id` は元 URL から導出した
+    /// ままで安定する。
+    #[test]
+    fn build_miss_file_proxies_remote_origin_url() {
+        let raw = json!({
+            "url": "https://misskey.example/files/photo.webp",
+            "mediaType": "image/webp",
+        });
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false, "sakurasato.test")
+            .expect("url is present");
+        let expected = media_proxy_url(
+            "sakurasato.test",
+            "https://misskey.example/files/photo.webp",
+            "preview",
+        );
+        assert_eq!(f.url, expected);
+        assert_eq!(f.thumbnail_url.as_deref(), Some(expected.as_str()));
+        // id/name は元 URL の basename/hash から安定的に決まる (proxy 書き換え
+        // 後の長い query 文字列に引きずられない)。
+        assert_eq!(f.name, "photo.webp");
+    }
+
+    /// remote note の **非画像** 添付 (動画/音声) は media-proxy の
+    /// `/v1/image/fetch` が画像デコード専用 (非画像を渡すと 502) なので、
+    /// proxy に倒さず元 URL をそのまま保つ (= regression guard)。
+    #[test]
+    fn build_miss_file_does_not_proxy_non_image_attachments() {
+        let raw = json!({
+            "url": "https://misskey.example/files/video.mp4",
+            "mediaType": "video/mp4",
+        });
+        let f = build_miss_file(&raw, "2026-06-03T00:00:00.000Z", false, "sakurasato.test")
+            .expect("url is present");
+        assert_eq!(f.url, "https://misskey.example/files/video.mp4");
+        assert!(f.thumbnail_url.is_none());
     }
 }

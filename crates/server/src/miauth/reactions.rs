@@ -238,7 +238,7 @@ pub async fn list(
             let built = match repo::actor::get_by_id(state.pool(), row.actor_id).await {
                 Ok(Some(actor)) => {
                     let emojis = resolve_user_emojis(state.pool(), &host, &actor).await;
-                    serde_json::to_value(from_actor_and_counts(&actor, 0, 0, 0, emojis))
+                    serde_json::to_value(from_actor_and_counts(&actor, &host, 0, 0, 0, emojis))
                         .unwrap_or(JsonValue::Null)
                 }
                 _ => JsonValue::Null,

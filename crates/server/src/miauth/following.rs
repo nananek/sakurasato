@@ -152,10 +152,11 @@ async fn build_create_response(state: &AppState, outcome: &FollowOutcome) -> ser
     let (followers, following, notes) =
         crate::miauth::counts::counts_for_actor(state, &outcome.target).await;
     let (rel, is_blocking, is_blocked) = relationships_or_neutral(state, outcome.target.id).await;
-    let emojis =
-        resolve_user_emojis(state.pool(), &state.config().server.host, &outcome.target).await;
+    let host = &state.config().server.host;
+    let emojis = resolve_user_emojis(state.pool(), host, &outcome.target).await;
     from_actor_detailed(
         &outcome.target,
+        host,
         followers,
         following,
         notes,
@@ -175,10 +176,11 @@ async fn build_delete_response(state: &AppState, outcome: &UnfollowOutcome) -> s
             let (followers, following, notes) =
                 crate::miauth::counts::counts_for_actor(state, &actor).await;
             let (rel, is_blocking, is_blocked) = relationships_or_neutral(state, actor.id).await;
-            let emojis =
-                resolve_user_emojis(state.pool(), &state.config().server.host, &actor).await;
+            let host = &state.config().server.host;
+            let emojis = resolve_user_emojis(state.pool(), host, &actor).await;
             from_actor_detailed(
                 &actor,
+                host,
                 followers,
                 following,
                 notes,
