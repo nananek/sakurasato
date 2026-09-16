@@ -393,11 +393,9 @@ async fn attempt_post(
     // 「攻撃者が DB 書き込みで `http://192.168.0.1/admin` のような行を
     // 仕込んでも内部サービスを叩けない」ことを担保する最小防御。
     //
-    // 完全な SSRF 対策 (DNS 解決後の再検証 / CIDR allowlist / 自前 connector
-    // による socket-level チェック) は CLAUDE.md §3 が「外部 URL 取得は
-    // 必ず media-proxy 経由」と定めている通り、本体ではなく media-proxy 側で
-    // 行う。M3b-3 で remote actor fetch を実装する際に media-proxy 配送経路へ
-    // 統合する想定。
+    // URL 検査に加え、共有 reqwest client の custom resolver が DNS 解決後の
+    // 全 IP を検査する。環境 proxy は無効なので、接続先の名前解決が resolver
+    // を迂回することもない。
     //
     // [`AppState::allow_internal_inbox`] が `true` の場合 (テスト経路のみ)
     // はガードを緩める ── 統合テスト用 inbox を loopback で立てるため。
@@ -418,6 +416,7 @@ async fn attempt_post(
     }
 
     if !state.allow_internal_inbox()
+        && !state.allows_private_egress()
         && let Some(reason) = net_guard::host_blocked(&url)
     {
         return Err(AttemptError::BlockedAddress {

@@ -68,7 +68,9 @@ async fn run_add(state: &AppState, add: NotificationChannelAddArgs) -> anyhow::R
     if parsed.host_str().is_none() {
         bail!("webhook URL must have a host component");
     }
-    if let Some(reason) = net_guard::host_blocked(&parsed) {
+    if !state.allows_private_egress()
+        && let Some(reason) = net_guard::host_blocked(&parsed)
+    {
         bail!(
             "webhook URL host {:?} is blocked ({reason})",
             parsed.host_str().unwrap_or("")

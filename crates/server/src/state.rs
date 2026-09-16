@@ -51,9 +51,12 @@ struct Inner {
     /// `http://127.0.0.1/admin` のような内部宛先に POST するのを遮断する。
     /// **テスト経路 [`AppState::from_pool`] のみ `true`** ── 統合テストは
     /// `127.0.0.1:0` の axum サーバを立ててダミー inbox にするため、
-    /// loopback を許可しないとテスト不能。本番 `from_config` を通る限り
-    /// 常に false 固定なので、CLI / serve 経路で内部宛先が通る経路は無い。
+    /// loopback を許可しないとテスト不能。本番 `from_config` では常に false。
+    /// Docker Federation は別フィールド `allow_private_egress` を明示的に使う。
     allow_internal_inbox: bool,
+    /// URL 文字列検査と DNS 解決後検査をともに緩める、テスト / Docker
+    /// Federation 専用 opt-in。本番では設定しない。
+    allow_private_egress: bool,
     /// 未知 actor 到来時に remote から actor JSON を fetch するかどうか。
     ///
     /// **本番経路 `from_config` は `true`** ── 受信 inbox で未知 keyId が
@@ -138,8 +141,8 @@ impl AppState {
             .context("connect to PostgreSQL")?;
         // 本番経路: DNS 解決後 IP の検証を有効化する。テスト / 連合テスト
         // だけが `SAKURASATO_ALLOW_PRIVATE_EGRESS` で明示的に緩める。
-        let http =
-            http_client::build_client(sakurasato_core::net_guard::allow_private_egress_from_env())?;
+        let allow_private_egress = sakurasato_core::net_guard::allow_private_egress_from_env();
+        let http = http_client::build_client(allow_private_egress)?;
         let s3 = build_s3_client(&config)?;
         let media_proxy = MediaProxyClient::new(config.media_proxy.socket.clone());
         let (timeline_tx, _) = broadcast::channel(TIMELINE_CHANNEL_CAPACITY);
@@ -152,6 +155,7 @@ impl AppState {
             timeline_tx,
             stream_tx,
             allow_internal_inbox: false,
+            allow_private_egress,
             enable_remote_fetch: true,
             media_proxy,
             delivery_notify: Arc::new(Notify::new()),
@@ -185,6 +189,9 @@ impl AppState {
             timeline_tx,
             stream_tx,
             allow_internal_inbox: true,
+            // from_pool の loopback 許可は配送テストだけに閉じ込める。
+            // 公開 media-proxy route 等の URL ガードまで緩めない。
+            allow_private_egress: false,
             enable_remote_fetch: false,
             media_proxy,
             delivery_notify: Arc::new(Notify::new()),
@@ -228,6 +235,11 @@ impl AppState {
     /// SSRF ガードを緩めるか。本番 (`from_config`) は常に `false`。
     pub(crate) fn allow_internal_inbox(&self) -> bool {
         self.0.allow_internal_inbox
+    }
+
+    /// URL / DNS の外向きガードを緩めるテスト専用 opt-in。
+    pub(crate) fn allows_private_egress(&self) -> bool {
+        self.0.allow_private_egress
     }
 
     /// 未知 actor 到来時に remote fetch を試みるか。本番 (`from_config`)

@@ -21,8 +21,8 @@
 //!   redirect 追従は禁止 (`http_client` 側で `Policy::none`)、ここでは
 //!   3xx を **明示拒否** することで「初回 URL のチェックは通ったが Location
 //!   で内部に飛ぶ」攻撃を遮断する。
-//! - **DNS 解決後の IP 再検証は本体ではできない** (libresolver 非露出)。
-//!   これは server 直の既知制限で、CLAUDE.md §3 再評価項目 (b) に既記載。
+//! - `reqwest` の custom resolver が DNS 解決後の全 IP を検査し、private /
+//!   loopback / link-local / 特殊用途アドレスを接続候補から除外する。
 //!
 //! ## レスポンス処理
 //!
@@ -273,7 +273,11 @@ pub(crate) async fn fetch_object_json(
     uri: &str,
 ) -> Result<JsonValue, FetchError> {
     let url = Url::parse(uri)?;
-    enforce_url_policy(&url, &state.config().server.host)?;
+    enforce_url_policy(
+        &url,
+        &state.config().server.host,
+        state.allows_private_egress(),
+    )?;
 
     // per-domain レート制限 (Issue #269)。actor / Note fetch の唯一の chokepoint
     // なので、ここで宛先 host のトークンを引く。flood (例: 悪意ある followee の
@@ -379,8 +383,9 @@ pub(crate) async fn fetch_object_json(
 /// 共有ガード ([`net_guard`]) を通して URL を検査する。
 ///
 /// 失敗時に呼び出し側で host を含むエラーを返したいので、ここでは結果を
-/// `Result<(), FetchError>` で返す。
-fn enforce_url_policy(url: &Url, server_host: &str) -> Result<(), FetchError> {
+/// `Result<(), FetchError>` で返す。`allow_private` は Docker Federation
+/// テスト専用で、scheme と self-host の検査は有効なまま host range のみ緩める。
+fn enforce_url_policy(url: &Url, server_host: &str, allow_private: bool) -> Result<(), FetchError> {
     if url.scheme() != "https" && url.scheme() != "http" {
         return Err(FetchError::Malformed(format!(
             "unsupported scheme {:?}",
@@ -393,7 +398,7 @@ fn enforce_url_policy(url: &Url, server_host: &str) -> Result<(), FetchError> {
             reason: "self-host",
         });
     }
-    if let Some(reason) = net_guard::host_blocked(url) {
+    if !allow_private && let Some(reason) = net_guard::host_blocked(url) {
         return Err(FetchError::Blocked {
             host: url.host_str().unwrap_or("").to_string(),
             reason,
@@ -786,7 +791,8 @@ mod tests {
 
     #[test]
     fn enforce_url_policy_blocks_loopback_literal() {
-        let err = enforce_url_policy(&url("http://127.0.0.1/users/x"), "example.test").unwrap_err();
+        let err = enforce_url_policy(&url("http://127.0.0.1/users/x"), "example.test", false)
+            .unwrap_err();
         assert!(matches!(
             err,
             FetchError::Blocked {
@@ -798,8 +804,8 @@ mod tests {
 
     #[test]
     fn enforce_url_policy_blocks_self_host() {
-        let err =
-            enforce_url_policy(&url("https://example.test/users/me"), "example.test").unwrap_err();
+        let err = enforce_url_policy(&url("https://example.test/users/me"), "example.test", false)
+            .unwrap_err();
         assert!(matches!(
             err,
             FetchError::Blocked {
@@ -811,8 +817,8 @@ mod tests {
 
     #[test]
     fn enforce_url_policy_blocks_local_tld() {
-        let err =
-            enforce_url_policy(&url("http://postgres.local/users/x"), "example.test").unwrap_err();
+        let err = enforce_url_policy(&url("http://postgres.local/users/x"), "example.test", false)
+            .unwrap_err();
         assert!(matches!(
             err,
             FetchError::Blocked {
@@ -824,12 +830,23 @@ mod tests {
 
     #[test]
     fn enforce_url_policy_allows_public_domain() {
-        enforce_url_policy(&url("https://mastodon.example/users/x"), "example.test").unwrap();
+        enforce_url_policy(
+            &url("https://mastodon.example/users/x"),
+            "example.test",
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn enforce_url_policy_allows_private_host_when_opted_in() {
+        enforce_url_policy(&url("https://mastodon/users/x"), "example.test", true).unwrap();
+        enforce_url_policy(&url("http://127.0.0.1/users/x"), "example.test", true).unwrap();
     }
 
     #[test]
     fn enforce_url_policy_rejects_file_scheme() {
-        let err = enforce_url_policy(&url("file:///etc/passwd"), "example.test").unwrap_err();
+        let err = enforce_url_policy(&url("file:///etc/passwd"), "example.test", true).unwrap_err();
         assert!(matches!(err, FetchError::Malformed(_)));
     }
 

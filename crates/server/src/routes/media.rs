@@ -13,12 +13,13 @@
 //!
 //! `GetObject` のレスポンスボディを画像は `media_proxy.max_bytes` (既定 25 MiB)、
 //! 動画は `media_proxy.video.max_bytes` (既定 200 MiB) で頭打ちにしながら
-//! 一括バッファリングして `Body::from(bytes)` で返す。
+//! S3 のチャンクをそのままレスポンスへストリーミングする。
 //! アップロード経路はサニタイザ側で同値を強制しているが、バケットに上限超過
 //! オブジェクトが存在しても (運用事故 / S3 直書き / 旧バージョンの残骸)
-//! 1 リクエストで無制限にメモリを消费しないよう、配信側でも
-//! `Content-Length` + ストリーミング累計の二重チェックを行う
-//! ([`collect_limited`])。完全なストリーミング配信は今後の milestone。
+//! 1 リクエストで無制限に転送しないよう、配信側でも `Content-Length` +
+//! ストリーミング累計の二重チェックを行う ([`limited_body`])。本文全体を
+//! `Vec` に保持しないため、動画上限を大きくしてもリクエスト数 × 上限値の
+//! メモリを消費しない。
 //!
 //! ## エラー
 //!
@@ -56,7 +57,6 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use sakurasato_core::repo;
-use tokio::io::AsyncReadExt;
 
 use crate::state::AppState;
 
@@ -167,8 +167,8 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
     // **メモリ上限**: バケットにアップロード経路の上限
     // を超えるオブジェクトが存在しても (運用事故 / 旧バージョンの残骸 /
     // S3 直書き)、1 リクエストで無制限にバッファしない。`Content-Length` が
-    // 申告されている場合は即拒否し、無い / 嘘の場合もストリーミングで
-    // 数えながら `max_bytes + 1` で打ち切る。
+    // 申告されている場合は即拒否し、無い / 嘘の場合もストリームの各 chunk
+    // を転送する前に累計を検査して打ち切る。
     let max_bytes = delivery_max_bytes(
         resp.content_type(),
         state.config().media_proxy.max_bytes,
@@ -180,19 +180,7 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
         tracing::warn!(key = %key, len, max_bytes, "media GET: object exceeds max_bytes");
         return no_store(StatusCode::BAD_GATEWAY);
     }
-    let bytes = match collect_limited(resp.body, max_bytes).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::InvalidData {
-                tracing::warn!(key = %key, max_bytes, "media GET: object exceeds max_bytes during stream");
-                return no_store(StatusCode::BAD_GATEWAY);
-            }
-            tracing::error!(?err, key = %key, "media GET: collect body failed");
-            return no_store(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    let mut response = (StatusCode::OK, Body::from(bytes)).into_response();
+    let mut response = (StatusCode::OK, limited_body(resp.body, max_bytes)).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, content_type_header);
     // PR #31 round-1 🟢 対応: media-proxy 経由のサニタイズが M7 まで入らない
@@ -227,23 +215,34 @@ fn delivery_max_bytes(content_type: Option<&str>, image_max: u64, video_max: u64
     if is_video { video_max } else { image_max }
 }
 
-/// `ByteStream` を `max_bytes` で頭打ちにしながら `Vec<u8>` へ読む。
+/// `ByteStream` を `max_bytes` で頭打ちにする axum response body へ変換する。
 ///
-/// 上限超過は [`std::io::ErrorKind::InvalidData`] で返し、呼び出し側が
-/// 「バケット側の想定外サイズ」と「S3 transport エラー」を区別できるようにする。
-/// `max_bytes + 1` バイト受信した時点で打ち切るため、ピークメモリは上限 + α。
-async fn collect_limited(body: ByteStream, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    let reader = body.into_async_read();
-    let mut limited = reader.take(max_bytes.saturating_add(1));
-    let mut buf = Vec::with_capacity(64 * 1024);
-    limited.read_to_end(&mut buf).await?;
-    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "object exceeds max_bytes",
-        ));
-    }
-    Ok(buf)
+/// 各 chunk をクライアントへ渡す前に累計を検査する。S3 transport error または
+/// 上限超過時は body stream を error で終了し、残りを読み込まない。
+fn limited_body(body: ByteStream, max_bytes: u64) -> Body {
+    let stream =
+        futures_util::stream::try_unfold((body, 0_u64), move |(mut body, received)| async move {
+            let Some(chunk) = body.next().await else {
+                return Ok(None);
+            };
+            let chunk = chunk.map_err(std::io::Error::other)?;
+            let total = received
+                .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "object byte count overflow",
+                    )
+                })?;
+            if total > max_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "object exceeds max_bytes",
+                ));
+            }
+            Ok(Some((chunk, (body, total))))
+        });
+    Body::from_stream(stream)
 }
 
 /// 負レスポンス (4xx/5xx) 共通の `Cache-Control: no-store` 付きレスポンス
@@ -346,6 +345,8 @@ fn is_safe_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{LOCAL_EMOJI_KEY_PREFIX, REMOTE_EMOJI_KEY_PREFIX, delivery_max_bytes, is_safe_key};
+    use aws_sdk_s3::primitives::ByteStream;
+    use http_body_util::BodyExt as _;
 
     #[test]
     fn delivery_limit_uses_video_limit_for_video_content_type() {
@@ -366,6 +367,19 @@ mod tests {
         );
         assert_eq!(delivery_max_bytes(Some("videotext/plain"), 25, 200), 25);
         assert_eq!(delivery_max_bytes(None, 25, 200), 25);
+    }
+
+    #[tokio::test]
+    async fn limited_body_streams_content_within_limit() {
+        let body = super::limited_body(ByteStream::from_static(b"video"), 5);
+        let bytes = body.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), b"video");
+    }
+
+    #[tokio::test]
+    async fn limited_body_errors_before_forwarding_oversized_chunk() {
+        let body = super::limited_body(ByteStream::from_static(b"video"), 4);
+        assert!(body.collect().await.is_err());
     }
 
     #[test]

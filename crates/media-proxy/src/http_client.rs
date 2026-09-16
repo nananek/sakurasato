@@ -53,11 +53,11 @@ const USER_AGENT: &str = concat!(
 /// `allow_private` はテスト / Docker 内連合テスト専用のオプトイン
 /// (`SAKURASATO_ALLOW_PRIVATE_EGRESS`)。本番は `false` を渡す。
 pub fn build_client(allow_private: bool) -> anyhow::Result<Client> {
-    let redirect = Policy::custom(|attempt| {
+    let redirect = Policy::custom(move |attempt| {
         if attempt.previous().len() >= MAX_REDIRECTS {
             return attempt.error(format!("too many redirects (>{MAX_REDIRECTS})"));
         }
-        if let Some(reason) = host_blocked(attempt.url()) {
+        if !allow_private && let Some(reason) = host_blocked(attempt.url()) {
             return attempt.error(format!("redirect to blocked host ({reason})"));
         }
         attempt.follow()

@@ -733,9 +733,10 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm server 
 Tailscale `MagicDNS` (`*.ts.net`) で 1 を回避できるため、**緩めないこと**。
 
 **テスト / Docker 内連合テスト専用**: `SAKURASATO_ALLOW_PRIVATE_EGRESS=1` (または `true`) を
-設定すると 2 をスキップして private IP への外向き接続を許可する。本番 compose / override では
+設定すると、単一ラベル・private IP literal を含む 1 と 2 をともにスキップして private IP への
+外向き接続を許可する (scheme / self-host 検査は維持)。本番 compose / override では
 **設定しない**こと。`compose/docker-compose.federation-*.yml` は Docker 内の単一ラベル名で
-連合するため、意図的に同 env を設定している。
+連合するため、server と media-proxy の双方に意図的に同 env を設定している。
 
 media-proxy は `egress` ネットワークのみに参加し `internal` には接続しない
 (postgres / versitygw / local API への横移動面を遮断。UDS は volume 越しなのでネットワーク不要)。

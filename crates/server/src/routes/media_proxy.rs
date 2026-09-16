@@ -55,7 +55,7 @@ use crate::media_proxy_route::{self, ProxyQuery};
 use crate::state::AppState;
 
 pub async fn handle(State(state): State<AppState>, Query(q): Query<ProxyQuery>) -> Response {
-    let parsed = match media_proxy_route::validate(&q) {
+    let parsed = match media_proxy_route::validate(&q, state.allows_private_egress()) {
         Ok(u) => u,
         Err(resp) => return resp,
     };

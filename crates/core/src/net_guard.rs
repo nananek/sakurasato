@@ -172,7 +172,7 @@ fn ipv4_block_reason(ip: Ipv4Addr) -> Option<&'static str> {
         Some("documentation")
     } else if is_ipv4_cgnat(ip) {
         Some("cgnat-shared")
-    } else if in_ipv4_cidr(ip, Ipv4Addr::new(0, 0, 0, 0), 8) {
+    } else if in_ipv4_cidr(ip, Ipv4Addr::UNSPECIFIED, 8) {
         Some("this-network")
     } else if in_ipv4_cidr(ip, Ipv4Addr::new(192, 0, 0, 0), 24) {
         Some("ietf-protocol-assignment")

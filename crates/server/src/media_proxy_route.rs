@@ -73,7 +73,7 @@ pub(crate) fn validate_variant(v: &str) -> bool {
 
 /// クエリを検証し、パース済み URL を返す。シンタックス / scheme / SSRF /
 /// variant のいずれかで弾かれたら `Err(400 Response)`。
-pub(crate) fn validate(q: &ProxyQuery) -> Result<url::Url, Response> {
+pub(crate) fn validate(q: &ProxyQuery, allow_private: bool) -> Result<url::Url, Response> {
     let parsed = url::Url::parse(&q.url).map_err(|e| error_400(format!("invalid url: {e}")))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(error_400(format!(
@@ -81,7 +81,7 @@ pub(crate) fn validate(q: &ProxyQuery) -> Result<url::Url, Response> {
             parsed.scheme()
         )));
     }
-    if let Some(reason) = host_blocked(&parsed) {
+    if !allow_private && let Some(reason) = host_blocked(&parsed) {
         return Err(error_400(format!(
             "host {:?} blocked: {reason}",
             parsed.host_str().unwrap_or("")
@@ -168,5 +168,15 @@ mod tests {
         assert!(!validate_variant("AVATAR"));
         assert!(!validate_variant("banner"));
         assert!(!validate_variant("../etc/passwd"));
+    }
+
+    #[test]
+    fn private_host_requires_explicit_test_opt_in() {
+        let query = ProxyQuery {
+            url: "http://media-host/avatar.png".into(),
+            variant: "avatar".into(),
+        };
+        assert!(validate(&query, false).is_err());
+        assert!(validate(&query, true).is_ok());
     }
 }
