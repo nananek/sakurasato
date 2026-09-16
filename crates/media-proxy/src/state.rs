@@ -19,8 +19,13 @@ pub struct ProxyState {
 
 impl ProxyState {
     /// 本番経路: `Config` から `reqwest::Client` を構築。
+    ///
+    /// DNS 解決後 IP の検証は既定で有効。テスト / Docker 内連合テストだけが
+    /// `SAKURASATO_ALLOW_PRIVATE_EGRESS` で明示的に緩める (server と共通の
+    /// 環境変数・判定関数を [`sakurasato_core::net_guard`] から使う)。
     pub fn from_config(config: Config) -> anyhow::Result<Arc<Self>> {
-        let http = http_client::build_client()?;
+        let allow_private = sakurasato_core::net_guard::allow_private_egress_from_env();
+        let http = http_client::build_client(allow_private)?;
         Ok(Arc::new(Self { config, http }))
     }
 

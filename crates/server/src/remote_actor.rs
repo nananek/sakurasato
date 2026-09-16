@@ -85,6 +85,9 @@ pub enum FetchError {
     #[error("outbound fetch to {host:?} is rate-limited; dropping (Issue #269)")]
     RateLimited { host: String },
 
+    #[error("outbound fetch concurrency limit reached; dropping")]
+    Busy,
+
     #[error("actor fetch timed out")]
     Timeout,
 
@@ -286,6 +289,16 @@ pub(crate) async fn fetch_object_json(
             host: host.to_string(),
         });
     }
+
+    // プロセス全体の同時実行数上限 (per-domain 制限を host ローテートで
+    // 回避されても、ここで並列度を bound する)。permit は HTTP 完了まで保持。
+    let Some(_fetch_slot) = state.try_acquire_fetch_slot() else {
+        warn!(
+            uri,
+            host, "outbound fetch concurrency limit reached; dropping",
+        );
+        return Err(FetchError::Busy);
+    };
 
     // 信頼境界外 URL なので Accept ヘッダで JSON-LD を明示要求。レスポンス
     // ボディは MAX_AP_OBJECT_BYTES で頭打ちする。reqwest は body streaming で

@@ -107,9 +107,28 @@ pub async fn handle(
         actor.display_name.as_deref(),
     );
     let mut response = (StatusCode::OK, html).into_response();
-    response.headers_mut().insert(
+    let headers = response.headers_mut();
+    headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    // 多層防御: permalink HTML は外部リソース (script / img / style) を一切
+    // 参照しないので `default-src 'none'` で締める。nosniff / no-referrer /
+    // frame-ancestors none も併せて付ける (万一の将来のテンプレート変更で
+    // 依存 URL を埋めても、ブラウザ側で実行・埋め込み・漏洩を止める)。
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
     );
     response
 }

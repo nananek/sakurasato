@@ -42,6 +42,13 @@ use self::keyid::KeyKind;
 /// なら相互運用上問題ない。NTP 同期があれば数秒以内に収まる。
 pub(crate) const MAX_CLOCK_SKEW: Duration = Duration::from_mins(5);
 
+/// `Signature-Input` で受理するラベル数の上限。
+///
+/// ラベルごとに actor lookup / 未知 keyId の remote fetch を試行するため、
+/// 大量ラベルは 1 リクエスト → 多数 outbound fetch の増幅になる。Fediverse
+/// の実装は 1 ラベル (稀に 2) なので 8 で十分。
+pub(crate) const MAX_SIGNATURE_LABELS: usize = 8;
+
 /// 署名スキームの種別。Mastodon 系互換と Nekonoverse 等の新世代の二分。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SigScheme {
@@ -193,6 +200,12 @@ pub(crate) fn extract_signature_infos(headers: &HeaderMap) -> Result<Vec<Signatu
         let input_raw = header_value(headers, "signature-input")?;
         let parsed_all = rfc9421::parse_signature_input_dict(input_raw)
             .map_err(|e| SigError::SignatureMalformed(e.to_string()))?;
+        if parsed_all.len() > MAX_SIGNATURE_LABELS {
+            return Err(SigError::SignatureMalformed(format!(
+                "too many Signature-Input labels ({} > {MAX_SIGNATURE_LABELS})",
+                parsed_all.len()
+            )));
+        }
         let mut out = Vec::with_capacity(parsed_all.len());
         for parsed in parsed_all {
             let key_id = parsed
@@ -687,6 +700,35 @@ mod tests {
         ]);
         let info = extract_signature_info(&h).unwrap();
         assert_eq!(info.scheme, SigScheme::Rfc9421);
+    }
+
+    #[test]
+    fn extract_info_rejects_too_many_labels() {
+        // 1 リクエストで未知 keyId fetch を大量に誘発する増幅を防ぐ。
+        let labels: Vec<String> = (0..=MAX_SIGNATURE_LABELS)
+            .map(|i| {
+                format!(
+                    r#"sig{i}=("@method" "@target-uri");keyid="https://x.test/users/a{i}#ed25519-key""#
+                )
+            })
+            .collect();
+        let h = headers(&[("Signature-Input", labels.join(", ").as_str())]);
+        let err = extract_signature_info(&h).unwrap_err();
+        assert!(matches!(err, SigError::SignatureMalformed(_)), "{err:?}");
+    }
+
+    #[test]
+    fn extract_info_accepts_label_count_at_cap() {
+        let labels: Vec<String> = (0..MAX_SIGNATURE_LABELS)
+            .map(|i| {
+                format!(
+                    r#"sig{i}=("@method" "@target-uri");keyid="https://x.test/users/a{i}#ed25519-key""#
+                )
+            })
+            .collect();
+        let h = headers(&[("Signature-Input", labels.join(", ").as_str())]);
+        let infos = extract_signature_infos(&h).unwrap();
+        assert_eq!(infos.len(), MAX_SIGNATURE_LABELS);
     }
 
     #[test]

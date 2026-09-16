@@ -6,7 +6,8 @@
 #     画像デコードを伴わない JSON 通信のみで、media-proxy 経由化の利得が薄い)。
 #   - 外部 GET (画像 / OGP) の egress は media-proxy のみ。M6 で TUI のアバター
 #     取得経路も `/api/v1/media/proxy` → media-proxy に切り替わった (Issue #36)。
-#   - postgres と versitygw は内部ネットからのみ到達可。
+#   - postgres と versitygw は内部ネットからのみ到達可。media-proxy は
+#     internal ネットワークに参加しない (= SSRF 成立時の横移動面を縮小)。
 #   - 全コンテナ非 root・read-only fs・cap_drop ALL・no-new-privileges。
 #   - シークレットは compose secrets で注入。
 
@@ -94,8 +95,10 @@ services:
     volumes:
       - media_sock:/run/sakurasato
     networks:
-      # media-proxy のみ外部 egress を持つ (internal: false)
-      - internal
+      # **egress のみ**。media-proxy は postgres / versitygw に触れる必要が
+      # 無く (取得した bytes は UDS で server に返し、S3 PUT は server が行う)、
+      # `internal` に居ると SSRF が成立した際の横移動先 (postgres / versitygw /
+      # local API) を自ら広げてしまう。UDS は volume なのでネットワーク不要。
       - egress
 
   server:

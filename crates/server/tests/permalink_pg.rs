@@ -360,6 +360,20 @@ async fn permalink_renders_local_note_with_escaped_content(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::OK);
     let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
     assert_eq!(ct, "text/html; charset=utf-8");
+    // 多層防御ヘッダ: permalink HTML は外部リソースを参照しないので
+    // `default-src 'none'` で締める。
+    assert_eq!(
+        resp.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+        "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    );
+    assert_eq!(
+        resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        resp.headers().get(header::REFERRER_POLICY).unwrap(),
+        "no-referrer"
+    );
 
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let html = std::str::from_utf8(&body).unwrap();

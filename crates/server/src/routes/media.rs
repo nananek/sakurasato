@@ -11,13 +11,13 @@
 //!
 //! ## 本文の扱い
 //!
-//! M4 PR1 では **`GetObject` のレスポンスボディを一括バッファリング** して
-//! `Body::from(bytes)` で返す。max オブジェクトサイズは `media_proxy.max_bytes`
-//! (既定 25 MiB) で、アップロードサニタイザ側で上限を強制している前提。
-//! 本来はストリーミング (`Body::from_stream` + `ByteStream`) が望ましいが、
-//! `ByteStream` の `Stream` 実装を axum の `Body::from_stream` シグネチャに
-//! 適合させる際に型のマッサージが要るため、PR1 ではシンプルに collect する。
-//! 巨大オブジェクトを扱うようになった段階で stream 化する (今後の milestone)。
+//! `GetObject` のレスポンスボディを `media_proxy.max_bytes` (既定 25 MiB) で
+//! 頭打ちにしながら一括バッファリングして `Body::from(bytes)` で返す。
+//! アップロード経路はサニタイザ側で同値を強制しているが、バケットに上限超過
+//! オブジェクトが存在しても (運用事故 / S3 直書き / 旧バージョンの残骸)
+//! 1 リクエストで無制限にメモリを消费しないよう、配信側でも
+//! `Content-Length` + ストリーミング累計の二重チェックを行う
+//! ([`collect_limited`])。完全なストリーミング配信は今後の milestone。
 //!
 //! ## エラー
 //!
@@ -49,11 +49,13 @@
 
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::primitives::ByteStream;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use sakurasato_core::repo;
+use tokio::io::AsyncReadExt;
 
 use crate::state::AppState;
 
@@ -161,10 +163,25 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
         .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
     let content_length = resp.content_length();
 
-    // body は ByteStream。`collect()` で全部バッファリングし `Body::from`。
-    let bytes = match resp.body.collect().await {
-        Ok(agg) => agg.into_bytes(),
+    // **メモリ上限**: バケットにアップロード経路の上限 (`media_proxy.max_bytes`)
+    // を超えるオブジェクトが存在しても (運用事故 / 旧バージョンの残骸 /
+    // S3 直書き)、1 リクエストで無制限にバッファしない。`Content-Length` が
+    // 申告されている場合は即拒否し、無い / 嘘の場合もストリーミングで
+    // 数えながら `max_bytes + 1` で打ち切る。
+    let max_bytes = state.config().media_proxy.max_bytes;
+    if let Some(len) = content_length
+        && u64::try_from(len).unwrap_or(u64::MAX) > max_bytes
+    {
+        tracing::warn!(key = %key, len, max_bytes, "media GET: object exceeds max_bytes");
+        return no_store(StatusCode::BAD_GATEWAY);
+    }
+    let bytes = match collect_limited(resp.body, max_bytes).await {
+        Ok(bytes) => bytes,
         Err(err) => {
+            if err.kind() == std::io::ErrorKind::InvalidData {
+                tracing::warn!(key = %key, max_bytes, "media GET: object exceeds max_bytes during stream");
+                return no_store(StatusCode::BAD_GATEWAY);
+            }
             tracing::error!(?err, key = %key, "media GET: collect body failed");
             return no_store(StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -192,6 +209,25 @@ pub async fn handle(State(state): State<AppState>, Path(key): Path<String>) -> R
         headers.insert(header::CONTENT_LENGTH, hv);
     }
     response
+}
+
+/// `ByteStream` を `max_bytes` で頭打ちにしながら `Vec<u8>` へ読む。
+///
+/// 上限超過は [`std::io::ErrorKind::InvalidData`] で返し、呼び出し側が
+/// 「バケット側の想定外サイズ」と「S3 transport エラー」を区別できるようにする。
+/// `max_bytes + 1` バイト受信した時点で打ち切るため、ピークメモリは上限 + α。
+async fn collect_limited(body: ByteStream, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let reader = body.into_async_read();
+    let mut limited = reader.take(max_bytes.saturating_add(1));
+    let mut buf = Vec::with_capacity(64 * 1024);
+    limited.read_to_end(&mut buf).await?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "object exceeds max_bytes",
+        ));
+    }
+    Ok(buf)
 }
 
 /// 負レスポンス (4xx/5xx) 共通の `Cache-Control: no-store` 付きレスポンス

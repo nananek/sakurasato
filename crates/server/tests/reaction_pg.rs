@@ -617,6 +617,47 @@ async fn inbound_emoji_react_without_content_returns_400(pool: PgPool) {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// 防御テスト: Like の `id` ホストが signer のホストと異なる場合は 400 で
+/// 拒否し、reaction 行も作らない。放置すると `victim.test` の Like `ap_id` を
+/// 先取りして帰属をすり替えたり、`ap_id` UNIQUE 衝突で正規 reaction を
+/// 記録不能にできる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn inbound_like_with_cross_host_activity_id_is_rejected(pool: PgPool) {
+    let (_, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(&pool, remote_actor("remote.test", "bob", &remote_pub))
+        .await
+        .unwrap();
+    let (_, note_ap_id) = seed_local_note(&pool, local.id).await;
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    // signer は remote.test / activity id は victim.test。
+    let activity_id = "https://victim.test/users/carol/activities/like-1".to_string();
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": activity_id,
+        "type": "Like",
+        "actor": remote.ap_id,
+        "object": note_ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let row = repo::reaction::get_by_ap_id(&pool, &activity_id)
+        .await
+        .unwrap();
+    assert!(row.is_none(), "cross-host activity id は記録しない");
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn inbound_like_to_unknown_note_is_silently_accepted(pool: PgPool) {
     // 我々が知らない Note URI に対する Like → 202 で受け流し、DB は触らない。

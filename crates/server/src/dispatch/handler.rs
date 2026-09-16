@@ -134,6 +134,27 @@ pub(crate) async fn handle_follow(
         }
     }
 
+    // **ap_id 再利用の拒否 (F5)**: `upsert_pending` は同一 `ap_id` の既存行を
+    // ペア検証なしで返す。同一ホストの別 actor が他人の Follow `ap_id` を
+    // 再利用すると、他人の follow 行を Accept 再送・状態遷移の対象にして
+    // しまうため、既に別の (follower, followed) ペアに束縛されていれば拒否する。
+    if let Some(existing) = repo::follow::get_by_ap_id(state.pool(), &follow_ap_id)
+        .await
+        .context("lookup follow by ap_id")?
+        && (existing.follower_actor_id != signer.id || existing.followed_actor_id != followed.id)
+    {
+        warn!(
+            follow_ap_id = %follow_ap_id,
+            signer = %signer.ap_id,
+            follower_actor_id = existing.follower_actor_id,
+            followed_actor_id = existing.followed_actor_id,
+            "Follow ap_id is bound to a different (follower, followed) pair; refusing",
+        );
+        bail!(
+            "Follow ap_id {follow_ap_id} is already bound to a different (follower, followed) pair"
+        );
+    }
+
     let row = repo::follow::upsert_pending(state.pool(), &follow_ap_id, signer.id, followed.id)
         .await
         .context("upsert follow row")?;

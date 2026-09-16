@@ -150,7 +150,7 @@ sakurasato/
 
 ### 5.3 media-proxy（隔離コンテナ）
 - **役割**:
-  1. リモートメディア取得（**SSRF 対策**: private/loopback/link-local/reserved を遮断、リダイレクト毎に再検証、許可 CIDR allowlist）
+  1. リモートメディア取得（**SSRF 二段ガード**: ① URL 文字列の private/loopback/link-local/CGNAT/reserved 遮断 + リダイレクト毎の再検証 ([`sakurasato_core::net_guard::host_blocked`](crates/core/src/net_guard.rs))、② **custom DNS resolver による解決後 IP の検証** ([`crates/media-proxy/src/dns_guard.rs`](crates/media-proxy/src/dns_guard.rs)) ── wildcard DNS (`*.nip.io`) / Docker 単一ラベル名 / Tailscale MagicDNS 経由の内部到達は ② が塞ぐ）
   2. 画像変換（リサイズ/WebP 化, `max_size`/`max_pixels` 上限。アバター/絵文字/プレビュー等のバリアント生成）
   3. OGP/summary 取得
   4. **アップロード画像のサニタイズ**（再エンコードで埋め込みペイロード除去・EXIF/位置情報などメタデータ除去）
@@ -193,7 +193,8 @@ TUI クライアントはコンテナ外（ホスト端末）で実行し、マ�
 - **rootless**: 非 root UID で実行（`USER nonroot` / 数値 UID）。
 - `read_only: true`（root fs）＋ 必要箇所のみ `tmpfs`(/tmp)。
 - `cap_drop: [ALL]`、`security_opt: ["no-new-privileges:true"]`。
-- **ネットワーク分離**: versitygw・postgres は内部ネットのみ。**media-proxy は外部 GET（画像 / OGP / WebFinger）の egress を持つ**。**server は AP 配送 POST と remote actor fetch（`followers`/`following`/`outbox` Collection `totalItems` 取得含む）/ remote Note fetch のみ外部に egress を持つ**（暫定、§3 / [Issue #23](https://github.com/nananek/sakurasato/issues/23)、Note fetch は [#266](https://github.com/nananek/sakurasato/issues/266)）── M10 で再評価し配送経路は当面 server 直のまま維持、WebFinger は M10 PR #51 で media-proxy 経由に移行。
+- **ネットワーク分離**: versitygw・postgres は内部ネットのみ。**media-proxy は外部 GET（画像 / OGP / WebFinger）の egress のみを持ち、internal ネットワークには参加しない**（UDS は volume 越しなのでネットワーク不要。SSRF 成立時の横移動先を自ら広げない）。**server は AP 配送 POST と remote actor fetch（`followers`/`following`/`outbox` Collection `totalItems` 取得含む）/ remote Note fetch のみ外部に egress を持つ**（暫定、§3 / [Issue #23](https://github.com/nananek/sakurasato/issues/23)、Note fetch は [#266](https://github.com/nananek/sakurasato/issues/266)）── M10 で再評価し配送経路は当面 server 直のまま維持、WebFinger は M10 PR #51 で media-proxy 経由に移行。
+- **SSRF の二段ガード (2026-09 追加)**: 外向き HTTP は server / media-proxy 双方で ① URL 文字列検査 ([`net_guard::host_blocked`](crates/core/src/net_guard.rs)) と ② custom DNS resolver による解決後 IP 検査 ([`crates/server/src/dns_guard.rs`](crates/server/src/dns_guard.rs) / [`crates/media-proxy/src/dns_guard.rs`](crates/media-proxy/src/dns_guard.rs)) を通す。**② が無いと `169.254.169.254.nip.io` のような wildcard DNS / Docker 単一ラベル名 (`versitygw`) / Tailscale `MagicDNS` で ① を回避できる**ため、新しい外向き HTTP 経路を足すときは必ず同じ `reqwest::Client` (resolver 登録済み) を使うこと。テスト / Docker 内連合テストだけが `SAKURASATO_ALLOW_PRIVATE_EGRESS=1` で明示的に緩める（本番では設定しない）。
 - **危険な入力の隔離**: 画像デコード・外部 GET は必ず media-proxy 側。server は信頼できないバイト列を直接デコードしない（AP 配送・actor fetch・Note fetch のレスポンスは JSON のみで扱う）。
 
 ### 7.1 シークレット管理

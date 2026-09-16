@@ -508,6 +508,11 @@ async fn custom_emojis_public_no_auth_returns_array(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // 数百 KB になりうる無認証の公開一覧なので CDN / ブラウザキャッシュを許す。
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=300"
+    );
     let json = read_json(resp).await;
     let arr = json
         .as_array()

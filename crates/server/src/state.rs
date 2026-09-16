@@ -9,7 +9,7 @@ use reqwest::Client;
 use sakurasato_core::Config;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, Semaphore, broadcast};
 
 use crate::event_bus::{STREAM_CHANNEL_CAPACITY, StreamEvent};
 use crate::fetch_rate_limit::DomainRateLimiter;
@@ -98,7 +98,20 @@ struct Inner {
     /// トークンまで枯渇させてしまい、同一 host への正規のフェデレーション
     /// 処理を巻き添えで詰まらせる。
     media_proxy_rate_limiter: DomainRateLimiter,
+    /// 外向き AP object fetch の **プロセス全体の同時実行数** 上限。
+    ///
+    /// per-domain レート制限は「同一 host への連投」しか抑えないため、
+    /// host をローテートする flood (未認証 keyId / 複数ラベル署名 /
+    /// `*.nip.io`) では fetch が並列に増え、DB プール (8) と配送ワーカを
+    /// 圧迫する。permit を取れない fetch は即 drop する (待たせない) ──
+    /// 署名検証経路は 401 に、followee 経路は boost の取りこぼしになるが、
+    /// どちらも相手の再送で回復できる。
+    fetch_gate: Arc<Semaphore>,
 }
+
+/// 外向き fetch の同時実行上限。お一人様サーバの通常運用 (散発的な actor /
+/// Note fetch) には十分で、flood 時だけ drop される値。
+const MAX_CONCURRENT_OUTBOUND_FETCHES: usize = 4;
 
 impl AppState {
     /// Build the `AppState` by resolving the DB URL (with password file
@@ -123,7 +136,10 @@ impl AppState {
             .connect(&url)
             .await
             .context("connect to PostgreSQL")?;
-        let http = http_client::build_client()?;
+        // 本番経路: DNS 解決後 IP の検証を有効化する。テスト / 連合テスト
+        // だけが `SAKURASATO_ALLOW_PRIVATE_EGRESS` で明示的に緩める。
+        let http =
+            http_client::build_client(sakurasato_core::net_guard::allow_private_egress_from_env())?;
         let s3 = build_s3_client(&config)?;
         let media_proxy = MediaProxyClient::new(config.media_proxy.socket.clone());
         let (timeline_tx, _) = broadcast::channel(TIMELINE_CHANNEL_CAPACITY);
@@ -141,6 +157,7 @@ impl AppState {
             delivery_notify: Arc::new(Notify::new()),
             fetch_rate_limiter: DomainRateLimiter::new(),
             media_proxy_rate_limiter: DomainRateLimiter::new(),
+            fetch_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_FETCHES)),
         })))
     }
 
@@ -150,7 +167,9 @@ impl AppState {
     /// SSRF ガードを緩める ([`Inner::allow_internal_inbox`] = `true`) ─
     /// 統合テスト用 inbox を `127.0.0.1` で立てるため。本番経路には影響しない。
     pub fn from_pool(pool: PgPool, config: Config) -> Self {
-        let http = http_client::build_client().expect("reqwest builder is infallible in tests");
+        // テスト経路は loopback のダミー inbox / ダミー fetch を使うため、
+        // resolver の private 検証を常に許可する。
+        let http = http_client::build_client(true).expect("reqwest builder is infallible in tests");
         // テスト経路は実 S3 / versitygw に出ない契約。ダミー endpoint で構築。
         // GET /media/<key> を叩くテストはコネクション失敗で 500 を返すだけ。
         let s3 =
@@ -171,6 +190,7 @@ impl AppState {
             delivery_notify: Arc::new(Notify::new()),
             fetch_rate_limiter: DomainRateLimiter::new(),
             media_proxy_rate_limiter: DomainRateLimiter::new(),
+            fetch_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_FETCHES)),
         }))
     }
 
@@ -230,6 +250,13 @@ impl AppState {
     /// のドキュメント参照)。
     pub(crate) fn try_acquire_media_proxy_fetch(&self, host: &str) -> bool {
         self.0.media_proxy_rate_limiter.try_acquire(host)
+    }
+
+    /// 外向き fetch のプロセス全体 permit を **待たずに** 取る。取れなければ
+    /// `None` (= 呼び出し側は fetch を drop)。permit は戻り値と共に保持し、
+    /// HTTP リクエスト完了まで離さないこと。
+    pub(crate) fn try_acquire_fetch_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.0.fetch_gate.try_acquire().ok()
     }
 
     /// Compute the canonical AP actor `id` URI for `username` against the

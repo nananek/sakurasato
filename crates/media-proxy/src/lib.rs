@@ -31,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dns_guard;
 pub mod error;
 pub mod fetch;
 pub mod http_client;
