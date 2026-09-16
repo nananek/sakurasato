@@ -6,7 +6,7 @@
 //! Follow/Like/EmojiReact/mention/Announce を silent drop するホットパス
 //! ガードは PR5 (`dispatch()` 冒頭) で追加する。
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::Context;
 use sakurasato_core::model::ActorRow;
 use sakurasato_core::repo;
 use serde_json::Value as JsonValue;
@@ -15,6 +15,16 @@ use tracing::info;
 use super::DispatchError;
 use super::handler::ensure_same_host;
 use crate::state::AppState;
+
+/// 再送しても直らない恒久的な Block 拒否。`dispatch` 側が 4xx にマップし、
+/// 503 (= リトライ保持) に乗せないためのマーカー。
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct PermanentBlockRejection(pub String);
+
+fn permanent(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(PermanentBlockRejection(msg.into()))
+}
 
 /// 受領 Block (`signer` → 我々の local actor) の処理。
 ///
@@ -33,30 +43,31 @@ pub(crate) async fn handle_block(
     activity: &JsonValue,
 ) -> anyhow::Result<()> {
     let block_ap_id = super::extract_activity_id(activity)
-        .map_err(|e| anyhow!("Block has no activity id: {e}"))?
+        .map_err(|e| permanent(format!("Block has no activity id: {e}")))?
         .to_string();
-    ensure_same_host(&block_ap_id, &signer.ap_id, "Block activity id")?;
+    ensure_same_host(&block_ap_id, &signer.ap_id, "Block activity id")
+        .map_err(|e| permanent(e.to_string()))?;
 
     let object_uri = super::extract_object_uri(activity)
-        .map_err(|e| anyhow!("Block has no usable `object`: {e}"))?
+        .map_err(|e| permanent(format!("Block has no usable `object`: {e}")))?
         .to_string();
 
     let blocked = repo::actor::get_by_ap_id(state.pool(), &object_uri)
         .await
         .context("lookup blocked (local) actor")?
-        .ok_or_else(|| anyhow!("Block target {object_uri} not found locally"))?;
+        .ok_or_else(|| permanent(format!("Block target {object_uri} not found locally")))?;
 
     if !blocked.is_local {
-        bail!(
+        return Err(permanent(format!(
             "Block target {} is not a local actor; refusing to accept",
             blocked.ap_id
-        );
+        )));
     }
     if blocked.actor_type.eq_ignore_ascii_case("Application") {
-        bail!(
+        return Err(permanent(format!(
             "Block target {} is an Application actor; refusing to accept",
             blocked.ap_id,
-        );
+        )));
     }
 
     // signer → local (blocked) の既存フォロー関係を強制解除。signer 自身が

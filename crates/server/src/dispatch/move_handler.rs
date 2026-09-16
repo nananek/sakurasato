@@ -199,6 +199,34 @@ async fn enqueue_auto_refollow(
         );
     }
 
+    // **block / suspend の尊重**: Move 経由の auto re-follow は
+    // `create_follow_core` のガードを通らないため、ここで明示的に拒否する。
+    // これが無いと「ブロック済み actor を Move で再フォロー」「suspend 済み
+    // ドメインへ新規 Follow を送出」が成立する。
+    if repo::block::is_blocked(state.pool(), local.id, target.id)
+        .await
+        .unwrap_or(false)
+    {
+        info!(
+            local = %local.ap_id,
+            target = %target.ap_id,
+            "Move target is blocked by local user; skipping auto re-follow",
+        );
+        return Ok(());
+    }
+    let target_host = sakurasato_core::net_guard::canonical_host(&target.host);
+    if let Ok(Some(m)) = repo::domain_moderation::get_by_host(state.pool(), &target_host).await
+        && m.severity == "suspend"
+    {
+        info!(
+            local = %local.ap_id,
+            target = %target.ap_id,
+            host = %target_host,
+            "Move target domain is suspended; skipping auto re-follow",
+        );
+        return Ok(());
+    }
+
     // 既に target を follow していれば何もしない。お一人様サーバなので
     // 重複 Follow を送ると相手の inbox を汚す。
     if (repo::follow::list_local_following(state.pool(), target.id).await?)

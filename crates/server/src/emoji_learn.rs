@@ -273,6 +273,23 @@ async fn fetch_and_cache_remote_emoji(
     signer_host: &str,
     shortcode: &str,
 ) -> anyhow::Result<(String, String)> {
+    // **外向き egress の共通ガード**: リモート起点で media-proxy に fetch を
+    // 走らせる経路なので、ドメイン suspend と per-domain レート制限を通す
+    // (`fetch_object_json` と同じ扱い。Announce / Note / reaction 由来で
+    // 大量の fetch を誘発されても、ここで宛先単位の増幅を抑える)。
+    let host = Url::parse(image_url)
+        .ok()
+        .and_then(|u| u.host_str().map(sakurasato_core::net_guard::canonical_host))
+        .ok_or_else(|| anyhow::anyhow!("emoji icon url has no host: {image_url}"))?;
+    if let Ok(Some(m)) = repo::domain_moderation::get_by_host(state.pool(), &host).await
+        && m.severity == "suspend"
+    {
+        anyhow::bail!("emoji icon host {host} is suspended; refusing fetch");
+    }
+    if !state.try_acquire_fetch(&host) {
+        anyhow::bail!("emoji icon fetch to {host} is rate-limited; dropping");
+    }
+
     let processed = state
         .media_proxy()
         .fetch_image(image_url, EMOJI_VARIANT)

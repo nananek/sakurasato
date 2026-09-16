@@ -36,11 +36,14 @@ pub fn extract_acct_host(acct: &str) -> Option<String> {
 pub fn ensure_webfinger_host_match(expected_host_lc: &str, actor_uri: &str) -> anyhow::Result<()> {
     let parsed = url::Url::parse(actor_uri)
         .with_context(|| format!("WebFinger returned invalid actor_uri {actor_uri:?}"))?;
-    let actor_host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("WebFinger actor_uri {actor_uri:?} has no host"))?
-        .to_ascii_lowercase();
-    if actor_host == expected_host_lc {
+    let actor_host = sakurasato_core::net_guard::canonical_host(
+        parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("WebFinger actor_uri {actor_uri:?} has no host"))?,
+    );
+    // 末尾ドットだけが違う同一ドメイン (`evil.example.` vs `evil.example`) を
+    // 不一致扱いしない。それ以外の host 差は従来どおり拒否する。
+    if actor_host == sakurasato_core::net_guard::canonical_host(expected_host_lc) {
         return Ok(());
     }
     bail!(
@@ -84,6 +87,12 @@ mod tests {
     #[test]
     fn ensure_webfinger_host_match_is_case_insensitive() {
         ensure_webfinger_host_match("evil.example", "https://EVIL.EXAMPLE/users/bob").unwrap();
+    }
+
+    #[test]
+    fn ensure_webfinger_host_match_ignores_trailing_dot() {
+        ensure_webfinger_host_match("evil.example", "https://evil.example./users/bob").unwrap();
+        ensure_webfinger_host_match("evil.example.", "https://evil.example/users/bob").unwrap();
     }
 
     #[test]

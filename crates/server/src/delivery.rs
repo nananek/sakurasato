@@ -250,7 +250,7 @@ pub async fn try_deliver_one(state: &AppState, queue_id: i64) -> anyhow::Result<
     // 取り込み拒否が主眼で、こちらから配送を止める必然性は薄いため)。
     if let Some(host) = reqwest::Url::parse(&row.inbox_url)
         .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
+        .and_then(|u| u.host_str().map(net_guard::canonical_host))
         && let Ok(Some(m)) = repo::domain_moderation::get_by_host(state.pool(), &host).await
         && m.severity == "suspend"
     {

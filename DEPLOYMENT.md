@@ -741,6 +741,15 @@ Tailscale `MagicDNS` (`*.ts.net`) で 1 を回避できるため、**緩めな�
 media-proxy は `egress` ネットワークのみに参加し `internal` には接続しない
 (postgres / versitygw / local API への横移動面を遮断。UDS は volume 越しなのでネットワーク不要)。
 
+media-proxy は画像 1 リクエストあたりの合計フレームメモリ (128 MiB) と同時実行数 (2) を
+内部定数で bound している。公開 `/media-proxy` は無認証のため、アニメ画像による
+`mem_limit` 超過 OOM を防ぐ目的。上限を変える場合は `crates/media-proxy` の
+`MAX_ANIMATED_TOTAL_FRAME_BYTES` / `MAX_CONCURRENT_MEDIA_JOBS` を調整する。
+
+ドメイン suspend (`sakurasato-server domain suspend <host>`) は inbound 受信だけでなく
+**外向き fetch** (actor / Note / remote emoji) も止める。ホスト名は末尾ドット・大文字
+小文字を正規化して保存される (migration 0033 で既存行も正規化済み)。
+
 ---
 
 ## 8. 運用タスク

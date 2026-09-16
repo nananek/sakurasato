@@ -114,11 +114,11 @@ pub async fn create_block_core(
         )));
     }
 
-    // local → target: 既存 pending/accepted 行があれば delete_follow_core を
-    // そのまま呼ぶ (Undo Follow 送出 + 行削除)。
-    if let Some(row) = repo::follow::get_by_pair(state.pool(), local.id, target_actor.id).await?
-        && matches!(row.state.as_str(), "pending" | "accepted")
-    {
+    // local → target: 既存行があれば state を問わず delete_follow_core を
+    // そのまま呼ぶ (Undo Follow 送出 + 行削除)。**rejected 行も消す** ──
+    // 残すと、ブロック後に対象が `Accept` を送りつけて accepted に
+    // 巻き戻せる (Accept は block ホットパスガードの対象外) ため。
+    if let Some(row) = repo::follow::get_by_pair(state.pool(), local.id, target_actor.id).await? {
         follow::delete_follow_core(state, row.id).await?;
     }
 

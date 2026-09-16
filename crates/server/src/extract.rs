@@ -143,7 +143,8 @@ where
             // ドメインの actor は crypto 検証を試みる前に拒否する (検証
             // コスト削減)。silence は inbox 受信自体を妨げない (§10 確定
             // 事項 #3、効果は handle_follow 側のガードに限定)。
-            match repo::domain_moderation::get_by_host(state.pool(), &actor.host).await {
+            let actor_host = crate::net_guard::canonical_host(&actor.host);
+            match repo::domain_moderation::get_by_host(state.pool(), &actor_host).await {
                 Ok(Some(m)) if m.severity == "suspend" => {
                     tracing::warn!(
                         actor_ap_id = %actor.ap_id,

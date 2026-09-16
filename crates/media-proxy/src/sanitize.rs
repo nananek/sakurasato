@@ -32,6 +32,10 @@ pub async fn handle(
     Query(q): Query<SanitizeQuery>,
     body: Bytes,
 ) -> Response {
+    // fetch と同じ同時実行ゲートを共有 (デコード / エンコードの OOM 防止)。
+    let Some(_job) = state.try_acquire_job() else {
+        return ApiError::busy("media-proxy is busy; retry later").into_response();
+    };
     match sanitize_inner(&state, q.variant, &body) {
         Ok(resp) => resp,
         Err(err) => err.into_response(),

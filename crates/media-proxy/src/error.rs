@@ -68,6 +68,16 @@ impl ApiError {
         }
     }
 
+    /// 同時実行ゲートが埋まっている (OOM 防止)。server 側は 503 として扱い、
+    /// 一時的な混雑なのでリトライ可能。
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            reason: "busy",
+            message: message.into(),
+        }
+    }
+
     pub fn internal(reason: &'static str, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

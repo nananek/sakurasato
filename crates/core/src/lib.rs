@@ -69,6 +69,8 @@ mod tests {
         //   持つ follow テーブル対称の設計、state 列は無し)
         // 0032 domain_moderation (= 連合ドメインブロック。host 単位で
         //   severity ('silence'/'suspend') を持つ)
-        assert_eq!(crate::MIGRATOR.migrations.len(), 32);
+        // 0033 canonicalize_hosts (= actor.host / domain_moderation.host の
+        //   末尾ドット・大文字小文字を一度だけ正規化する backfill)
+        assert_eq!(crate::MIGRATOR.migrations.len(), 33);
     }
 }
