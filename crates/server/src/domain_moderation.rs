@@ -62,13 +62,20 @@ pub struct DomainDetail {
 }
 
 fn normalize_host(raw: &str) -> Result<String, DomainModerationError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    let normalized = sakurasato_core::net_guard::canonical_host(raw);
+    if normalized.is_empty() {
         return Err(DomainModerationError::BadRequest(
             "host must not be empty".into(),
         ));
     }
-    Ok(trimmed.to_ascii_lowercase())
+    // URL から貼り付けた `https://evil.example/` のような入力を弾く
+    // (canonical_host は末尾ドットしか落とさない)。
+    if normalized.contains('/') || normalized.contains('@') {
+        return Err(DomainModerationError::BadRequest(format!(
+            "host must be a bare hostname, got {raw:?}"
+        )));
+    }
+    Ok(normalized)
 }
 
 async fn resolve_local_actor_id(state: &AppState) -> Result<i64, DomainModerationError> {

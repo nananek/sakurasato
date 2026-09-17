@@ -7,8 +7,17 @@ use std::sync::Arc;
 
 use reqwest::Client;
 use sakurasato_core::Config;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::http_client;
+
+/// 同時に処理する fetch / sanitize ジョブ数の上限。
+///
+/// 1 リクエストあたりのメモリは `MAX_ANIMATED_TOTAL_FRAME_BYTES` (128 MiB) +
+/// デコード / エンコードの一時バッファで、コンテナの `mem_limit: 1024m` に
+/// 対して 2 並列までなら収まる。公開 `/media-proxy` から並列リクエストを
+/// 大量に投げられてもメモリを bound する (超過分は 503 busy)。
+const MAX_CONCURRENT_MEDIA_JOBS: usize = 2;
 
 /// media-proxy の共有状態。`Arc` で包んで axum の `State` に載せる。
 #[derive(Debug)]
@@ -18,6 +27,8 @@ pub struct ProxyState {
     /// テスト / Docker 内連合テストで URL・DNS の SSRF ガードを緩める。
     /// 本番では `false`。
     allow_private_egress: bool,
+    /// fetch / sanitize の同時実行数ゲート (OOM 防止)。
+    jobs: Arc<Semaphore>,
 }
 
 impl ProxyState {
@@ -33,7 +44,14 @@ impl ProxyState {
             config,
             http,
             allow_private_egress: allow_private,
+            jobs: Arc::new(Semaphore::new(MAX_CONCURRENT_MEDIA_JOBS)),
         }))
+    }
+
+    /// fetch / sanitize ジョブの permit を **待たずに** 取る。取れなければ
+    /// `None` (= 呼び出し側は 503 busy)。permit は処理完了まで保持する。
+    pub fn try_acquire_job(&self) -> Option<SemaphorePermit<'_>> {
+        self.jobs.try_acquire().ok()
     }
 
     pub fn config(&self) -> &Config {

@@ -17,8 +17,20 @@
 //!   documentation / CGNAT に加え、IETF protocol assignment・benchmarking・
 //!   multicast・将来用途の予約範囲も遮断する
 //! - IPv6 = loopback / 未指定 / multicast / link-local (`fe80::/10`) /
-//!   unique-local (`fc00::/7`) / documentation (`2001:db8::/32`) /
-//!   IPv4-mapped で埋め込み IPv4 が private な場合
+//!   unique-local (`fc00::/7`) / documentation (`2001:db8::/32`, `3fff::/20`) /
+//!   site-local (`fec0::/10`) / ORCHID (`2001:10::/28`, `2001:20::/28`) /
+//!   discard-only (`100::/64`) / benchmarking (`2001:2::/48`) /
+//!   `5f00::/16`。加えて **埋め込み IPv4 を持つ移行アドレス**
+//!   (NAT64 `64:ff9b::/96`、6to4 `2002::/16`、Teredo `2001::/32`) は
+//!   埋め込み IPv4 を IPv4 ルールで再検査し、private / loopback / 特殊なら
+//!   遮断する (public への NAT64 は IPv6-only 環境の正規経路なので許可)。
+//!   deprecated な IPv4-compatible `::a.b.c.d` は一律遮断。
+//!
+//! ## ホスト名の正規化
+//!
+//! `url::Url::host_str()` は FQDN の末尾ドットを保持する (`evil.example.`)。
+//! DB 保存・モデレーション照合・[`is_self_host`] は [`canonical_host`] を
+//! 通し、末尾ドット付きの別名でガードをすり抜けられないようにする。
 //!
 //! ドメイン側は RFC 6761 `localhost.` / `*.localhost`、`localhost.localdomain`、
 //! RFC 6762 mDNS `.local`、および **ドットを含まない単一ラベルのホスト名**
@@ -122,11 +134,22 @@ where
     Ok(allowed)
 }
 
+/// ホスト名を比較・保存用に正規化する (小文字化 + 末尾ドット除去)。
+///
+/// `url::Url::host_str()` は FQDN の末尾ドットを保持するため、同じ実体でも
+/// `evil.example` と `evil.example.` が別文字列になる。ドメインモデレーション
+/// (`domain_moderation.host`) や `is_self_host` がこれを取りこぼすと、
+/// ブロック済みドメインが別名で素通りする。ホスト文字列を DB に書くとき・
+/// 照合するときは必ず本関数を通すこと。
+pub fn canonical_host(raw: &str) -> String {
+    raw.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// `url` の host が `server_host` (本インスタンスの公開ホスト名) と
-/// 大文字小文字を区別せず一致するか。
+/// 大文字小文字 / 末尾ドットを無視して一致するか。
 pub fn is_self_host(url: &url::Url, server_host: &str) -> bool {
     url.host_str()
-        .is_some_and(|h| h.eq_ignore_ascii_case(server_host))
+        .is_some_and(|h| canonical_host(h) == canonical_host(server_host))
 }
 
 fn domain_block_reason(domain: &str) -> Option<&'static str> {
@@ -217,13 +240,93 @@ fn ipv6_block_reason(ip: Ipv6Addr) -> Option<&'static str> {
     if (segs[0] & 0xfe00) == 0xfc00 {
         return Some("unique-local");
     }
+    if (segs[0] & 0xffc0) == 0xfec0 {
+        // fec0::/10 site-local (RFC 3879 で廃止)。現行 OS でも内部扱い。
+        return Some("site-local");
+    }
     if segs[0] == 0x2001 && segs[1] == 0x0db8 {
         return Some("documentation");
+    }
+    if segs[0] == 0x3fff && (segs[1] & 0xf000) == 0 {
+        // 3fff::/20 (RFC 9637 で追加された documentation 用)。
+        // 20bit prefix = segs[0] 全体 (16bit) + segs[1] の上位 4bit。
+        return Some("documentation");
+    }
+    if segs[0] == 0x5f00 {
+        // 5f00::/16 (SRv6 SID、グローバル到達性なし)。
+        return Some("segment-routing");
+    }
+    if segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 {
+        // 100::/64 (RFC 6666 discard-only)。
+        return Some("discard-only");
+    }
+    if segs[0] == 0x2001 && (segs[1] & 0xfff0) == 0x0010 {
+        // 2001:10::/28 ORCHID (RFC 4843)。
+        return Some("orchid");
+    }
+    if segs[0] == 0x2001 && (segs[1] & 0xfff0) == 0x0020 {
+        // 2001:20::/28 ORCHIDv2 (RFC 7343)。
+        return Some("orchid");
+    }
+    if segs[0] == 0x2001 && segs[1] == 0x0002 && segs[2] == 0 {
+        // 2001:2::/48 benchmarking (RFC 5180)。
+        return Some("benchmarking");
+    }
+    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
+        // 64:ff9b:1::/48 local-use NAT64 (RFC 8215)。インターネット向けの
+        // 正規経路ではないため一律遮断。
+        return Some("nat64-local-use");
+    }
+    // 埋め込み IPv4 を持つ移行アドレスは、埋め込み IPv4 を IPv4 ルールで
+    // 再検査する。private / loopback / 特殊用途なら遮断し、public なら
+    // 許可する (IPv6-only + NAT64 環境の正規トラフィックを壊さない)。
+    if let Some((v4, kind)) = embedded_ipv4(&ip) {
+        return ipv4_block_reason(v4).map(|_| match kind {
+            "nat64" => "nat64-private",
+            "6to4" => "6to4-private",
+            _ => "teredo-private",
+        });
     }
     if let Some(v4) = ip.to_ipv4_mapped() {
         return ipv4_block_reason(v4);
     }
+    if ip.to_ipv4().is_some() {
+        // deprecated な IPv4-compatible `::a.b.c.d` (:: と ::1、::ffff:0:0/96
+        // は上で処理済み)。ルーティング可能な正規用途が無いため一律遮断。
+        return Some("ipv4-compatible");
+    }
     None
+}
+
+/// IPv6 の移行アドレスに埋め込まれた IPv4 を取り出す。
+///
+/// - NAT64 well-known prefix `64:ff9b::/96` (RFC 6052): 下位 32bit
+/// - 6to4 `2002::/16` (RFC 3056): bit 16..48
+/// - Teredo `2001::/32` (RFC 4380): 下位 32bit が obfuscated client IPv4
+fn embedded_ipv4(ip: &Ipv6Addr) -> Option<(Ipv4Addr, &'static str)> {
+    let segs = ip.segments();
+    if segs[0] == 0x0064
+        && segs[1] == 0xff9b
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0
+        && segs[5] == 0
+    {
+        return Some((v4_from_segs(segs[6], segs[7]), "nat64"));
+    }
+    if segs[0] == 0x2002 {
+        return Some((v4_from_segs(segs[1], segs[2]), "6to4"));
+    }
+    if segs[0] == 0x2001 && segs[1] == 0x0000 {
+        let obfuscated = (u32::from(segs[6]) << 16) | u32::from(segs[7]);
+        return Some((Ipv4Addr::from(!obfuscated), "teredo"));
+    }
+    None
+}
+
+fn v4_from_segs(hi: u16, lo: u16) -> Ipv4Addr {
+    #[allow(clippy::cast_possible_truncation)] // 16bit を上下 8bit に分割
+    Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
 }
 
 #[cfg(test)]
@@ -493,5 +596,95 @@ mod tests {
             &url("https://sub.example.test/x"),
             "example.test"
         ));
+    }
+
+    #[test]
+    fn self_host_matches_trailing_dot_alias() {
+        // `url` crate は末尾ドットを保持するため、末尾ドット付きの別名で
+        // 自己配送ループガードをすり抜けられないことを担保する。
+        assert!(is_self_host(
+            &url("https://example.test./inbox"),
+            "example.test"
+        ));
+        assert!(is_self_host(
+            &url("https://EXAMPLE.test./x"),
+            "example.test."
+        ));
+    }
+
+    #[test]
+    fn canonical_host_normalizes_case_and_trailing_dot() {
+        assert_eq!(canonical_host("Example.TEST."), "example.test");
+        assert_eq!(canonical_host("evil.example"), "evil.example");
+        assert_eq!(canonical_host("evil.example..."), "evil.example");
+        assert_eq!(canonical_host("  EVIL.example. "), "evil.example");
+    }
+
+    #[test]
+    fn blocks_ipv6_special_use_ranges() {
+        for s in [
+            "http://[fec0::1]/x",
+            "http://[100::1]/x",
+            "http://[2001:10::1]/x",
+            "http://[2001:20::1]/x",
+            "http://[2001:2::1]/x",
+            "http://[3fff::1]/x",
+            "http://[5f00::1]/x",
+            "http://[64:ff9b:1::1]/x",
+            "http://[::7f00:1]/x",
+        ] {
+            assert!(host_blocked(&url(s)).is_some(), "{s} must be blocked");
+        }
+    }
+
+    #[test]
+    fn blocks_transition_addresses_embedding_private_ipv4() {
+        // ATK: NAT64 / 6to4 / Teredo で private / IMDS へ翻訳させる経路。
+        for s in [
+            "http://[64:ff9b::7f00:1]/x",          // 127.0.0.1
+            "http://[64:ff9b::a9fe:a9fe]/x",       // 169.254.169.254
+            "http://[64:ff9b::a00:1]/x",           // 10.0.0.1
+            "http://[2002:7f00:1::]/x",            // 6to4 127.0.0.1
+            "http://[2002:c0a8:101::]/x",          // 6to4 192.168.1.1
+            "http://[2001:0:0:0:0:0:80ff:fffe]/x", // Teredo client 127.0.0.1
+        ] {
+            assert!(host_blocked(&url(s)).is_some(), "{s} must be blocked");
+        }
+    }
+
+    #[test]
+    fn allows_transition_addresses_embedding_public_ipv4() {
+        // IPv6-only + NAT64 環境では public IPv4 サイトが 64:ff9b::/96 に
+        // 解決される。公開アドレスへの正規経路は許可する。
+        assert_eq!(host_blocked(&url("http://[64:ff9b::1.1.1.1]/x")), None);
+        assert_eq!(host_blocked(&url("http://[2002:101:101::]/x")), None);
+    }
+
+    #[test]
+    fn documentation_3fff_check_matches_rfc9637_prefix_exactly() {
+        // RFC 9637 の 3fff::/20 は segs[0] 全体 (0x3fff) + segs[1] の上位
+        // 4bit が対象。segs[0] のみを緩いマスクで見ると、隣接する未割当の
+        // global unicast 空間 (3ff0::〜3ffe:: や 3fff: の他サブネット) まで
+        // 誤って "documentation" 扱いしてしまう回帰を防ぐ。
+        assert_eq!(
+            host_blocked(&url("http://[3fff::1]/x")),
+            Some("documentation"),
+            "3fff::/20 本体は引き続き遮断される"
+        );
+        assert_eq!(
+            host_blocked(&url("http://[3fff:fff:ffff::1]/x")),
+            Some("documentation"),
+            "segs[1] 上位4bit が 0 なら /20 の範囲内"
+        );
+        assert_eq!(
+            host_blocked(&url("http://[3ff0::1]/x")),
+            None,
+            "3ff0::/16 は /20 予約範囲の外 (未割当空間で SSRF ガード対象外)"
+        );
+        assert_eq!(
+            host_blocked(&url("http://[3fff:1000::1]/x")),
+            None,
+            "segs[1] 上位4bit が 0 でなければ /20 の範囲外"
+        );
     }
 }

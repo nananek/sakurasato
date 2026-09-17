@@ -74,6 +74,18 @@ const HARD_MAX_DIMENSION: u32 = 4096;
 /// そもそも emoji / avatar の用途ではないため、ここで CPU / メモリを守る。
 const MAX_ANIMATED_FRAMES: usize = 300;
 
+/// animated 入力で **resize 後の全フレーム合計** に許すバイト数上限。
+///
+/// `MAX_ANIMATED_FRAMES` だけでは、1 frame 目で大きい canvas を確定させ
+/// (preview = 1280×1280 RGBA ≒ 6.5 MiB)、残りを小さい差分フレームにした
+/// 入力で、300 frame × canvas サイズ ≒ 1.8 GiB まで蓄積できてしまう
+/// (コンテナの `mem_limit: 1024m` を超えて OOM kill)。合計バイトでも
+/// 打ち切ることで、公開 `/media-proxy` からの未認証 OOM を防ぐ。
+///
+/// 128 MiB は preview canvas で約 19 frame、emoji canvas (512×512) で
+/// 約 128 frame に相当し、通常のアニメ絵文字 / スタンプには十分。
+const MAX_ANIMATED_TOTAL_FRAME_BYTES: usize = 128 * 1024 * 1024;
+
 /// バリアント (= 出力サイズの上限ボックス)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -212,8 +224,13 @@ fn process_animated(
     max_pixels: u64,
 ) -> Result<ProcessedImage, ApiError> {
     let limits = make_limits(max_pixels);
-    let (resized_frames, canvas_w, canvas_h) =
-        decode_and_resize_animation(input, format, limits, variant)?;
+    let (resized_frames, canvas_w, canvas_h) = decode_and_resize_animation(
+        input,
+        format,
+        limits,
+        variant,
+        MAX_ANIMATED_TOTAL_FRAME_BYTES,
+    )?;
 
     if resized_frames.is_empty() {
         // animated と検出したが実は 0 frame だった ── 壊れた input。
@@ -263,6 +280,7 @@ fn encode_still_webp(rgba: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> Result<Bytes, Api
 }
 
 /// resize 後の frame。canvas 寸法に揃った RGBA + 表示時間 (ms)。
+#[derive(Debug)]
 struct ResizedFrame {
     rgba: ImageBuffer<Rgba<u8>, Vec<u8>>,
     delay_ms: u32,
@@ -278,6 +296,7 @@ fn decode_and_resize_animation(
     format: ImageFormat,
     limits: image::Limits,
     variant: Variant,
+    max_total_frame_bytes: usize,
 ) -> Result<(Vec<ResizedFrame>, u32, u32), ApiError> {
     match format {
         ImageFormat::Gif => {
@@ -287,7 +306,7 @@ fn decode_and_resize_animation(
             decoder.set_limits(limits).map_err(|e| {
                 ApiError::unsupported_media("decode_failed", format!("gif limits: {e}"))
             })?;
-            process_frames(decoder.into_frames(), variant)
+            process_frames(decoder.into_frames(), variant, max_total_frame_bytes)
         }
         ImageFormat::Png => {
             let mut decoder = PngDecoder::new(Cursor::new(input)).map_err(|e| {
@@ -299,7 +318,7 @@ fn decode_and_resize_animation(
             let apng = decoder
                 .apng()
                 .map_err(|e| ApiError::unsupported_media("decode_failed", format!("apng: {e}")))?;
-            process_frames(apng.into_frames(), variant)
+            process_frames(apng.into_frames(), variant, max_total_frame_bytes)
         }
         ImageFormat::WebP => {
             let mut decoder = WebPDecoder::new(Cursor::new(input)).map_err(|e| {
@@ -308,7 +327,7 @@ fn decode_and_resize_animation(
             decoder.set_limits(limits).map_err(|e| {
                 ApiError::unsupported_media("decode_failed", format!("webp limits: {e}"))
             })?;
-            process_frames(decoder.into_frames(), variant)
+            process_frames(decoder.into_frames(), variant, max_total_frame_bytes)
         }
         // is_animated_bytes が true を返したのに format がここに来るのは
         // ありえない。is_animated_bytes との不整合は internal error。
@@ -327,13 +346,18 @@ fn decode_and_resize_animation(
 /// `MAX_ANIMATED_FRAMES` 超過は **`next()` を呼ぶ前** に判定する ── for ループ
 /// だと `iter.next()` の後に body が走るため N+1 番目の decode が発生してしまう。
 /// 明示 `loop { check; next; ... }` で N+1 件目以降は decode しない契約。
+///
+/// `max_total_frame_bytes` は resize 後の RGBA 合計バイト上限。canvas が
+/// 大きい入力 (preview) でフレーム数を増やして OOM させる攻撃を防ぐ。
 fn process_frames(
     mut frames: image::Frames<'_>,
     variant: Variant,
+    max_total_frame_bytes: usize,
 ) -> Result<(Vec<ResizedFrame>, u32, u32), ApiError> {
     let mut out: Vec<ResizedFrame> = Vec::new();
     let mut canvas_w: u32 = 0;
     let mut canvas_h: u32 = 0;
+    let mut total_frame_bytes: usize = 0;
     loop {
         if out.len() >= MAX_ANIMATED_FRAMES {
             return Err(ApiError::too_large(format!(
@@ -358,6 +382,17 @@ fn process_frames(
             // 2 frame 目以降: canvas 寸法に exact resize。
             resize_frame_exact(&buffer, canvas_w, canvas_h)
         };
+        // 合計バイト上限の検査 (push 前)。canvas が大きい入力でフレーム数を
+        // 増やして OOM させる攻撃をここで打ち切る。
+        let frame_bytes = resized.as_raw().len();
+        total_frame_bytes = total_frame_bytes
+            .checked_add(frame_bytes)
+            .ok_or_else(|| ApiError::too_large("animated frame byte count overflow"))?;
+        if total_frame_bytes > max_total_frame_bytes {
+            return Err(ApiError::too_large(format!(
+                "animated input exceeds {max_total_frame_bytes} bytes of resized frames",
+            )));
+        }
         // `buffer` (= 元寸法の入力 frame) はこのスコープ末尾で drop。
         // = `out` には resize 後の小さい RGBA だけが残る = ピーク 2 重保持なし。
         out.push(ResizedFrame {
@@ -803,6 +838,37 @@ mod tests {
         }
         let err = process(&out, Variant::Emoji, 10_000_000).unwrap_err();
         assert_eq!(err.reason, "too_large");
+    }
+
+    #[test]
+    fn animated_total_frame_bytes_budget_is_enforced() {
+        // preview canvas (1280×1280 RGBA) × 多数フレームでコンテナ mem_limit を
+        // 超える OOM を防ぐ合計バイト予算の回帰テスト。小さい予算で最初の
+        // frame が拒否されることを確認する。
+        let bytes = animated_gif_2_frames();
+        let err = decode_and_resize_animation(
+            &bytes,
+            ImageFormat::Gif,
+            make_limits(1_000_000),
+            Variant::Emoji,
+            8,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.reason, "too_large",
+            "budget must reject the first frame"
+        );
+
+        // 十分な予算なら 2 frame とも通る。
+        let (frames, _, _) = decode_and_resize_animation(
+            &bytes,
+            ImageFormat::Gif,
+            make_limits(1_000_000),
+            Variant::Emoji,
+            MAX_ANIMATED_TOTAL_FRAME_BYTES,
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 2);
     }
 
     #[test]

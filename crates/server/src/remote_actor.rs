@@ -279,19 +279,31 @@ pub(crate) async fn fetch_object_json(
         state.allows_private_egress(),
     )?;
 
+    // **ドメインモデレーション (suspend)**: 停止したドメインへの外向き fetch を
+    // 止める。Announce / Move / プロフィール更新など、リモート起点で
+    // `fetch_object_json` に到達するすべての GET に効く。DB エラーは
+    // fail-open (配送ガードと同じ扱い)。
+    let host = net_guard::canonical_host(url.host_str().unwrap_or_default());
+    if let Ok(Some(m)) = repo::domain_moderation::get_by_host(state.pool(), &host).await
+        && m.severity == "suspend"
+    {
+        warn!(uri, host, "outbound AP fetch refused: domain suspended");
+        return Err(FetchError::Blocked {
+            host,
+            reason: "domain-suspended",
+        });
+    }
+
     // per-domain レート制限 (Issue #269)。actor / Note fetch の唯一の chokepoint
     // なので、ここで宛先 host のトークンを引く。flood (例: 悪意ある followee の
     // Announce 大量送出) のとき外部ドメインへの増幅 fetch を drop する。SSRF
     // 検査を通った後にチェックするので、host は検証済みの宛先。
-    let host = url.host_str().unwrap_or_default();
-    if !state.try_acquire_fetch(host) {
+    if !state.try_acquire_fetch(&host) {
         warn!(
             uri,
             host, "outbound AP fetch rate-limited for domain; dropping (Issue #269)",
         );
-        return Err(FetchError::RateLimited {
-            host: host.to_string(),
-        });
+        return Err(FetchError::RateLimited { host });
     }
 
     // プロセス全体の同時実行数上限 (per-domain 制限を host ローテートで
@@ -442,10 +454,14 @@ fn parse_actor_json(ap_id: &str, json: &JsonValue) -> Result<ParsedRemoteActor, 
     let preferred_username = s("preferredUsername")
         .ok_or_else(|| FetchError::Malformed("actor has no preferredUsername".into()))?;
 
-    let host = Url::parse(ap_id)?
-        .host_str()
-        .ok_or_else(|| FetchError::Malformed("actor ap_id has no host".into()))?
-        .to_string();
+    // **正規化必須**: `host_str()` は FQDN の末尾ドットを保持するため、
+    // 生のまま保存すると `evil.example.` が `evil.example` のモデレーション
+    // (完全一致) をすり抜ける。保存・照合は常に canonical_host を通す。
+    let host = net_guard::canonical_host(
+        Url::parse(ap_id)?
+            .host_str()
+            .ok_or_else(|| FetchError::Malformed("actor ap_id has no host".into()))?,
+    );
 
     let inbox_url =
         s("inbox").ok_or_else(|| FetchError::Malformed("actor has no inbox URL".into()))?;
@@ -883,6 +899,25 @@ mod tests {
             p.image_url.as_deref(),
             Some("https://cdn.x.test/header.png")
         );
+    }
+
+    #[test]
+    fn parse_actor_json_canonicalizes_trailing_dot_host() {
+        // `url` crate は FQDN の末尾ドットを保持するため、保存側で正規化しないと
+        // `evil.example.` が `evil.example` のドメインモデレーションをすり抜ける。
+        let j = json!({
+            "id": "https://x.test./users/alice",
+            "type": "Person",
+            "preferredUsername": "alice",
+            "inbox": "https://x.test./users/alice/inbox",
+            "publicKey": {
+                "id": "https://x.test./users/alice#main-key",
+                "owner": "https://x.test./users/alice",
+                "publicKeyPem": "PEM",
+            },
+        });
+        let p = parse_actor_json("https://x.test./users/alice", &j).unwrap();
+        assert_eq!(p.host, "x.test", "trailing dot must be stripped");
     }
 
     #[test]

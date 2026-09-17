@@ -65,7 +65,9 @@ pub struct CreateFollowResponse {
 pub struct DeleteFollowResponse {
     pub follow_id: i64,
     pub target_ap_id: String,
-    pub delivery_queue_id: i64,
+    /// `rejected` 行の削除は Undo Follow を送らない (=
+    /// [`crate::follow::delete_follow_core`] 参照) ので `None`。
+    pub delivery_queue_id: Option<i64>,
     pub inbox_url: String,
 }
 
@@ -97,7 +99,7 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
             info!(
                 follow_id = outcome.follow_id,
                 target = %outcome.target_ap_id,
-                queue_id = outcome.queue_id,
+                queue_id = ?outcome.queue_id,
                 "DELETE /api/v1/follow ok"
             );
             (StatusCode::OK, Json(to_delete_response(outcome))).into_response()

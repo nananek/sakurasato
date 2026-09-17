@@ -114,7 +114,8 @@ pub(crate) async fn handle_follow(
     // silence 導入前から続く正当な関係なので妨げない。Create/Like/
     // EmojiReact/Announce 等、既存 followee を前提とするインタラクションは
     // ここでは一切触れない (silence は Follow ハンドラのみで完結させる)。
-    if let Some(m) = repo::domain_moderation::get_by_host(state.pool(), &signer.host)
+    let signer_host = crate::net_guard::canonical_host(&signer.host);
+    if let Some(m) = repo::domain_moderation::get_by_host(state.pool(), &signer_host)
         .await
         .context("domain moderation lookup for inbound Follow")?
         && m.severity == "silence"

@@ -40,6 +40,11 @@ pub async fn handle(
     State(state): State<Arc<ProxyState>>,
     Json(req): Json<FetchRequest>,
 ) -> Response {
+    // 同時実行ゲート: デコード / エンコードのピークメモリを bound する
+    // (公開 `/media-proxy` からの並列 OOM 対策)。permit は応答まで保持。
+    let Some(_job) = state.try_acquire_job() else {
+        return ApiError::busy("media-proxy is busy; retry later").into_response();
+    };
     match fetch_inner(&state, &req).await {
         Ok(resp) => resp,
         Err(err) => err.into_response(),

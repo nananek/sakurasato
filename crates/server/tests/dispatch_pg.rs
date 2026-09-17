@@ -3223,3 +3223,76 @@ async fn domain_suspend_rejects_inbox_with_403(pool: PgPool) {
             .is_none(),
     );
 }
+
+/// 恒久的な Block 拒否 (target が DB に無い) は 503 ではなく 400 を返し、
+/// 送信側の retry ループに乗せない (R-10)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn inbound_block_to_unknown_target_returns_400(pool: PgPool) {
+    let (_, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+
+    repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor(
+            "remote.test",
+            "bob",
+            &remote_pub,
+            "https://remote.test/users/bob/inbox",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.test/activities/block-unknown",
+        "type": "Block",
+        "actor": remote.ap_id,
+        "object": "https://remote.test/users/never-seen",
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+    let req = build_signed_post(body.as_bytes(), "/inbox", &remote_priv, &keyid, LOCAL_HOST);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "unknown Block target is a permanent rejection (4xx, not 503)",
+    );
+}
+
+/// suspend 済みドメインへの外向き actor fetch は、ネットワークに触れる前に
+/// 拒否される (Announce / Move / プロフィール更新から到達する共通経路)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn fetch_and_upsert_refuses_suspended_domain(pool: PgPool) {
+    use sakurasato_server::remote_actor::{self, FetchError};
+
+    let (_, local_pub) = fresh_rsa();
+    repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    repo::domain_moderation::upsert(&pool, "suspended.test", "suspend", None)
+        .await
+        .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let err = remote_actor::fetch_and_upsert(&state, "https://suspended.test/users/x")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FetchError::Blocked {
+                reason: "domain-suspended",
+                ..
+            }
+        ),
+        "suspended domain must be refused before fetch: {err:?}",
+    );
+}

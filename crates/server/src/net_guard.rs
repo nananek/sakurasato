@@ -9,5 +9,6 @@
 //! [PR #35 claude-review]: SSRF 対策の重複防止 (= 配送 / actor fetch / TUI が
 //! すべて同一関数を通すこと) は M3b-3 PR2 で決まった不変条件。
 
+pub(crate) use sakurasato_core::net_guard::canonical_host;
 pub(crate) use sakurasato_core::net_guard::host_blocked;
 pub(crate) use sakurasato_core::net_guard::is_self_host;
