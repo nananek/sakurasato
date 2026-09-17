@@ -3429,3 +3429,76 @@ async fn unknown_actor_with_valid_signature_is_persisted(pool: PgPool) {
         .expect("Follow row must exist");
     assert_eq!(follow.state, "accepted");
 }
+
+/// `POST /users/{name}/inbox` は存在しないローカルユーザ名なら 404。shared
+/// inbox と同一扱いにしない。署名自体は正規 (seed 済み remote 鍵) のため、
+/// 404 は recipient 検証によるものであることが確定する。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn user_inbox_unknown_recipient_is_404(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (remote_priv, remote_pub) = fresh_rsa();
+    let _ = local_priv;
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let remote_inbox = "https://remote.test/users/bob/inbox".to_string();
+    let remote = repo::actor::insert(
+        &pool,
+        remote_actor("remote.test", "bob", &remote_pub, &remote_inbox),
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::from_pool(pool.clone(), make_config());
+    let app = router(state);
+
+    let follow_id = format!(
+        "https://remote.test/users/bob/activities/follow-{}",
+        local.id
+    );
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_id,
+        "type": "Follow",
+        "actor": remote.ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{}#main-key", remote.ap_id);
+
+    // 存在しないユーザ宛 → 404、dispatch は走らない (follow 行なし)。
+    let req = build_signed_post(
+        body.as_bytes(),
+        "/users/nouser/inbox",
+        &remote_priv,
+        &keyid,
+        LOCAL_HOST,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "unknown recipient inbox must be 404"
+    );
+    let follow = repo::follow::get_by_ap_id(&pool, &follow_id).await.unwrap();
+    assert!(
+        follow.is_none(),
+        "404 recipient must not dispatch: {follow:?}"
+    );
+
+    // 正規のローカルユーザ宛 → 従来どおり受理される (不退化)。
+    let req = build_signed_post(
+        body.as_bytes(),
+        &format!("/users/{LOCAL_USER}/inbox"),
+        &remote_priv,
+        &keyid,
+        LOCAL_HOST,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "local recipient inbox must still accept"
+    );
+}

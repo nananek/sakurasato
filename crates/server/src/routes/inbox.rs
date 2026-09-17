@@ -12,7 +12,9 @@
 //! 未対応 Activity 型は 202 で受け流す ── 相手の再送ループに乗せないため。
 
 use axum::extract::{Path, State};
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use sakurasato_core::repo;
 
 use crate::dispatch::{self, DispatchError};
 use crate::extract::SignedInboxBody;
@@ -30,6 +32,20 @@ pub(crate) async fn user_inbox(
     Path(name): Path<String>,
     signed: SignedInboxBody,
 ) -> Result<Response, DispatchError> {
+    // recipient がローカルユーザでなければ 404 ── 存在しないユーザ宛 inbox を
+    // shared と同一扱いにしない。署名検証 (extractor) は通過済みだが、dispatch
+    // 前に弾くことで未知宛ての受信処理・ログ混入を防ぐ。
+    let host = &state.config().server.host;
+    let is_local_user = match repo::actor::get_by_username_host(state.pool(), &name, host).await {
+        Ok(Some(row)) => row.is_local,
+        Ok(None) => false,
+        Err(e) => {
+            return Err(DispatchError::Internal(e.into()));
+        }
+    };
+    if !is_local_user {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
     handle(&state, &signed, Some(name.as_str())).await
 }
 
