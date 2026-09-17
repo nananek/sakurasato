@@ -1336,6 +1336,100 @@ async fn users_lists_create_without_scope_is_403(pool: PgPool) {
     assert_eq!(v["error"]["code"], "PERMISSION_DENIED");
 }
 
+/// リスト名の長さ上限 (`repo::user_list::MAX_LIST_NAME_CHARS` = 100 文字)。
+/// 正常系 / 境界値は通し、上限超過は 400 `INVALID_PARAM` で弾く。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_lists_create_enforces_name_length_limit(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account"]).await;
+
+    // 正常系: 短い名前は 200。
+    let resp = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({"i": token, "name": "ok"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 境界値: ちょうど 100 文字は 200。マルチバイト文字で「bytes ではなく
+    // chars で数える」ことも同時に担保する。
+    let boundary = "あ".repeat(sakurasato_core::repo::user_list::MAX_LIST_NAME_CHARS);
+    let resp = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({"i": token, "name": boundary}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 上限超過: 101 文字は 400。
+    let over = "a".repeat(sakurasato_core::repo::user_list::MAX_LIST_NAME_CHARS + 1);
+    let resp = post_json(
+        app,
+        "/api/users/lists/create",
+        json!({"i": token, "name": over}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = read_json(resp).await;
+    assert_eq!(v["error"]["code"], "INVALID_PARAM");
+}
+
+/// `users/lists/update` でも同じ長さ上限が効く ── 超過は 400 で既存名を
+/// 変えず、境界値は 200 で反映される。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn users_lists_update_enforces_name_length_limit(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = make_state(pool.clone(), "sakurasato.test", "alice");
+    let app = router_for(&state);
+    let token = issue_token_with_scopes(&pool, &["write:account", "read:account"]).await;
+
+    let created = read_json(
+        post_json(
+            app.clone(),
+            "/api/users/lists/create",
+            json!({"i": token, "name": "before"}),
+        )
+        .await,
+    )
+    .await;
+    let list_id = created["id"].as_str().unwrap().to_string();
+
+    // 上限超過 → 400。既存名は変更されない。
+    let over = "a".repeat(sakurasato_core::repo::user_list::MAX_LIST_NAME_CHARS + 1);
+    let resp = post_json(
+        app.clone(),
+        "/api/users/lists/update",
+        json!({"i": token, "listId": list_id, "name": over}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let show = read_json(
+        post_json(
+            app.clone(),
+            "/api/users/lists/show",
+            json!({"i": token, "listId": list_id}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(show["name"], "before");
+
+    // 境界値 → 200 で反映される。
+    let boundary = "あ".repeat(sakurasato_core::repo::user_list::MAX_LIST_NAME_CHARS);
+    let resp = post_json(
+        app.clone(),
+        "/api/users/lists/update",
+        json!({"i": token, "listId": list_id, "name": boundary.clone()}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(read_json(resp).await["name"], boundary);
+}
+
 // ─── following/requests/{list,accept,reject,cancel} (Aria FollowRequestsNotifier fix) ──
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

@@ -101,6 +101,14 @@ pub async fn create(State(state): State<AppState>, Json(req): Json<CreateListReq
     if title.is_empty() {
         return bad_request("title must not be empty");
     }
+    // タイトルの長さ上限 (DB 行肥大対策)。`repo::user_list` の 1 点で
+    // MiAuth 側 (`users/lists/*`) と同じ上限を共有する。
+    if !repo::user_list::is_valid_list_name(title) {
+        return bad_request(&format!(
+            "title exceeds the {}-character limit",
+            repo::user_list::MAX_LIST_NAME_CHARS
+        ));
+    }
     match repo::user_list::create(state.pool(), title).await {
         Ok(row) => (StatusCode::CREATED, Json(to_dto(row, 0))).into_response(),
         Err(err) => {
@@ -157,6 +165,12 @@ pub async fn rename(
     let title = req.title.trim();
     if title.is_empty() {
         return bad_request("title must not be empty");
+    }
+    if !repo::user_list::is_valid_list_name(title) {
+        return bad_request(&format!(
+            "title exceeds the {}-character limit",
+            repo::user_list::MAX_LIST_NAME_CHARS
+        ));
     }
     match repo::user_list::rename(state.pool(), id, title).await {
         Ok(Some(row)) => {
