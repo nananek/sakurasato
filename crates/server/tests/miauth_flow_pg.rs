@@ -189,6 +189,53 @@ async fn landing_inserts_pending_session(pool: PgPool) {
     assert_eq!(row.state, "pending");
 }
 
+/// G1 回帰テスト: `GET /miauth/{uuid}` の landing HTML が多層防御ヘッダ
+/// (CSP / nosniff / no-referrer) を返す (`routes/tags.rs` の F5 と同流儀)。
+/// CSP は inline `<style>` を持つ landing のため `style-src 'unsafe-inline'` を
+/// 1 トークン追加している (script 実行は引き続き禁止)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn landing_sets_hardening_headers(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
+    let app = miauth::router(state);
+
+    let uuid = Uuid::new_v4();
+    let path = format!("/miauth/{uuid}?name=Milktea");
+    let resp = app
+        .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers = resp.headers();
+    assert_eq!(
+        headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    );
+    assert_eq!(
+        headers
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "nosniff",
+    );
+    assert_eq!(
+        headers
+            .get(header::REFERRER_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no-referrer",
+    );
+}
+
 /// `GET /miauth/{uuid}` の query が空のときは scope ゼロ + `app_name=unknown app`。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn landing_with_empty_query_records_empty_scope(pool: PgPool) {
