@@ -52,7 +52,7 @@
 //! 操作性を維持)。
 
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::Duration;
 use sakurasato_core::model::MiAuthSessionState;
@@ -287,12 +287,7 @@ pub async fn handle(
                 ),
                 Some(state_kind) => render_existing_state(uuid, state_kind),
             };
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                body,
-            )
-                .into_response();
+            return landing_html(StatusCode::OK, body);
         }
         Ok(None) => { /* fall through to INSERT */ }
         Err(err) => {
@@ -333,24 +328,51 @@ pub async fn handle(
                 row.callback_url.as_deref(),
                 &row.permissions.0,
             );
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                body,
-            )
-                .into_response();
+            return landing_html(StatusCode::OK, body);
         }
         tracing::error!(?err, %uuid, "miauth_session insert failed");
         return landing_error("failed to create the MiAuth session");
     }
 
     let body = render_landing(uuid, &app_name, callback_url.as_deref(), &permissions);
-    (
-        StatusCode::OK,
+    landing_html(StatusCode::OK, body)
+}
+
+/// HTML landing レスポンス共通のコンストラクタ (G1)。
+///
+/// `Content-Type` に加え、`routes/tags.rs` / permalink と同じ多層防御ヘッダ
+/// (CSP / nosniff / no-referrer) を付ける。landing 本文は escape 済みで外部
+/// リソース参照もないが、将来のテンプレート変更時の実行・埋め込み・漏洩を
+/// ブラウザ側で止める。
+///
+/// CSP だけ tags/permalink と 1 トークン違う (`style-src 'unsafe-inline'`):
+/// landing は inline `<style>` で見た目を整えており、素の
+/// `default-src 'none'` ではスタイルが死んで素の HTML になる。inline style の
+/// 許可は script 実行阻止と無関係 (`script-src` は `default-src 'none'` に
+/// フォールバックして引き続き禁止) ので、描画を保ったまま XSS 耐性を得られる。
+fn landing_html(status: StatusCode, body: String) -> Response {
+    let mut response = (
+        status,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         body,
     )
-        .into_response()
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 
 /// `MiAuth` landing でのサーバ内部エラーを `text/html` で返す。
@@ -360,15 +382,13 @@ pub async fn handle(
 /// 見せる ── bare 500 だと webview に空ページが出て原因が分からない。
 /// `message` は本 module 内の静的文字列のみを渡す契約 (= HTML エスケープ不要)。
 fn landing_error(message: &str) -> Response {
-    (
+    landing_html(
         StatusCode::INTERNAL_SERVER_ERROR,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         format!(
             "<!doctype html><meta charset=\"utf-8\"><title>MiAuth error</title>\
              <p>MiAuth: {message}</p>"
         ),
     )
-        .into_response()
 }
 
 /// 既存 session が pending **以外** だったときの informational page。
@@ -487,6 +507,43 @@ mod tests {
         );
         assert!(render_existing_state(uuid, MiAuthSessionState::Rejected).contains("rejected"));
         assert!(render_existing_state(uuid, MiAuthSessionState::Expired).contains("expired"));
+    }
+
+    /// G1 回帰テスト: landing HTML が多層防御ヘッダ (CSP / nosniff /
+    /// no-referrer) を返す (`routes/tags.rs` の F5 と同流儀)。
+    #[test]
+    fn landing_html_sets_hardening_headers() {
+        let resp = landing_html(StatusCode::OK, "<p>hi</p>".to_string());
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        );
+        assert_eq!(
+            headers
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "nosniff",
+        );
+        assert_eq!(
+            headers
+                .get(header::REFERRER_POLICY)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "no-referrer",
+        );
+        // Content-Type は従来どおり HTML のまま。
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "text/html; charset=utf-8",
+        );
     }
 }
 
