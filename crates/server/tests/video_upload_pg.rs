@@ -246,3 +246,83 @@ async fn non_video_content_type_uses_image_path(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
+
+/// F1: 動画 slot 占有中は 2 件目の動画アップロードが 503 になる
+/// (待たせない)。単発 454 MiB 実測に対し cgroup 768m では 2 並列で
+/// 超過するため。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn second_concurrent_video_upload_returns_503(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    // 別リクエストが処理中という想定で slot を占有する。
+    let holder = state.clone();
+    let _held = holder
+        .try_acquire_video_upload_slot()
+        .expect("video upload slot should be free");
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/media?kind=attachment")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "video/mp4")
+                .body(Body::from(vec![0u8; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// F1: 動画 slot 占有中でも画像アップロードは gate されない
+/// (= media-proxy 到達で socket 未接続の 502 になる)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn image_upload_not_gated_by_video_slot(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let holder = state.clone();
+    let _held = holder
+        .try_acquire_video_upload_slot()
+        .expect("video upload slot should be free");
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/media?kind=attachment")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(Body::from(vec![0u8; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+/// F1: 画像は動画上限 (このテストでは 1000 バイトではなく画像上限 4 MiB)
+/// ではなく画像上限で頭打ちになる。5 MiB の画像は読みながら 413 で
+/// 落ちる (= route 層の 200 MiB 級上限まで buffer しない)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn image_payload_uses_image_max_not_video_max(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let raw = issue_token(&pool, "tui").await;
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/media?kind=attachment")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(Body::from(vec![0u8; 5 * 1024 * 1024]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}

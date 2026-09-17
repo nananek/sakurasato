@@ -214,7 +214,9 @@ fn is_ap_link_type(typ: &str) -> bool {
 }
 
 async fn download_webfinger(state: &ProxyState, url: &Url) -> Result<Vec<u8>, ApiError> {
-    let max_bytes = state.max_bytes();
+    // F3: 画像用 max_bytes (既定 25 MiB) ではなく WebFinger 専用の小さい
+    // 上限 (64 KiB) で頭打ちにする。JRD は actor 解決用の小さな JSON。
+    let max_bytes = state.max_webfinger_bytes();
     let resp = state
         .http()
         .get(url.clone())
@@ -349,5 +351,17 @@ mod tests {
             extract_self_link(&json!({"links": [{"rel": "other", "type": "application/activity+json", "href": "x"}]}))
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use crate::state::MAX_WEBFINGER_BYTES;
+
+    /// F3: `WebFinger` 上限が画像用上限 (MiB 級) に戻っていないことを担保する。
+    /// JRD は actor 解決用の小さな JSON であり、64 KiB で十分。
+    #[test]
+    fn webfinger_cap_stays_small() {
+        assert_eq!(MAX_WEBFINGER_BYTES, 64 * 1024);
     }
 }

@@ -350,3 +350,28 @@ async fn sanitize_resizes_oversized_avatar() {
     assert!(w <= 256, "width {w} > 256");
     assert!(h <= 256, "height {h} > 256");
 }
+
+/// F2 回帰テスト: job slot (2) を占有した状態では `/v1/video/sanitize` が
+/// 503 busy になる (= 画像 fetch / sanitize と同じゲートが動画にも掛かる)。
+/// 動画は 1 件で約 400 MiB を食うため、gate なしの並列でコンテナ
+/// (`mem_limit` 1024m) を OOM させられる。
+#[tokio::test]
+async fn video_sanitize_returns_busy_when_job_slots_exhausted() {
+    let state = ProxyState::from_config(make_config()).expect("ProxyState build");
+    let holder = state.clone();
+    let _first = holder.try_acquire_job().expect("slot 1 should be free");
+    let _second = holder.try_acquire_job().expect("slot 2 should be free");
+    let app = sakurasato_media_proxy::router(state);
+    let resp = app
+        .oneshot(
+            Request::post("/v1/video/sanitize")
+                .header(header::CONTENT_TYPE, "video/mp4")
+                .body(Body::from(vec![0u8; 64]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = read_json(resp).await;
+    assert_eq!(json["reason"], "busy");
+}

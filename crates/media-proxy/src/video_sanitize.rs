@@ -23,6 +23,13 @@ use crate::state::ProxyState;
 use crate::video_pipeline;
 
 pub async fn handle(State(state): State<Arc<ProxyState>>, body: Bytes) -> Response {
+    // F2: 画像 fetch / sanitize と同じ同時実行ゲートを掛ける。動画は 1 件で
+    // 入力 (最大 200 MiB) + process 内コピーと約 400 MiB を食うため、
+    // gate なしの並列リクエストでコンテナ (mem_limit 1024m) を OOM させられる。
+    // permit は応答まで保持する。
+    let Some(_job) = state.try_acquire_job() else {
+        return ApiError::busy("media-proxy is busy; retry later").into_response();
+    };
     match sanitize_inner(&state, &body) {
         Ok(resp) => resp,
         Err(err) => err.into_response(),
