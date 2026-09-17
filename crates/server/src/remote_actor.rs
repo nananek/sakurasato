@@ -96,8 +96,8 @@ pub enum FetchError {
     #[error("actor JSON is malformed: {0}")]
     Malformed(String),
 
-    #[error("response too large (>{MAX_AP_OBJECT_BYTES} bytes)")]
-    TooLarge,
+    #[error("response too large (>{max_bytes} bytes)")]
+    TooLarge { max_bytes: usize },
 
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
@@ -421,7 +421,7 @@ async fn read_body_limited(resp: reqwest::Response, max_bytes: usize) -> Result<
             len,
             max_bytes, "AP object fetch Content-Length exceeds limit; refusing to read body",
         );
-        return Err(FetchError::TooLarge);
+        return Err(FetchError::TooLarge { max_bytes });
     }
 
     let mut stream = resp.bytes_stream();
@@ -433,7 +433,7 @@ async fn read_body_limited(resp: reqwest::Response, max_bytes: usize) -> Result<
                 max_bytes,
                 "AP object fetch body exceeds limit during streaming; aborting"
             );
-            return Err(FetchError::TooLarge);
+            return Err(FetchError::TooLarge { max_bytes });
         }
         buf.extend_from_slice(&chunk);
     }
@@ -1193,7 +1193,7 @@ mod tests {
             .await
             .expect("must abort early; reading forever means the limit is not enforced");
 
-        assert!(matches!(result, Err(FetchError::TooLarge)));
+        assert!(matches!(result, Err(FetchError::TooLarge { max_bytes }) if max_bytes == limit));
 
         // 早期打ち切りでなければ、この時点でサーバ側は大幅に送信を続けている。
         // (旧実装は本文を読み切るまで返らないため、そもそも timeout で落ちる)
@@ -1232,7 +1232,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(5), read_body_limited(resp, limit))
             .await
             .expect("must not wait for a body declared over the limit");
-        assert!(matches!(result, Err(FetchError::TooLarge)));
+        assert!(matches!(result, Err(FetchError::TooLarge { max_bytes }) if max_bytes == limit));
     }
 
     #[tokio::test]
@@ -1311,6 +1311,6 @@ mod tests {
         let err = read_body_limited(resp, LIMIT)
             .await
             .expect_err("limit + 1 bytes must be rejected");
-        assert!(matches!(err, FetchError::TooLarge));
+        assert!(matches!(err, FetchError::TooLarge { max_bytes } if max_bytes == LIMIT));
     }
 }
