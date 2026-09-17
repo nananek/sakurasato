@@ -46,6 +46,30 @@ pub(crate) struct SignedInboxBody {
 /// inbox に到達するリクエストの最大ボディサイズ (1 MiB)。
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// ラベル解決の結果。DB 既存行か、fetch 済み・未永続化の二択。
+enum ResolvedActor {
+    /// DB に既にあった行。そのまま検証・dispatch に使える。
+    Persisted(ActorRow),
+    /// remote から取得・パース済みだが **DB 未書き込み**。署名検証に成功
+    /// してから [`crate::remote_actor::upsert_parsed`] で永続化する。
+    /// 検証失敗時は両方とも捨てる (= 未認証 POST で actor 行が残留しない)。
+    Unverified {
+        transient: ActorRow,
+        parsed: Box<remote_actor::ParsedRemoteActor>,
+    },
+}
+
+impl ResolvedActor {
+    /// 署名検証・ドメインブロック判定が読む行。`Unverified` のときは DB に
+    /// 存在しない一時行 (`id: 0`) で、検証成功前の下流利用は禁止。
+    fn for_verification(&self) -> &ActorRow {
+        match self {
+            Self::Persisted(row) => row,
+            Self::Unverified { transient, .. } => transient,
+        }
+    }
+}
+
 impl<B> FromRequest<AppState, B> for SignedInboxBody
 where
     B: Send + 'static,
@@ -106,7 +130,7 @@ where
             };
             let ap_id = parsed_keyid.ap_id;
             let actor = match repo::actor::get_by_ap_id(state.pool(), ap_id).await {
-                Ok(Some(row)) => row,
+                Ok(Some(row)) => ResolvedActor::Persisted(row),
                 Ok(None) if !state.enable_remote_fetch() => {
                     // テスト経路 (`AppState::from_pool`) では remote fetch を
                     // 無効化する。未知 keyId は次のラベルがあればそちらを試行、
@@ -117,11 +141,19 @@ where
                 Ok(None) => {
                     // 未知 actor → remote fetch を試みる。SSRF ガード・
                     // redirect 拒否・size 上限は [`remote_actor`] が責任を持つ。
+                    // ここではパースまでに留め、DB 書き込みは署名検証の成功
+                    // 後に回す (= 検証前の永続化による残留行を作らない)。
                     tracing::info!(ap_id, "actor not in DB; attempting remote fetch");
-                    match remote_actor::fetch_and_upsert_for_signature(state, ap_id).await {
-                        Ok(row) => row,
+                    match remote_actor::fetch_and_parse(state, ap_id).await {
+                        Ok(parsed) => {
+                            let transient = parsed.to_transient_row();
+                            ResolvedActor::Unverified {
+                                transient,
+                                parsed: Box::new(parsed),
+                            }
+                        }
                         Err(remote_actor::FetchError::Db(e)) => {
-                            tracing::error!(error = %e, ap_id, "DB error during remote actor upsert");
+                            tracing::error!(error = %e, ap_id, "DB error during remote actor fetch");
                             // DB 障害は他ラベルでも失敗確実 → 即 503 を返す。
                             return Err(SigError::Internal);
                         }
@@ -138,24 +170,25 @@ where
                     return Err(SigError::Internal);
                 }
             };
+            let verification_actor = actor.for_verification();
 
             // 4.5. 連合ドメインブロック (PR5、計画書 §6.4): suspend 対象
             // ドメインの actor は crypto 検証を試みる前に拒否する (検証
             // コスト削減)。silence は inbox 受信自体を妨げない (§10 確定
             // 事項 #3、効果は handle_follow 側のガードに限定)。
-            let actor_host = crate::net_guard::canonical_host(&actor.host);
+            let actor_host = crate::net_guard::canonical_host(&verification_actor.host);
             match repo::domain_moderation::get_by_host(state.pool(), &actor_host).await {
                 Ok(Some(m)) if m.severity == "suspend" => {
                     tracing::warn!(
-                        actor_ap_id = %actor.ap_id,
-                        host = %actor.host,
+                        actor_ap_id = %verification_actor.ap_id,
+                        host = %verification_actor.host,
                         "inbox rejected: actor's domain is suspended",
                     );
                     return Err(SigError::DomainSuspended);
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::error!(error = %e, host = %actor.host, "DB error during domain moderation lookup");
+                    tracing::error!(error = %e, host = %verification_actor.host, "DB error during domain moderation lookup");
                     return Err(SigError::Internal);
                 }
             }
@@ -164,8 +197,24 @@ where
             //    鍵種別は検証側が actor の鍵と突き合わせて確定した値を使う
             //    (keyId の fragment 由来の暫定値ではない、#374)。
             let scheme = info.scheme;
-            match sign::verify_request_with_actor(&ctx, &info, &actor) {
+            match sign::verify_request_with_actor(&ctx, &info, verification_actor) {
                 Ok(key_kind) => {
+                    // 検証成功後に初めて永続化する。`fetch_and_parse` で
+                    // 取得しただけの actor はここで upsert し、本物の行を
+                    // 下流 (dispatch) に渡す。検証失敗ラベルでは何も書かず
+                    // 次ラベルへ進むため、未認証 POST の残留行が出ない。
+                    let actor = match actor {
+                        ResolvedActor::Persisted(row) => row,
+                        ResolvedActor::Unverified { parsed, .. } => {
+                            match remote_actor::upsert_parsed(state, *parsed).await {
+                                Ok(row) => row,
+                                Err(e) => {
+                                    tracing::error!(error = %e, ap_id, "DB error during post-verification actor upsert");
+                                    return Err(SigError::Internal);
+                                }
+                            }
+                        }
+                    };
                     tracing::info!(
                         scheme = ?scheme,
                         key_kind = ?key_kind,
