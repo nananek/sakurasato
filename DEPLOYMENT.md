@@ -756,6 +756,33 @@ media-proxy は画像 1 リクエストあたりの合計フレームメモリ (
 **外向き fetch** (actor / Note / remote emoji) も止める。ホスト名は末尾ドット・大文字
 小文字を正規化して保存される (migration 0033 で既存行も正規化済み)。
 
+### 7.3 inbound レート制限は edge (Cloudflare) が前提
+
+server の公開 listener (`routes::router` ── WebFinger / actor / inbox / permalink /
+`/media/*` / 公開 `/media-proxy` 等) には **アプリ内蔵の inbound レート制限が無い**。
+per-request の増幅は egress 側で bound しているが (宛先 host ごとの per-domain バケット、
+同時実行ゲート、本文上限、コンテナ `mem_limit`)、無認証 GET/POST 自体の受付頻度は
+制限していない ── 意図的な設計判断で、以下 2 点が理由:
+
+1. **Tunnel 越しではアプリ層の IP 制限が効かない**。§0/§4 の構成では全 inbound が
+   cloudflared 経由 (= server から見える peer IP は常に cloudflared 1 本) のため、
+   アプリ内で peer IP バケットを切っても正規の連合トラフィック全体を一括で絞る
+   だけで攻撃者だけを落とせない。正しい client IP が見えるのは edge だけ。
+2. **単発コストは小さい**。公開 GET は 1〜数 DB クエリ + S3 GET 程度で、重い処理
+   (画像デコード / 外向き fetch) は media-proxy 側のゲート・バケットで別途 bound
+   している。お一人様規模では edge の protection で足りる。
+
+したがって flood 対策は **Cloudflare 側で設定すること**:
+
+- Cloudflare ダッシュボード → 対象ドメイン → Security → WAF → Rate limiting rules で、
+  高コストな無認証エンドポイントにルールを当てる (例: `POST /inbox`・`/users/*/inbox` の
+  同一 IP からの連投、公開 `GET /media-proxy` の連投 → 一時 Block / Managed Challenge)。
+- §6.2 の代替構成 (nginx / caddy で直接リバースプロキシ) を使う場合はそちらで
+  `limit_req` (nginx) / `rate_limit` (caddy) を同等に設定する。`server` の TCP を直接
+  公開する構成では edge protection が無い分、この設定が唯一の inbound 障壁になる。
+- MiAuth listener (`miauth.sock`) と local API は Tailscale 限定運用 (§5・§6) のため
+  本項の対象外 ── §6.2 の警告どおり cloudflared / nginx 越しに公開しないこと。
+
 ---
 
 ## 8. 運用タスク
