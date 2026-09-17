@@ -138,6 +138,14 @@ pub async fn create(
     else {
         return bad_request("name is required");
     };
+    // 名前の長さ上限 (DB 行肥大対策)。`repo::user_list` の 1 点で TUI 側
+    // (`/api/v1/lists`) と同じ上限を共有する。
+    if !repo::user_list::is_valid_list_name(name) {
+        return bad_request(&format!(
+            "name exceeds the {}-character limit",
+            repo::user_list::MAX_LIST_NAME_CHARS
+        ));
+    }
     match repo::user_list::create(state.pool(), name).await {
         Ok(row) => Json(user_list_to_miss(&row, &[])).into_response(),
         Err(err) => {
@@ -225,6 +233,12 @@ pub async fn update(
     else {
         return bad_request("name is required");
     };
+    if !repo::user_list::is_valid_list_name(name) {
+        return bad_request(&format!(
+            "name exceeds the {}-character limit",
+            repo::user_list::MAX_LIST_NAME_CHARS
+        ));
+    }
     match repo::user_list::rename(state.pool(), list_id, name).await {
         Ok(Some(_)) => respond_with_list(&state, list_id).await,
         Ok(None) => error_resp(StatusCode::NOT_FOUND, "NO_SUCH_LIST", "no such list"),

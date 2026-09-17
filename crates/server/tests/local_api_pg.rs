@@ -2928,6 +2928,140 @@ async fn list_create_and_list_roundtrip(pool: PgPool) {
     );
 }
 
+/// リストタイトルの長さ上限 (`repo::user_list::MAX_LIST_NAME_CHARS` = 100 文字)。
+/// 正常系 / 境界値は作成でき、上限超過は 400 で弾く。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn list_create_enforces_title_length_limit(pool: PgPool) {
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    // 正常系: 短いタイトルは 201。
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/lists")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": "ok" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // 境界値: ちょうど 100 文字は 201。マルチバイト文字で「bytes ではなく
+    // chars で数える」ことも同時に担保する。
+    let boundary = "あ".repeat(sakurasato_core::repo::user_list::MAX_LIST_NAME_CHARS);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/lists")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": boundary })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // 上限超過: 101 文字は 400。
+    let over = "a".repeat(sakurasato_core::repo::user_list::MAX_LIST_NAME_CHARS + 1);
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/lists")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": over })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// リネームでも同じ長さ上限が効く ── 超過は 400 で既存タイトルを変えず、
+/// 境界値は 200 で反映される。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn list_rename_enforces_title_length_limit(pool: PgPool) {
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/lists")
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": "before" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_id = read_json(resp).await["id"].as_i64().unwrap();
+
+    // 上限超過 → 400。既存タイトルは変更されない。
+    let over = "a".repeat(sakurasato_core::repo::user_list::MAX_LIST_NAME_CHARS + 1);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/lists/{list_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": over })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/lists/{list_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_json(resp).await["title"], "before");
+
+    // 境界値 → 200 で反映される。
+    let boundary = "あ".repeat(sakurasato_core::repo::user_list::MAX_LIST_NAME_CHARS);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/lists/{list_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "title": boundary.clone() })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(read_json(resp).await["title"], boundary);
+}
+
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn list_add_member_requires_accepted_follow(pool: PgPool) {
     let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))

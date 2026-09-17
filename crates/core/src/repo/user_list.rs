@@ -14,6 +14,27 @@ use sqlx::types::Json;
 use crate::model::UserListRow;
 use crate::repo::note::TimelineEntry;
 
+/// リスト名 (`title` / `name`) の最大文字数。
+///
+/// `miauth::lists` (Misskey `users/lists/*`, wire 名 `name`)、
+/// `local_api::user_list` (TUI `/api/v1/lists`, wire 名 `title`)、
+/// `list_cli` (`sakurasato-server list create|rename`, `--title`) の
+/// 3 経路すべてがこの 1 点の上限を共有する。Misskey のリスト名は実用上数十文字で、
+/// 100 文字は正当な名前を弾かず DB 行の肥大を防ぐ値 (`i/update` の
+/// `FIELD_NAME_MAX` と同じ規模感)。
+pub const MAX_LIST_NAME_CHARS: usize = 100;
+
+/// リスト名として妥当か。`trim` 済みの **非空** 文字列で
+/// [`MAX_LIST_NAME_CHARS`] 以内なら `true`。
+///
+/// 空文字列は `false` を返す (呼び出し側は「required」エラーを先に返す)。
+/// 文字数は Unicode scalar value 単位で数える (`chars().count()`) ──
+/// `i/update` の field 上限 (`FIELD_NAME_MAX` 等) と同じ流儀。
+pub fn is_valid_list_name(name: &str) -> bool {
+    let len = name.chars().count();
+    (1..=MAX_LIST_NAME_CHARS).contains(&len)
+}
+
 pub async fn create(pool: &PgPool, title: &str) -> sqlx::Result<UserListRow> {
     sqlx::query_as!(
         UserListRow,
@@ -240,4 +261,33 @@ pub async fn list_all_with_counts(pool: &PgPool) -> sqlx::Result<Vec<UserListWit
         out.push(UserListWithCount { list, member_count });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_name_accepts_normal_and_boundary() {
+        // 正常系
+        assert!(is_valid_list_name("friends"));
+        // 境界値: ちょうど MAX_LIST_NAME_CHARS 文字は通る。
+        let boundary = "あ".repeat(MAX_LIST_NAME_CHARS);
+        assert_eq!(boundary.chars().count(), MAX_LIST_NAME_CHARS);
+        assert!(is_valid_list_name(&boundary));
+    }
+
+    #[test]
+    fn list_name_rejects_over_limit() {
+        let over = "あ".repeat(MAX_LIST_NAME_CHARS + 1);
+        assert!(!is_valid_list_name(&over));
+        // ASCII でも同様 (= bytes ではなく chars で数えることの担保)。
+        let ascii_over = "a".repeat(MAX_LIST_NAME_CHARS + 1);
+        assert!(!is_valid_list_name(&ascii_over));
+    }
+
+    #[test]
+    fn list_name_rejects_empty() {
+        assert!(!is_valid_list_name(""));
+    }
 }
