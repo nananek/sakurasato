@@ -770,3 +770,26 @@ async fn tags_page_sets_hardening_headers(pool: PgPool) {
         "no-referrer",
     );
 }
+
+/// F6 回帰テスト: inbound webfinger が末尾ドット / 大文字の host を
+/// 正規化して照合する (正規化前は 404 になった)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn webfinger_matches_canonicalized_host(pool: PgPool) {
+    repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/.well-known/webfinger?resource=acct:alice@EXAMPLE.test.")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["subject"], "acct:alice@example.test");
+}

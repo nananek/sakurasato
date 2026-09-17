@@ -40,10 +40,16 @@ pub async fn handle(
     let Some((username, host)) = parse_acct(&query.resource) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if host != state.config().server.host {
+    // F6: host を正規化してから比較・照合する (`EXAMPLE.test.` のような
+    // 大文字 / FQDN 末尾ドット表記でも自ホストとして受理する。actor.host
+    // の保存側は既に正規化済みのため、照合側も揃えないと 404 になる)。
+    // 設定側も同じ正規化を通す (運用時の表記ゆれ対策)。
+    let host = sakurasato_core::net_guard::canonical_host(host);
+    let configured = sakurasato_core::net_guard::canonical_host(&state.config().server.host);
+    if host != configured {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let row = match repo::actor::get_by_username_host(state.pool(), username, host).await {
+    let row = match repo::actor::get_by_username_host(state.pool(), username, &host).await {
         Ok(Some(row)) if row.is_local => row,
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
