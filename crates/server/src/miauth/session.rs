@@ -78,6 +78,44 @@ pub struct LandingQuery {
     pub callback: Option<String>,
 }
 
+/// `GET /miauth/{uuid}` の query 由来値の長さ上限 (F4)。
+///
+/// session 行は未認証 GET 1 回で INSERT されるため、上限がないと巨大な
+/// `name` / `callback` / `permission` CSV で DB 行を膨らませられる。
+/// listener 自体は Tailscale 限定運用のため深刻度は Info だが、正当な
+/// クライアント (アプリ名は数十文字、permission は Misskey の固定語彙
+/// 30 種前後、callback は通常の URL 長) が踏まない値で頭打ちにする。
+/// 超過は 400 (= クライアントバグ扱い。黙って切り詰めると permission の
+/// 意味が変わりうるため)。
+const APP_NAME_MAX_CHARS: usize = 200;
+const CALLBACK_URL_MAX_CHARS: usize = 2048;
+const PERMISSIONS_MAX_ENTRIES: usize = 64;
+const PERMISSION_MAX_CHARS: usize = 64;
+
+/// query 由来の session 入力値を検証する。超過があれば静的メッセージを返す。
+fn check_session_input_lengths(
+    app_name: &str,
+    callback_url: Option<&str>,
+    permissions: &[String],
+) -> Result<(), &'static str> {
+    if app_name.chars().count() > APP_NAME_MAX_CHARS {
+        return Err("app name exceeds the 200-character limit");
+    }
+    if callback_url.is_some_and(|u| u.chars().count() > CALLBACK_URL_MAX_CHARS) {
+        return Err("callback URL exceeds the 2048-character limit");
+    }
+    if permissions.len() > PERMISSIONS_MAX_ENTRIES {
+        return Err("permission list exceeds the 64-entry limit");
+    }
+    if permissions
+        .iter()
+        .any(|p| p.chars().count() > PERMISSION_MAX_CHARS)
+    {
+        return Err("permission entry exceeds the 64-character limit");
+    }
+    Ok(())
+}
+
 /// CSV (`read:account,write:reactions`) を `Vec<String>` に分解する。空白は
 /// trim、空要素 / 重複は除去、結果が空なら `Vec::new()`。
 ///
@@ -218,6 +256,18 @@ pub async fn handle(
         .as_deref()
         .map(str::to_owned)
         .filter(|s| !s.is_empty());
+
+    // F4: 未認証 GET で DB 行を作る前に入力長の上限を検査する。超過は 400。
+    if let Err(reason) =
+        check_session_input_lengths(&app_name, callback_url.as_deref(), &permissions)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            reason,
+        )
+            .into_response();
+    }
 
     // 既存 session の探索 ── pending / approved / consumed / rejected / expired
     // いずれの場合も同 UUID を **再 INSERT しない** (= UUID は client 生成、
@@ -437,5 +487,48 @@ mod tests {
         );
         assert!(render_existing_state(uuid, MiAuthSessionState::Rejected).contains("rejected"));
         assert!(render_existing_state(uuid, MiAuthSessionState::Expired).contains("expired"));
+    }
+}
+
+#[cfg(test)]
+mod input_length_tests {
+    use super::check_session_input_lengths;
+
+    /// F4: 正常範囲は通す。
+    #[test]
+    fn accepts_normal_lengths() {
+        assert!(
+            check_session_input_lengths(
+                "Milktea",
+                Some("https://app.test/callback"),
+                &["read:account".to_string(), "write:notes".to_string()],
+            )
+            .is_ok()
+        );
+        // 空も正当 (Misskey spec で全部 optional)。
+        assert!(check_session_input_lengths("unknown app", None, &[]).is_ok());
+    }
+
+    /// F4: 上限超過は 400 相当の Err になる。
+    #[test]
+    fn rejects_oversized_inputs() {
+        let long_entry = "r".repeat(65);
+        assert!(check_session_input_lengths(&"a".repeat(201), None, &[]).is_err());
+        assert!(check_session_input_lengths("ok", Some(&"u".repeat(2049)), &[]).is_err());
+        assert!(
+            check_session_input_lengths("ok", None, &vec!["read:account".to_string(); 65]).is_err()
+        );
+        assert!(
+            check_session_input_lengths("ok", None, std::slice::from_ref(&long_entry)).is_err()
+        );
+    }
+
+    /// F4: 境界値 (ちょうど上限) は通す。
+    #[test]
+    fn accepts_exact_limits() {
+        assert!(check_session_input_lengths(&"a".repeat(200), None, &[]).is_ok());
+        assert!(
+            check_session_input_lengths("ok", None, &vec!["read:account".to_string(); 64],).is_ok()
+        );
     }
 }
