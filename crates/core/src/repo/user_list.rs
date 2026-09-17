@@ -16,9 +16,10 @@ use crate::repo::note::TimelineEntry;
 
 /// リスト名 (`title` / `name`) の最大文字数。
 ///
-/// `miauth::lists` (Misskey `users/lists/*`, wire 名 `name`) と
-/// `local_api::user_list` (TUI `/api/v1/lists`, wire 名 `title`) の両方が
-/// この 1 点の上限を共有する。Misskey のリスト名は実用上数十文字で、
+/// `miauth::lists` (Misskey `users/lists/*`, wire 名 `name`)、
+/// `local_api::user_list` (TUI `/api/v1/lists`, wire 名 `title`)、
+/// `list_cli` (`sakurasato-server list create|rename`, `--title`) の
+/// 3 経路すべてがこの 1 点の上限を共有する。Misskey のリスト名は実用上数十文字で、
 /// 100 文字は正当な名前を弾かず DB 行の肥大を防ぐ値 (`i/update` の
 /// `FIELD_NAME_MAX` と同じ規模感)。
 pub const MAX_LIST_NAME_CHARS: usize = 100;

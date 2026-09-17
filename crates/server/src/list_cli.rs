@@ -31,6 +31,14 @@ async fn create(state: &AppState, args: ListCreateArgs) -> anyhow::Result<()> {
     if title.is_empty() {
         bail!("--title must not be empty");
     }
+    // MiAuth (`crate::miauth::lists`) / TUI ローカル API
+    // (`crate::local_api::user_list`) と同じ上限をこの経路にも適用する。
+    if !repo::user_list::is_valid_list_name(title) {
+        bail!(
+            "--title exceeds the {}-character limit",
+            repo::user_list::MAX_LIST_NAME_CHARS
+        );
+    }
     let row = repo::user_list::create(state.pool(), title)
         .await
         .context("insert user_list row")?;
@@ -82,6 +90,12 @@ async fn rename(state: &AppState, args: ListRenameArgs) -> anyhow::Result<()> {
     let title = args.title.trim();
     if title.is_empty() {
         bail!("--title must not be empty");
+    }
+    if !repo::user_list::is_valid_list_name(title) {
+        bail!(
+            "--title exceeds the {}-character limit",
+            repo::user_list::MAX_LIST_NAME_CHARS
+        );
     }
     let Some(row) = repo::user_list::rename(state.pool(), args.id, title)
         .await
