@@ -430,6 +430,72 @@ async fn check_after_consume_returns_token_only_within_ttl(pool: PgPool) {
     );
 }
 
+/// `miauth revoke` 等で `miauth_token` 行が削除された後の consumed session
+/// check は raw token を返さない (`delete_token_by_id` の FK `ON DELETE SET
+/// NULL` で session の `issued_token_id` 自体が NULL に倒れる ── TTL が
+/// 生きているか判定できない以上、expired と同じ扱いで隠す)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn check_after_consume_hides_token_once_revoked(pool: PgPool) {
+    let _ = seed_local_actor(&pool, "sakurasato.test", "alice").await;
+    let state = AppState::from_pool(
+        pool.clone(),
+        common::make_config("sakurasato.test", "alice"),
+    );
+    let app = miauth::router(state.clone());
+
+    let uuid = Uuid::new_v4();
+    repo::miauth::insert_session(
+        &pool,
+        repo::miauth::NewMiAuthSession {
+            uuid,
+            app_name: "TestApp".into(),
+            callback_url: None,
+            permissions: vec!["read:account".into()],
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+        },
+    )
+    .await
+    .unwrap();
+    let rows = repo::miauth::approve_session(&pool, uuid, &["read:account".into()])
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+
+    let path = format!("/api/miauth/{uuid}/check");
+    let resp = app
+        .clone()
+        .oneshot(Request::post(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_json(resp).await;
+    assert!(body["token"].is_string(), "first check returns raw token");
+
+    // `miauth revoke` を模して token 行だけを削除する
+    // (FK `ON DELETE SET NULL` で session.issued_token_id が NULL に倒れる)。
+    let session = repo::miauth::get_session(&pool, uuid)
+        .await
+        .unwrap()
+        .unwrap();
+    let token_id = session.issued_token_id.expect("token should be issued");
+    let deleted = repo::miauth::delete_token_by_id(&pool, token_id)
+        .await
+        .unwrap();
+    assert!(deleted);
+
+    let resp2 = app
+        .oneshot(Request::post(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let body2 = read_json(resp2).await;
+    assert_eq!(body2["ok"], true);
+    assert!(
+        body2["token"].is_null(),
+        "revoked token must not be returned: {body2:?}",
+    );
+}
+
 /// rejected session への check は 404。
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn check_rejected_session_returns_404(pool: PgPool) {

@@ -185,8 +185,8 @@ async fn handle_consumed(state: &AppState, session: &MiAuthSessionRow) -> Respon
         .miauth
         .as_ref()
         .map_or(600, |m| m.session_ttl_secs);
-    let token = match session.issued_token_id {
-        Some(_) => match repo::miauth::find_token_by_session(state.pool(), session.uuid).await {
+    let token = if session.issued_token_id.is_some() {
+        match repo::miauth::find_token_by_session(state.pool(), session.uuid).await {
             Ok(Some(token_row)) => {
                 let age = chrono::Utc::now().signed_duration_since(token_row.created_at);
                 if age.num_seconds() > i64::try_from(ttl_secs).unwrap_or(i64::MAX) {
@@ -199,7 +199,11 @@ async fn handle_consumed(state: &AppState, session: &MiAuthSessionRow) -> Respon
                     session.raw_token_for_polling.clone()
                 }
             }
-            Ok(None) => session.raw_token_for_polling.clone(),
+            // `issued_token_id` はあるのに join が空 (`delete_token_by_id` の
+            // FK は `ON DELETE SET NULL` なので理論上到達しないはずだが、
+            // 万一のズレに備えて安全側に倒す)。raw を返し続けると TTL 検査の
+            // 意味が無くなるので、expired と同じ扱いにする。
+            Ok(None) => None,
             Err(err) => {
                 tracing::warn!(
                     ?err,
@@ -208,8 +212,17 @@ async fn handle_consumed(state: &AppState, session: &MiAuthSessionRow) -> Respon
                 );
                 session.raw_token_for_polling.clone()
             }
-        },
-        None => session.raw_token_for_polling.clone(),
+        }
+    } else {
+        // `miauth revoke` (`delete_token_by_id`) は FK `ON DELETE SET NULL` で
+        // まさにこの列を NULL に倒す (`miauth_cli.rs` 参照)。revoke 済み token
+        // の age を検証する手立てが無い以上、raw を返し続けるのは TTL 保護の
+        // 抜け穴になる ── expired と同じ扱いで隠す。
+        tracing::info!(
+            uuid = %session.uuid,
+            "MiAuth consumed session has no issued_token_id (revoked); returning null",
+        );
+        None
     };
     Json(CheckResponse {
         ok: true,
