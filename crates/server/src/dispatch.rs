@@ -311,18 +311,11 @@ pub(crate) async fn dispatch(
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
         "Block" => {
-            // 恒久的な拒否 (self-block / target 不明 / 形式不備) は 4xx で返し、
-            // 送信側の無限リトライに乗せない (503 だと Mastodon が保持する)。
-            // DB / 一時障害のみ 503 に倒す。
-            block::handle_block(state, signer, &activity)
-                .await
-                .map_err(|e| {
-                    if e.downcast_ref::<block::PermanentBlockRejection>().is_some() {
-                        DispatchError::Malformed(e.to_string())
-                    } else {
-                        DispatchError::Internal(e)
-                    }
-                })?;
+            // 恒久的な拒否 (self-block / target 不明 / 形式不備) は
+            // `handle_block` が `DispatchError::Malformed` (400) を直接返す
+            // ので、送信側の無限リトライに乗せない (503 だと Mastodon が
+            // 保持する)。DB / 一時障害は `DispatchError::Internal` (503)。
+            block::handle_block(state, signer, &activity).await?;
             Ok((StatusCode::ACCEPTED, "accepted").into_response())
         }
         other => {

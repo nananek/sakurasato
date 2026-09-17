@@ -16,16 +16,6 @@ use super::DispatchError;
 use super::handler::ensure_same_host;
 use crate::state::AppState;
 
-/// 再送しても直らない恒久的な Block 拒否。`dispatch` 側が 4xx にマップし、
-/// 503 (= リトライ保持) に乗せないためのマーカー。
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub(crate) struct PermanentBlockRejection(pub String);
-
-fn permanent(msg: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(PermanentBlockRejection(msg.into()))
-}
-
 /// 受領 Block (`signer` → 我々の local actor) の処理。
 ///
 /// 1. F4 相当の host 一致検証 (`ensure_same_host`、`handler::handle_follow`
@@ -37,34 +27,42 @@ fn permanent(msg: impl Into<String>) -> anyhow::Error {
 ///    signer に送り返す必要はない ── signer 自身が Block した以上、フォロー
 ///    解除の意思は明確)。
 /// 4. `block` 行を `(blocker=signer.id, blocked=local.id)` で upsert。
+///
+/// 再送しても直らない恒久的な拒否 (self-block / target 不明 / 形式不備) は
+/// `DispatchError::Malformed` (400) で返し、送信側の無限リトライに乗せない
+/// (503 だと Mastodon が保持する)。DB / 一時障害は `DispatchError::Internal`
+/// (503)。`handle_undo_block` と同じ分類方針。
 pub(crate) async fn handle_block(
     state: &AppState,
     signer: &ActorRow,
     activity: &JsonValue,
-) -> anyhow::Result<()> {
+) -> Result<(), DispatchError> {
     let block_ap_id = super::extract_activity_id(activity)
-        .map_err(|e| permanent(format!("Block has no activity id: {e}")))?
+        .map_err(|e| DispatchError::Malformed(format!("Block has no activity id: {e}")))?
         .to_string();
     ensure_same_host(&block_ap_id, &signer.ap_id, "Block activity id")
-        .map_err(|e| permanent(e.to_string()))?;
+        .map_err(|e| DispatchError::Malformed(e.to_string()))?;
 
     let object_uri = super::extract_object_uri(activity)
-        .map_err(|e| permanent(format!("Block has no usable `object`: {e}")))?
+        .map_err(|e| DispatchError::Malformed(format!("Block has no usable `object`: {e}")))?
         .to_string();
 
     let blocked = repo::actor::get_by_ap_id(state.pool(), &object_uri)
         .await
-        .context("lookup blocked (local) actor")?
-        .ok_or_else(|| permanent(format!("Block target {object_uri} not found locally")))?;
+        .context("lookup blocked (local) actor")
+        .map_err(DispatchError::Internal)?
+        .ok_or_else(|| {
+            DispatchError::Malformed(format!("Block target {object_uri} not found locally"))
+        })?;
 
     if !blocked.is_local {
-        return Err(permanent(format!(
+        return Err(DispatchError::Malformed(format!(
             "Block target {} is not a local actor; refusing to accept",
             blocked.ap_id
         )));
     }
     if blocked.actor_type.eq_ignore_ascii_case("Application") {
-        return Err(permanent(format!(
+        return Err(DispatchError::Malformed(format!(
             "Block target {} is an Application actor; refusing to accept",
             blocked.ap_id,
         )));
@@ -80,7 +78,8 @@ pub(crate) async fn handle_block(
     )
     .execute(state.pool())
     .await
-    .context("delete forced-unfollow row on inbound Block")?;
+    .context("delete forced-unfollow row on inbound Block")
+    .map_err(DispatchError::Internal)?;
     if deleted.rows_affected() > 0 {
         info!(
             follower = %signer.ap_id,
@@ -91,7 +90,8 @@ pub(crate) async fn handle_block(
 
     repo::block::insert(state.pool(), &block_ap_id, signer.id, blocked.id)
         .await
-        .context("upsert inbound block row")?;
+        .context("upsert inbound block row")
+        .map_err(DispatchError::Internal)?;
 
     info!(
         blocker = %signer.ap_id,
