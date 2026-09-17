@@ -69,7 +69,11 @@ pub async fn handle(State(state): State<AppState>, Query(q): Query<ProxyQuery>) 
     let Some(host) = parsed.host_str() else {
         return media_proxy_route::error_400("url missing host");
     };
-    if !state.try_acquire_media_proxy_fetch(host) {
+    // バケットキーは正規化して使う ── `example.test.` と `example.test` を
+    // 別枠にすると per-domain 制限が 2 倍に抜ける。AP object fetch 側
+    // (`remote_actor::fetch_object_json`) と同一規則 (`canonical_host`)。
+    let host = sakurasato_core::net_guard::canonical_host(host);
+    if !state.try_acquire_media_proxy_fetch(&host) {
         return media_proxy_route::error_status(
             StatusCode::TOO_MANY_REQUESTS,
             "media-proxy rate limit exceeded for this host; retry later",

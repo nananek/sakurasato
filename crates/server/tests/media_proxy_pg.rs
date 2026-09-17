@@ -291,3 +291,52 @@ async fn proxy_returns_bad_gateway_when_socket_missing(pool: PgPool) {
     // 接続エラーは Transport → BAD_GATEWAY にマップされる。
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
+
+/// 公開 `GET /media-proxy` の per-domain バケットは末尾ドット違いを同一枠に
+/// する (`canonical_host`)。`victim.test` / `victim.test.` を交互に叩いても
+/// burst (20) を超えたら 429 になること。非正規化のままだと別枠になり 21 件
+/// 目も素通し (502) になる。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn public_media_proxy_rate_limit_shares_bucket_across_trailing_dot(pool: PgPool) {
+    let state = sakurasato_server::state::AppState::from_pool(
+        pool,
+        make_config("example.test", &dead_socket_path()),
+    );
+    let app = sakurasato_server::routes::router(state);
+
+    let mut statuses = Vec::new();
+    for i in 0..25 {
+        // 偶数: `victim.test`、奇数: `victim.test.` (FQDN 末尾ドット表記)。
+        let host = if i % 2 == 0 {
+            "victim.test"
+        } else {
+            "victim.test."
+        };
+        let path = format!(
+            "/media-proxy?url={}",
+            url_encode(&format!("https://{host}/a.png"))
+        );
+        let resp = app
+            .clone()
+            .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        statuses.push(resp.status());
+    }
+
+    // 先頭 20 件はバケット内 (socket 不在なので 502 まで到達する)。
+    for (i, status) in statuses.iter().enumerate().take(20) {
+        assert_ne!(
+            *status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "request {i} must be within burst"
+        );
+    }
+    // 21 件目前後で 429 に倒れる (refill の微振動を見て 22 件目まで許容)。
+    // 修正前 (非正規化キー) は 41 件目まで 429 にならない。
+    assert!(
+        statuses[20] == StatusCode::TOO_MANY_REQUESTS
+            || statuses[21] == StatusCode::TOO_MANY_REQUESTS,
+        "trailing-dot variant must share the rate-limit bucket: {statuses:?}"
+    );
+}
