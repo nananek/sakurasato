@@ -197,6 +197,29 @@ impl AppState {
     /// SSRF ガードを緩める ([`Inner::allow_internal_inbox`] = `true`) ─
     /// 統合テスト用 inbox を `127.0.0.1` で立てるため。本番経路には影響しない。
     pub fn from_pool(pool: PgPool, config: Config) -> Self {
+        Self::from_pool_inner(pool, config, false, false)
+    }
+
+    /// Build the state for integration tests that exercise the remote-fetch
+    /// path (inbox signature verification with an unknown keyId, Announce
+    /// fetch, …). Same as [`from_pool`](Self::from_pool), but with
+    /// private-egress allowed and remote fetch enabled, so tests can serve
+    /// stub actors/notes from a `127.0.0.1` stub server.
+    ///
+    /// 通常の `from_pool` と同じくテスト専用 ── 本番経路
+    /// ([`from_config`](Self::from_config)) には影響しない
+    /// (`try_acquire_video_upload_slot` と同じく、統合テストから呼べるよう
+    /// `pub` にしている)。
+    pub fn from_pool_with_remote_fetch(pool: PgPool, config: Config) -> Self {
+        Self::from_pool_inner(pool, config, true, true)
+    }
+
+    fn from_pool_inner(
+        pool: PgPool,
+        config: Config,
+        allow_private_egress: bool,
+        enable_remote_fetch: bool,
+    ) -> Self {
         // テスト経路は loopback のダミー inbox / ダミー fetch を使うため、
         // resolver の private 検証を常に許可する。
         let http = http_client::build_client(true).expect("reqwest builder is infallible in tests");
@@ -215,10 +238,12 @@ impl AppState {
             timeline_tx,
             stream_tx,
             allow_internal_inbox: true,
-            // from_pool の loopback 許可は配送テストだけに閉じ込める。
-            // 公開 media-proxy route 等の URL ガードまで緩めない。
-            allow_private_egress: false,
-            enable_remote_fetch: false,
+            // `from_pool` (通常テスト) の loopback 許可は配送テストだけに
+            // 閉じ込める。公開 media-proxy route 等の URL ガードまで緩めない。
+            // `from_pool_with_remote_fetch` のみ両方 `true` にして stub fetch を
+            // 許可する。
+            allow_private_egress,
+            enable_remote_fetch,
             media_proxy,
             delivery_notify: Arc::new(Notify::new()),
             fetch_rate_limiter: DomainRateLimiter::new(),
