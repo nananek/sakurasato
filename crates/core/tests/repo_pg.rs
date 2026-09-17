@@ -1973,3 +1973,105 @@ async fn list_remote_note_tags_since_id_pages_by_id(pool: PgPool) -> sqlx::Resul
 
     Ok(())
 }
+
+/// migration `0033_canonicalize_hosts` の本体 SQL (`include_str!` で drift 防止)。
+const CANONICALIZE_HOSTS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0033_canonicalize_hosts.sql"
+));
+
+fn sample_remote_actor(username: &str, host: &str, ap_id_suffix: &str) -> repo::actor::NewActor {
+    repo::actor::NewActor {
+        ap_id: format!("https://remote.test/users/{ap_id_suffix}"),
+        preferred_username: username.into(),
+        host: host.into(),
+        display_name: None,
+        summary: None,
+        icon_url: None,
+        image_url: None,
+        inbox_url: format!("https://remote.test/users/{ap_id_suffix}/inbox"),
+        shared_inbox_url: None,
+        outbox_url: None,
+        followers_url: None,
+        following_url: None,
+        public_key_id: format!("https://remote.test/users/{ap_id_suffix}#main-key"),
+        public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----".into(),
+        private_key_pem: None,
+        ed25519_public_key_id: None,
+        ed25519_public_key_pem: None,
+        ed25519_private_key_pem: None,
+        also_known_as: vec![],
+        moved_to_ap_id: None,
+        is_local: false,
+        actor_type: "Person".into(),
+        manually_approves_followers: false,
+    }
+}
+
+/// 正規化前に別名 (末尾ドット違い) で `silence` と `suspend` が別々の行として
+/// 存在していた場合、dedup は id の若さではなく **severity の強さ** で残す行を
+/// 選ぶ (id 基準だと、先に `silence` を設定して後から同じドメインを
+/// `suspend` した運用シーケンスで suspend が黙って消え、silence に格下げ
+/// されてしまう)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn migration_0033_dedup_keeps_strongest_severity(pool: PgPool) -> sqlx::Result<()> {
+    // 先に silence (id が若い) → 後から同じドメインの別名を suspend (id が新しい)。
+    repo::domain_moderation::upsert(&pool, "evil.example", "silence", Some("spam")).await?;
+    repo::domain_moderation::upsert(&pool, "evil.example.", "suspend", Some("abuse")).await?;
+
+    sqlx::raw_sql(CANONICALIZE_HOSTS_SQL).execute(&pool).await?;
+
+    let rows = repo::domain_moderation::list(&pool).await?;
+    assert_eq!(rows.len(), 1, "重複は 1 行に畳まれる; got {rows:?}");
+    assert_eq!(rows[0].host, "evil.example");
+    assert_eq!(
+        rows[0].severity, "suspend",
+        "id が若い方ではなく severity が強い方 (suspend) を残す"
+    );
+    Ok(())
+}
+
+/// `actor` は `(preferred_username, host)` UNIQUE (`idx_actor_username_host`)。
+/// 正規化後に衝突する行は actor 削除が note/follow/reaction 等を巻き込むため
+/// 機械的に merge/delete せず、**元のホスト文字列のまま残す** (= migration が
+/// 失敗して deploy をブロックすることも、どちらかの actor を silently
+/// 消すこともない)。衝突しない行は従来どおり正規化される。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn migration_0033_skips_colliding_actor_rows(pool: PgPool) -> sqlx::Result<()> {
+    // 同じ preferred_username "alice" を、正規化後に同一ホストへ縮退する
+    // 2 通りの別名 (大文字 + 末尾ドット違い) で保持する remote actor 2 件。
+    let alice_a = repo::actor::insert(
+        &pool,
+        sample_remote_actor("alice", "Example.test", "m33-alice-a"),
+    )
+    .await?;
+    let alice_b = repo::actor::insert(
+        &pool,
+        sample_remote_actor("alice", "example.test.", "m33-alice-b"),
+    )
+    .await?;
+    // 衝突しない actor は従来どおり正規化される対照群。
+    let bob =
+        repo::actor::insert(&pool, sample_remote_actor("bob", "Bob.example.", "m33-bob")).await?;
+
+    sqlx::raw_sql(CANONICALIZE_HOSTS_SQL).execute(&pool).await?;
+
+    let alice_a = repo::actor::get_by_id(&pool, alice_a.id).await?.unwrap();
+    let alice_b = repo::actor::get_by_id(&pool, alice_b.id).await?.unwrap();
+    assert_eq!(
+        alice_a.host, "Example.test",
+        "衝突する行は正規化されず元のホストのまま残る"
+    );
+    assert_eq!(
+        alice_b.host, "example.test.",
+        "衝突する行は正規化されず元のホストのまま残る"
+    );
+
+    let bob = repo::actor::get_by_id(&pool, bob.id).await?.unwrap();
+    assert_eq!(
+        bob.host, "bob.example",
+        "衝突しない行は通常どおり正規化される"
+    );
+
+    Ok(())
+}
