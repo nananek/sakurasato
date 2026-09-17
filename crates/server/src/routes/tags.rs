@@ -73,10 +73,30 @@ pub async fn handle(State(state): State<AppState>, Path(name): Path<String>) -> 
     let _ = writeln!(buf, "</body></html>");
 
     let mut response = (StatusCode::OK, Body::from(buf)).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("text/html; charset=utf-8"),
-    );
+    {
+        let headers = response.headers_mut();
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        // F5: permalink と同じ多層防御ヘッダを付ける。本文は escape 済みで
+        // 外部リソース参照もないが、将来のテンプレート変更時の実行・埋め込み・
+        // 漏洩をブラウザ側で止める (`routes/permalink.rs` と同値)。
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            header::HeaderValue::from_static(
+                "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            ),
+        );
+        headers.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::HeaderValue::from_static("nosniff"),
+        );
+        headers.insert(
+            header::REFERRER_POLICY,
+            header::HeaderValue::from_static("no-referrer"),
+        );
+    }
     response
 }
 

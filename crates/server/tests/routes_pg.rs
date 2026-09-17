@@ -731,3 +731,42 @@ async fn misskey_emojis_accepts_post_and_empty(pool: PgPool) {
     let json = read_json(resp).await;
     assert_eq!(json["emojis"].as_array().unwrap().len(), 0);
 }
+
+/// F5 回帰テスト: `/tags/{name}` が permalink と同じ多層防御ヘッダ
+/// (CSP / nosniff / no-referrer) を返す。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn tags_page_sets_hardening_headers(pool: PgPool) {
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(Request::get("/tags/sakura").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers = resp.headers();
+    assert_eq!(
+        headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    );
+    assert_eq!(
+        headers
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "nosniff",
+    );
+    assert_eq!(
+        headers
+            .get(header::REFERRER_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no-referrer",
+    );
+}
