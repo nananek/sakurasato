@@ -40,6 +40,8 @@
 //!
 //! - [`sakurasato_core::net_guard::host_blocked`] による SSRF ガード
 //!   (private/loopback/link-local/reserved 遮断、[`crate::media_proxy_route::validate`])。
+//! - **自ホスト宛 URL の拒否** ([`crate::media_proxy_route::reject_self_host`]) ──
+//!   `https://<自ホスト>/media-proxy?url=...` の自己プロキシ連鎖を遮断する。
 //! - 宛先 host ごとの per-domain トークンバケット
 //!   ([`AppState::try_acquire_media_proxy_fetch`])。AP object fetch 用の
 //!   [`AppState::try_acquire_fetch`] とは **別バケット** ── 本エンドポイント
@@ -59,6 +61,11 @@ pub async fn handle(State(state): State<AppState>, Query(q): Query<ProxyQuery>) 
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    // 自己プロキシ連鎖の遮断 (E-8)。validate の後 (= URL が妥当と確認できた
+    // 後) に置き、allow_private とは独立に常に適用する。
+    if let Err(resp) = media_proxy_route::reject_self_host(&parsed, &state.config().server.host) {
+        return resp;
+    }
     let Some(host) = parsed.host_str() else {
         return media_proxy_route::error_400("url missing host");
     };

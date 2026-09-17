@@ -436,7 +436,9 @@ impl ResolveError {
                 Self::BadGateway(format!("remote actor redirect refused: {loc}"))
             }
             FetchError::Timeout => Self::BadGateway("remote actor fetch timed out".into()),
-            FetchError::TooLarge => Self::BadGateway("remote actor response too large".into()),
+            FetchError::TooLarge { .. } => {
+                Self::BadGateway("remote actor response too large".into())
+            }
             other => Self::BadGateway(format!("remote actor fetch failed: {other}")),
         }
     }

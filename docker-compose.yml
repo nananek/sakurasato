@@ -109,6 +109,21 @@ services:
     <<: *hardening
     tmpfs:
       - /tmp
+    # E-1 の多層防御 (2026-09 workerB 監査): `fetch_object_json` の
+    # ストリーミング化で攻撃起因のメモリ増加は 256 KiB × 同時 4 に収まるが、
+    # 将来の別の無制限バッファリング系バグを cgroup で bound する。
+    # 値の根拠 (release バイナリをローカル Postgres + 計測用 fake media-proxy
+    # で起動し `/proc/<pid>/status` の VmHWM = ピーク RSS を観測):
+    #   - 正当な最大動画アップロード (media_proxy.video.max_bytes 既定 200 MiB):
+    #     ピーク 454 MiB (`upload_video_core` の to_vec() コピーを含む)
+    #   - 未認証 keyId による無限 chunked fetch 16 並列 (修正後):
+    #     ピーク 20 MiB
+    # 観測ピーク 454 MiB + 50% ≒ 681 MiB → 768m。
+    # server は media-proxy と違い OOM kill = 唯一の daemon の瞬断なので、
+    # 「正当な最大動画アップロードが通る」ことが下限。`media_proxy.video.max_bytes`
+    # を引き上げる場合は本値も比例して見直すこと。
+    mem_limit: 768m
+    memswap_limit: 768m
     depends_on:
       postgres:
         condition: service_healthy

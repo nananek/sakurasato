@@ -42,7 +42,9 @@ indexmap.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 base16ct.workspace = true
-reqwest.workspace = true
+# `stream` feature: `fetch_object_json` のレスポンス本文を `bytes_stream()` で
+# 読みながら上限を強制する (E-1)。media-proxy 側と同じ feature 指定。
+reqwest = { workspace = true, features = ["stream"] }
 url.workspace = true
 aws-sdk-s3.workspace = true
 aws-credential-types.workspace = true

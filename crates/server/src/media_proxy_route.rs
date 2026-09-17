@@ -38,7 +38,9 @@
 //!
 //! `url`/`variant` の scheme / SSRF / variant 検証は [`validate`] が本サーバ側
 //! でも先に行う (media-proxy も同じ検査をするが、ここで弾ければ UDS 往復を
-//! 1 回節約できる多層防御)。
+//! 1 回節約できる多層防御)。加えて公開ルートは [`reject_self_host`] で
+//! 自ホスト宛 URL (自己プロキシ連鎖) を拒否する ([`reject_self_host`] の doc
+//! を参照)。
 //!
 //! ## クエリパラメータ
 //!
@@ -48,7 +50,7 @@
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use sakurasato_core::net_guard::host_blocked;
+use sakurasato_core::net_guard::{host_blocked, is_self_host};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -91,6 +93,68 @@ pub(crate) fn validate(q: &ProxyQuery, allow_private: bool) -> Result<url::Url, 
         return Err(error_400(format!("invalid variant {:?}", q.variant)));
     }
     Ok(parsed)
+}
+
+/// 検証済み URL の host が自インスタンスの公開 AP host と一致するなら拒否する
+/// (E-8)。
+///
+/// 公開 (無認証) `GET /media-proxy` は media-proxy コンテナに任意 URL を
+/// fetch させる。`host_blocked` は自ホストの公開ドメインを遮断しないため、
+/// `/media-proxy?url=https://<自ホスト>/media-proxy?url=...` のような
+/// **自己プロキシ連鎖** が成立してしまう (egress → インターネット → 自ホスト
+/// の hairpin。per-domain レート制限と同時実行上限で増幅は有限だが、
+/// media-proxy のスロットと実帯域を無駄に消費する)。
+///
+/// [`crate::remote_actor::enforce_url_policy`] / [`crate::delivery`] と同様に
+/// **`allow_private` とは独立に常に効かせる** (自己 fetch はテスト /
+/// 連合テストモードでも許可しない、という既存の横断方針に合わせる)。
+///
+/// 適用先は 2026-09 時点では公開 `GET /media-proxy` のみ。TUI 用
+/// `/api/v1/media/proxy` は自ホスト `/media/<key>` (ローカル actor の
+/// アバター・添付・絵文字) を表示する正当用途があり、TUI は画像バイト列を
+/// すべてこの経路で受け取る設計のため、無条件適用するとローカルメディアが
+/// 描画できなくなる。適用範囲の見直しは別途 follow-up。
+///
+/// **既知の限界 (2026-09 レビュー、2026-09 再レビューで訂正)**: 本チェックは
+/// `server_host` との文字列一致 ([`is_self_host`]) のみで、IP リテラルでの
+/// 自己参照は検出しない (`host_blocked` も public IP は private/loopback 判定
+/// に掛からず通す)。理論上 `url=http://<自ホストの公開 IP>/media-proxy?...`
+/// で同じ自己プロキシ連鎖を再現できる余地は残る。
+///
+/// `DEPLOYMENT.md` §0/§4 が**推奨**する Cloudflare Tunnel 構成では `server` に
+/// `ports:` を一切開けず (本番 `docker-compose.yml` に該当行なし) 自宅/VPS の
+/// 実 IP を外部公開しないため、この構成だけを見ればこの IP に到達する経路は
+/// ない。**ただし Cloudflare Tunnel は「唯一公式にサポートする構成」ではない**
+/// ── `DEPLOYMENT.md` §6.2 は nginx / caddy で `server` を直接リバースプロキシ
+/// する代替構成を、動作する設定例つきで明示的に文書化している。この構成では
+/// ホストの実 IP がインターネットに直接晒される。§6.2 の例自体は `/media-proxy`
+/// を転送対象に含めていないため単体では影響しないが、MiAuth (本モジュールが
+/// まさに支えている経路) をこの構成で使うには `/media-proxy` も転送するのが
+/// 自然な追加であり、その時点で本ギャップが実際に到達可能になる。
+///
+/// docker 内部ネットワーク経由の代替 (compose サービス名 `server` や internal
+/// ネットの private IP) は `host_blocked` の single-label-host 判定 / private
+/// IP 判定が別途遮断済み (本関数とは独立)。受信側で Host ヘッダを
+/// `server_host` と照合する検証層は現状どこにも無いことも確認済みだが、
+/// 追加するなら `release-validation.yml` の `stack-smoke` が
+/// `config.server.host = "localhost"` のまま `curl http://127.0.0.1:8080/...`
+/// で probe している点との非互換に注意 (素朴な完全一致では既存 CI を壊す)。
+///
+/// 以上より本ギャップは「Cloudflare Tunnel 構成に限定すれば無害」ではあるが
+/// 「本プロジェクトの公式デプロイ構成全般で無害」とまでは言えない、というのが
+/// 正確な現状認識。nginx/caddy 構成 + `MiAuth` 併用時の実害は
+/// `/media-proxy` 転送の有無に依存するため未検証。実装コスト (Host ヘッダ
+/// 検証は前述の通り stack-smoke と非互換) との兼ね合いで当面はコード変更を
+/// 見送るが、「実害なし」ではなく「残存リスクを許容している」に近い判断で
+/// あることを次にこの関数を触る人が誤解しないよう明記する。
+pub(crate) fn reject_self_host(parsed: &url::Url, server_host: &str) -> Result<(), Response> {
+    if is_self_host(parsed, server_host) {
+        return Err(error_400(format!(
+            "host {:?} is blocked: self-host",
+            parsed.host_str().unwrap_or("")
+        )));
+    }
+    Ok(())
 }
 
 /// 検証済み URL を media-proxy 経由で取得し、レスポンスに変換する。
@@ -178,5 +242,39 @@ mod tests {
         };
         assert!(validate(&query, false).is_err());
         assert!(validate(&query, true).is_ok());
+    }
+
+    #[test]
+    fn reject_self_host_matches_canonicalized_host() {
+        // 大文字 / 末尾ドット違いでも自ホストとして拒否する
+        // (net_guard::canonical_host の正規化に依存)。
+        let query = ProxyQuery {
+            url: "https://EXAMPLE.test./media/a.webp".into(),
+            variant: "avatar".into(),
+        };
+        let parsed = validate(&query, false).unwrap();
+        assert!(reject_self_host(&parsed, "example.test").is_err());
+    }
+
+    #[test]
+    fn reject_self_host_allows_other_hosts() {
+        let query = ProxyQuery {
+            url: "https://remote.test/media/a.webp".into(),
+            variant: "avatar".into(),
+        };
+        let parsed = validate(&query, false).unwrap();
+        assert!(reject_self_host(&parsed, "example.test").is_ok());
+    }
+
+    #[test]
+    fn reject_self_host_is_independent_of_allow_private() {
+        // テスト用 opt-in (allow_private) が立っていても自己 fetch は拒否する
+        // ── remote_actor::enforce_url_policy / delivery と同じ横断方針。
+        let query = ProxyQuery {
+            url: "http://example.test/media/a.webp".into(),
+            variant: "avatar".into(),
+        };
+        let parsed = validate(&query, true).unwrap();
+        assert!(reject_self_host(&parsed, "example.test").is_err());
     }
 }
