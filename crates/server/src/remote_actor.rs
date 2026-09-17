@@ -33,7 +33,9 @@
 use std::time::Duration;
 
 use anyhow::anyhow;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
 use reqwest::StatusCode;
 use sakurasato_core::model::{ActorField, ActorRow};
 use sakurasato_core::repo;
@@ -359,13 +361,16 @@ pub(crate) async fn fetch_object_json(
     // 本来 Content-Type 検査も行うべきだが、Mastodon は `Vary` や
     // `; charset=utf-8` を付ける実装が多い ── まずバイト列を取り JSON
     // パースで本物判定する方が頑健。サイズ上限だけ厳格に適用する。
-    let bytes = match timeout(FETCH_DEADLINE, resp.bytes()).await {
+    //
+    // 上限は [`read_body_limited`] が **読みながら** 強制する (Content-Length
+    // 事前検査 + ストリーミング累積検査)。`resp.bytes()` は本文全体を読み切って
+    // から返すため、Content-Length を宣言しない (chunked の) サーバに対して
+    // 上限なくメモリを確保してしまう ── 旧実装の「読み切ってから事後検査」は
+    // この穴を塞げていなかった。
+    let bytes = match timeout(FETCH_DEADLINE, read_body_limited(resp, MAX_AP_OBJECT_BYTES)).await {
         Ok(r) => r?,
         Err(_) => return Err(FetchError::Timeout),
     };
-    if bytes.len() > MAX_AP_OBJECT_BYTES {
-        return Err(FetchError::TooLarge);
-    }
 
     let json: JsonValue = serde_json::from_slice(&bytes)
         .map_err(|e| FetchError::Malformed(format!("not JSON: {e}")))?;
@@ -390,6 +395,49 @@ pub(crate) async fn fetch_object_json(
     }
 
     Ok(json)
+}
+
+/// レスポンスボディを `max_bytes` で頭打ちにしながら集める (E-1)。
+///
+/// `reqwest::Response::bytes()` は本文全体を読み切ってから返すため、
+/// `Content-Length` を宣言せず chunked で送り続けるサーバに対して
+/// `max_bytes` を超えてメモリを確保してしまう。media-proxy の `download()`
+/// (`crates/media-proxy/src/fetch.rs`) と同じ二段構えで上限を強制する:
+///
+/// 1. `Content-Length` の事前検査 ── 超過を宣言していれば body を 1 バイトも
+///    読まずに [`FetchError::TooLarge`] を返す
+/// 2. `bytes_stream()` のチャンクごとの累積検査 ── 累計が `max_bytes` を
+///    超えた時点で読み取りを打ち切り [`FetchError::TooLarge`] を返す
+///    (宣言が無い / 嘘でも防げる)
+///
+/// 戻り値の [`Bytes`] は高々 `max_bytes`。全体 deadline は呼び出し側
+/// ([`fetch_object_json`]) が `FETCH_DEADLINE` で wrap する前提。
+async fn read_body_limited(resp: reqwest::Response, max_bytes: usize) -> Result<Bytes, FetchError> {
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if let Some(len) = resp.content_length()
+        && len > max_bytes_u64
+    {
+        warn!(
+            len,
+            max_bytes, "AP object fetch Content-Length exceeds limit; refusing to read body",
+        );
+        return Err(FetchError::TooLarge);
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            warn!(
+                max_bytes,
+                "AP object fetch body exceeds limit during streaming; aborting"
+            );
+            return Err(FetchError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
 }
 
 /// 共有ガード ([`net_guard`]) を通して URL を検査する。
@@ -1062,5 +1110,207 @@ mod tests {
         assert!(!is_remote_actor_stale(Some(
             now + chrono::Duration::hours(1)
         )));
+    }
+
+    // ── E-1: レスポンス本文のストリーミング上限 (read_body_limited) ─────────
+    //
+    // 生 HTTP/1.1 サーバをローカルに立て、実 `reqwest::Response` を
+    // `read_body_limited` に食わせる。fetch_object_json 本体は AppState
+    // (DB / resolver ガード) に依存するため、上限強制の核となるこの関数を
+    // 直接テストする。旧実装 (`resp.bytes()`) に対する回帰は
+    // 「巨大 chunked body で永久に読み続ける = テストがタイムアウトする」で
+    // 検出できる。
+
+    /// 接続 1 本だけ受けて、リクエストを読み捨てた後に `handler` に書き込みを
+    /// 委ねる生 HTTP/1.1 サーバを立てる。戻り値は接続先アドレス。
+    async fn spawn_raw_http_server<F, Fut>(handler: F) -> std::net::SocketAddr
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw http test server");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            handler(sock).await;
+        });
+        addr
+    }
+
+    /// テスト用 client。環境 proxy (`HTTP_PROXY` 等) の影響を避ける。
+    fn test_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build test client")
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_aborts_oversized_chunked_body_early() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        let sent = Arc::new(AtomicUsize::new(0));
+        let sent_for_task = Arc::clone(&sent);
+        let addr = spawn_raw_http_server(move |mut sock| async move {
+            if sock
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // 悪意あるサーバの模擬: 上限を無視して延々と chunk を送り続ける。
+            let chunk = vec![b'a'; 64 * 1024];
+            let header = format!("{:x}\r\n", chunk.len());
+            loop {
+                if sock.write_all(header.as_bytes()).await.is_err()
+                    || sock.write_all(&chunk).await.is_err()
+                    || sock.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+                sent_for_task.fetch_add(chunk.len(), Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+
+        let limit = MAX_AP_OBJECT_BYTES;
+        let resp = test_http_client()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("get response headers");
+        let result = tokio::time::timeout(Duration::from_secs(5), read_body_limited(resp, limit))
+            .await
+            .expect("must abort early; reading forever means the limit is not enforced");
+
+        assert!(matches!(result, Err(FetchError::TooLarge)));
+
+        // 早期打ち切りでなければ、この時点でサーバ側は大幅に送信を続けている。
+        // (旧実装は本文を読み切るまで返らないため、そもそも timeout で落ちる)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let total = sent.load(Ordering::SeqCst);
+        assert!(
+            total < 8 * 1024 * 1024,
+            "server-side streamed bytes {total} exceed the early-abort bound",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_rejects_declared_content_length_over_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let limit = MAX_AP_OBJECT_BYTES;
+        let declared = limit + 1;
+        let addr = spawn_raw_http_server(move |mut sock| async move {
+            // Content-Length だけ上限超過を宣言し、body は送らない。
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\n");
+            if sock.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            // client が切るまで接続を維持する (body 無しの即 close だと
+            // transport error になる実装差を避ける)。
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf).await;
+        })
+        .await;
+
+        let resp = test_http_client()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("get response headers");
+        let result = tokio::time::timeout(Duration::from_secs(5), read_body_limited(resp, limit))
+            .await
+            .expect("must not wait for a body declared over the limit");
+        assert!(matches!(result, Err(FetchError::TooLarge)));
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_accepts_body_within_limit() {
+        use tokio::io::AsyncWriteExt;
+
+        let body = br#"{"id":"https://remote.test/users/a","type":"Person"}"#;
+        let body_for_task = body.to_vec();
+        let addr = spawn_raw_http_server(move |mut sock| async move {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body_for_task.len(),
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body_for_task).await;
+        })
+        .await;
+
+        let resp = test_http_client()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("get response headers");
+        let bytes = read_body_limited(resp, MAX_AP_OBJECT_BYTES)
+            .await
+            .expect("body within the limit must be returned");
+        assert_eq!(&bytes[..], &body[..]);
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_enforces_exact_boundary() {
+        use tokio::io::AsyncWriteExt;
+
+        const LIMIT: usize = 1024;
+
+        // ちょうど LIMIT バイトの chunked body は成功する。
+        let addr = spawn_raw_http_server(move |mut sock| async move {
+            let chunk = vec![b'x'; LIMIT / 2];
+            let mut out = Vec::new();
+            out.extend_from_slice(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            for _ in 0..2 {
+                out.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                out.extend_from_slice(&chunk);
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(b"0\r\n\r\n");
+            let _ = sock.write_all(&out).await;
+        })
+        .await;
+        let resp = test_http_client()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("get response headers");
+        let bytes = read_body_limited(resp, LIMIT)
+            .await
+            .expect("exactly limit bytes must pass");
+        assert_eq!(bytes.len(), LIMIT);
+
+        // LIMIT + 1 バイトは TooLarge。
+        let addr = spawn_raw_http_server(move |mut sock| async move {
+            let chunk = vec![b'x'; LIMIT + 1];
+            let mut out = Vec::new();
+            out.extend_from_slice(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            out.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            out.extend_from_slice(&chunk);
+            out.extend_from_slice(b"\r\n0\r\n\r\n");
+            let _ = sock.write_all(&out).await;
+        })
+        .await;
+        let resp = test_http_client()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("get response headers");
+        let err = read_body_limited(resp, LIMIT)
+            .await
+            .expect_err("limit + 1 bytes must be rejected");
+        assert!(matches!(err, FetchError::TooLarge));
     }
 }

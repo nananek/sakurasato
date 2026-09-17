@@ -38,7 +38,9 @@
 //!
 //! `url`/`variant` の scheme / SSRF / variant 検証は [`validate`] が本サーバ側
 //! でも先に行う (media-proxy も同じ検査をするが、ここで弾ければ UDS 往復を
-//! 1 回節約できる多層防御)。
+//! 1 回節約できる多層防御)。加えて公開ルートは [`reject_self_host`] で
+//! 自ホスト宛 URL (自己プロキシ連鎖) を拒否する ([`reject_self_host`] の doc
+//! を参照)。
 //!
 //! ## クエリパラメータ
 //!
@@ -48,7 +50,7 @@
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use sakurasato_core::net_guard::host_blocked;
+use sakurasato_core::net_guard::{host_blocked, is_self_host};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -91,6 +93,35 @@ pub(crate) fn validate(q: &ProxyQuery, allow_private: bool) -> Result<url::Url, 
         return Err(error_400(format!("invalid variant {:?}", q.variant)));
     }
     Ok(parsed)
+}
+
+/// 検証済み URL の host が自インスタンスの公開 AP host と一致するなら拒否する
+/// (E-8)。
+///
+/// 公開 (無認証) `GET /media-proxy` は media-proxy コンテナに任意 URL を
+/// fetch させる。`host_blocked` は自ホストの公開ドメインを遮断しないため、
+/// `/media-proxy?url=https://<自ホスト>/media-proxy?url=...` のような
+/// **自己プロキシ連鎖** が成立してしまう (egress → インターネット → 自ホスト
+/// の hairpin。per-domain レート制限と同時実行上限で増幅は有限だが、
+/// media-proxy のスロットと実帯域を無駄に消費する)。
+///
+/// [`crate::remote_actor::enforce_url_policy`] / [`crate::delivery`] と同様に
+/// **`allow_private` とは独立に常に効かせる** (自己 fetch はテスト /
+/// 連合テストモードでも許可しない、という既存の横断方針に合わせる)。
+///
+/// 適用先は 2026-09 時点では公開 `GET /media-proxy` のみ。TUI 用
+/// `/api/v1/media/proxy` は自ホスト `/media/<key>` (ローカル actor の
+/// アバター・添付・絵文字) を表示する正当用途があり、TUI は画像バイト列を
+/// すべてこの経路で受け取る設計のため、無条件適用するとローカルメディアが
+/// 描画できなくなる。適用範囲の見直しは別途 follow-up。
+pub(crate) fn reject_self_host(parsed: &url::Url, server_host: &str) -> Result<(), Response> {
+    if is_self_host(parsed, server_host) {
+        return Err(error_400(format!(
+            "host {:?} is blocked: self-host",
+            parsed.host_str().unwrap_or("")
+        )));
+    }
+    Ok(())
 }
 
 /// 検証済み URL を media-proxy 経由で取得し、レスポンスに変換する。
@@ -178,5 +209,39 @@ mod tests {
         };
         assert!(validate(&query, false).is_err());
         assert!(validate(&query, true).is_ok());
+    }
+
+    #[test]
+    fn reject_self_host_matches_canonicalized_host() {
+        // 大文字 / 末尾ドット違いでも自ホストとして拒否する
+        // (net_guard::canonical_host の正規化に依存)。
+        let query = ProxyQuery {
+            url: "https://EXAMPLE.test./media/a.webp".into(),
+            variant: "avatar".into(),
+        };
+        let parsed = validate(&query, false).unwrap();
+        assert!(reject_self_host(&parsed, "example.test").is_err());
+    }
+
+    #[test]
+    fn reject_self_host_allows_other_hosts() {
+        let query = ProxyQuery {
+            url: "https://remote.test/media/a.webp".into(),
+            variant: "avatar".into(),
+        };
+        let parsed = validate(&query, false).unwrap();
+        assert!(reject_self_host(&parsed, "example.test").is_ok());
+    }
+
+    #[test]
+    fn reject_self_host_is_independent_of_allow_private() {
+        // テスト用 opt-in (allow_private) が立っていても自己 fetch は拒否する
+        // ── remote_actor::enforce_url_policy / delivery と同じ横断方針。
+        let query = ProxyQuery {
+            url: "http://example.test/media/a.webp".into(),
+            variant: "avatar".into(),
+        };
+        let parsed = validate(&query, true).unwrap();
+        assert!(reject_self_host(&parsed, "example.test").is_err());
     }
 }

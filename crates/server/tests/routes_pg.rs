@@ -132,6 +132,42 @@ async fn webfinger_returns_local_actor(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn public_media_proxy_rejects_self_host_target(pool: PgPool) {
+    // E-8: 公開 `/media-proxy` は自ホスト宛 URL を拒否する (自己プロキシ
+    // 連鎖の遮断)。media-proxy socket には到達しない (400 で早期拒否)。
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/media-proxy?url=https%3A%2F%2Fexample.test%2Fmedia%2Fx.webp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn public_media_proxy_rejects_self_host_target_with_trailing_dot(pool: PgPool) {
+    // canonical_host (末尾ドット / 大文字小文字の正規化) が効いていることの
+    // 回帰テスト。正規化前は `example.test.` が self-host 判定をすり抜けた。
+    let state = sakurasato_server::state::AppState::from_pool(pool, make_config("example.test"));
+    let app = sakurasato_server::routes::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/media-proxy?url=https%3A%2F%2FEXAMPLE.test.%2Fmedia%2Fx.webp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
 async fn webfinger_rejects_unknown_host(pool: PgPool) {
     repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
         .await
