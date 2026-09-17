@@ -487,6 +487,12 @@ listen = "unix:/run/sakurasato/miauth.sock"
 # pending session の有効期限 (秒)。Misskey 公式クライアントが UUID 生成 →
 # 認可 URL 表示 → CLI で approve → polling 開始までの現実的所要時間で 10 分。
 session_ttl_secs = 600
+# permission scope の検査を行わない (既定 true)。Aria 等が要求 scope を
+# 取りこぼして 401 になる問題を避けるためのアナーキーフラグで、**有効な
+# トークンは要求 permission に関わらず全 read/write が可能**になる。
+# 同意画面の permission は記録・監査用で強制はされない。厳密に運用したい
+# 場合は false にする (トークンは再 approve が必要)。
+# ignore_scope = true
 ```
 
 env で上書きする場合 (`docker-compose.override.yml`):

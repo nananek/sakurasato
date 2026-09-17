@@ -176,9 +176,57 @@ async fn handle_consumed(state: &AppState, session: &MiAuthSessionRow) -> Respon
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    // raw token の返却は polling 冪等のための一時的なもの。発行から
+    // `session_ttl_secs` を過ぎたら返さない ── UUID を後から知った第三者が
+    // 同じ token を取得し続けられないようにする。期限後の client は手元の
+    // token を保持して使い続ける契約 (wire 仕様、token: null で通知)。
+    let ttl_secs = state
+        .config()
+        .miauth
+        .as_ref()
+        .map_or(600, |m| m.session_ttl_secs);
+    let token = if session.issued_token_id.is_some() {
+        match repo::miauth::find_token_by_session(state.pool(), session.uuid).await {
+            Ok(Some(token_row)) => {
+                let age = chrono::Utc::now().signed_duration_since(token_row.created_at);
+                if age.num_seconds() > i64::try_from(ttl_secs).unwrap_or(i64::MAX) {
+                    tracing::info!(
+                        uuid = %session.uuid,
+                        "MiAuth consumed session raw token expired; returning null (client keeps its copy)",
+                    );
+                    None
+                } else {
+                    session.raw_token_for_polling.clone()
+                }
+            }
+            // `issued_token_id` はあるのに join が空 (`delete_token_by_id` の
+            // FK は `ON DELETE SET NULL` なので理論上到達しないはずだが、
+            // 万一のズレに備えて安全側に倒す)。raw を返し続けると TTL 検査の
+            // 意味が無くなるので、expired と同じ扱いにする。
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    uuid = %session.uuid,
+                    "miauth_token lookup failed; returning raw token (fail-open)",
+                );
+                session.raw_token_for_polling.clone()
+            }
+        }
+    } else {
+        // `miauth revoke` (`delete_token_by_id`) は FK `ON DELETE SET NULL` で
+        // まさにこの列を NULL に倒す (`miauth_cli.rs` 参照)。revoke 済み token
+        // の age を検証する手立てが無い以上、raw を返し続けるのは TTL 保護の
+        // 抜け穴になる ── expired と同じ扱いで隠す。
+        tracing::info!(
+            uuid = %session.uuid,
+            "MiAuth consumed session has no issued_token_id (revoked); returning null",
+        );
+        None
+    };
     Json(CheckResponse {
         ok: true,
-        token: session.raw_token_for_polling.clone(),
+        token,
         user: Some(user),
     })
     .into_response()

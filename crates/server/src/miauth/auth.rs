@@ -172,9 +172,23 @@ pub fn parse_bearer_header(header_value: &str) -> Option<&str> {
 /// (= 無効 / revoke 済み token の 401 は維持)。
 pub async fn require_scope(
     state: &AppState,
-    headers: &axum::http::HeaderMap,
+    headers: &axum::http::header::HeaderMap,
     body_i: Option<&str>,
     required_scope: &str,
+) -> Result<MiAuthTokenRow, MiAuthScopeError> {
+    require_scope_any(state, headers, body_i, &[required_scope]).await
+}
+
+/// 複数 scope の **いずれか 1 つ** を要求する版。
+///
+/// Misskey の permission 体系 (`read:notifications` / `write:notifications` /
+/// `read:following` / `read:reactions`) と、既存 deploy のトークンが要求して
+/// きた `read:account` の互換を取るために使う (どちらで grant されていても通す)。
+pub async fn require_scope_any(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body_i: Option<&str>,
+    required_scopes: &[&str],
 ) -> Result<MiAuthTokenRow, MiAuthScopeError> {
     let raw = match body_i.filter(|s| !s.is_empty()) {
         Some(s) => s.to_string(),
@@ -185,7 +199,7 @@ pub async fn require_scope(
             .map(str::to_string)
             .ok_or(MiAuthScopeError::Unauthorized)?,
     };
-    validate_token_for_scope(state, &raw, required_scope).await
+    validate_token_for_scope_any(state, &raw, required_scopes).await
 }
 
 /// `require_scope` のうち「raw token 確定後」の部分。
@@ -198,6 +212,15 @@ pub async fn validate_token_for_scope(
     state: &AppState,
     raw: &str,
     required_scope: &str,
+) -> Result<MiAuthTokenRow, MiAuthScopeError> {
+    validate_token_for_scope_any(state, raw, &[required_scope]).await
+}
+
+/// [`validate_token_for_scope`] の複数 scope (OR) 版。
+pub async fn validate_token_for_scope_any(
+    state: &AppState,
+    raw: &str,
+    required_scopes: &[&str],
 ) -> Result<MiAuthTokenRow, MiAuthScopeError> {
     // token 有効性はアナーキーでも常に検査 (= 無効 / revoke 済みは 401)。
     let Some(token_row) = validate_token_raw(state, raw).await else {
@@ -212,7 +235,7 @@ pub async fn validate_token_for_scope(
         mark_used_async(state, token_row.id);
         return Ok(token_row);
     }
-    if !has_scope(&token_row, required_scope) {
+    if !required_scopes.iter().any(|s| has_scope(&token_row, s)) {
         return Err(MiAuthScopeError::Forbidden);
     }
     mark_used_async(state, token_row.id);

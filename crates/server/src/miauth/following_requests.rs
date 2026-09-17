@@ -65,6 +65,9 @@ use crate::miauth::notes::resolve_self_actor;
 use crate::state::AppState;
 
 const SCOPE_READ_ACCOUNT: &str = "read:account";
+/// Misskey の permission 体系では follow request 一覧は `read:following`。
+/// 既存 deploy の `read:account` トークンとも互換を取る。
+const SCOPE_READ_FOLLOWING: &str = "read:following";
 const SCOPE_WRITE_FOLLOWING: &str = "write:following";
 
 #[derive(Debug, Deserialize, Default)]
@@ -94,11 +97,17 @@ pub async fn list(
     body: Option<Json<ListBody>>,
 ) -> Response {
     let body = body.map(|j| j.0).unwrap_or_default();
-    let _token_row =
-        match auth::require_scope(&state, &headers, body.i.as_deref(), SCOPE_READ_ACCOUNT).await {
-            Ok(t) => t,
-            Err(e) => return e.into_response(),
-        };
+    let _token_row = match auth::require_scope_any(
+        &state,
+        &headers,
+        body.i.as_deref(),
+        &[SCOPE_READ_FOLLOWING, SCOPE_READ_ACCOUNT],
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     let Some(me) = resolve_self_actor(&state).await else {
         return error_resp(
             StatusCode::INTERNAL_SERVER_ERROR,

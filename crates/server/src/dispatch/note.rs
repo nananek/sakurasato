@@ -444,7 +444,12 @@ async fn build_remote_note(
         .get("sensitive")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
-    let url = obj.get("url").and_then(extract_url_string);
+    // `url` は TUI / MiAuth がリンクとして表示しうるため、http(s) 以外
+    // (`javascript:` / `data:` 等) は保存しない (AP `url` は remote 制御)。
+    let url = obj
+        .get("url")
+        .and_then(extract_url_string)
+        .filter(|raw| is_http_url(raw));
     let published_at = super::parse_ap_timestamp(obj.get("published"));
     let attachments = obj
         .get("attachment")
@@ -514,6 +519,12 @@ fn extract_url_string(v: &JsonValue) -> Option<String> {
         JsonValue::Array(arr) => arr.iter().find_map(extract_url_string),
         _ => None,
     }
+}
+
+/// `raw` が `http` / `https` の絶対 URL か。`Note.url` として保存してよい
+/// 入力かの判定に使う。
+fn is_http_url(raw: &str) -> bool {
+    Url::parse(raw).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
 }
 
 /// AP の `to`/`cc` 配列から DB の `visibility` 列の値を推測する。
@@ -639,6 +650,17 @@ mod tests {
             extract_url_string(&json!([{"href": "https://z"}, "ignored"])),
             Some("https://z".into())
         );
+    }
+
+    #[test]
+    fn is_http_url_rejects_non_http_schemes() {
+        assert!(is_http_url("https://x.example/notes/1"));
+        assert!(is_http_url("http://x.example/notes/1"));
+        assert!(!is_http_url("javascript:alert(1)"));
+        assert!(!is_http_url("data:text/html;base64,AAAA"));
+        assert!(!is_http_url("file:///etc/passwd"));
+        assert!(!is_http_url("not a url"));
+        assert!(!is_http_url(""));
     }
 
     #[test]

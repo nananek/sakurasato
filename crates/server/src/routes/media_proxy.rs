@@ -68,5 +68,13 @@ pub async fn handle(State(state): State<AppState>, Query(q): Query<ProxyQuery>) 
             "media-proxy rate limit exceeded for this host; retry later",
         );
     }
+    // ホストローテート flood への第二の bound (per-domain だけでは
+    // 総並列度を抑えられない)。permit は fetch 完了まで保持する。
+    let Some(_slot) = state.try_acquire_media_proxy_slot() else {
+        return media_proxy_route::error_status(
+            StatusCode::TOO_MANY_REQUESTS,
+            "media-proxy concurrency limit reached; retry later",
+        );
+    };
     media_proxy_route::fetch_and_respond(&state, parsed.as_str(), &q.variant).await
 }
