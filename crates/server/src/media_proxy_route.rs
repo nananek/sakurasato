@@ -114,6 +114,25 @@ pub(crate) fn validate(q: &ProxyQuery, allow_private: bool) -> Result<url::Url, 
 /// アバター・添付・絵文字) を表示する正当用途があり、TUI は画像バイト列を
 /// すべてこの経路で受け取る設計のため、無条件適用するとローカルメディアが
 /// 描画できなくなる。適用範囲の見直しは別途 follow-up。
+///
+/// **既知の限界 (2026-09 レビュー)**: 本チェックは `server_host` との文字列
+/// 一致 ([`is_self_host`]) のみで、IP リテラルでの自己参照は検出しない
+/// (`host_blocked` も public IP は private/loopback 判定に掛からず通す)。
+/// 理論上 `url=http://<自ホストの公開 IP>/media-proxy?...` で同じ自己
+/// プロキシ連鎖を再現できる余地は残る。ただし本プロジェクトが唯一公式に
+/// サポートするデプロイ構成 (`DEPLOYMENT.md` §0/§4, Cloudflare Tunnel) では
+/// `server` に `ports:` を一切開けず (本番 `docker-compose.yml` に該当行なし)
+/// 自宅/VPS の実 IP を外部公開しない設計のため、攻撃者がこの IP に到達する
+/// 経路自体が存在しない。docker 内部ネットワーク経由の代替 (compose サービス
+/// 名 `server` や internal ネットの private IP) も `host_blocked` の
+/// single-label-host 判定 / private IP 判定が別途遮断済み (本関数とは独立)。
+/// 受信側で Host ヘッダを `server_host` と照合する検証層は現状どこにも無い
+/// ことも確認済みだが、追加するなら `release-validation.yml` の
+/// `stack-smoke` が `config.server.host = "localhost"` のまま
+/// `curl http://127.0.0.1:8080/...` で probe している点との非互換に注意
+/// (素朴な完全一致では既存 CI を壊す)。Cloudflare Tunnel を介さない直接公開
+/// デプロイを新たにサポートする場合はこの前提が崩れるため、その時点で
+/// 再評価すること。
 pub(crate) fn reject_self_host(parsed: &url::Url, server_host: &str) -> Result<(), Response> {
     if is_self_host(parsed, server_host) {
         return Err(error_400(format!(
