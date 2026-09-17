@@ -247,8 +247,9 @@ fn ipv6_block_reason(ip: Ipv6Addr) -> Option<&'static str> {
     if segs[0] == 0x2001 && segs[1] == 0x0db8 {
         return Some("documentation");
     }
-    if (segs[0] & 0xfff0) == 0x3ff0 {
+    if segs[0] == 0x3fff && (segs[1] & 0xf000) == 0 {
         // 3fff::/20 (RFC 9637 で追加された documentation 用)。
+        // 20bit prefix = segs[0] 全体 (16bit) + segs[1] の上位 4bit。
         return Some("documentation");
     }
     if segs[0] == 0x5f00 {
@@ -657,5 +658,33 @@ mod tests {
         // 解決される。公開アドレスへの正規経路は許可する。
         assert_eq!(host_blocked(&url("http://[64:ff9b::1.1.1.1]/x")), None);
         assert_eq!(host_blocked(&url("http://[2002:101:101::]/x")), None);
+    }
+
+    #[test]
+    fn documentation_3fff_check_matches_rfc9637_prefix_exactly() {
+        // RFC 9637 の 3fff::/20 は segs[0] 全体 (0x3fff) + segs[1] の上位
+        // 4bit が対象。segs[0] のみを緩いマスクで見ると、隣接する未割当の
+        // global unicast 空間 (3ff0::〜3ffe:: や 3fff: の他サブネット) まで
+        // 誤って "documentation" 扱いしてしまう回帰を防ぐ。
+        assert_eq!(
+            host_blocked(&url("http://[3fff::1]/x")),
+            Some("documentation"),
+            "3fff::/20 本体は引き続き遮断される"
+        );
+        assert_eq!(
+            host_blocked(&url("http://[3fff:fff:ffff::1]/x")),
+            Some("documentation"),
+            "segs[1] 上位4bit が 0 なら /20 の範囲内"
+        );
+        assert_eq!(
+            host_blocked(&url("http://[3ff0::1]/x")),
+            None,
+            "3ff0::/16 は /20 予約範囲の外 (未割当空間で SSRF ガード対象外)"
+        );
+        assert_eq!(
+            host_blocked(&url("http://[3fff:1000::1]/x")),
+            None,
+            "segs[1] 上位4bit が 0 でなければ /20 の範囲外"
+        );
     }
 }
