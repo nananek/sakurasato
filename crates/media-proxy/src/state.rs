@@ -11,14 +11,17 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::http_client;
 
-/// 同時に処理する fetch / sanitize ジョブ数の上限。
-///
+/// 同時に処理する fetch / sanitize ジョブ数の上限。///
 /// 対象は `fetch` / `sanitize` (画像) + `video_sanitize` (動画) + 将来の
 /// 重いジョブ全般。1 リクエストあたりのメモリは `MAX_ANIMATED_TOTAL_FRAME_BYTES` (128 MiB) +
 /// デコード / エンコードの一時バッファ、動画は入力 + コピーで約 400 MiB で、
 /// コンテナの `mem_limit: 1024m` に対して 2 並列までなら収まる。公開 `/media-proxy` から並列リクエストを
 /// 大量に投げられてもメモリを bound する (超過分は 503 busy)。
 const MAX_CONCURRENT_MEDIA_JOBS: usize = 2;
+
+/// `WebFinger` JRD 取得の本文上限 (64 KiB)。画像用 `max_bytes` (既定 25 MiB)
+/// とは別枠 ── [`ProxyState::max_webfinger_bytes`] 参照。
+pub(crate) const MAX_WEBFINGER_BYTES: usize = 64 * 1024;
 
 /// media-proxy の共有状態。`Arc` で包んで axum の `State` に載せる。
 #[derive(Debug)]
@@ -72,6 +75,16 @@ impl ProxyState {
     /// 環境変数で 64bit の巨大値が入っていた場合は `usize::MAX` にクランプ。
     pub fn max_bytes(&self) -> usize {
         usize::try_from(self.config.media_proxy.max_bytes).unwrap_or(usize::MAX)
+    }
+
+    /// `WebFinger` JRD 取得の本文上限。`max_bytes` (画像用、既定 25 MiB) とは
+    /// 別枠の小さい固定値にする (F3)。
+    ///
+    /// `WebFinger` レスポンスは actor 解決のための小さな JSON で、通常数 KiB、
+    /// リンクの多い実装でも数十 KiB に収まる。画像用上限を流用すると 25 MiB
+    /// まで buffer してしまうため、64 KiB で頭打ちにする。
+    pub fn max_webfinger_bytes(&self) -> usize {
+        MAX_WEBFINGER_BYTES
     }
 
     /// `max_pixels`: デコード時の `image::Limits` に渡す。
