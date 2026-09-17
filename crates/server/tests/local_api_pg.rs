@@ -2009,6 +2009,61 @@ async fn unfollow_enqueues_undo_and_deletes_row(pool: PgPool) {
     assert_eq!(activity["object"]["object"], bob.ap_id);
 }
 
+/// `DELETE /api/v1/follow/{id}` で `rejected` 行を消すと、follow 行は消えるが
+/// **Undo Follow は送らない** (相手が一度も accept していない follow を undo
+/// するのは不自然、かつ block 実行時にこの経路を再利用するため)。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn unfollow_rejected_row_deletes_without_undo(pool: PgPool) {
+    let me = repo::actor::insert(&pool, common::sample_local_actor("alice", "example.test"))
+        .await
+        .unwrap();
+    let mut bob = sample_remote_actor("bob", "remote.test");
+    bob.shared_inbox_url = Some("https://remote.test/inbox".into());
+    let bob = repo::actor::insert(&pool, bob).await.unwrap();
+    let follow_id = insert_follow(
+        &pool,
+        me.id,
+        bob.id,
+        sakurasato_core::model::FollowState::Rejected,
+    )
+    .await;
+
+    let raw = issue_token(&pool, "tui").await;
+    let state =
+        sakurasato_server::state::AppState::from_pool(pool.clone(), make_config("example.test"));
+    let app = sakurasato_server::local_api::router(state);
+    let resp = app
+        .oneshot(
+            Request::delete(format!("/api/v1/follow/{follow_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_json(resp).await;
+    assert_eq!(json["follow_id"], follow_id);
+    assert_eq!(json["target_ap_id"], bob.ap_id);
+    assert!(
+        json["delivery_queue_id"].is_null(),
+        "rejected row must not enqueue an Undo Follow: {json:?}"
+    );
+
+    // follow 行は消えた。
+    let row = repo::follow::get_by_pair(&pool, me.id, bob.id)
+        .await
+        .unwrap();
+    assert!(row.is_none(), "follow row must be deleted");
+
+    // delivery_queue には何も積まれていない。
+    let due = repo::delivery_queue::pick_due(&pool, 10).await.unwrap();
+    assert!(
+        due.is_empty(),
+        "no Undo Follow must be queued for a rejected row: {due:?}"
+    );
+}
+
 /// `DELETE /api/v1/follow/{id}` で「他人の follow」を消そうとすると 403。
 /// (= 我々が follower でない follow 行をローカル API から触れない)
 #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]

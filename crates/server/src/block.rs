@@ -646,6 +646,48 @@ mod tests {
         assert_eq!(types, vec!["Undo".to_string(), "Block".to_string()]);
     }
 
+    /// local → remote の既存 follow が `rejected` (= 相手が一度も accept して
+    /// いない) 場合、block 実行はその行を削除するが **Undo Follow は送らない**
+    /// (成立したことのない follow の Undo は不自然、
+    /// [`crate::follow::delete_follow_core`] 参照)。Block activity のみ enqueue
+    /// される。
+    #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+    async fn create_block_core_skips_undo_for_rejected_outbound_follow(pool: PgPool) {
+        let local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();
+        let remote = repo::actor::insert(&pool, new_remote_actor("remote.test", "bob"))
+            .await
+            .unwrap();
+
+        let out_ap_id = format!("https://{HOST}/activities/follow-out-rejected");
+        let out_row = repo::follow::insert_pending(&pool, &out_ap_id, local.id, remote.id)
+            .await
+            .unwrap();
+        repo::follow::set_state(
+            &pool,
+            out_row.id,
+            sakurasato_core::model::FollowState::Rejected,
+        )
+        .await
+        .unwrap();
+
+        let state = AppState::from_pool(pool.clone(), test_config());
+        create_block_core(&state, FollowTarget::ActorId(remote.id))
+            .await
+            .unwrap();
+
+        assert!(
+            repo::follow::get_by_pair(&pool, local.id, remote.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "rejected follow row must still be removed",
+        );
+
+        // delivery_queue には Block だけが積まれる (Undo は無し)。
+        let types = queued_activity_types(&pool, local.id).await;
+        assert_eq!(types, vec!["Block".to_string()]);
+    }
+
     #[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
     async fn create_block_core_rejects_self_block(pool: PgPool) {
         let local = repo::actor::insert(&pool, new_local_actor()).await.unwrap();

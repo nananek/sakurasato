@@ -155,12 +155,13 @@ pub struct FollowOutcome {
     pub already_pending: bool,
 }
 
-/// `delete_follow_core` の結果。Undo Follow activity を必ず 1 行 enqueue する。
+/// `delete_follow_core` の結果。`rejected` 行の削除では Undo Follow を送らない
+/// ため (下記) `queue_id` は enqueue した場合のみ `Some`。
 #[derive(Debug, Clone)]
 pub struct UnfollowOutcome {
     pub follow_id: i64,
     pub target_ap_id: String,
-    pub queue_id: i64,
+    pub queue_id: Option<i64>,
     pub inbox_url: String,
 }
 
@@ -454,16 +455,41 @@ pub async fn delete_follow_core(
             ))
         })?;
 
-    let undo_ap_id = format!(
-        "https://{host}/users/{user}/activities/undo-follow-{follow_id}",
-        host = state.config().server.host,
-        user = local.preferred_username,
-    );
     let inbox = target
         .shared_inbox_url
         .as_deref()
         .unwrap_or(&target.inbox_url)
         .to_string();
+
+    // `rejected` 行は相手が一度も accept していない (= follow 関係が成立した
+    // ことがない) ので、Undo Follow を送ると「存在しない follow の取り消し」
+    // という不自然な activity を相手の inbox に投げることになる。行の削除
+    // だけ行い、配送はしない。
+    if row.state == "rejected" {
+        sqlx::query!("DELETE FROM follow WHERE id = $1", row.id)
+            .execute(state.pool())
+            .await
+            .map_err(|e| {
+                FollowError::Internal(anyhow::Error::new(e).context("delete rejected follow row"))
+            })?;
+        info!(
+            follow_id = row.id,
+            target = %target.ap_id,
+            "rejected follow row deleted; no Undo Follow sent (never accepted)",
+        );
+        return Ok(UnfollowOutcome {
+            follow_id: row.id,
+            target_ap_id: target.ap_id,
+            queue_id: None,
+            inbox_url: inbox,
+        });
+    }
+
+    let undo_ap_id = format!(
+        "https://{host}/users/{user}/activities/undo-follow-{follow_id}",
+        host = state.config().server.host,
+        user = local.preferred_username,
+    );
     let activity = build_undo_follow_activity(&undo_ap_id, &local.ap_id, &row, &target.ap_id);
 
     let mut tx =
@@ -495,7 +521,7 @@ pub async fn delete_follow_core(
     Ok(UnfollowOutcome {
         follow_id: row.id,
         target_ap_id: target.ap_id,
-        queue_id: queued.id,
+        queue_id: Some(queued.id),
         inbox_url: inbox,
     })
 }
