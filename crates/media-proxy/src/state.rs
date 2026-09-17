@@ -13,9 +13,10 @@ use crate::http_client;
 
 /// 同時に処理する fetch / sanitize ジョブ数の上限。
 ///
-/// 1 リクエストあたりのメモリは `MAX_ANIMATED_TOTAL_FRAME_BYTES` (128 MiB) +
-/// デコード / エンコードの一時バッファで、コンテナの `mem_limit: 1024m` に
-/// 対して 2 並列までなら収まる。公開 `/media-proxy` から並列リクエストを
+/// 対象は `fetch` / `sanitize` (画像) + `video_sanitize` (動画) + 将来の
+/// 重いジョブ全般。1 リクエストあたりのメモリは `MAX_ANIMATED_TOTAL_FRAME_BYTES` (128 MiB) +
+/// デコード / エンコードの一時バッファ、動画は入力 + コピーで約 400 MiB で、
+/// コンテナの `mem_limit: 1024m` に対して 2 並列までなら収まる。公開 `/media-proxy` から並列リクエストを
 /// 大量に投げられてもメモリを bound する (超過分は 503 busy)。
 const MAX_CONCURRENT_MEDIA_JOBS: usize = 2;
 
