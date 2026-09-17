@@ -105,11 +105,13 @@ pub mod whoami;
 pub fn router(state: AppState) -> Router {
     // M7: 画像アップロードはサニタイズ前段で media-proxy.max_bytes に達する
     // 想定の大きいバイト列を受ける。axum の DefaultBodyLimit (= 2 MiB) を
-    // 当該ルートだけ拡張する。`media.upload` ハンドラ自身も上限を再確認
-    // するので、ここは max_bytes と同じ値に揃えればよい。
+    // 当該ルートだけ拡張する。
     // 動画対応で `media_proxy.video.max_bytes` (既定200MiB > 画像の25MiB) が
-    // 加わったため、DefaultBodyLimit はこの層で弾かれないよう大きい方を採用する
-    // (= 実際の上限判定は `upload_image_core` / `upload_video_core` 側で行う)。
+    // 加わったため、DefaultBodyLimit はこの層では大きい方を採用する。
+    // ただし F1 以降、ハンドラ (`media::upload`) が Content-Type ヒントで
+    // 画像 / 動画の cap を選び分け `to_bytes` で読みながら頭打ちにするため、
+    // 画像が 200 MiB まで buffer されることはない (= 実際の上限判定は
+    // ハンドラ側で行う)。ここは extractor 差し替え時の後ろ盾として残す。
     let upload_max = usize::try_from(
         state
             .config()

@@ -6,8 +6,10 @@
 //! 2. クエリ `kind` (avatar / header / attachment) を検証。`alt` (代替テキスト)
 //!    は任意で、長さ上限を `ALT_MAX` で切る。
 //! 3. リクエスト本文をバイト列で受け取る (= TUI は raw `application/octet-stream`
-//!    か `image/<fmt>` で送る)。axum の `Bytes` extractor が `DefaultBodyLimit`
-//!    を尊重する。サーバ全体の上限は `media_proxy.max_bytes` を採用する。
+//!    か `image/<fmt>` / `video/<fmt>` で送る)。`Content-Type` ヒントで画像 /
+//!    動画の上限 (`media_proxy.max_bytes` / `media_proxy.video.max_bytes`) を
+//!    選び分け、`to_bytes` で読みながら頭打ちにする。route 層の
+//!    `DefaultBodyLimit` (動画上限に揃えた値) は後ろ盾として残す。
 //! 4. media-proxy `/v1/image/sanitize?variant=<v>` を呼び、再エンコード後の
 //!    WebP バイト列を受け取る。本体 server は中身を **デコードしない**
 //!    (= CLAUDE.md §7 の信頼境界を維持)。
@@ -34,8 +36,8 @@
 
 use aws_sdk_s3::primitives::ByteStream;
 use axum::Json;
-use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base16ct::lower as base16;
@@ -147,11 +149,41 @@ pub async fn upload(
     State(state): State<AppState>,
     Query(q): Query<UploadQuery>,
     headers: HeaderMap,
-    body: Bytes,
+    req: Request<Body>,
 ) -> Response {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
+    let is_video_hint = content_type.is_some_and(|ct| ct.starts_with("video/"));
+    // F1: 動画は 1 件で実測 454 MiB を消費するため、body を読む **前** に
+    // slot を取る。取れなければ待たせず 503。permit は処理完了まで保持する。
+    // 画像は軽い (上限 25 MiB + UDS 4 MiB cap) ので gate しない。
+    let _video_slot: Option<tokio::sync::SemaphorePermit<'_>> = if is_video_hint {
+        match state.try_acquire_video_upload_slot() {
+            Some(permit) => Some(permit),
+            None => {
+                return error_with_body(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "another video upload is in progress; retry later",
+                );
+            }
+        }
+    } else {
+        None
+    };
+    // F1: 画像/動画で上限を分離しながらストリーミングで読む。route 層の
+    // `DefaultBodyLimit` は動画上限 (既定 200 MiB) に揃えてあるため、画像を
+    // `Bytes` extractor で受けると 200 MiB まで無条件に buffer してしまう。
+    // `Content-Type` ヒントで cap を選び `to_bytes` で読みながら頭打ちにする
+    // (= `upload_image_core` / `upload_video_core` 側の事後検査に到達する前に
+    // メモリを抑える)。
+    let cap = upload_body_cap(&state, is_video_hint);
+    let Ok(body) = axum::body::to_bytes(req.into_body(), cap).await else {
+        return error_with_body(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "upload exceeds the size limit for its content type",
+        );
+    };
     match upload_media_core(&state, &q.kind, q.alt.as_deref(), content_type, body).await {
         Ok((row, created)) => {
             // dedupe ヒット (= 同一バイト列の既存行) は 200、新規 INSERT は 201。
@@ -164,6 +196,18 @@ pub async fn upload(
         }
         Err(resp) => resp,
     }
+}
+
+/// リクエスト `Content-Type` ヒントに応じた body 上限。画像は
+/// `media_proxy.max_bytes`、動画は `media_proxy.video.max_bytes` を使う。
+/// `upload` ハンドラが `to_bytes` の cap として渡し、読みながら頭打ちにする。
+fn upload_body_cap(state: &AppState, is_video_hint: bool) -> usize {
+    let max = if is_video_hint {
+        state.config().media_proxy.video.max_bytes
+    } else {
+        state.config().media_proxy.max_bytes
+    };
+    usize::try_from(max).unwrap_or(usize::MAX)
 }
 
 /// アップロードの共通入り口。`Content-Type` ヒント (`video/*` かどうか) で

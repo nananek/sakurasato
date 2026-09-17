@@ -116,6 +116,15 @@ struct Inner {
     /// 署名検証経路は 401 に、followee 経路は boost の取りこぼしになるが、
     /// どちらも相手の再送で回復できる。
     fetch_gate: Arc<Semaphore>,
+    /// 動画アップロード (`POST /api/v1/media` の `video/*` 経路) の
+    /// **プロセス全体の同時実行数** 上限。
+    ///
+    /// 動画 1 件の処理中メモリは request body (最大
+    /// `media_proxy.video.max_bytes`、既定 200 MiB) + media-proxy 応答 +
+    /// `upload_video_core` の `to_vec()` コピーで実測 454 MiB に達する
+    /// (docker-compose.yml の根拠コメント参照)。server の cgroup 上限
+    /// 768m に対して 2 並列で超過するため、2 件目は待たせず 503 で返す。
+    video_upload_gate: Arc<Semaphore>,
 }
 
 /// 外向き fetch の同時実行上限。お一人様サーバの通常運用 (散発的な actor /
@@ -125,6 +134,11 @@ const MAX_CONCURRENT_OUTBOUND_FETCHES: usize = 4;
 /// 公開 `GET /media-proxy` の同時実行上限。無認証のため、通常のブラウザ
 /// 画像取得 (数枚) は通しつつ flood を bound する値。
 const MAX_CONCURRENT_PUBLIC_MEDIA_PROXY_FETCHES: usize = 4;
+
+/// 動画アップロードの同時実行上限。単発の実測 454 MiB に対し cgroup 768m
+/// では 2 並列で超過するため 1 に絞る (TUI は逐次アップロードなので通常は
+/// 当たらない)。
+const MAX_CONCURRENT_VIDEO_UPLOADS: usize = 1;
 
 impl AppState {
     /// Build the `AppState` by resolving the DB URL (with password file
@@ -173,6 +187,7 @@ impl AppState {
             media_proxy_rate_limiter: DomainRateLimiter::new(),
             media_proxy_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_PUBLIC_MEDIA_PROXY_FETCHES)),
             fetch_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_FETCHES)),
+            video_upload_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_VIDEO_UPLOADS)),
         })))
     }
 
@@ -210,6 +225,7 @@ impl AppState {
             media_proxy_rate_limiter: DomainRateLimiter::new(),
             media_proxy_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_PUBLIC_MEDIA_PROXY_FETCHES)),
             fetch_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_FETCHES)),
+            video_upload_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_VIDEO_UPLOADS)),
         }))
     }
 
@@ -287,6 +303,14 @@ impl AppState {
     /// HTTP リクエスト完了まで離さないこと。
     pub(crate) fn try_acquire_fetch_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
         self.0.fetch_gate.try_acquire().ok()
+    }
+
+    /// 動画アップロードの同時実行 permit を **待たずに** 取る。取れなければ
+    /// `None` (= 呼び出し側は 503)。`POST /api/v1/media` の動画経路が body
+    /// の読み取り **前** に取得し、処理完了まで保持する。統合テストからも
+    /// 呼べるよう `pub` にしている (slot 占有時の 503 回帰テスト用)。
+    pub fn try_acquire_video_upload_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.0.video_upload_gate.try_acquire().ok()
     }
 
     /// Compute the canonical AP actor `id` URI for `username` against the
