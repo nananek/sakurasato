@@ -3223,3 +3223,140 @@ async fn domain_suspend_rejects_inbox_with_403(pool: PgPool) {
             .is_none(),
     );
 }
+
+/// 未知 keyId の actor JSON を返す最小 stub。`127.0.0.1` エフェメラルポートで
+/// actor 1 件だけを配信する。戻り値は actor の `ap_id`。
+///
+/// 「fetch → 署名検証 → 成功時のみ upsert」の順序を検証するためのテスト
+/// インフラ。`AppState::from_pool_with_remote_fetch` が
+/// `allow_internal_inbox = true` にするため loopback fetch が通る。
+async fn spawn_actor_stub(pub_pem: &str) -> String {
+    use axum::extract::State as AxState;
+    use axum::response::IntoResponse;
+
+    async fn serve_actor(
+        AxState((ap_id, pub_pem)): AxState<(String, String)>,
+    ) -> impl IntoResponse {
+        let body = serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": ap_id,
+            "type": "Person",
+            "preferredUsername": "bob",
+            "inbox": format!("{ap_id}/inbox"),
+            "publicKey": {
+                "id": format!("{ap_id}#main-key"),
+                "owner": ap_id,
+                "publicKeyPem": pub_pem,
+            },
+        })
+        .to_string();
+        (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/activity+json",
+            )],
+            body,
+        )
+    }
+
+    // 先にポートだけ確保して ap_id を確定させてからサーバを立てる。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let ap_id = format!("http://{addr}/users/bob");
+    let app = Router::new()
+        .route("/users/bob", axum::routing::get(serve_actor))
+        .with_state((ap_id.clone(), pub_pem.to_string()));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    ap_id
+}
+
+/// 署名検証に失敗した未知 actor は DB に残留しない (fetch→検証→成功時のみ
+/// upsert の順序保証)。stub の公開鍵と異なる鍵で署名 → 401 + 行なし。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn unknown_actor_with_bad_signature_leaves_no_row(pool: PgPool) {
+    let (stub_priv, stub_pub) = fresh_rsa();
+    let (evil_priv, _) = fresh_rsa();
+    let _ = stub_priv;
+
+    let stub_ap_id = spawn_actor_stub(&stub_pub).await;
+
+    let state = AppState::from_pool_with_remote_fetch(pool.clone(), make_config());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": format!("{stub_ap_id}/activities/follow-1"),
+        "type": "Follow",
+        "actor": stub_ap_id,
+        "object": format!("https://{LOCAL_HOST}/users/{LOCAL_USER}"),
+    })
+    .to_string();
+    let keyid = format!("{stub_ap_id}#main-key");
+    // stub とは別鍵で署名 → 検証失敗が確定する。
+    let req = build_signed_post(body.as_bytes(), "/inbox", &evil_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "bad signature from unknown actor must be 401"
+    );
+
+    let row = repo::actor::get_by_ap_id(&pool, &stub_ap_id).await.unwrap();
+    assert!(
+        row.is_none(),
+        "failed-verification actor must not be persisted: {row:?}"
+    );
+}
+
+/// 署名検証に成功した未知 actor は upsert されて dispatch が通る (正常系の
+/// 不退化)。正鍵で署名した Follow → 202 + actor 行 + accepted follow 行。
+#[sqlx::test(migrator = "sakurasato_core::MIGRATOR")]
+async fn unknown_actor_with_valid_signature_is_persisted(pool: PgPool) {
+    let (local_priv, local_pub) = fresh_rsa();
+    let (stub_priv, stub_pub) = fresh_rsa();
+    let _ = local_priv;
+
+    let local = repo::actor::insert(&pool, local_actor(&local_pub, "PRIV"))
+        .await
+        .unwrap();
+    let stub_ap_id = spawn_actor_stub(&stub_pub).await;
+
+    let state = AppState::from_pool_with_remote_fetch(pool.clone(), make_config());
+    let app = router(state);
+
+    let follow_id = format!("{stub_ap_id}/activities/follow-1");
+    let body = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_id,
+        "type": "Follow",
+        "actor": stub_ap_id,
+        "object": local.ap_id,
+    })
+    .to_string();
+    let keyid = format!("{stub_ap_id}#main-key");
+    let req = build_signed_post(body.as_bytes(), "/inbox", &stub_priv, &keyid, LOCAL_HOST);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "valid Follow from fetched actor must be accepted"
+    );
+
+    let row = repo::actor::get_by_ap_id(&pool, &stub_ap_id)
+        .await
+        .unwrap()
+        .expect("verified actor must be persisted");
+    assert!(!row.is_local);
+    // 保存時に外周 whitespace が落とされる (`parse_public_key` の canonicalize)。
+    assert_eq!(row.public_key_pem, stub_pub.trim());
+
+    let follow = repo::follow::get_by_ap_id(&pool, &follow_id)
+        .await
+        .unwrap()
+        .expect("Follow row must exist");
+    assert_eq!(follow.state, "accepted");
+}

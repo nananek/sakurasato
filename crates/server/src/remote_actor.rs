@@ -101,17 +101,29 @@ pub enum FetchError {
     Other(#[from] anyhow::Error),
 }
 
-/// 受信 inbox の署名検証で未知 actor が来たときに呼ぶエントリポイント。
+/// 受信 inbox の署名検証で未知 actor が来たときに呼ぶ取得部。
 ///
 /// `<ap_id>` から actor JSON を `GET` し、パース・SSRF 検査・公開鍵
-/// `owner` 検査を経て `actor` テーブルに upsert してから `ActorRow` を返す。
-/// [`crate::extract::SignedInboxBody`] が DB 再 lookup を重複させずに済むよう、
+/// `owner` 検査まで行うが、**DB には書き込まない** ── 署名検証前に永続化
+/// すると、検証に失敗した攻撃者由来の actor 行が残留し、未認証 POST による
+/// DB 書き込み増幅になる。呼び出し側 ([`crate::extract::SignedInboxBody`])
+/// が署名検証に成功してから [`upsert_parsed`] で永続化する。
 /// 既存行チェックは extractor 側で済ませてから本関数を呼ぶ。
-pub(crate) async fn fetch_and_upsert_for_signature(
+pub(crate) async fn fetch_and_parse(
     state: &AppState,
     ap_id: &str,
+) -> Result<ParsedRemoteActor, FetchError> {
+    let json = fetch_actor_json(state, ap_id).await?;
+    parse_actor_json(ap_id, &json)
+}
+
+/// [`fetch_and_parse`] で取得したパース済み actor を `actor` テーブルに
+/// upsert する。署名検証経路 (extractor) が検証成功後に呼ぶ。
+pub(crate) async fn upsert_parsed(
+    state: &AppState,
+    parsed: ParsedRemoteActor,
 ) -> Result<ActorRow, FetchError> {
-    fetch_and_upsert(state, ap_id).await
+    upsert(state, parsed).await
 }
 
 /// `ap_id` から actor JSON を `GET` し、SSRF / `id` 一致 / 鍵 `owner` を検査
@@ -128,8 +140,7 @@ pub(crate) async fn fetch_and_upsert_for_signature(
 /// [`fetch_and_upsert_with_counts`] がこの関数を呼んでから後追いで取得する
 /// (プロフィール表示用途の呼び出し側はそちらを選ぶ)。
 pub async fn fetch_and_upsert(state: &AppState, ap_id: &str) -> Result<ActorRow, FetchError> {
-    let json = fetch_actor_json(state, ap_id).await?;
-    let parsed = parse_actor_json(ap_id, &json)?;
+    let parsed = fetch_and_parse(state, ap_id).await?;
     upsert(state, parsed).await
 }
 
@@ -270,7 +281,11 @@ pub(crate) async fn fetch_object_json(
     uri: &str,
 ) -> Result<JsonValue, FetchError> {
     let url = Url::parse(uri)?;
-    enforce_url_policy(&url, &state.config().server.host)?;
+    enforce_url_policy(
+        &url,
+        &state.config().server.host,
+        state.allow_internal_inbox(),
+    )?;
 
     // per-domain レート制限 (Issue #269)。actor / Note fetch の唯一の chokepoint
     // なので、ここで宛先 host のトークンを引く。flood (例: 悪意ある followee の
@@ -366,8 +381,12 @@ pub(crate) async fn fetch_object_json(
 /// 共有ガード ([`net_guard`]) を通して URL を検査する。
 ///
 /// 失敗時に呼び出し側で host を含むエラーを返したいので、ここでは結果を
-/// `Result<(), FetchError>` で返す。
-fn enforce_url_policy(url: &Url, server_host: &str) -> Result<(), FetchError> {
+/// `Result<(), FetchError>` で返す。`allow_private` はテスト専用
+/// ([`AppState::allow_internal_inbox`] = `from_pool` 経路のみ `true`) で、
+/// scheme と self-host の検査は有効なまま host range のみ緩める ──
+/// 統合テストが `127.0.0.1` の stub actor を fetch できるようにするため。
+/// 本番経路 (`from_config`) は常に `false`。
+fn enforce_url_policy(url: &Url, server_host: &str, allow_private: bool) -> Result<(), FetchError> {
     if url.scheme() != "https" && url.scheme() != "http" {
         return Err(FetchError::Malformed(format!(
             "unsupported scheme {:?}",
@@ -380,7 +399,7 @@ fn enforce_url_policy(url: &Url, server_host: &str) -> Result<(), FetchError> {
             reason: "self-host",
         });
     }
-    if let Some(reason) = net_guard::host_blocked(url) {
+    if !allow_private && let Some(reason) = net_guard::host_blocked(url) {
         return Err(FetchError::Blocked {
             host: url.host_str().unwrap_or("").to_string(),
             reason,
@@ -391,7 +410,7 @@ fn enforce_url_policy(url: &Url, server_host: &str) -> Result<(), FetchError> {
 
 /// パース済みの actor 表現。`NewActor` に詰め替える前段。
 #[derive(Debug)]
-struct ParsedRemoteActor {
+pub(crate) struct ParsedRemoteActor {
     ap_id: String,
     preferred_username: String,
     host: String,
@@ -415,6 +434,56 @@ struct ParsedRemoteActor {
     /// 相手側でどう Follow を扱っているかのキャッシュとして保持する。
     /// 値が無ければ `false` (= 通常アカ扱い)。
     manually_approves_followers: bool,
+}
+
+impl ParsedRemoteActor {
+    /// 署名検証専用の一時行を組み立てる。DB には触れない。
+    ///
+    /// 署名検証 ([`crate::sign::verify_request_with_actor`]) とドメインブロック
+    /// 判定が読むのは公開鍵・`ap_id`・`host` だけなので、それらをパース結果
+    /// から埋め、それ以外は検証に影響しないダミー値にする。呼び出し側は検証
+    /// 成功後に [`upsert_parsed`] で本物の行を取得し、この一時行を下流
+    /// (dispatch 等) に流してはならない (`id: 0` は DB に存在しない番兵)。
+    pub(crate) fn to_transient_row(&self) -> ActorRow {
+        let now = Utc::now();
+        ActorRow {
+            id: 0,
+            ap_id: self.ap_id.clone(),
+            preferred_username: self.preferred_username.clone(),
+            host: self.host.clone(),
+            display_name: self.display_name.clone(),
+            summary: self.summary.clone(),
+            icon_url: self.icon_url.clone(),
+            image_url: self.image_url.clone(),
+            inbox_url: self.inbox_url.clone(),
+            shared_inbox_url: self.shared_inbox_url.clone(),
+            outbox_url: self.outbox_url.clone(),
+            followers_url: self.followers_url.clone(),
+            following_url: self.following_url.clone(),
+            public_key_id: self.public_key_id.clone(),
+            public_key_pem: self.public_key_pem.clone(),
+            private_key_pem: None,
+            ed25519_public_key_id: self.ed25519_public_key_id.clone(),
+            ed25519_public_key_pem: self.ed25519_public_key_pem.clone(),
+            ed25519_private_key_pem: None,
+            also_known_as: sqlx::types::Json(self.also_known_as.clone()),
+            moved_to_ap_id: self.moved_to_ap_id.clone(),
+            is_local: false,
+            actor_type: self.actor_type.clone(),
+            manually_approves_followers: self.manually_approves_followers,
+            birthday: None,
+            location: None,
+            lang: None,
+            followed_message: None,
+            fields: sqlx::types::Json(Vec::new()),
+            followers_count: 0,
+            following_count: 0,
+            notes_count: 0,
+            fetched_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 }
 
 /// 取得した actor JSON をパースして必要フィールドを取り出す。
@@ -773,7 +842,8 @@ mod tests {
 
     #[test]
     fn enforce_url_policy_blocks_loopback_literal() {
-        let err = enforce_url_policy(&url("http://127.0.0.1/users/x"), "example.test").unwrap_err();
+        let err = enforce_url_policy(&url("http://127.0.0.1/users/x"), "example.test", false)
+            .unwrap_err();
         assert!(matches!(
             err,
             FetchError::Blocked {
@@ -785,8 +855,8 @@ mod tests {
 
     #[test]
     fn enforce_url_policy_blocks_self_host() {
-        let err =
-            enforce_url_policy(&url("https://example.test/users/me"), "example.test").unwrap_err();
+        let err = enforce_url_policy(&url("https://example.test/users/me"), "example.test", false)
+            .unwrap_err();
         assert!(matches!(
             err,
             FetchError::Blocked {
@@ -798,8 +868,8 @@ mod tests {
 
     #[test]
     fn enforce_url_policy_blocks_local_tld() {
-        let err =
-            enforce_url_policy(&url("http://postgres.local/users/x"), "example.test").unwrap_err();
+        let err = enforce_url_policy(&url("http://postgres.local/users/x"), "example.test", false)
+            .unwrap_err();
         assert!(matches!(
             err,
             FetchError::Blocked {
@@ -811,12 +881,32 @@ mod tests {
 
     #[test]
     fn enforce_url_policy_allows_public_domain() {
-        enforce_url_policy(&url("https://mastodon.example/users/x"), "example.test").unwrap();
+        enforce_url_policy(
+            &url("https://mastodon.example/users/x"),
+            "example.test",
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn enforce_url_policy_allows_private_host_when_opted_in() {
+        // テスト経路 (`AppState::from_pool`) のみ `allow_private = true`。
+        // self-host 検査は緩めない。
+        enforce_url_policy(&url("http://127.0.0.1/users/x"), "example.test", true).unwrap();
+        assert!(matches!(
+            enforce_url_policy(&url("https://example.test/users/me"), "example.test", true)
+                .unwrap_err(),
+            FetchError::Blocked {
+                reason: "self-host",
+                ..
+            }
+        ));
     }
 
     #[test]
     fn enforce_url_policy_rejects_file_scheme() {
-        let err = enforce_url_policy(&url("file:///etc/passwd"), "example.test").unwrap_err();
+        let err = enforce_url_policy(&url("file:///etc/passwd"), "example.test", true).unwrap_err();
         assert!(matches!(err, FetchError::Malformed(_)));
     }
 

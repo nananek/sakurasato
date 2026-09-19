@@ -174,6 +174,36 @@ impl AppState {
         }))
     }
 
+    /// テスト専用: 未知 actor の remote fetch を有効にした [`AppState`]。
+    ///
+    /// [`Self::from_pool`] と同じく SSRF ガードを緩める
+    /// ([`Inner::allow_internal_inbox`] = `true`) ── 未知 actor を
+    /// `127.0.0.1` の stub で配信する署名検証回帰テスト
+    /// (`tests/dispatch_pg.rs`) のため。本番経路は [`Self::from_config`] を
+    /// 通り、こちらは使われない。
+    pub fn from_pool_with_remote_fetch(pool: PgPool, config: Config) -> Self {
+        let http = http_client::build_client().expect("reqwest builder is infallible in tests");
+        let s3 =
+            build_s3_client(&config).expect("aws-sdk-s3 builder is infallible from static creds");
+        let media_proxy = MediaProxyClient::new(config.media_proxy.socket.clone());
+        let (timeline_tx, _) = broadcast::channel(TIMELINE_CHANNEL_CAPACITY);
+        let (stream_tx, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
+        Self(Arc::new(Inner {
+            config,
+            pool,
+            http,
+            s3,
+            timeline_tx,
+            stream_tx,
+            allow_internal_inbox: true,
+            enable_remote_fetch: true,
+            media_proxy,
+            delivery_notify: Arc::new(Notify::new()),
+            fetch_rate_limiter: DomainRateLimiter::new(),
+            media_proxy_rate_limiter: DomainRateLimiter::new(),
+        }))
+    }
+
     pub fn config(&self) -> &Config {
         &self.0.config
     }
