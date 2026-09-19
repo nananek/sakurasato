@@ -48,11 +48,13 @@ struct Inner {
     /// SSRF ガード ([`crate::net_guard::host_blocked`]) を緩めるかどうか。
     ///
     /// **本番経路 [`AppState::from_config`] は常に `false`** ── 配送ワーカが
-    /// `http://127.0.0.1/admin` のような内部宛先に POST するのを遮断する。
-    /// **テスト経路 [`AppState::from_pool`] のみ `true`** ── 統合テストは
-    /// `127.0.0.1:0` の axum サーバを立ててダミー inbox にするため、
-    /// loopback を許可しないとテスト不能。本番 `from_config` を通る限り
-    /// 常に false 固定なので、CLI / serve 経路で内部宛先が通る経路は無い。
+    /// `http://127.0.0.1/admin` のような内部宛先に POST することを、AP object
+    /// fetch ([`crate::remote_actor::fetch_object_json`]) が内部宛先を GET
+    /// することを遮断する。**テスト経路 ([`AppState::from_pool`] /
+    /// [`AppState::from_pool_with_remote_fetch`]) のみ `true`** ── 統合テストは
+    /// `127.0.0.1:0` の axum サーバを立ててダミー inbox / actor stub にする
+    /// ため、loopback 許可が必須。本番 `from_config` を通る限り常に false
+    /// 固定なので、CLI / serve 経路で内部宛先が通る経路は無い。
     allow_internal_inbox: bool,
     /// 未知 actor 到来時に remote から actor JSON を fetch するかどうか。
     ///

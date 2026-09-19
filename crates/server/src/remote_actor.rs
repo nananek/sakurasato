@@ -891,8 +891,8 @@ mod tests {
 
     #[test]
     fn enforce_url_policy_allows_private_host_when_opted_in() {
-        // テスト経路 (`AppState::from_pool`) のみ `allow_private = true`。
-        // self-host 検査は緩めない。
+        // テスト経路 (`AppState::from_pool` / `from_pool_with_remote_fetch`) の
+        // み `allow_private = true`。self-host 検査は緩めない。
         enforce_url_policy(&url("http://127.0.0.1/users/x"), "example.test", true).unwrap();
         assert!(matches!(
             enforce_url_policy(&url("https://example.test/users/me"), "example.test", true)
